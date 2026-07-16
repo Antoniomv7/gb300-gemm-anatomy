@@ -1,0 +1,49 @@
+# Build / binary / object output
+build/
+bin/
+*.o
+*.obj
+*.a
+*.so
+*.out
+*.exe
+*.cubin
+*.fatbin
+*.ptx
+*.sass
+smoke/cuda_smoke
+
+# Python environments and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs and profiler output
+*.log
+*.ncu-rep
+*.nsys-rep
+
+# Raw preflight and experiment output. Selected, curated processed results
+# (small CSV/JSON) are committed deliberately elsewhere under results/;
+# CSV/JSON are intentionally NOT blanket-ignored.
+results/preflight/
+
+# Temporary / editor / container-local metadata
+*.tmp
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+.claude/
+
+# Secrets: environment files are never committed.
+# VERSIONS.env is the tracked, non-secret version contract (re-included below).
+*.env
+.env.*
+!VERSIONS.env
