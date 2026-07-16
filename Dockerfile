@@ -58,9 +58,9 @@ RUN git init -q /opt/cutlass \
 
 # Install CuTe DSL with the pinned commit's own installer, which resolves to
 # the version-pinned wheel nvidia-cutlass-dsl[cu13]==4.6.1. The import check
-# is host-side Python only; no GPU is touched during build.
+# is host-side Python only; no GPU is touched during build. PIP_NO_CACHE_DIR=1
+# already prevents cache writes, so no cache cleanup step is needed.
 RUN bash /opt/cutlass/python/CuTeDSL/setup.sh --cu13 \
-    && python3 -c "import cutlass; v = cutlass.__version__; assert v == '4.6.1', f'unexpected CuTe DSL version {v}'; print('CuTeDSL', v)" \
-    && pip cache purge 2>/dev/null || true
+    && python3 -c "import cutlass; v = cutlass.__version__; assert v == '4.6.1', f'unexpected CuTe DSL version {v}'; print('CuTeDSL', v)"
 
 WORKDIR /workspace

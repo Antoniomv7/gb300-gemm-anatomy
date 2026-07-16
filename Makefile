@@ -7,6 +7,10 @@ include VERSIONS.env
 
 IMAGE_TAG ?= gb300-gemm-anatomy:phase0
 
+# Derived pins: "13.1" from CUDA_VERSION=13.1.0, "4.6.1" from CUTLASS_VERSION=v4.6.1.
+CUDA_SHORT_VERSION := $(basename $(CUDA_VERSION))
+CUTEDSL_VERSION := $(patsubst v%,%,$(CUTLASS_VERSION))
+
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
 	Dockerfile Makefile \
@@ -81,15 +85,41 @@ check-env:
 		--network none \
 		--security-opt no-new-privileges \
 		--cap-drop ALL \
+		-e CUDA_SHORT_VERSION="$(CUDA_SHORT_VERSION)" \
+		-e CUTEDSL_VERSION="$(CUTEDSL_VERSION)" \
 		"$(IMAGE_TAG)" \
-		bash -c 'set -eu; \
-			echo "== nvcc ==";      nvcc --version | tail -n 3; \
-			echo "== ptxas ==";     ptxas --version | tail -n 2; \
-			echo "== cuobjdump =="; cuobjdump --version | tail -n 2; \
-			echo "== nvdisasm ==";  nvdisasm --version | tail -n 2; \
-			echo "== ncu ==";       ncu --version | tail -n 2; \
-			echo "== python ==";    python3 --version; \
-			echo "== cutedsl ==";   python3 -c "import cutlass; v = cutlass.__version__; assert v == \"4.6.1\", v; print(\"CuTeDSL\", v)"; \
+		bash -c 'set -euo pipefail; \
+			for tool in nvcc ptxas cuobjdump nvdisasm ncu python3; do \
+				command -v "$$tool" >/dev/null 2>&1 \
+					|| { echo "check-env: MISSING tool: $$tool" >&2; exit 1; }; \
+			done; \
+			nvcc_v="$$(nvcc --version | grep -i release)"; \
+			[ -n "$$nvcc_v" ] || { echo "check-env: empty nvcc version output" >&2; exit 1; }; \
+			echo "nvcc: $$nvcc_v"; \
+			case "$$nvcc_v" in \
+				*"release $${CUDA_SHORT_VERSION}"*) ;; \
+				*) echo "check-env: nvcc is not CUDA $${CUDA_SHORT_VERSION}: $$nvcc_v" >&2; exit 1;; \
+			esac; \
+			ptxas_v="$$(ptxas --version | grep -i release)"; \
+			[ -n "$$ptxas_v" ] || { echo "check-env: empty ptxas version output" >&2; exit 1; }; \
+			echo "ptxas: $$ptxas_v"; \
+			case "$$ptxas_v" in \
+				*"release $${CUDA_SHORT_VERSION}"*) ;; \
+				*) echo "check-env: ptxas is not CUDA $${CUDA_SHORT_VERSION}: $$ptxas_v" >&2; exit 1;; \
+			esac; \
+			cuobjdump_v="$$(cuobjdump --version | grep -i release)"; \
+			[ -n "$$cuobjdump_v" ] || { echo "check-env: empty cuobjdump version output" >&2; exit 1; }; \
+			echo "cuobjdump: $$cuobjdump_v"; \
+			nvdisasm_v="$$(nvdisasm --version | grep -i release)"; \
+			[ -n "$$nvdisasm_v" ] || { echo "check-env: empty nvdisasm version output" >&2; exit 1; }; \
+			echo "nvdisasm: $$nvdisasm_v"; \
+			ncu_v="$$(ncu --version | grep -i version)"; \
+			[ -n "$$ncu_v" ] || { echo "check-env: empty ncu version output" >&2; exit 1; }; \
+			echo "ncu: $$ncu_v"; \
+			py_v="$$(python3 --version)"; \
+			[ -n "$$py_v" ] || { echo "check-env: empty python3 version output" >&2; exit 1; }; \
+			echo "python3: $$py_v"; \
+			python3 -c "import os, cutlass; v = cutlass.__version__; expected = os.environ[\"CUTEDSL_VERSION\"]; assert v == expected, f\"CuTeDSL {v} != pinned {expected}\"; print(\"cutedsl:\", v)"; \
 			echo "check-env: OK"'
 
 preflight:

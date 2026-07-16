@@ -23,7 +23,7 @@ DSL implementation approach cuBLASLt?
 2. **BF16 UMMA throughput** — estimate the fifth-generation Tensor Core
    ceiling and 2-SM scaling. BF16×BF16 with FP32 accumulation; 1-SM M=128,
    2-SM M=256; N ∈ {64, 128, 256}; depth ∈ {4, 16, 64, 256}; at most 24
-   configurations; tcgen05/UTCMMA verified in SASS.
+   configurations; tcgen05/UTCMMA usage to be verified in SASS.
 3. **CuTe DSL BF16 GEMM versus cuBLASLt** — use experiments 1–2 to configure a
    GEMM and explain the remaining gap. Variants: non-persistent 1-CTA,
    persistent 1-CTA, persistent 2-CTA; at most six candidates per shape; an

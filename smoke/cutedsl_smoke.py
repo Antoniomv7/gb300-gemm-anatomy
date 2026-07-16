@@ -90,18 +90,42 @@ def add_launcher(
     )
 
 
+def error_name(err) -> str:
+    """Best-effort symbolic name for a CUresult (e.g. CUDA_ERROR_...)."""
+    name_err, name = cuda_driver.cuGetErrorName(err)
+    if name_err != cuda_driver.CUresult.CUDA_SUCCESS:
+        return f"CUresult({int(err)})"
+    return name.decode() if isinstance(name, bytes) else str(name)
+
+
 def check_cuda(result, what):
     """Unpack a cuda.bindings (err, value...) tuple, raising on any error."""
     err, rest = result[0], result[1:]
     if err != cuda_driver.CUresult.CUDA_SUCCESS:
-        _, name = cuda_driver.cuGetErrorName(err)
-        name = name.decode() if isinstance(name, bytes) else str(name)
-        raise RuntimeError(f"{what} failed: {name}")
+        raise RuntimeError(f"{what} failed: {error_name(err)}")
     if len(rest) == 0:
         return None
     if len(rest) == 1:
         return rest[0]
     return rest
+
+
+def cleanup(device, buffers) -> bool:
+    """Free device buffers and release the primary context, checking every
+    return code. Prints each cleanup failure and returns False if any cleanup
+    call failed. Never raises, so an in-flight primary exception is not
+    replaced or hidden."""
+    ok = True
+    for label, buf in buffers:
+        err = cuda_driver.cuMemFree(buf)[0]
+        if err != cuda_driver.CUresult.CUDA_SUCCESS:
+            print(f"CUTEDSL_SMOKE cleanup_error=cuMemFree({label}):{error_name(err)}")
+            ok = False
+    err = cuda_driver.cuDevicePrimaryCtxRelease(device)[0]
+    if err != cuda_driver.CUresult.CUDA_SUCCESS:
+        print(f"CUTEDSL_SMOKE cleanup_error=cuDevicePrimaryCtxRelease:{error_name(err)}")
+        ok = False
+    return ok
 
 
 def main() -> int:
@@ -138,7 +162,11 @@ def main() -> int:
     context = check_cuda(cuda_driver.cuDevicePrimaryCtxRetain(device), "cuDevicePrimaryCtxRetain")
     check_cuda(cuda_driver.cuCtxSetCurrent(context), "cuCtxSetCurrent")
 
-    d_a = d_b = d_c = None
+    # Buffers are recorded as they are successfully allocated so that cleanup
+    # frees exactly what exists, on both the success and the error path.
+    buffers = []
+    status = 1
+    primary_exc = None
     try:
         # Deterministic inputs whose float32 sum is exact: a=i, b=2i, c=3i.
         a_host = np.arange(M * N, dtype=np.float32).reshape(M, N)
@@ -147,8 +175,11 @@ def main() -> int:
         nbytes = a_host.nbytes
 
         d_a = check_cuda(cuda_driver.cuMemAlloc(nbytes), "cuMemAlloc(a)")
+        buffers.append(("a", d_a))
         d_b = check_cuda(cuda_driver.cuMemAlloc(nbytes), "cuMemAlloc(b)")
+        buffers.append(("b", d_b))
         d_c = check_cuda(cuda_driver.cuMemAlloc(nbytes), "cuMemAlloc(c)")
+        buffers.append(("c", d_c))
         check_cuda(cuda_driver.cuMemcpyHtoD(d_a, a_host, nbytes), "cuMemcpyHtoD(a)")
         check_cuda(cuda_driver.cuMemcpyHtoD(d_b, b_host, nbytes), "cuMemcpyHtoD(b)")
         check_cuda(cuda_driver.cuMemcpyHtoD(d_c, c_host, nbytes), "cuMemcpyHtoD(c)")
@@ -169,17 +200,24 @@ def main() -> int:
         print(f"CUTEDSL_SMOKE elements={M * N} mismatches={mismatches}")
         if mismatches != 0:
             print("CUTEDSL_SMOKE correctness=MISMATCH")
-            print("CUTEDSL_SMOKE_RESULT=FAIL")
-            return 1
+            status = 1
+        else:
+            print("CUTEDSL_SMOKE correctness=OK")
+            status = 0
+    except Exception as exc:
+        primary_exc = exc
 
-        print("CUTEDSL_SMOKE correctness=OK")
-        print("CUTEDSL_SMOKE_RESULT=PASS")
-        return 0
-    finally:
-        for buf in (d_a, d_b, d_c):
-            if buf is not None:
-                cuda_driver.cuMemFree(buf)
-        cuda_driver.cuDevicePrimaryCtxRelease(device)
+    cleanup_ok = cleanup(device, buffers)
+
+    if primary_exc is not None:
+        # Re-raised only after cleanup ran; cleanup failures were printed
+        # above and do not replace the primary error.
+        raise primary_exc
+    if not cleanup_ok:
+        print("CUTEDSL_SMOKE cleanup=FAILED")
+        status = 1
+    print(f"CUTEDSL_SMOKE_RESULT={'PASS' if status == 0 else 'FAIL'}")
+    return status
 
 
 if __name__ == "__main__":

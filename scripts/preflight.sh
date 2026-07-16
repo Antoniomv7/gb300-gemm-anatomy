@@ -2,7 +2,15 @@
 # Phase 0 preflight for gb300-gemm-anatomy.
 #
 # Runs INSIDE the pinned container, launched by scripts/run_container.sh
-# (which guarantees exactly one GPU is visible as CUDA logical device 0).
+# (which guarantees exactly one GPU is visible as CUDA logical device 0 and
+# exports EXPECTED_GPU_UUID; this script refuses to start without it).
+#
+# Check gating (dependent checks are SKIPped with an explicit reason):
+#   cuda_smoke_compile  requires tool_versions PASS
+#   cuda_smoke_run      requires gpu_visibility PASS and cuda_smoke_compile PASS
+#   cutedsl_smoke       requires gpu_visibility PASS and tool_versions PASS
+#   ncu_profile         requires gpu_visibility PASS and cuda_smoke_run PASS
+# No CUDA, CuTe DSL, or NCU execution happens unless gpu_visibility is PASS.
 #
 # Checks (all required):
 #   gpu_visibility      exactly one GPU, allowlisted fields, CC 10.3
@@ -24,6 +32,13 @@
 # once execution has started, even when a check fails mid-run.
 
 set -u -o pipefail
+
+# The launcher must have pinned the exact device; refuse to run without it.
+if [ -z "${EXPECTED_GPU_UUID:-}" ]; then
+    echo "preflight: ERROR: EXPECTED_GPU_UUID is not set." >&2
+    echo "preflight: run this script only via scripts/run_container.sh." >&2
+    exit 2
+fi
 
 SCHEMA_VERSION="1"
 CUDA_ARCH="sm_103a"
@@ -141,9 +156,10 @@ log_has_driver_error() {
 }
 
 # --- check 1: gpu_visibility -------------------------------------------------
-gpu_query="$(nvidia-smi --query-gpu=index,name,uuid,driver_version,compute_cap,memory.total \
-    --format=csv,noheader 2>"${OUT_DIR}/gpu_query.err")"
-if [ $? -ne 0 ] || [ -z "${gpu_query}" ]; then
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+    STATUS[gpu_visibility]="FAIL"; REASON[gpu_visibility]="NVIDIA_SMI_MISSING"
+elif ! gpu_query="$(nvidia-smi --query-gpu=index,name,uuid,driver_version,compute_cap,memory.total \
+        --format=csv,noheader 2>"${OUT_DIR}/gpu_query.err")" || [ -z "${gpu_query}" ]; then
     STATUS[gpu_visibility]="FAIL"; REASON[gpu_visibility]="NVIDIA_SMI_FAILED"
 else
     n_gpus="$(grep -c . <<<"${gpu_query}")"
@@ -161,7 +177,7 @@ else
             echo "compute_cap=${g_cc}"
             echo "memory_total=${g_mem}"
         } > "${GPU_KV}"
-        if [ -n "${EXPECTED_GPU_UUID:-}" ] && [ "${g_uuid}" != "${EXPECTED_GPU_UUID}" ]; then
+        if [ "${g_uuid}" != "${EXPECTED_GPU_UUID}" ]; then
             STATUS[gpu_visibility]="FAIL"; REASON[gpu_visibility]="UUID_MISMATCH"
         elif [ "${g_cc}" != "${REQUIRED_CC}" ]; then
             STATUS[gpu_visibility]="FAIL"; REASON[gpu_visibility]="UNEXPECTED_COMPUTE_CAP_${g_cc}"
@@ -173,34 +189,59 @@ fi
 echo "preflight: gpu_visibility ${STATUS[gpu_visibility]} (${REASON[gpu_visibility]})"
 
 # --- check 2: tool_versions --------------------------------------------------
+# Version queries only; nothing here executes GPU work. A tool is rejected if
+# it is absent, its version command fails, or its output is empty/malformed
+# (must match the expected version pattern).
 tools_ok=1
 record_tool() {
-    local name="$1"; shift
-    local out
-    if out="$("$@" 2>&1)"; then
-        echo "${name}=$(head -n1 <<<"${out}" | tr -d '\r')" >> "${TOOLS_KV}"
-    else
+    local name="$1" pattern="$2"
+    shift 2
+    local out line
+    if ! command -v "$1" >/dev/null 2>&1; then
         echo "${name}=MISSING" >> "${TOOLS_KV}"
         tools_ok=0
+        return
     fi
+    if ! out="$("$@" 2>&1)"; then
+        echo "${name}=COMMAND_FAILED" >> "${TOOLS_KV}"
+        tools_ok=0
+        return
+    fi
+    line="$(grep -iE -- "${pattern}" <<<"${out}" | head -n1 | tr -d '\r')"
+    if [ -z "${line}" ]; then
+        echo "${name}=MALFORMED_VERSION_OUTPUT" >> "${TOOLS_KV}"
+        tools_ok=0
+        return
+    fi
+    echo "${name}=${line}" >> "${TOOLS_KV}"
 }
-record_tool "nvcc"      bash -c 'nvcc --version | grep -i release | head -n1'
-record_tool "ptxas"     bash -c 'ptxas --version | grep -i release | head -n1'
-record_tool "cuobjdump" bash -c 'cuobjdump --version | grep -i release | head -n1'
-record_tool "nvdisasm"  bash -c 'nvdisasm --version | grep -i release | head -n1'
-record_tool "ncu"       bash -c 'ncu --version | grep -i version | head -n1'
-record_tool "python3"   python3 --version
-record_tool "cutedsl"   python3 -c 'import cutlass; print(cutlass.__version__)'
+record_tool "nvcc"      'release [0-9]+\.[0-9]+'  nvcc --version
+record_tool "ptxas"     'release [0-9]+\.[0-9]+'  ptxas --version
+record_tool "cuobjdump" 'release [0-9]+\.[0-9]+'  cuobjdump --version
+record_tool "nvdisasm"  'release [0-9]+\.[0-9]+'  nvdisasm --version
+record_tool "ncu"       'version [0-9]+'          ncu --version
+record_tool "python3"   'python [0-9]+\.[0-9]+'   python3 --version
+# CuTe DSL is a module, not an executable; validate a real version string.
+if dsl_out="$(python3 -c 'import cutlass; print(cutlass.__version__)' 2>&1)" \
+        && [[ "${dsl_out}" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "cutedsl=${dsl_out}" >> "${TOOLS_KV}"
+else
+    echo "cutedsl=MISSING_OR_MALFORMED" >> "${TOOLS_KV}"
+    tools_ok=0
+fi
 if [ "${tools_ok}" -eq 1 ]; then
     STATUS[tool_versions]="PASS"; REASON[tool_versions]="OK"
 else
-    STATUS[tool_versions]="FAIL"; REASON[tool_versions]="TOOL_MISSING"
+    STATUS[tool_versions]="FAIL"; REASON[tool_versions]="TOOL_MISSING_OR_MALFORMED"
 fi
 echo "preflight: tool_versions ${STATUS[tool_versions]} (${REASON[tool_versions]})"
 
 # --- check 3: cuda_smoke_compile ---------------------------------------------
 SMOKE_BIN="${OUT_DIR}/cuda_smoke"
-if nvcc -arch=${CUDA_ARCH} -O2 -o "${SMOKE_BIN}" smoke/cuda_smoke.cu \
+if [ "${STATUS[tool_versions]}" != "PASS" ]; then
+    STATUS[cuda_smoke_compile]="SKIP"
+    REASON[cuda_smoke_compile]="DEPENDENCY_TOOL_VERSIONS_${STATUS[tool_versions]}"
+elif nvcc -arch=${CUDA_ARCH} -O2 -o "${SMOKE_BIN}" smoke/cuda_smoke.cu \
         > "${OUT_DIR}/cuda_smoke_compile.log" 2>&1; then
     STATUS[cuda_smoke_compile]="PASS"; REASON[cuda_smoke_compile]="OK"
 else
@@ -210,8 +251,12 @@ echo "preflight: cuda_smoke_compile ${STATUS[cuda_smoke_compile]} (${REASON[cuda
 
 # --- check 4: cuda_smoke_run --------------------------------------------------
 RUN_LOG="${OUT_DIR}/cuda_smoke_run.log"
-if [ "${STATUS[cuda_smoke_compile]}" != "PASS" ]; then
-    STATUS[cuda_smoke_run]="SKIP"; REASON[cuda_smoke_run]="DEPENDENCY_FAILED"
+if [ "${STATUS[gpu_visibility]}" != "PASS" ]; then
+    STATUS[cuda_smoke_run]="SKIP"
+    REASON[cuda_smoke_run]="DEPENDENCY_GPU_VISIBILITY_${STATUS[gpu_visibility]}"
+elif [ "${STATUS[cuda_smoke_compile]}" != "PASS" ]; then
+    STATUS[cuda_smoke_run]="SKIP"
+    REASON[cuda_smoke_run]="DEPENDENCY_CUDA_SMOKE_COMPILE_${STATUS[cuda_smoke_compile]}"
 else
     "${SMOKE_BIN}" > "${RUN_LOG}" 2>&1
     rc=$?
@@ -231,23 +276,33 @@ echo "preflight: cuda_smoke_run ${STATUS[cuda_smoke_run]} (${REASON[cuda_smoke_r
 
 # --- check 5: cutedsl_smoke ----------------------------------------------------
 DSL_LOG="${OUT_DIR}/cutedsl_smoke.log"
-python3 smoke/cutedsl_smoke.py > "${DSL_LOG}" 2>&1
-rc=$?
-if log_has_driver_error "${DSL_LOG}"; then
-    STATUS[cutedsl_smoke]="BLOCKED"; REASON[cutedsl_smoke]="BLOCKED_DRIVER"
-elif [ "${rc}" -eq 0 ] && grep -q 'CUTEDSL_SMOKE_RESULT=PASS' "${DSL_LOG}"; then
-    STATUS[cutedsl_smoke]="PASS"; REASON[cutedsl_smoke]="OK"
+if [ "${STATUS[gpu_visibility]}" != "PASS" ]; then
+    STATUS[cutedsl_smoke]="SKIP"
+    REASON[cutedsl_smoke]="DEPENDENCY_GPU_VISIBILITY_${STATUS[gpu_visibility]}"
+elif [ "${STATUS[tool_versions]}" != "PASS" ]; then
+    STATUS[cutedsl_smoke]="SKIP"
+    REASON[cutedsl_smoke]="DEPENDENCY_TOOL_VERSIONS_${STATUS[tool_versions]}"
 else
-    STATUS[cutedsl_smoke]="FAIL"; REASON[cutedsl_smoke]="SMOKE_RUN_FAILED_RC_${rc}"
+    python3 smoke/cutedsl_smoke.py > "${DSL_LOG}" 2>&1
+    rc=$?
+    if log_has_driver_error "${DSL_LOG}"; then
+        STATUS[cutedsl_smoke]="BLOCKED"; REASON[cutedsl_smoke]="BLOCKED_DRIVER"
+    elif [ "${rc}" -eq 0 ] && grep -q 'CUTEDSL_SMOKE_RESULT=PASS' "${DSL_LOG}"; then
+        STATUS[cutedsl_smoke]="PASS"; REASON[cutedsl_smoke]="OK"
+    else
+        STATUS[cutedsl_smoke]="FAIL"; REASON[cutedsl_smoke]="SMOKE_RUN_FAILED_RC_${rc}"
+    fi
 fi
 echo "preflight: cutedsl_smoke ${STATUS[cutedsl_smoke]} (${REASON[cutedsl_smoke]})"
 
 # --- check 6: ncu_profile ------------------------------------------------------
 NCU_LOG="${OUT_DIR}/ncu_profile.log"
-if [ "${STATUS[cuda_smoke_run]}" = "BLOCKED" ]; then
-    STATUS[ncu_profile]="SKIP"; REASON[ncu_profile]="DEPENDENCY_BLOCKED"
+if [ "${STATUS[gpu_visibility]}" != "PASS" ]; then
+    STATUS[ncu_profile]="SKIP"
+    REASON[ncu_profile]="DEPENDENCY_GPU_VISIBILITY_${STATUS[gpu_visibility]}"
 elif [ "${STATUS[cuda_smoke_run]}" != "PASS" ]; then
-    STATUS[ncu_profile]="SKIP"; REASON[ncu_profile]="DEPENDENCY_FAILED"
+    STATUS[ncu_profile]="SKIP"
+    REASON[ncu_profile]="DEPENDENCY_CUDA_SMOKE_RUN_${STATUS[cuda_smoke_run]}"
 else
     ncu --set basic --force-overwrite -o "${OUT_DIR}/cuda_smoke_profile" \
         "${SMOKE_BIN}" > "${NCU_LOG}" 2>&1
