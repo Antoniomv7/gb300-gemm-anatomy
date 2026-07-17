@@ -160,14 +160,17 @@ def main() -> int:
     print(f"CUTEDSL_SMOKE compute_capability={cc_major}.{cc_minor}")
 
     context = check_cuda(cuda_driver.cuDevicePrimaryCtxRetain(device), "cuDevicePrimaryCtxRetain")
-    check_cuda(cuda_driver.cuCtxSetCurrent(context), "cuCtxSetCurrent")
 
-    # Buffers are recorded as they are successfully allocated so that cleanup
-    # frees exactly what exists, on both the success and the error path.
+    # Cleanup state exists from the instant the primary context is retained,
+    # so the context is released even if cuCtxSetCurrent or anything after it
+    # fails. Buffers are recorded as they are successfully allocated so that
+    # cleanup frees exactly what exists, on both the success and error paths.
     buffers = []
     status = 1
     primary_exc = None
     try:
+        check_cuda(cuda_driver.cuCtxSetCurrent(context), "cuCtxSetCurrent")
+
         # Deterministic inputs whose float32 sum is exact: a=i, b=2i, c=3i.
         a_host = np.arange(M * N, dtype=np.float32).reshape(M, N)
         b_host = 2.0 * a_host
