@@ -1,7 +1,6 @@
 # results/
 
-There are **no results yet**. This directory currently contains only this
-policy file.
+No experimental performance results exist yet. One Phase 0 diagnostic preflight completed successfully on 20 July 2026.
 
 ## Future contents
 
