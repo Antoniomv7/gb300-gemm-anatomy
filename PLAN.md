@@ -12,19 +12,20 @@ Field semantics (per unit):
 - **Verified on GB300** — the unit has actually been exercised successfully on
   the target GB300 hardware.
 
-No unit in this repository has been audited or verified yet.
+Phase 0 has been independently audited. Its executable units were
+successfully verified on the target GB300 hardware on 20 July 2026.
 
 ## Phase 0 — Contract, environment, launcher, smoke (17–19 July 2026)
 
-Gate: every P0 unit implemented, independently audited, and verified on GB300
-before Phase 1 begins.
+Gate: every P0 unit implemented and independently audited, and every
+executable P0 unit verified on GB300 before Phase 1 begins.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
 | P0.1 | Contract and repository (AGENTS.md, README.md, PLAN.md, LICENSE, .gitignore, VERSIONS.env) | YES | YES | N/A |
-| P0.2 | Reproducible CUDA 13.1 + CuTe DSL environment (Dockerfile, image pinning) | YES (definition only; image not built) | YES | YES |
-| P0.3 | Safe one-GPU launcher and preflight (run_container.sh, preflight.sh, Makefile) | YES (static only; never run) | YES | YES |
-| P0.4 | CUDA, CuTe DSL, and NCU smoke checks (cuda_smoke.cu, cutedsl_smoke.py, ncu step in preflight) | YES (source only; never compiled or run) | YES | YES |
+| P0.2 | Reproducible CUDA 13.1 + CuTe DSL environment (Dockerfile, image pinning) | YES | YES | YES |
+| P0.3 | Safe one-GPU launcher and preflight (run_container.sh, preflight.sh, Makefile) | YES | YES | YES |
+| P0.4 | CUDA, CuTe DSL, and NCU smoke checks (cuda_smoke.cu, cutedsl_smoke.py, ncu step in preflight) | YES | YES | YES |
 
 ## Phase 1 — LDGSTS versus TMA (20–26 July 2026)
 

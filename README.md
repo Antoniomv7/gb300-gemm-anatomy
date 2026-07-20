@@ -3,9 +3,11 @@
 Anatomy of BF16 GEMM performance on NVIDIA GB300: a small, reproducible,
 auditable measurement study.
 
-**Status: `Phase 0 implementation — pending audit`.** Nothing in this
-repository has been built, executed, or verified on hardware yet. There are
-no results and no performance or compatibility claims.
+**Status: `Phase 0 — audited and verified on GB300`.**
+
+The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
+test, and Nsight Compute access were successfully verified on the target
+hardware on 20 July 2026. No experimental performance results exist yet.
 
 ## Research question
 
@@ -30,58 +32,113 @@ DSL implementation approach cuBLASLt?
    equivalent cuBLASLt baseline.
 
 Final `(M,N,K)` shapes for experiment 3:
-`(4096,4096,4096)`, `(8192,8192,8192)`, `(16384,512,4096)`,
-`(32768,512,4096)`, `(512,16384,4096)`.
+
+- `(4096,4096,4096)`
+- `(8192,8192,8192)`
+- `(16384,512,4096)`
+- `(32768,512,4096)`
+- `(512,16384,4096)`
 
 ## Out of scope
 
-Hopper; FP8/FP4/NVFP4/MXFP4; multi-GPU, NVLink, or Grace-Blackwell coherence;
-attention, convolution, or elementwise studies; a general instruction
-catalogue; a CUDA-core roofline; exhaustive sweeps; and beating cuBLASLt as a
-success criterion.
+Hopper; FP8, FP4, NVFP4, and MXFP4; multi-GPU execution, NVLink, or
+Grace–Blackwell coherence; attention, convolution, or elementwise studies; a
+general instruction catalogue; a CUDA-core roofline; exhaustive sweeps; and
+beating cuBLASLt as a success criterion.
 
-## Target environment — pending verification
+## Verified target environment
 
-The following is **expected but not yet verified** in this repository; the
-preflight (not yet run) is what will verify it:
+Phase 0 was verified with the following environment:
 
-- Shared node with eight NVIDIA GB300/B300 GPUs, exactly one physical GPU per run.
-- Expected compute capability 10.3 (`sm_103a`).
-- Previously observed driver 580.95.05 — note that CUDA 13.1 ships with driver
-  590.44.01 and 580.x relies on CUDA 13.x minor-version compatibility; this is
-  an open risk the preflight must resolve, not a verified fact.
+- Shared node containing eight NVIDIA B300 SXM6 AC GPUs.
+- Exactly one explicitly selected physical GPU exposed to each container run.
+- Selected physical GPU mapped to logical device 0 inside the container.
+- Compute capability 10.3 with compilation target `sm_103a`.
+- NVIDIA driver 580.95.05.
+- CUDA Toolkit 13.1.0:
+  - `nvcc` 13.1.80
+  - `ptxas` 13.1.80
+  - `cuobjdump` 13.1.80
+  - `nvdisasm` 13.1.80
+- Nsight Compute 2025.4.0.0.
+- Python 3.12.3.
+- CUTLASS/CuTe DSL 4.6.1.
 - Docker with the NVIDIA Container Toolkit.
-- Pinned software: CUDA 13.1.0, CUTLASS/CuTe DSL v4.6.1 (see `VERSIONS.env`).
 
-## Repository contents (Phase 0)
+The successful smoke tests establish compatibility for the Phase 0 checks.
+Each later experimental phase must still validate correctness and the required
+Blackwell instructions before collecting performance measurements.
+
+## Phase 0 verification record
+
+The executable Phase 0 implementation was verified at Git commit:
+
+```text
+7bb553fe7df95daf7a8ee07a4cd4cf5cc0824fb7
+```
+
+The preflight ran with a clean Git worktree and produced:
+
+```text
+Timestamp:               20260720T161935Z
+GPU visibility:          PASS
+Tool versions:           PASS
+CUDA smoke compilation:  PASS
+CUDA smoke execution:    PASS
+CuTe DSL smoke:          PASS
+Nsight Compute profile:  PASS
+Overall status:          PASS
+Exit code:               0
+```
+
+The run used physical GPU index 4, whose UUID was verified against logical
+device 0 inside the container. No active compute processes were present when
+the launcher performed its pre-execution check.
+
+Raw diagnostic output is stored locally under:
+
+```text
+results/preflight/20260720T161935Z/
+```
+
+This directory contains logs, the smoke binary, the Nsight Compute report, and
+`summary.json`. Raw preflight output is intentionally ignored by Git.
+
+## Repository contents after Phase 0
 
 ```text
 AGENTS.md                 Binding rules for agents and shared-cluster safety
-README.md                 This file
+README.md                 Project scope and current verified status
 PLAN.md                   Phase plan with per-unit audit/verification status
 LICENSE                   BSD 3-Clause
-.gitignore                Ignore rules (raw outputs, caches, secrets)
-VERSIONS.env              Immutable version contract (image digest, commit)
-Dockerfile                Reproducible CUDA 13.1 + CuTe DSL environment
-Makefile                  help / check-static / build-image / check-env / preflight
-scripts/run_container.sh  Safe fail-closed one-GPU container launcher
-scripts/preflight.sh      In-container preflight (smokes + ncu, JSON summary)
-smoke/cuda_smoke.cu       Deterministic CUDA smoke test (no benchmarking)
-smoke/cutedsl_smoke.py    Real minimal CuTe DSL kernel smoke test (non-GEMM)
-results/README.md         Policy for result storage and publication
+.gitignore                Ignore rules for raw outputs, caches, and secrets
+VERSIONS.env              Immutable version contract
+Dockerfile                Reproducible CUDA 13.1 and CuTe DSL environment
+Makefile                  Phase 0 build and validation entry points
+scripts/run_container.sh  Fail-closed single-GPU container launcher
+scripts/preflight.sh      In-container preflight and JSON summary generation
+smoke/cuda_smoke.cu       Deterministic CUDA smoke test
+smoke/cutedsl_smoke.py    Minimal real CuTe DSL kernel smoke test
+results/README.md         Result storage and publication policy
 ```
 
-## Intended usage — not yet run
+## Phase 0 validation workflow
 
-None of the following has been executed yet; they require an independent
-audit first, then the shared GB300 node:
+The completed Phase 0 workflow is:
 
 ```bash
-make check-static                              # static validation only (safe anywhere)
-make build-image                               # build pinned image, no GPU
-make check-env                                 # tool checks in a GPU-less container
-BLACKWELL_GPU_INDEX=<physical-index> make preflight   # explicit single-GPU preflight
+make check-static
+make build-image
+make check-env
+
+# Select a physical GPU only after confirming that it is available.
+BLACKWELL_GPU_INDEX=<physical-index> make preflight
 ```
 
-There are no results yet. See `PLAN.md` for schedule and per-unit status and
-`AGENTS.md` for the mandatory shared-cluster rules.
+`BLACKWELL_GPU_INDEX` is mandatory. The project never selects a GPU
+automatically and never exposes all GPUs to a container.
+
+Phase 0 provides environment and tooling validation only. Experiments 1–3 have
+not started, and the repository contains no bandwidth, throughput, GEMM
+performance, or cuBLASLt comparison results yet. See `PLAN.md` for the
+remaining schedule and `AGENTS.md` for the mandatory shared-cluster rules.
