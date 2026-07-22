@@ -1,14 +1,21 @@
-# src/memory — P1.1 standalone LDGSTS baseline
+# src/memory — P1.1 LDGSTS baseline and P1.2 TMA path
 
-This is the LDGSTS arm of the "LDGSTS versus TMA" experiment (experiment 1 in
-`AGENTS.md`). It measures the effective copy bandwidth of a vectorized
-`cp.async.cg.shared.global` (LDGSTS) software pipeline from global memory to
-shared memory. Dynamic shared memory caps the maximum active residency at one
-CTA per SM; it does not observe or guarantee runtime block placement.
+This directory holds both arms of the "LDGSTS versus TMA" experiment
+(experiment 1 in `AGENTS.md`): the P1.1 LDGSTS baseline
+(`src/memory/ldgsts.cu`) and the P1.2 2D unicast TMA path
+(`src/memory/tma.cu`). Each measures the effective copy bandwidth of its own
+global-memory-to-shared-memory software pipeline. Dynamic shared memory caps
+the maximum active residency at one CTA per SM for both; neither observes or
+guarantees runtime block placement.
 
-**Status: implemented, pending audit and GB300 verification (see `PLAN.md`).**
-No experimental numbers from this code have been published in `README.md` or
-anywhere else in the repository.
+**Status: P1.1 implemented, pending audit and GB300 verification. P1.2
+implemented, pending audit and GB300 verification (see `PLAN.md`).** No
+experimental numbers from either binary have been published in `README.md`
+or anywhere else in the repository. P1.3 (the joint sweep) and P1.4
+(profiling/analysis) have not started and remain blocked until P1.1 and P1.2
+are both independently audited and verified on GB300.
+
+## P1.1 — standalone LDGSTS baseline
 
 ## What P1.1 measures
 
@@ -30,9 +37,13 @@ anywhere else in the repository.
   by measured kernel time. It says nothing about where those bytes actually
   came from (L2 vs DRAM) — that requires Nsight Compute, which is out of
   scope until P1.4.
-- **Not a TMA comparison.** TMA / `cp.async.bulk` is P1.2. The 2D tile
-  layout here is deliberately chosen so P1.2 can express the identical
-  tiles, but no TMA code exists yet.
+- **Not yet a TMA comparison.** TMA / `cp.async.bulk.tensor` is now
+  implemented in `src/memory/tma.cu` (P1.2, `method=tma`), which expresses
+  this file's exact 2D tile layout as 2D unicast TMA loads (see "P1.2 —
+  standalone 2D unicast TMA path" below). The two arms are still not
+  compared, aggregated, or run jointly: P1.2 is implemented but unaudited
+  and unverified on GB300 (see `PLAN.md`), and the joint sweep that would
+  actually compare them is P1.3, which has not started.
 - **Not a sweep or an analysis.** This binary runs one specialization (or,
   under `--self-test`, validates all nine) per invocation. Aggregation,
   statistics, plots, and conclusions are P1.3/P1.4.
@@ -206,6 +217,177 @@ build/memory/ldgsts --stages 4 --bytes-in-flight-kib 32 --run-kind benchmark \
     --working-set-mib 512 --passes 4 --warmup-ms 200 --repetitions 20
 ```
 
+## P1.2 — standalone 2D unicast TMA path
+
+This is the TMA arm of the same experiment. It measures the effective copy
+bandwidth of a 2D unicast Tensor Memory Accelerator pipeline
+(`cp.async.bulk.tensor.2d.shared::cta.global` with mbarrier transaction
+completion) moving the exact same logical tiles as P1.1, from a host-encoded
+rank-2 `CUtensorMap` descriptor, into the same per-SM shared-memory ring
+buffer shape.
+
+**Status: implemented, pending audit and GB300 verification (see
+`PLAN.md`).** No experimental numbers from this code have been published in
+`README.md` or anywhere else in the repository.
+
+### What P1.2 measures
+
+- The *effective copy bandwidth* (`effective_gbps`) of a 2D unicast TMA
+  pipeline for each of the same nine frozen `(stages, bytes_in_flight_per_sm)`
+  specializations as P1.1.
+- Whether every copied 16-byte vector lands in shared memory with the exact
+  bytes the same deterministic source pattern predicts (`correctness`,
+  `mismatches`), for all nine specializations under `--self-test`.
+- The same `occupancy_ctas_per_sm = 1` residency cap as P1.1, verified with
+  the occupancy API for both the validate and benchmark kernels.
+
+### What it cannot yet claim
+
+Identical caveats to P1.1: not HBM/DRAM bandwidth (`effective_gbps` is
+*effective copy bandwidth*, not a claim about L2 vs DRAM traffic — that is
+an NCU question for P1.4); not a comparison against LDGSTS (P1.3 is the
+joint sweep; it has not started); not a sweep or an analysis (this binary
+runs one specialization, or under `--self-test` validates all nine, per
+invocation); not a final result (`run_kind=smoke` is a functional check
+only, never a publishable measurement).
+
+### Frozen contract
+
+- Method: `tma`. PTX: `cp.async.bulk.tensor.2d.shared::cta.global...
+  mbarrier::complete_tx::bytes`, issued through the CUDA 13.1 `cuda::ptx`
+  low-level wrappers (`cp_async_bulk_tensor`, `mbarrier_arrive_expect_tx`,
+  `mbarrier_try_wait_parity`, `elect_sync`).
+- Same threads/CTA, grid, occupancy cap, stages, and bytes-in-flight sets as
+  P1.1: 128 threads/CTA, grid = SM count, maximum active residency = 1
+  CTA/SM, stages ∈ {2, 4, 8}, bytes-in-flight/SM ∈ {16, 32, 64} KiB.
+- One pipeline stage = one 2D TMA tile transfer of exactly `stage_bytes`,
+  tracked by one distinct shared-memory mbarrier with explicit phase/parity
+  reuse (`mbarrier.try_wait.parity`), not `cp.async`'s commit/wait-group
+  counters.
+- **Single geometry source of truth.** `stage_bytes`, and therefore
+  `tile_height = stage_bytes / 256`, are computed once
+  (`compute_stage_bytes()` / `compute_tile_height()` in `src/memory/tma.cu`)
+  and reused everywhere that value is needed: the host-side `Specialization`
+  table, the `CUtensorMap` descriptor's `boxDim[1]`, each kernel's Y-coordinate
+  stride, the expected-source-index computation, the shared-memory payload
+  sizing, and a dispatch-time runtime check that the caller-selected
+  `Specialization` matches the `<STAGES, COPIES>` template it is about to
+  launch. `static_assert`s pin all five distinct `COPIES` values
+  (1, 2, 4, 8, 16) and the full nine-specialization table to their frozen
+  expected numbers, so a regression to an independently-computed (and
+  therefore driftable) tile height fails to compile.
+
+#### Bytes-in-flight formulas
+
+```
+stage_bytes                 = bytes_in_flight_per_sm / stages
+copies_per_thread_per_stage = stage_bytes / (128 threads * 16 bytes)
+bytes_in_flight_per_sm      = stages * stage_bytes
+tile_height                 = stage_bytes / 256
+```
+
+Identical formulas and identical resulting nine-row table to P1.1's (see
+above); `copies_per_thread_per_stage` and `vector_bytes=16` describe the
+logical LDGSTS-equivalent tile decomposition retained for CSV/validation
+compatibility — TMA itself issues exactly one 2D tile operation per stage,
+not one operation per 16-byte vector.
+
+### Tensor map descriptor
+
+A host-encoded rank-2 `CUtensorMap`, built once per specialization via
+`cuTensorMapEncodeTiled` (obtained at run time through
+`cudaGetDriverEntryPointByVersion`, so the GPU-free build never links a
+driver stub):
+
+| Field | Value |
+| --- | --- |
+| Element type | `CU_TENSOR_MAP_DATA_TYPE_UINT16` (opaque BF16-width storage; no arithmetic) |
+| Rank | 2 |
+| `globalDim[0]` | 128 elements |
+| `globalDim[1]` | `working_set_bytes / 256` |
+| `globalStrides[0]` | 256 bytes (no padding between rows) |
+| `boxDim[0]` | 128 elements |
+| `boxDim[1]` | `tile_height` (the corrected, shared-geometry value) |
+| `elementStrides` | `{1, 1}` |
+| Interleave / swizzle / L2 promotion / OOB fill | all `NONE` |
+
+Coordinates are `{x = 0, y = global_tile_index * tile_height}`
+(fastest-moving dimension first). The descriptor is passed to both kernel
+templates as a `const __grid_constant__ CUtensorMap` parameter.
+
+### Mbarrier pipeline: issue, wait, and invalidation
+
+Both kernel templates share the same TMA issue and synchronization helpers
+(`tma_elect_leader`, `tma_init_barriers`, `tma_issue_stage`,
+`tma_wait_stage`, `tma_invalidate_barriers`), so the timed benchmark path is
+the one `--self-test` validates:
+
+- **Issue.** Exactly one compiler-elected thread in warp 0 (`elect.sync`)
+  registers the expected transaction byte count
+  (`mbarrier.arrive.expect_tx`) and issues the 2D TMA tile transfer
+  (`cp.async.bulk.tensor.2d...mbarrier::complete_tx::bytes`) for one ring
+  slot.
+- **Wait.** Every thread independently spins
+  `mbarrier.try_wait.parity` on that slot's mbarrier, tracking its own
+  per-slot phase parity; a successful wait already guarantees full
+  visibility of the TMA-written bytes to that thread.
+- **Pipeline shape.** Fill `STAGES` distinct ring slots before the first
+  wait, wait for the oldest slot, consume it, synchronize the CTA before
+  reusing that slot, refill it on the next iteration, and drain every
+  outstanding stage after the main loop (or after the last pass, for the
+  benchmark kernel's per-launch pass loop).
+- **Invalidation.** After the drain loop's final `__syncthreads()` — i.e.
+  only once every outstanding TMA transaction on every stage has completed
+  and every consumer has finished reading its payload — the same elected
+  leader thread invalidates all `STAGES` mbarriers
+  (`mbarrier.inval.shared.b64`, sm_103a SASS: `SYNCS.CCTL.IV`, one
+  instruction per ring slot), followed by one more `__syncthreads()` so the
+  invalidation is visible to every thread before kernel exit. This never
+  races a pending transaction: invalidation only ever follows a full drain.
+
+### Build, SASS, self-test, and smoke
+
+```bash
+make check-static           # no Docker, no GPU, no network
+make memory-tma-build       # compile inside the pinned image; no GPU
+make memory-tma-sass        # verify 2D unicast TMA loads, transaction-barrier
+                             # completion, and full mbarrier invalidation; no GPU
+
+# GPU-executing targets require an explicit, operator-provided physical
+# index and go exclusively through scripts/run_container.sh:
+BLACKWELL_GPU_INDEX=<physical-index> make memory-tma-self-test
+BLACKWELL_GPU_INDEX=<physical-index> make memory-tma-smoke
+```
+
+Direct CLI usage (inside the container, e.g. via
+`scripts/run_container.sh build/memory/tma ...`):
+
+```bash
+build/memory/tma --help
+build/memory/tma --self-test
+build/memory/tma --stages 4 --bytes-in-flight-kib 32 --run-kind benchmark \
+    --working-set-mib 512 --passes 4 --warmup-ms 200 --repetitions 20
+```
+
+## LDGSTS/TMA equivalence table
+
+| Dimension | P1.1 LDGSTS | P1.2 TMA |
+| --- | --- | --- |
+| Threads/CTA, grid | 128 threads/CTA, grid = SM count | Identical |
+| Occupancy cap | `occupancy_ctas_per_sm = 1`, enforced identically | Identical |
+| Stages | `{2, 4, 8}` | Identical |
+| Bytes in flight/SM | `{16, 32, 64}` KiB | Identical |
+| Stage bytes | `bytes_in_flight_per_sm / stages` | Identical formula |
+| Tile width | 128 BF16-width elements = 256 bytes | Identical |
+| Tile height | `stage_bytes / 256` | Identical formula, single shared source of truth (see "Frozen contract" above) |
+| Working-set partition | Disjoint per-CTA slice, `sm_count*32KiB` common multiple, `>2xL2` for `benchmark` | Identical |
+| Passes / rotation | `useful_bytes = working_set_bytes * passes`; starting tile rotates between passes and repetitions | Identical |
+| Timing | CUDA events around one kernel launch per CSV sample; warm-up outside timed events | Identical |
+| Correctness | Full-working-set validation before any timing; device-side mismatch accumulation; no timed run after a mismatch | Identical |
+| CSV schema | `schema_version="1"`, `method=ldgsts` | Same schema, `method=tma`; `vector_bytes`/`copies_per_thread_per_stage` describe the logical LDGSTS-equivalent decomposition, not TMA's issuing granularity |
+| Issuing mechanism | Every thread issues its own 16-byte `cp.async.cg.shared.global` copies | One elected thread issues one 2D tile TMA operation per stage |
+| Completion mechanism | `cp.async.commit_group` / `cp.async.wait_group<N>` per-thread counters | One mbarrier per ring slot; `mbarrier.arrive.expect_tx` + `mbarrier.try_wait.parity`, explicit phase/parity tracking, explicit `mbarrier.inval` after drain |
+
 ## CSV schema
 
 Emitted only for `--stages`/`--bytes-in-flight-kib`/`--run-kind` invocations
@@ -214,10 +396,10 @@ stdout; everything else goes to stderr.
 
 | Column | Unit / format | Meaning |
 | --- | --- | --- |
-| `schema_version` | string | CSV schema version (`"1"`). P1.2 reuses this schema. |
+| `schema_version` | string | CSV schema version (`"1"`), shared by both `build/memory/ldgsts` and `build/memory/tma`. |
 | `timestamp_utc` | ISO 8601, UTC | Wall-clock time the row was produced. |
 | `run_kind` | `smoke` \| `benchmark` | As passed on the CLI. |
-| `method` | string | Always `ldgsts` in this file; P1.2 will emit `tma`. |
+| `method` | string | `ldgsts` from `build/memory/ldgsts`; `tma` from `build/memory/tma`. |
 | `sample_index` | integer | 0-based repetition index within this run. |
 | `stages` | integer | Ring buffer depth (2, 4, or 8). |
 | `tile_width_elements` | BF16-width elements | Always 128. |
@@ -225,14 +407,14 @@ stdout; everything else goes to stderr.
 | `tile_height` | rows | `stage_bytes / 256`. |
 | `stage_bytes` | bytes | One pipeline stage's transfer size. |
 | `bytes_in_flight_per_sm` | bytes | `stages * stage_bytes`. |
-| `vector_bytes` | bytes | Always 16 (the `cp.async.cg` fixed vector width). |
-| `copies_per_thread_per_stage` | count | `stage_bytes / (128 * 16)`. |
+| `vector_bytes` | bytes | Always 16 (the `cp.async.cg` fixed vector width for `ldgsts`; the logical LDGSTS-equivalent decomposition unit for `tma`, not its issuing granularity). |
+| `copies_per_thread_per_stage` | count | `stage_bytes / (128 * 16)`. For `tma`, describes the logical tile decomposition used for validation/comparison; TMA itself issues one 2D tile operation per stage, not one operation per vector. |
 | `threads_per_cta` | count | Always 128. |
 | `target_ctas_per_sm` | count | Always 1: the frozen target for maximum active residency. |
 | `occupancy_ctas_per_sm` | count | Maximum active blocks/SM reported by `cudaOccupancyMaxActiveBlocksPerMultiprocessor`; always 1 or the run aborts. This is not an observed block-placement count. |
 | `grid_blocks` | count | Equals `sm_count`. |
 | `sm_count` | count | Queried `multiProcessorCount`. |
-| `smem_reservation_bytes` | bytes | Actual dynamic shared memory reserved (> half of `sharedMemPerMultiprocessor`, includes padding beyond `bytes_in_flight_per_sm`). |
+| `smem_reservation_bytes` | bytes | Actual dynamic shared memory reserved (> half of `sharedMemPerMultiprocessor`, includes padding beyond `bytes_in_flight_per_sm`; for `tma`, also includes mbarrier storage). |
 | `l2_bytes` | bytes | Queried `l2CacheSize`. |
 | `requested_working_set_bytes` | bytes | Before rounding (CLI value or the 4xL2 default). |
 | `working_set_bytes` | bytes | After rounding to the `sm_count*32KiB` common multiple. |

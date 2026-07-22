@@ -13,6 +13,9 @@ for each one:
 * at least one phase/parity wait instruction
   (``SYNCS.PHASECHK.TRANS*.TRYWAIT``, sm_103a's lowering of
   ``mbarrier.try_wait.parity``);
+* at least STAGES mbarrier invalidation instructions (``SYNCS.CCTL.IV``,
+  sm_103a's lowering of ``mbarrier.inval.shared.b64``) — one per ring slot,
+  issued only after the pipeline is fully drained;
 * no LDGSTS transfer path and no UBLKCP 1D bulk-copy path.
 
 These mnemonics were read directly from ``cuobjdump -sass`` output of this
@@ -20,8 +23,11 @@ project's own ``build/memory/tma`` binary compiled for sm_103a with CUDA
 13.1.80 ptxas, not guessed from documentation. ``ptxas`` may unroll or peel
 the source loop and duplicate a complete static sequence (for example the
 try_wait spin loop's fast-path check plus its retry-loop body both lower to
-a static TRYWAIT), so the checker requires only presence, never an exact
-static instruction count.
+a static TRYWAIT), so the checker requires only presence — never an exact
+static instruction count — for every category except invalidation, where the
+source's own `#pragma unroll` over a compile-time-known STAGES gives a
+stable per-specialization minimum (observed as exactly STAGES static
+SYNCS.CCTL.IV per specialization, with no retry-loop-style duplication).
 
 Usage:
   check_tma_sass.py <binary> <output-sass-path>
@@ -59,6 +65,7 @@ SPEC_PATTERNS = (
 UTMALDG_PATTERN = re.compile(r"\bUTMALDG((?:\.[A-Z0-9_]+)*)\b")
 ARRIVE_TRANS_PATTERN = re.compile(r"\bSYNCS\.ARRIVE\.TRANS\d*\b")
 PHASECHK_TRYWAIT_PATTERN = re.compile(r"\bSYNCS\.PHASECHK\.TRANS\d*\.TRYWAIT\b")
+INVALIDATE_PATTERN = re.compile(r"\bSYNCS\.CCTL\.IV\b")
 LDGSTS_PATTERN = re.compile(r"\bLDGSTS\b")
 UBLKCP_PATTERN = re.compile(r"\bUBLKCP\b")
 
@@ -130,6 +137,7 @@ def analyze_sass(sass_text: str) -> tuple[list[str], list[str]]:
         utmaldg_matches = list(UTMALDG_PATTERN.finditer(text_block))
         arrive_count = len(ARRIVE_TRANS_PATTERN.findall(text_block))
         trywait_count = len(PHASECHK_TRYWAIT_PATTERN.findall(text_block))
+        inval_count = len(INVALIDATE_PATTERN.findall(text_block))
         ldgsts_count = len(LDGSTS_PATTERN.findall(text_block))
         ublkcp_count = len(UBLKCP_PATTERN.findall(text_block))
 
@@ -161,6 +169,11 @@ def analyze_sass(sass_text: str) -> tuple[list[str], list[str]]:
                 "no phase/parity wait instruction "
                 "(expected SYNCS.PHASECHK.TRANS*.TRYWAIT)"
             )
+        if inval_count < stages:
+            spec_errors.append(
+                f"fewer than STAGES={stages} mbarrier invalidation instruction(s) "
+                f"(expected SYNCS.CCTL.IV, one per ring slot; found {inval_count})"
+            )
         if ldgsts_count != 0:
             spec_errors.append(f"LDGSTS transfer path present (count={ldgsts_count})")
         if ublkcp_count != 0:
@@ -173,7 +186,8 @@ def analyze_sass(sass_text: str) -> tuple[list[str], list[str]]:
         else:
             status_lines.append(
                 f"OK   {label} UTMALDG.2D={len(utmaldg_matches)} "
-                f"ARRIVE.TRANS={arrive_count} PHASECHK.TRYWAIT={trywait_count}"
+                f"ARRIVE.TRANS={arrive_count} PHASECHK.TRYWAIT={trywait_count} "
+                f"CCTL.IV={inval_count}"
             )
 
     return status_lines, errors
@@ -187,6 +201,7 @@ def synthetic_block(
     utmaldg_qualifier: str = "2D",
     arrive_count: int = 1,
     trywait_count: int = 2,
+    inval_count: int | None = None,
     ldgsts_count: int = 0,
     ublkcp_count: int = 0,
 ) -> str:
@@ -194,9 +209,12 @@ def synthetic_block(
 
     Shaped after this project's own real cuobjdump -sass output for
     build/memory/tma on sm_103a (CUDA 13.1.80 ptxas): one UTMALDG.2D, one
-    SYNCS.ARRIVE.TRANS64, and two SYNCS.PHASECHK.TRANS64.TRYWAIT (fast-path
-    check plus retry-loop body) per specialization.
+    SYNCS.ARRIVE.TRANS64, two SYNCS.PHASECHK.TRANS64.TRYWAIT (fast-path check
+    plus retry-loop body), and exactly STAGES SYNCS.CCTL.IV (one per
+    #pragma-unrolled ring slot) per specialization.
     """
+    if inval_count is None:
+        inval_count = stages
     lines = [
         "Function : "
         f"_Zsynthetic_tma_benchmark_kernelILi{stages}ELi{copies}EEv"
@@ -207,6 +225,8 @@ def synthetic_block(
         lines.append("        SYNCS.ARRIVE.TRANS64 RZ, [R5+UR19+0x10000], R2 ;")
     for _ in range(trywait_count):
         lines.append("        SYNCS.PHASECHK.TRANS64.TRYWAIT P1, [UR18+0x10000], R2 ;")
+    for i in range(inval_count):
+        lines.append(f"        SYNCS.CCTL.IV [UR4+0x{0x10000 + 8 * i:x}] ;")
     for _ in range(ldgsts_count):
         lines.append("        LDGSTS.E.BYPASS.128 [R0], [R2] ;")
     for _ in range(ublkcp_count):
@@ -278,6 +298,16 @@ def run_self_test() -> int:
             synthetic_sass({(8, 2): {"trywait_count": 0}}),
             "no phase/parity wait instruction",
         ),
+        (
+            "rejects insufficient mbarrier invalidation",
+            synthetic_sass({(8, 4): {"inval_count": 3}}),
+            "fewer than STAGES=8 mbarrier invalidation instruction(s)",
+        ),
+        (
+            "rejects a completely missing mbarrier invalidation",
+            synthetic_sass({(2, 4): {"inval_count": 0}}),
+            "fewer than STAGES=2 mbarrier invalidation instruction(s)",
+        ),
     ]
 
     failures: list[str] = []
@@ -346,7 +376,8 @@ def check_binary(binary_path: str, out_path: str) -> int:
 
     print(
         "check_tma_sass: OK: all nine specializations contain 2D unicast TMA loads "
-        "with transaction-barrier completion and no LDGSTS fallback",
+        "with transaction-barrier completion, full mbarrier invalidation after drain, "
+        "and no LDGSTS fallback",
         file=sys.stderr,
     )
     return 0

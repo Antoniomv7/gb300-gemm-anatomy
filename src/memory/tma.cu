@@ -196,6 +196,47 @@ class CudaEvent {
 };
 
 // ---------------------------------------------------------------------------
+// Shared compile-time geometry helpers: the single source of truth for the
+// stage_bytes -> tile_height relationship. Every geometry-dependent
+// computation in this file (the host-side Specialization table, both kernel
+// templates' tile height and shared-memory layout, the TMA descriptor's
+// boxDim[1], the TMA Y-coordinate stride, the expected-source-index
+// computation, and the dispatch-time runtime consistency check below) calls
+// through these two functions instead of recomputing the relationship
+// independently. A previous version of this file computed the device-side
+// tile height as COPIES * (kTileWidthBytes / kVectorBytes) (= 16 * COPIES),
+// which silently diverged from the correct stage_bytes / kTileWidthBytes
+// (= 8 * COPIES): the TMA Y-coordinate then advanced twice as far per tile
+// as the descriptor's boxDim[1] actually covered, leaving every tile after
+// the first out of alignment with the linear index validation expects.
+// Funneling every use through compute_stage_bytes()/compute_tile_height(),
+// plus the static_asserts immediately below, makes that class of bug fail to
+// compile if reintroduced.
+__host__ __device__ constexpr int64_t compute_stage_bytes(int copies) {
+    return static_cast<int64_t>(kThreadsPerCta) * static_cast<int64_t>(copies) * kVectorBytes;
+}
+
+__host__ __device__ constexpr int64_t compute_tile_height(int64_t stage_bytes) {
+    return stage_bytes / kTileWidthBytes;
+}
+
+// Every distinct COPIES value used across the nine frozen specializations
+// (1, 2, 4, 8, 16) must produce tile_height = 8 * COPIES. These literals are
+// independent of compute_tile_height()'s implementation, so a regression
+// that reintroduces the old 16*COPIES formula (or any other divergence)
+// fails to compile rather than silently producing wrong SASS.
+static_assert(compute_tile_height(compute_stage_bytes(1)) == 8,
+              "COPIES=1 must yield tile_height=8 (stage_bytes/256)");
+static_assert(compute_tile_height(compute_stage_bytes(2)) == 16,
+              "COPIES=2 must yield tile_height=16 (stage_bytes/256)");
+static_assert(compute_tile_height(compute_stage_bytes(4)) == 32,
+              "COPIES=4 must yield tile_height=32 (stage_bytes/256)");
+static_assert(compute_tile_height(compute_stage_bytes(8)) == 64,
+              "COPIES=8 must yield tile_height=64 (stage_bytes/256)");
+static_assert(compute_tile_height(compute_stage_bytes(16)) == 128,
+              "COPIES=16 must yield tile_height=128 (stage_bytes/256)");
+
+// ---------------------------------------------------------------------------
 // The nine frozen specializations, derived from the formulas (not
 // hand-copied from the table) so the formulas are the single source of
 // truth. Identical formulas to P1.1's make_spec(); duplicated rather than
@@ -217,7 +258,7 @@ constexpr Specialization make_spec(int stages, int bif_kib) {
     s.bif_kib = bif_kib;
     s.stage_bytes = (static_cast<int64_t>(bif_kib) * 1024) / stages;
     s.copies_per_thread = static_cast<int>(s.stage_bytes / (kThreadsPerCta * kVectorBytes));
-    s.tile_height = static_cast<int>(s.stage_bytes / kTileWidthBytes);
+    s.tile_height = static_cast<int>(compute_tile_height(s.stage_bytes));
     s.bytes_in_flight_per_sm = s.stage_bytes * stages;
     return s;
 }
@@ -227,6 +268,39 @@ constexpr Specialization kSpecializations[9] = {
     make_spec(4, 16), make_spec(4, 32), make_spec(4, 64),
     make_spec(8, 16), make_spec(8, 32), make_spec(8, 64),
 };
+
+// Whole-table regression gate: cross-checks the formula-derived
+// kSpecializations against literal expected values transcribed from the
+// frozen nine-specialization contract table, independently of
+// compute_tile_height()'s own implementation. This fails to compile if the
+// formulas above ever regress for any (stages, bif_kib) pair, not just the
+// five distinct COPIES values checked above.
+constexpr bool geometry_table_is_correct() {
+    struct Expected {
+        int stages;
+        int bif_kib;
+        int64_t stage_bytes;
+        int tile_height;
+        int64_t bytes_in_flight_per_sm;
+    };
+    constexpr Expected kExpected[9] = {
+        {2, 16, 8 * 1024, 32, 16 * 1024},  {2, 32, 16 * 1024, 64, 32 * 1024},
+        {2, 64, 32 * 1024, 128, 64 * 1024}, {4, 16, 4 * 1024, 16, 16 * 1024},
+        {4, 32, 8 * 1024, 32, 32 * 1024},  {4, 64, 16 * 1024, 64, 64 * 1024},
+        {8, 16, 2 * 1024, 8, 16 * 1024},   {8, 32, 4 * 1024, 16, 32 * 1024},
+        {8, 64, 8 * 1024, 32, 64 * 1024},
+    };
+    for (int i = 0; i < 9; ++i) {
+        if (kSpecializations[i].stages != kExpected[i].stages) return false;
+        if (kSpecializations[i].bif_kib != kExpected[i].bif_kib) return false;
+        if (kSpecializations[i].stage_bytes != kExpected[i].stage_bytes) return false;
+        if (kSpecializations[i].tile_height != kExpected[i].tile_height) return false;
+        if (kSpecializations[i].bytes_in_flight_per_sm != kExpected[i].bytes_in_flight_per_sm) return false;
+    }
+    return true;
+}
+static_assert(geometry_table_is_correct(),
+              "P1.2 frozen nine-specialization geometry table regressed");
 
 const Specialization& find_spec(int stages, int bif_kib) {
     for (const auto& s : kSpecializations) {
@@ -333,6 +407,40 @@ __device__ __forceinline__ void tma_wait_stage(uint64_t* bar, uint32_t& parity) 
     parity ^= 1u;
 }
 
+// Invalidates one mbarrier object, ending its lifetime. cuda::ptx does not
+// (as of the CUDA 13.1 CCCL headers) expose a dedicated mbarrier_inval()
+// wrapper, so this uses the exact inline-PTX idiom CUDA's own cuda::barrier
+// destructor emits for the equivalent shared-memory object
+// (cuda/__barrier/barrier_block_scope.h: mbarrier.inval.shared.b64 [addr]),
+// which is the documented mechanism in the PTX ISA's mbarrier chapter.
+__device__ __forceinline__ void tma_invalidate_barrier(uint64_t* bar) {
+    asm volatile("mbarrier.inval.shared.b64 [%0];"
+                 :
+                 : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar)))
+                 : "memory");
+}
+
+// Invalidates every one of this CTA's STAGES mbarriers. Callers must only
+// invoke this after every outstanding TMA transaction on every stage has
+// completed and every consumer has finished reading its payload (i.e. after
+// the pipeline's drain loop and its synchronizing __syncthreads()), so that
+// invalidation never races a pending transaction. Only the same
+// compiler-recognized elected thread that issues TMA transfers performs the
+// invalidation, mirroring the issue path; the trailing __syncthreads()
+// makes the invalidation visible to every thread before kernel exit, so the
+// mbarrier objects' lifetime is unambiguous. Shared verbatim by the
+// validation and benchmark kernels.
+template <int STAGES>
+__device__ __forceinline__ void tma_invalidate_barriers(bool is_leader, uint64_t* bars) {
+    if (is_leader) {
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s) {
+            tma_invalidate_barrier(&bars[s]);
+        }
+    }
+    __syncthreads();
+}
+
 // Correctness path: walks every tile once (no rotation needed — rotation
 // only permutes visit order within a pass, not the set of tiles visited),
 // verifies every copied 16-byte vector, and accumulates mismatches locally
@@ -347,10 +455,12 @@ __global__ void tma_validate_kernel(
         int64_t tiles_per_cta,
         unsigned long long* __restrict__ g_mismatch_count) {
     extern __shared__ __align__(128) unsigned char smem[];
-    constexpr int64_t kElemsPerTile = static_cast<int64_t>(kThreadsPerCta) * COPIES;
-    constexpr int64_t kStageBytes = kElemsPerTile * kVectorBytes;
+    constexpr int64_t kStageBytes = compute_stage_bytes(COPIES);
+    constexpr int64_t kElemsPerTile = kStageBytes / kVectorBytes;
     constexpr int64_t kPayloadBytes = static_cast<int64_t>(STAGES) * kStageBytes;
-    constexpr int64_t kTileHeight = static_cast<int64_t>(COPIES) * (kTileWidthBytes / kVectorBytes);
+    constexpr int64_t kTileHeight = compute_tile_height(kStageBytes);
+    static_assert(kElemsPerTile == static_cast<int64_t>(kThreadsPerCta) * COPIES,
+                  "kStageBytes must equal 128 threads * COPIES * 16 bytes");
 
     unsigned char* payload = smem;
     uint64_t* bars = reinterpret_cast<uint64_t*>(smem + kPayloadBytes);
@@ -407,6 +517,11 @@ __global__ void tma_validate_kernel(
     }
     __syncthreads();
 
+    // Every stage has been waited on and consumed above, so no TMA
+    // transaction is outstanding on any of this CTA's STAGES mbarriers;
+    // invalidate them all before kernel exit.
+    tma_invalidate_barriers<STAGES>(is_leader, bars);
+
     if (local_mismatches != 0) {
         atomicAdd(g_mismatch_count, local_mismatches);
     }
@@ -427,10 +542,12 @@ __global__ void tma_benchmark_kernel(
         int64_t passes,
         int64_t rotation_base) {
     extern __shared__ __align__(128) unsigned char smem[];
-    constexpr int64_t kElemsPerTile = static_cast<int64_t>(kThreadsPerCta) * COPIES;
-    constexpr int64_t kStageBytes = kElemsPerTile * kVectorBytes;
+    constexpr int64_t kStageBytes = compute_stage_bytes(COPIES);
+    constexpr int64_t kElemsPerTile = kStageBytes / kVectorBytes;
     constexpr int64_t kPayloadBytes = static_cast<int64_t>(STAGES) * kStageBytes;
-    constexpr int64_t kTileHeight = static_cast<int64_t>(COPIES) * (kTileWidthBytes / kVectorBytes);
+    constexpr int64_t kTileHeight = compute_tile_height(kStageBytes);
+    static_assert(kElemsPerTile == static_cast<int64_t>(kThreadsPerCta) * COPIES,
+                  "kStageBytes must equal 128 threads * COPIES * 16 bytes");
 
     unsigned char* payload = smem;
     uint64_t* bars = reinterpret_cast<uint64_t*>(smem + kPayloadBytes);
@@ -480,6 +597,11 @@ __global__ void tma_benchmark_kernel(
         }
         __syncthreads();
     }
+
+    // All passes are complete, so every stage has been waited on and
+    // consumed and no TMA transaction is outstanding on any of this CTA's
+    // STAGES mbarriers; invalidate them all before kernel exit.
+    tma_invalidate_barriers<STAGES>(is_leader, bars);
 
     g_sink[static_cast<int64_t>(blockIdx.x) * kThreadsPerCta + tid] = sink_acc;
 }
@@ -960,6 +1082,28 @@ RunStatus run_specialization(
         uint64_t* out_mismatches) {
     static_assert(STAGES == 2 || STAGES == 4 || STAGES == 8, "invalid STAGES");
     if (out_mismatches) *out_mismatches = 0;
+
+    // Dispatch-time consistency check: the runtime Specialization the caller
+    // (dispatch_run's stages/bif_kib switch) selected must describe exactly
+    // the same geometry as this function's own <STAGES, COPIES> template
+    // arguments compute from the shared helpers above. A mismatch here means
+    // dispatch_run wired a (stages, bif_kib) pair to the wrong template
+    // instantiation; catching it before any CUDA call is cheaper and more
+    // legible than a downstream correctness mismatch.
+    {
+        constexpr int64_t kExpectedStageBytes = compute_stage_bytes(COPIES);
+        constexpr int64_t kExpectedTileHeight = compute_tile_height(kExpectedStageBytes);
+        constexpr int64_t kExpectedBif = static_cast<int64_t>(STAGES) * kExpectedStageBytes;
+        if (spec.stages != STAGES || spec.stage_bytes != kExpectedStageBytes ||
+            spec.tile_height != kExpectedTileHeight || spec.bytes_in_flight_per_sm != kExpectedBif) {
+            fail("stages=%d bytes_in_flight_kib=%d: dispatch geometry mismatch: spec={stage_bytes=%lld "
+                 "tile_height=%d bytes_in_flight_per_sm=%lld} template<STAGES=%d,COPIES=%d> expects "
+                 "{stage_bytes=%lld tile_height=%lld bytes_in_flight_per_sm=%lld}",
+                 spec.stages, spec.bif_kib, (long long)spec.stage_bytes, spec.tile_height,
+                 (long long)spec.bytes_in_flight_per_sm, STAGES, COPIES,
+                 (long long)kExpectedStageBytes, (long long)kExpectedTileHeight, (long long)kExpectedBif);
+        }
+    }
 
     const int grid_blocks = gpu.sm_count;
     const int64_t per_cta_bytes = ws.working_set_bytes / grid_blocks;

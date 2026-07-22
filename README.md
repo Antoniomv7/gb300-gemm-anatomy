@@ -4,7 +4,9 @@ Anatomy of BF16 GEMM performance on NVIDIA GB300: a small, reproducible,
 auditable measurement study.
 
 **Status: `Phase 0 — audited and verified on GB300`. `P1.1 (standalone LDGSTS
-baseline) — implemented, pending audit and GB300 verification`.**
+baseline) — implemented, pending audit and GB300 verification`. `P1.2
+(standalone 2D unicast TMA path) — implemented, pending audit and GB300
+verification`.**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -17,8 +19,21 @@ and matching commit/wait dependency instructions for all nine frozen
 specializations, while allowing `ptxas` to duplicate whole groups when it
 unrolls or peels the loop (see `src/memory/README.md`). The corrected
 implementation still requires re-audit and execution on GB300 hardware, so
-`PLAN.md` records Audited=NO and Verified on GB300=NO for P1.1. The TMA arm
-(P1.2) has not been started.
+`PLAN.md` records Audited=NO and Verified on GB300=NO for P1.1.
+
+P1.2, the standalone 2D unicast TMA arm (`src/memory/tma.cu`), is implemented
+as the TMA counterpart: it moves the exact same logical tiles as P1.1 through
+a host-encoded rank-2 `CUtensorMap` descriptor and an mbarrier-tracked
+pipeline (`cp.async.bulk.tensor.2d.shared::cta.global`), with the same
+128-threads/CTA, grid-equals-SM-count, and one-CTA-per-SM occupancy contract.
+Its GPU-free SASS gate requires a genuine `UTMALDG.2D` load, transaction-aware
+mbarrier arrival, phase/parity waits, and full mbarrier invalidation after the
+pipeline drains for all nine frozen specializations, with no LDGSTS, 1D, or
+multicast/cluster fallback (see `src/memory/README.md`). P1.2 is implemented
+but has not been independently audited or executed on GB300, so `PLAN.md`
+records Audited=NO and Verified on GB300=NO for P1.2 as well. P1.3 (the joint
+LDGSTS/TMA sweep) has not started and remains blocked until both arms are
+independently audited and verified on GB300.
 
 ## Research question
 
@@ -151,8 +166,8 @@ BLACKWELL_GPU_INDEX=<physical-index> make preflight
 automatically and never exposes all GPUs to a container.
 
 Phase 0 provides environment and tooling validation only. Experiment 1 has
-started with the P1.1 LDGSTS implementation, which remains pending re-audit
-and GB300 verification; P1.2 and experiments 2–3 have not started. The
-repository contains no bandwidth, throughput, GEMM performance, or cuBLASLt
-comparison results yet. See `PLAN.md` for the remaining schedule and
-`AGENTS.md` for the mandatory shared-cluster rules.
+started with both the P1.1 LDGSTS and P1.2 TMA implementations, each pending
+independent audit and GB300 verification; P1.3, P1.4, and experiments 2–3
+have not started. The repository contains no bandwidth, throughput, GEMM
+performance, or cuBLASLt comparison results yet. See `PLAN.md` for the
+remaining schedule and `AGENTS.md` for the mandatory shared-cluster rules.

@@ -138,6 +138,25 @@ check-static:
 	python3 scripts/check_tma_sass.py --self-test
 	@rm -rf scripts/__pycache__
 	@test -x scripts/check_tma_sass.py
+	@echo "== TMA geometry regression gate (P1.2 remediation) =="
+	@! grep -nE '\(COPIES\)\s*\*\s*\(kTileWidthBytes\s*/\s*kVectorBytes\)' src/memory/tma.cu
+	@grep -Fq 'compute_stage_bytes' src/memory/tma.cu
+	@grep -Fq 'compute_tile_height' src/memory/tma.cu
+	@grep -Fq 'static_assert(geometry_table_is_correct()' src/memory/tma.cu
+	@grep -Fq 'compute_tile_height(compute_stage_bytes(1)) == 8' src/memory/tma.cu
+	@grep -Fq 'compute_tile_height(compute_stage_bytes(2)) == 16' src/memory/tma.cu
+	@grep -Fq 'compute_tile_height(compute_stage_bytes(4)) == 32' src/memory/tma.cu
+	@grep -Fq 'compute_tile_height(compute_stage_bytes(8)) == 64' src/memory/tma.cu
+	@grep -Fq 'compute_tile_height(compute_stage_bytes(16)) == 128' src/memory/tma.cu
+	@echo "== TMA mbarrier invalidation present, source and SASS checker (P1.2 remediation) =="
+	@grep -Fq 'tma_invalidate_barrier' src/memory/tma.cu
+	@grep -Fq 'mbarrier.inval.shared.b64' src/memory/tma.cu
+	@grep -Fq 'SYNCS.CCTL.IV' scripts/check_tma_sass.py
+	@echo "== documentation reports P1.2 as implemented, not unimplemented (P1.2 remediation) =="
+	@grep -Fq 'P1.2 | Equivalent TMA path | YES | NO | NO |' PLAN.md
+	@! grep -rnF 'has not been started' README.md src/memory/README.md
+	@! grep -rnF 'no TMA code exists yet' README.md src/memory/README.md
+	@! grep -nF 'P1.2 and experiments' README.md
 	@echo "check-static: OK"
 
 build-image:
