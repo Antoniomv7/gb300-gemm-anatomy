@@ -1,7 +1,8 @@
 # gb300-gemm-anatomy Makefile.
 # Exposed targets: help, check-static, build-image, check-env, preflight,
 # memory-ldgsts-build, memory-ldgsts-sass, memory-ldgsts-self-test,
-# memory-ldgsts-smoke.
+# memory-ldgsts-smoke, memory-tma-build, memory-tma-sass,
+# memory-tma-self-test, memory-tma-smoke.
 # No target selects a GPU automatically, elevates privileges, or exceeds two
 # build jobs.
 
@@ -17,20 +18,26 @@ MEMORY_LDGSTS_SRC := src/memory/ldgsts.cu
 MEMORY_LDGSTS_BIN := build/memory/ldgsts
 MEMORY_LDGSTS_SASS := build/memory/ldgsts.sass
 
+MEMORY_TMA_SRC := src/memory/tma.cu
+MEMORY_TMA_BIN := build/memory/tma
+MEMORY_TMA_SASS := build/memory/tma.sass
+
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
 	Dockerfile Makefile \
 	scripts/run_container.sh scripts/preflight.sh scripts/check_ldgsts_sass.py \
+	scripts/check_tma_sass.py \
 	smoke/cuda_smoke.cu smoke/cutedsl_smoke.py \
-	src/memory/ldgsts.cu src/memory/README.md \
+	src/memory/ldgsts.cu src/memory/tma.cu src/memory/README.md \
 	results/README.md
 
 .DEFAULT_GOAL := help
 .PHONY: help check-static build-image check-env preflight \
-	memory-ldgsts-build memory-ldgsts-sass memory-ldgsts-self-test memory-ldgsts-smoke
+	memory-ldgsts-build memory-ldgsts-sass memory-ldgsts-self-test memory-ldgsts-smoke \
+	memory-tma-build memory-tma-sass memory-tma-self-test memory-tma-smoke
 
 help:
-	@echo "gb300-gemm-anatomy — Phase 0 + P1.1 (LDGSTS) targets"
+	@echo "gb300-gemm-anatomy — Phase 0 + P1.1 (LDGSTS) + P1.2 (TMA) targets"
 	@echo ""
 	@echo "  make help                     Show this help."
 	@echo "  make check-static             Static validation: no Docker, no GPU, no network."
@@ -40,6 +47,8 @@ help:
 	@echo "                                an explicit BLACKWELL_GPU_INDEX=<physical-index>;"
 	@echo "                                never selects a GPU automatically."
 	@echo ""
+	@echo "  -- P1.1 LDGSTS (GPU-free build/SASS targets below; GPU targets require"
+	@echo "     BLACKWELL_GPU_INDEX) --"
 	@echo "  make memory-ldgsts-build      Compile the P1.1 LDGSTS microbenchmark. No GPU."
 	@echo "  make memory-ldgsts-sass       Disassemble it and verify per-specialization"
 	@echo "                                16-byte LDGSTS groups and commit/wait barriers."
@@ -47,6 +56,19 @@ help:
 	@echo "  make memory-ldgsts-self-test  Validate all nine specializations on GPU (no"
 	@echo "                                publishable numbers). Requires BLACKWELL_GPU_INDEX."
 	@echo "  make memory-ldgsts-smoke      Self-test, then one short run_kind=smoke"
+	@echo "                                measurement (NOT a final result). Requires"
+	@echo "                                BLACKWELL_GPU_INDEX."
+	@echo ""
+	@echo "  -- P1.2 TMA (GPU-free build/SASS targets below; GPU targets require"
+	@echo "     BLACKWELL_GPU_INDEX) --"
+	@echo "  make memory-tma-build         Compile the P1.2 2D unicast TMA microbenchmark."
+	@echo "                                No GPU."
+	@echo "  make memory-tma-sass          Disassemble it and verify per-specialization"
+	@echo "                                UTMALDG.2D loads and transaction-barrier"
+	@echo "                                completion. No GPU."
+	@echo "  make memory-tma-self-test     Validate all nine specializations on GPU (no"
+	@echo "                                publishable numbers). Requires BLACKWELL_GPU_INDEX."
+	@echo "  make memory-tma-smoke         Self-test, then one short run_kind=smoke"
 	@echo "                                measurement (NOT a final result). Requires"
 	@echo "                                BLACKWELL_GPU_INDEX."
 	@echo ""
@@ -84,7 +106,8 @@ check-static:
 	pat="$$pat|\bs""udo\b|\$$\(np""roc\)|nvidia-smi[^|]*(-pm|--persistence-mode|-lgc|--lock-gpu-clocks|-pl|--power-limit)"; \
 	! grep -nE -- "$$pat" scripts/run_container.sh scripts/preflight.sh Dockerfile \
 		smoke/cuda_smoke.cu smoke/cutedsl_smoke.py \
-		src/memory/ldgsts.cu scripts/check_ldgsts_sass.py
+		src/memory/ldgsts.cu scripts/check_ldgsts_sass.py \
+		src/memory/tma.cu scripts/check_tma_sass.py
 	@! grep -nE "s""udo|np""roc" Makefile
 	@echo "== LDGSTS source uses the frozen PTX path (P1.1 contract) =="
 	@grep -Fq 'cp.async.cg.shared.global' src/memory/ldgsts.cu
@@ -98,6 +121,23 @@ check-static:
 	python3 scripts/check_ldgsts_sass.py --self-test
 	@rm -rf scripts/__pycache__
 	@test -x scripts/check_ldgsts_sass.py
+	@echo "== TMA source uses the frozen 2D unicast TMA path (P1.2 contract) =="
+	@grep -Fq 'cp_async_bulk_tensor' src/memory/tma.cu
+	@grep -Fq 'mbarrier_arrive_expect_tx' src/memory/tma.cu
+	@grep -Fq 'mbarrier_try_wait_parity' src/memory/tma.cu
+	@grep -Fq 'elect_sync' src/memory/tma.cu
+	@grep -Fq 'cuTensorMapEncodeTiled' src/memory/tma.cu
+	@grep -Fq 'cudaGetDriverEntryPointByVersion' src/memory/tma.cu
+	@echo "== TMA source absent of prohibited 1D/multicast/cluster/LDGSTS transfer paths =="
+	@! grep -nE 'cp\.async\.cg\.shared\.global|cuda::memcpy_async|cooperative_groups::memcpy_async|__pipeline_memcpy_async|cp_async_bulk\(' src/memory/tma.cu
+	@! grep -nE 'space_cluster|cta_group|multicast|MULTICAST|UBLKCP' src/memory/tma.cu
+	@echo "== TMA Makefile target pins the contract architecture =="
+	@grep -Fq -- '-arch=$$(CUDA_ARCH)' Makefile
+	@echo "== TMA SASS checker syntax and synthetic contract tests =="
+	python3 -m py_compile scripts/check_tma_sass.py
+	python3 scripts/check_tma_sass.py --self-test
+	@rm -rf scripts/__pycache__
+	@test -x scripts/check_tma_sass.py
 	@echo "check-static: OK"
 
 build-image:
@@ -216,6 +256,68 @@ memory-ldgsts-smoke: memory-ldgsts-build
 	scripts/run_container.sh $(MEMORY_LDGSTS_BIN) --self-test
 	@echo "== memory-ldgsts-smoke: short run_kind=smoke measurement (NOT a final result) =="
 	scripts/run_container.sh $(MEMORY_LDGSTS_BIN) \
+		--stages 4 --bytes-in-flight-kib 32 --run-kind smoke \
+		--working-set-mib 64 --passes 2 --warmup-ms 200 --repetitions 5
+	@echo "=============================================================================="
+	@echo "The run_kind=smoke output above is a functional smoke check only. It is NOT a"
+	@echo "final experimental result and must not be cited as a performance number."
+	@echo "=============================================================================="
+
+# --- P1.2: standalone 2D unicast TMA microbenchmark -------------------------
+# memory-tma-build and memory-tma-sass never touch a GPU: they compile and
+# disassemble inside the pinned, network-less, unprivileged image, same
+# secure pattern as memory-ldgsts-build/sass. memory-tma-self-test and
+# memory-tma-smoke execute on GPU and therefore go exclusively through
+# scripts/run_container.sh, which requires an explicit BLACKWELL_GPU_INDEX
+# and proves the device is free.
+
+memory-tma-build:
+	@mkdir -p build/memory
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-v "$(CURDIR):/workspace" \
+		-w /workspace \
+		"$(IMAGE_TAG)" \
+		nvcc -std=c++17 -O3 -lineinfo -arch=$(CUDA_ARCH) \
+			-o $(MEMORY_TMA_BIN) $(MEMORY_TMA_SRC)
+
+memory-tma-sass: memory-tma-build
+	@mkdir -p build/memory
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-v "$(CURDIR):/workspace" \
+		-w /workspace \
+		"$(IMAGE_TAG)" \
+		python3 scripts/check_tma_sass.py $(MEMORY_TMA_BIN) $(MEMORY_TMA_SASS)
+
+memory-tma-self-test: memory-tma-build
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make memory-tma-self-test"; \
+		echo "       This project never selects a GPU automatically."; \
+		exit 2; \
+	fi
+	scripts/run_container.sh $(MEMORY_TMA_BIN) --self-test
+
+memory-tma-smoke: memory-tma-build
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make memory-tma-smoke"; \
+		echo "       This project never selects a GPU automatically."; \
+		exit 2; \
+	fi
+	@echo "== memory-tma-smoke: self-test =="
+	scripts/run_container.sh $(MEMORY_TMA_BIN) --self-test
+	@echo "== memory-tma-smoke: short run_kind=smoke measurement (NOT a final result) =="
+	scripts/run_container.sh $(MEMORY_TMA_BIN) \
 		--stages 4 --bytes-in-flight-kib 32 --run-kind smoke \
 		--working-set-mib 64 --passes 2 --warmup-ms 200 --repetitions 5
 	@echo "=============================================================================="
