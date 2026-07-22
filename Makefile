@@ -42,7 +42,8 @@ help:
 	@echo ""
 	@echo "  make memory-ldgsts-build      Compile the P1.1 LDGSTS microbenchmark. No GPU."
 	@echo "  make memory-ldgsts-sass       Disassemble it and verify per-specialization"
-	@echo "                                LDGSTS counts plus commit/wait barriers. No GPU."
+	@echo "                                16-byte LDGSTS groups and commit/wait barriers."
+	@echo "                                No GPU."
 	@echo "  make memory-ldgsts-self-test  Validate all nine specializations on GPU (no"
 	@echo "                                publishable numbers). Requires BLACKWELL_GPU_INDEX."
 	@echo "  make memory-ldgsts-smoke      Self-test, then one short run_kind=smoke"
@@ -92,8 +93,9 @@ check-static:
 	@! grep -nE 'cuda::memcpy_async|cooperative_groups::memcpy_async|__pipeline_memcpy_async|cp\.async\.bulk' src/memory/ldgsts.cu
 	@echo "== LDGSTS Makefile target pins the contract architecture =="
 	@grep -Fq -- '-arch=$$(CUDA_ARCH)' Makefile
-	@echo "== LDGSTS SASS checker python syntax =="
+	@echo "== LDGSTS SASS checker syntax and synthetic contract tests =="
 	python3 -m py_compile scripts/check_ldgsts_sass.py
+	python3 scripts/check_ldgsts_sass.py --self-test
 	@rm -rf scripts/__pycache__
 	@test -x scripts/check_ldgsts_sass.py
 	@echo "check-static: OK"

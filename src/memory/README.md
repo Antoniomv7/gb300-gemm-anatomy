@@ -188,7 +188,7 @@ GB/s: `useful_bytes / kernel_time_seconds / 1e9`.
 ```bash
 make check-static             # no Docker, no GPU, no network
 make memory-ldgsts-build       # compile inside the pinned image; no GPU
-make memory-ldgsts-sass        # verify LDGSTS counts + commit/wait SASS; no GPU
+make memory-ldgsts-sass        # verify complete 16B groups + commit/wait SASS; no GPU
 
 # GPU-executing targets require an explicit, operator-provided physical
 # index and go exclusively through scripts/run_container.sh:

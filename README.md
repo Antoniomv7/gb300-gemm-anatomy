@@ -12,11 +12,13 @@ hardware on 20 July 2026. No experimental performance results exist yet.
 
 P1.1, the standalone LDGSTS arm of the "LDGSTS versus TMA" experiment
 (`src/memory/ldgsts.cu`), is implemented as a global-memory-to-SMEM effective
-copy benchmark. Its GPU-free SASS gate requires the exact LDGSTS count and the
-commit/wait dependency instructions for all nine frozen specializations (see
-`src/memory/README.md`). The corrected implementation still requires
-re-audit and execution on GB300 hardware, so `PLAN.md` records Audited=NO and
-Verified on GB300=NO for P1.1. The TMA arm (P1.2) has not been started.
+copy benchmark. Its GPU-free SASS gate requires complete 16-byte LDGSTS groups
+and matching commit/wait dependency instructions for all nine frozen
+specializations, while allowing `ptxas` to duplicate whole groups when it
+unrolls or peels the loop (see `src/memory/README.md`). The corrected
+implementation still requires re-audit and execution on GB300 hardware, so
+`PLAN.md` records Audited=NO and Verified on GB300=NO for P1.1. The TMA arm
+(P1.2) has not been started.
 
 ## Research question
 
