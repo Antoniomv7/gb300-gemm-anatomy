@@ -1,5 +1,7 @@
-# gb300-gemm-anatomy Phase 0 Makefile.
-# Exposed targets: help, check-static, build-image, check-env, preflight.
+# gb300-gemm-anatomy Makefile.
+# Exposed targets: help, check-static, build-image, check-env, preflight,
+# memory-ldgsts-build, memory-ldgsts-sass, memory-ldgsts-self-test,
+# memory-ldgsts-smoke.
 # No target selects a GPU automatically, elevates privileges, or exceeds two
 # build jobs.
 
@@ -11,26 +13,41 @@ IMAGE_TAG ?= gb300-gemm-anatomy:phase0
 CUDA_SHORT_VERSION := $(basename $(CUDA_VERSION))
 CUTEDSL_VERSION := $(patsubst v%,%,$(CUTLASS_VERSION))
 
+MEMORY_LDGSTS_SRC := src/memory/ldgsts.cu
+MEMORY_LDGSTS_BIN := build/memory/ldgsts
+MEMORY_LDGSTS_SASS := build/memory/ldgsts.sass
+
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
 	Dockerfile Makefile \
-	scripts/run_container.sh scripts/preflight.sh \
+	scripts/run_container.sh scripts/preflight.sh scripts/check_ldgsts_sass.py \
 	smoke/cuda_smoke.cu smoke/cutedsl_smoke.py \
+	src/memory/ldgsts.cu src/memory/README.md \
 	results/README.md
 
 .DEFAULT_GOAL := help
-.PHONY: help check-static build-image check-env preflight
+.PHONY: help check-static build-image check-env preflight \
+	memory-ldgsts-build memory-ldgsts-sass memory-ldgsts-self-test memory-ldgsts-smoke
 
 help:
-	@echo "gb300-gemm-anatomy — Phase 0 targets"
+	@echo "gb300-gemm-anatomy — Phase 0 + P1.1 (LDGSTS) targets"
 	@echo ""
-	@echo "  make help          Show this help."
-	@echo "  make check-static  Static validation: no Docker, no GPU, no network."
-	@echo "  make build-image   Build the pinned image ($(IMAGE_TAG)). No GPU."
-	@echo "  make check-env     Check tools/versions inside a GPU-less container."
-	@echo "  make preflight     Run the single-GPU preflight. Requires an explicit"
-	@echo "                     BLACKWELL_GPU_INDEX=<physical-index>; never"
-	@echo "                     selects a GPU automatically."
+	@echo "  make help                     Show this help."
+	@echo "  make check-static             Static validation: no Docker, no GPU, no network."
+	@echo "  make build-image              Build the pinned image ($(IMAGE_TAG)). No GPU."
+	@echo "  make check-env                Check tools/versions inside a GPU-less container."
+	@echo "  make preflight                Run the single-GPU Phase 0 preflight. Requires"
+	@echo "                                an explicit BLACKWELL_GPU_INDEX=<physical-index>;"
+	@echo "                                never selects a GPU automatically."
+	@echo ""
+	@echo "  make memory-ldgsts-build      Compile the P1.1 LDGSTS microbenchmark. No GPU."
+	@echo "  make memory-ldgsts-sass       Disassemble it and verify LDGSTS appears in all"
+	@echo "                                nine benchmark specializations. No GPU."
+	@echo "  make memory-ldgsts-self-test  Validate all nine specializations on GPU (no"
+	@echo "                                publishable numbers). Requires BLACKWELL_GPU_INDEX."
+	@echo "  make memory-ldgsts-smoke      Self-test, then one short run_kind=smoke"
+	@echo "                                measurement (NOT a final result). Requires"
+	@echo "                                BLACKWELL_GPU_INDEX."
 	@echo ""
 	@echo "Pinned contract (VERSIONS.env): CUDA $(CUDA_VERSION), CUTLASS $(CUTLASS_VERSION),"
 	@echo "arch $(CUDA_ARCH), max build jobs $(MAX_BUILD_JOBS)."
@@ -61,12 +78,24 @@ check-static:
 	@grep -Fq "CUTLASS_COMMIT=$(CUTLASS_COMMIT)" Dockerfile
 	@echo "== preflight targets pinned architecture =="
 	@grep -Fq -- "-arch=$(CUDA_ARCH)" scripts/preflight.sh
-	@echo "== forbidden patterns absent from scripts, Dockerfile, smoke =="
+	@echo "== forbidden patterns absent from scripts, Dockerfile, smoke, memory =="
 	@pat='--gpus[ =]+all|NVIDIA_VISIBLE_DEVICES=all|--privileged|--pid[ =]+host|docker\.sock|--cap-add|SYS_ADMIN|set -x'; \
 	pat="$$pat|\bs""udo\b|\$$\(np""roc\)|nvidia-smi[^|]*(-pm|--persistence-mode|-lgc|--lock-gpu-clocks|-pl|--power-limit)"; \
 	! grep -nE -- "$$pat" scripts/run_container.sh scripts/preflight.sh Dockerfile \
-		smoke/cuda_smoke.cu smoke/cutedsl_smoke.py
+		smoke/cuda_smoke.cu smoke/cutedsl_smoke.py \
+		src/memory/ldgsts.cu scripts/check_ldgsts_sass.py
 	@! grep -nE "s""udo|np""roc" Makefile
+	@echo "== LDGSTS source uses the frozen PTX path (P1.1 contract) =="
+	@grep -Fq 'cp.async.cg.shared.global' src/memory/ldgsts.cu
+	@grep -Fq 'cp.async.commit_group' src/memory/ldgsts.cu
+	@grep -Fq 'cp.async.wait_group' src/memory/ldgsts.cu
+	@! grep -nE 'cuda::memcpy_async|cooperative_groups::memcpy_async|__pipeline_memcpy_async|cp\.async\.bulk' src/memory/ldgsts.cu
+	@echo "== LDGSTS Makefile target pins the contract architecture =="
+	@grep -Fq -- '-arch=$$(CUDA_ARCH)' Makefile
+	@echo "== LDGSTS SASS checker python syntax =="
+	python3 -m py_compile scripts/check_ldgsts_sass.py
+	@rm -rf scripts/__pycache__
+	@test -x scripts/check_ldgsts_sass.py
 	@echo "check-static: OK"
 
 build-image:
@@ -130,3 +159,64 @@ preflight:
 		exit 2; \
 	fi
 	scripts/run_container.sh bash scripts/preflight.sh
+
+# --- P1.1: standalone LDGSTS microbenchmark ---------------------------------
+# memory-ldgsts-build and memory-ldgsts-sass never touch a GPU: they compile
+# and disassemble inside the pinned, network-less, unprivileged image, same
+# secure pattern as check-env. memory-ldgsts-self-test and memory-ldgsts-smoke
+# execute on GPU and therefore go exclusively through scripts/run_container.sh,
+# which requires an explicit BLACKWELL_GPU_INDEX and proves the device is free.
+
+memory-ldgsts-build:
+	@mkdir -p build/memory
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-v "$(CURDIR):/workspace" \
+		-w /workspace \
+		"$(IMAGE_TAG)" \
+		nvcc -std=c++17 -O3 -lineinfo -arch=$(CUDA_ARCH) \
+			-o $(MEMORY_LDGSTS_BIN) $(MEMORY_LDGSTS_SRC)
+
+memory-ldgsts-sass: memory-ldgsts-build
+	@mkdir -p build/memory
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-v "$(CURDIR):/workspace" \
+		-w /workspace \
+		"$(IMAGE_TAG)" \
+		python3 scripts/check_ldgsts_sass.py $(MEMORY_LDGSTS_BIN) $(MEMORY_LDGSTS_SASS)
+
+memory-ldgsts-self-test: memory-ldgsts-build
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make memory-ldgsts-self-test"; \
+		echo "       This project never selects a GPU automatically."; \
+		exit 2; \
+	fi
+	scripts/run_container.sh $(MEMORY_LDGSTS_BIN) --self-test
+
+memory-ldgsts-smoke: memory-ldgsts-build
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make memory-ldgsts-smoke"; \
+		echo "       This project never selects a GPU automatically."; \
+		exit 2; \
+	fi
+	@echo "== memory-ldgsts-smoke: self-test =="
+	scripts/run_container.sh $(MEMORY_LDGSTS_BIN) --self-test
+	@echo "== memory-ldgsts-smoke: short run_kind=smoke measurement (NOT a final result) =="
+	scripts/run_container.sh $(MEMORY_LDGSTS_BIN) \
+		--stages 4 --bytes-in-flight-kib 32 --run-kind smoke \
+		--working-set-mib 64 --passes 2 --warmup-ms 200 --repetitions 5
+	@echo "=============================================================================="
+	@echo "The run_kind=smoke output above is a functional smoke check only. It is NOT a"
+	@echo "final experimental result and must not be cited as a performance number."
+	@echo "=============================================================================="

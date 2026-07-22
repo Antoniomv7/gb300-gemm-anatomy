@@ -33,7 +33,7 @@ Gate: Phase 0 gate passed; correctness validated before any timing/profiling.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
-| P1.1 | Minimal LDGSTS path | NO | NO | NO |
+| P1.1 | Standalone LDGSTS baseline | YES | NO | NO |
 | P1.2 | Equivalent TMA path | NO | NO | NO |
 | P1.3 | Joint sweep (≤18 configurations) | NO | NO | NO |
 | P1.4 | Profiling, validation, analysis, pilot | NO | NO | NO |

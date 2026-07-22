@@ -3,11 +3,20 @@
 Anatomy of BF16 GEMM performance on NVIDIA GB300: a small, reproducible,
 auditable measurement study.
 
-**Status: `Phase 0 — audited and verified on GB300`.**
+**Status: `Phase 0 — audited and verified on GB300`. `P1.1 (standalone LDGSTS
+baseline) — implemented, pending audit and GB300 verification`.**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
 hardware on 20 July 2026. No experimental performance results exist yet.
+
+P1.1, the standalone LDGSTS arm of the "LDGSTS versus TMA" experiment
+(`src/memory/ldgsts.cu`), is implemented: it builds and its SASS was verified
+to contain the LDGSTS opcode for all nine frozen specializations under
+GPU-free static checks (see `src/memory/README.md`). It has not yet been
+independently audited or executed on GB300 hardware, so `PLAN.md` records
+Audited=NO and Verified on GB300=NO for P1.1. The TMA arm (P1.2) has not been
+started.
 
 ## Research question
 
