@@ -1,28 +1,56 @@
 #!/usr/bin/env python3
 """GPU-free SASS verification for the P1.1 LDGSTS microbenchmark.
 
-Disassembles the compiled build/memory/ldgsts binary with `cuobjdump -sass`
-(never accepting the .ptx as sufficient proof), then checks that the LDGSTS
-opcode is present in every one of the nine benchmark-kernel specializations,
-printing the dependency/barrier instructions found alongside each one.
+Disassemble the compiled binary with ``cuobjdump -sass`` (PTX is not accepted
+as proof), identify all nine benchmark template specializations, and verify
+for each one:
+
+* the exact static LDGSTS count implied by ``COPIES``;
+* an LDGDEPBAR instruction for ``cp.async.commit_group``; and
+* DEPBAR.LE waits for both ``wait_group<STAGES - 1>`` and the final
+  ``wait_group 0`` drain.
 
 Usage: check_ldgsts_sass.py <binary> <output-sass-path>
-Exit code: 0 if LDGSTS is present in all nine benchmark specializations,
-1 otherwise (missing opcode, wrong specialization count, or cuobjdump
-failure), 2 on a usage error.
+Exit code: 0 only when the full contract passes, 1 on a validation or
+``cuobjdump`` failure, and 2 on a usage error.
 """
+
 import re
 import subprocess
 import sys
 
-EXPECTED_SPECS = 9
+
 BENCHMARK_MARKER = "ldgsts_benchmark_kernel"
-BARRIER_PATTERN = re.compile(r"\b(DEPBAR|BAR\.\w+|MEMBAR\.\w*|ARRIVES\.\w*)\b")
+EXPECTED_SPECS = {
+    (2, 4),
+    (2, 8),
+    (2, 16),
+    (4, 2),
+    (4, 4),
+    (4, 8),
+    (8, 1),
+    (8, 2),
+    (8, 4),
+}
+
+# cuobjdump normally prints mangled CUDA symbols, but accepting a demangled
+# spelling makes the checker resilient to output-mode changes.
+SPEC_PATTERNS = (
+    re.compile(r"ldgsts_benchmark_kernelILi(\d+)ELi(\d+)EE"),
+    re.compile(r"ldgsts_benchmark_kernel<\s*(\d+)\s*,\s*(\d+)\s*>")
+)
+
+LDGSTS_PATTERN = re.compile(r"\bLDGSTS(?:\.[A-Z0-9_]+)*\b")
+LDGDEPBAR_PATTERN = re.compile(r"\bLDGDEPBAR(?:\.[A-Z0-9_]+)*\b")
+DEPBAR_PATTERN = re.compile(r"\bDEPBAR(?:\.[A-Z0-9_]+)*\b")
+WAIT_VALUE_PATTERN = re.compile(
+    r"\bDEPBAR\.LE\s+SB0\s*,\s*(0[xX][0-9A-Fa-f]+|\d+)\b"
+)
 
 
-def split_function_blocks(sass_text: str):
-    blocks = []
-    current = []
+def split_function_blocks(sass_text: str) -> list[list[str]]:
+    blocks: list[list[str]] = []
+    current: list[str] = []
     for line in sass_text.splitlines():
         if "Function :" in line:
             if current:
@@ -35,52 +63,135 @@ def split_function_blocks(sass_text: str):
     return blocks
 
 
+def parse_specialization(header: str) -> tuple[int, int] | None:
+    for pattern in SPEC_PATTERNS:
+        match = pattern.search(header)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    return None
+
+
+def parse_wait_values(lines: list[str]) -> set[int]:
+    values: set[int] = set()
+    for line in lines:
+        match = WAIT_VALUE_PATTERN.search(line)
+        if match:
+            token = match.group(1)
+            base = 16 if token.lower().startswith("0x") else 10
+            values.add(int(token, base))
+    return values
+
+
 def main() -> int:
     if len(sys.argv) != 3:
         print("usage: check_ldgsts_sass.py <binary> <output-sass-path>", file=sys.stderr)
         return 2
     binary_path, out_path = sys.argv[1], sys.argv[2]
 
-    result = subprocess.run(["cuobjdump", "-sass", binary_path], capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"check_ldgsts_sass: cuobjdump failed (rc={result.returncode}):\n{result.stderr}",
-              file=sys.stderr)
+    try:
+        result = subprocess.run(
+            ["cuobjdump", "-sass", binary_path], capture_output=True, text=True
+        )
+    except OSError as exc:
+        print(f"check_ldgsts_sass: unable to run cuobjdump: {exc}", file=sys.stderr)
         return 1
+    if result.returncode != 0:
+        print(
+            f"check_ldgsts_sass: cuobjdump failed (rc={result.returncode}):\n"
+            f"{result.stderr}",
+            file=sys.stderr,
+        )
+        return 1
+
     sass_text = result.stdout
-    with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(sass_text)
+    try:
+        with open(out_path, "w", encoding="utf-8") as output_file:
+            output_file.write(sass_text)
+    except OSError as exc:
+        print(f"check_ldgsts_sass: unable to write {out_path}: {exc}", file=sys.stderr)
+        return 1
     print(f"check_ldgsts_sass: wrote {out_path}", file=sys.stderr)
 
-    benchmark_blocks = [b for b in split_function_blocks(sass_text) if BENCHMARK_MARKER in b[0]]
-    print(f"check_ldgsts_sass: found {len(benchmark_blocks)} benchmark kernel specialization(s) "
-          f"in the disassembly (expected {EXPECTED_SPECS})", file=sys.stderr)
+    candidate_blocks = [
+        block
+        for block in split_function_blocks(sass_text)
+        if BENCHMARK_MARKER in block[0]
+    ]
+    blocks_by_spec: dict[tuple[int, int], list[str]] = {}
+    errors: list[str] = []
 
-    missing = []
-    for block in benchmark_blocks:
+    for block in candidate_blocks:
         header = block[0].strip()
-        body = "\n".join(block)
-        if "LDGSTS" not in body:
-            missing.append(header)
+        spec = parse_specialization(header)
+        if spec is None:
+            errors.append(f"could not identify STAGES/COPIES in {header}")
             continue
-        print(f"check_ldgsts_sass: OK  {header}", file=sys.stderr)
-        for line in block:
-            if BARRIER_PATTERN.search(line):
-                print(f"check_ldgsts_sass:     barrier: {line.strip()}", file=sys.stderr)
+        if spec in blocks_by_spec:
+            errors.append(f"duplicate benchmark specialization {spec}: {header}")
+            continue
+        blocks_by_spec[spec] = block
 
-    ok = True
-    if len(benchmark_blocks) != EXPECTED_SPECS:
-        print(f"check_ldgsts_sass: FAIL: expected {EXPECTED_SPECS} benchmark specializations, "
-              f"found {len(benchmark_blocks)}", file=sys.stderr)
-        ok = False
-    if missing:
-        print("check_ldgsts_sass: FAIL: LDGSTS opcode missing in:", file=sys.stderr)
-        for header in missing:
-            print(f"check_ldgsts_sass:   {header}", file=sys.stderr)
-        ok = False
+    found_specs = set(blocks_by_spec)
+    for spec in sorted(EXPECTED_SPECS - found_specs):
+        errors.append(f"missing benchmark specialization STAGES={spec[0]} COPIES={spec[1]}")
+    for spec in sorted(found_specs - EXPECTED_SPECS):
+        errors.append(f"unexpected benchmark specialization STAGES={spec[0]} COPIES={spec[1]}")
 
-    if not ok:
+    print(
+        "check_ldgsts_sass: found "
+        f"{len(candidate_blocks)} benchmark function block(s); "
+        f"identified {len(found_specs)}/{len(EXPECTED_SPECS)} expected specializations",
+        file=sys.stderr,
+    )
+
+    for stages, copies in sorted(EXPECTED_SPECS):
+        block = blocks_by_spec.get((stages, copies))
+        if block is None:
+            continue
+
+        instruction_lines = block[1:]
+        ldgsts_lines = [line for line in instruction_lines if LDGSTS_PATTERN.search(line)]
+        commit_lines = [line for line in instruction_lines if LDGDEPBAR_PATTERN.search(line)]
+        wait_lines = [line for line in instruction_lines if DEPBAR_PATTERN.search(line)]
+        wait_values = parse_wait_values(wait_lines)
+        expected_wait_values = {0, stages - 1}
+
+        spec_errors: list[str] = []
+        if len(ldgsts_lines) != copies:
+            spec_errors.append(f"LDGSTS count={len(ldgsts_lines)} expected={copies}")
+        if not commit_lines:
+            spec_errors.append("LDGDEPBAR missing (commit_group not demonstrated)")
+        missing_waits = expected_wait_values - wait_values
+        if missing_waits:
+            spec_errors.append(
+                "DEPBAR.LE SB0 wait value(s) missing: "
+                + ", ".join(str(value) for value in sorted(missing_waits))
+                + f"; observed={sorted(wait_values)}"
+            )
+
+        label = f"STAGES={stages} COPIES={copies}"
+        if spec_errors:
+            for detail in spec_errors:
+                errors.append(f"{label}: {detail}")
+            print(f"check_ldgsts_sass: FAIL {label}", file=sys.stderr)
+        else:
+            print(
+                f"check_ldgsts_sass: OK   {label} LDGSTS={len(ldgsts_lines)} "
+                f"LDGDEPBAR={len(commit_lines)} waits={sorted(wait_values)}",
+                file=sys.stderr,
+            )
+
+    if errors:
+        print("check_ldgsts_sass: contract validation failed:", file=sys.stderr)
+        for error in errors:
+            print(f"check_ldgsts_sass:   - {error}", file=sys.stderr)
         return 1
-    print("check_ldgsts_sass: OK: LDGSTS present in all benchmark specializations", file=sys.stderr)
+
+    print(
+        "check_ldgsts_sass: OK: all nine specializations have exact LDGSTS "
+        "counts plus commit/wait dependency instructions",
+        file=sys.stderr,
+    )
     return 0
 
 

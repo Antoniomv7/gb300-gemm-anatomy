@@ -2,8 +2,9 @@
 
 This is the LDGSTS arm of the "LDGSTS versus TMA" experiment (experiment 1 in
 `AGENTS.md`). It measures the effective copy bandwidth of a vectorized
-`cp.async.cg.shared.global` (LDGSTS) software pipeline from HBM to shared
-memory, with one CTA per SM genuinely enforced by occupancy.
+`cp.async.cg.shared.global` (LDGSTS) software pipeline from global memory to
+shared memory. Dynamic shared memory caps the maximum active residency at one
+CTA per SM; it does not observe or guarantee runtime block placement.
 
 **Status: implemented, pending audit and GB300 verification (see `PLAN.md`).**
 No experimental numbers from this code have been published in `README.md` or
@@ -18,8 +19,9 @@ anywhere else in the repository.
 - Whether every copied 16-byte vector, for the selected configuration, lands
   in shared memory with the exact bytes the deterministic source pattern
   predicts (`correctness`, `mismatches`).
-- Whether the launch configuration and shared-memory reservation actually
-  produce exactly one resident CTA per SM (`occupancy_ctas_per_sm`).
+- Whether the launch configuration and shared-memory reservation limit the
+  occupancy API's maximum active residency to one CTA per SM
+  (`occupancy_ctas_per_sm`).
 
 ## What it cannot yet claim
 
@@ -44,8 +46,8 @@ anywhere else in the repository.
 - Method: `ldgsts`. PTX instruction: `cp.async.cg.shared.global` (the `.cg`
   qualifier requires exactly 16-byte copies, which is why 16 bytes is fixed
   rather than configurable).
-- 128 threads/CTA, exactly 1 CTA/SM (grid = SM count), stages ∈ {2, 4, 8},
-  bytes-in-flight/SM ∈ {16, 32, 64} KiB.
+- 128 threads/CTA, grid = SM count, maximum active residency = 1 CTA/SM,
+  stages ∈ {2, 4, 8}, bytes-in-flight/SM ∈ {16, 32, 64} KiB.
 - One pipeline stage = one `cp.async` group = one `cp.async.commit_group`.
   Steady state waits with `cp.async.wait_group<Stages-1>` before reusing a
   ring slot; draining the pipeline waits with `cp.async.wait_group 0`.
@@ -93,7 +95,7 @@ nine times.
   array: this microbenchmark measures copied bytes, not arithmetic, so no
   BF16 arithmetic type is needed in memory.
 
-### One real CTA per SM
+### Maximum-active-CTA occupancy cap
 
 `sharedMemPerMultiprocessor`, the max opt-in shared memory per block
 (`cudaDevAttrMaxSharedMemoryPerBlockOptin`), and the SM count are all queried
@@ -108,7 +110,14 @@ and benchmark kernels; if either reports anything other than exactly 1, the
 binary aborts with a diagnostic instead of continuing silently. Only the
 first `bytes_in_flight_per_sm` bytes of the reservation are the actual ring
 buffer; the rest is deliberate, untouched padding whose only purpose is
-capping occupancy at 1.
+capping maximum active residency at one CTA per SM.
+
+The occupancy API reports a resource-based upper bound; it does not inspect
+where the scheduler places blocks during a launch. Likewise, launching
+`grid_blocks = sm_count` does not by itself prove that every SM concurrently
+receives one block. P1.1 therefore claims only
+`max_active_ctas_per_sm = 1`, recorded in the frozen CSV column
+`occupancy_ctas_per_sm`, and makes no stronger placement claim.
 
 ### Working set and rotation
 
@@ -144,13 +153,14 @@ path runs the identical PTX sequence the validated path already proved
 correct:
 
 - **Validation** initializes the working set on-device with a deterministic
-  pattern that is a pure function of each 16-byte vector's global index
+  pattern that mixes all 64 bits of each 16-byte vector's global index
   (`expected_vector()`), runs the same pipeline once over the whole working
   set, and compares every copied vector — not a sample — against the
   recomputed expected value. Mismatches accumulate in per-thread registers
   and reach the host as a single `atomicAdd`'d counter, so the working set
-  never has to travel back to the host. Any mismatch, or any CUDA error at
-  any point, prevents warm-up and timing entirely.
+  never has to travel back to the host. Any mismatch, or any CUDA error before
+  warm-up, prevents timing; later CUDA errors are reported separately from
+  correctness failures and make any partial CSV invalid.
 - **Benchmark** only runs after that exact configuration's validation
   passed. It contains only pipeline issue/wait/rotate logic plus a minimal
   sink: each thread XORs one 32-bit lane per consumed slot into a
@@ -178,7 +188,7 @@ GB/s: `useful_bytes / kernel_time_seconds / 1e9`.
 ```bash
 make check-static             # no Docker, no GPU, no network
 make memory-ldgsts-build       # compile inside the pinned image; no GPU
-make memory-ldgsts-sass        # disassemble + verify LDGSTS; no GPU
+make memory-ldgsts-sass        # verify LDGSTS counts + commit/wait SASS; no GPU
 
 # GPU-executing targets require an explicit, operator-provided physical
 # index and go exclusively through scripts/run_container.sh:
@@ -218,8 +228,8 @@ stdout; everything else goes to stderr.
 | `vector_bytes` | bytes | Always 16 (the `cp.async.cg` fixed vector width). |
 | `copies_per_thread_per_stage` | count | `stage_bytes / (128 * 16)`. |
 | `threads_per_cta` | count | Always 128. |
-| `target_ctas_per_sm` | count | Always 1 (the frozen target). |
-| `occupancy_ctas_per_sm` | count | Measured via `cudaOccupancyMaxActiveBlocksPerMultiprocessor`; always 1 or the run aborts. |
+| `target_ctas_per_sm` | count | Always 1: the frozen target for maximum active residency. |
+| `occupancy_ctas_per_sm` | count | Maximum active blocks/SM reported by `cudaOccupancyMaxActiveBlocksPerMultiprocessor`; always 1 or the run aborts. This is not an observed block-placement count. |
 | `grid_blocks` | count | Equals `sm_count`. |
 | `sm_count` | count | Queried `multiProcessorCount`. |
 | `smem_reservation_bytes` | bytes | Actual dynamic shared memory reserved (> half of `sharedMemPerMultiprocessor`, includes padding beyond `bytes_in_flight_per_sm`). |

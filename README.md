@@ -11,12 +11,12 @@ test, and Nsight Compute access were successfully verified on the target
 hardware on 20 July 2026. No experimental performance results exist yet.
 
 P1.1, the standalone LDGSTS arm of the "LDGSTS versus TMA" experiment
-(`src/memory/ldgsts.cu`), is implemented: it builds and its SASS was verified
-to contain the LDGSTS opcode for all nine frozen specializations under
-GPU-free static checks (see `src/memory/README.md`). It has not yet been
-independently audited or executed on GB300 hardware, so `PLAN.md` records
-Audited=NO and Verified on GB300=NO for P1.1. The TMA arm (P1.2) has not been
-started.
+(`src/memory/ldgsts.cu`), is implemented as a global-memory-to-SMEM effective
+copy benchmark. Its GPU-free SASS gate requires the exact LDGSTS count and the
+commit/wait dependency instructions for all nine frozen specializations (see
+`src/memory/README.md`). The corrected implementation still requires
+re-audit and execution on GB300 hardware, so `PLAN.md` records Audited=NO and
+Verified on GB300=NO for P1.1. The TMA arm (P1.2) has not been started.
 
 ## Research question
 
@@ -29,8 +29,9 @@ DSL implementation approach cuBLASLt?
 1. **LDGSTS versus TMA** — compare equivalent HBM-to-SMEM paths (vectorized
    LDGSTS/`cp.async` versus 2D unicast TMA) and determine sustained traffic
    and the in-flight bytes needed for saturation. 2/4/8 stages, three byte
-   volumes, at most 18 configurations, one CTA per SM, working set above 2× L2,
-   with selected SASS and Nsight Compute checks.
+   volumes, at most 18 configurations, maximum active residency of one CTA per
+   SM, grid equal to the SM count, working set above 2× L2, with selected SASS
+   and Nsight Compute checks.
 2. **BF16 UMMA throughput** — estimate the fifth-generation Tensor Core
    ceiling and 2-SM scaling. BF16×BF16 with FP32 accumulation; 1-SM M=128,
    2-SM M=256; N ∈ {64, 128, 256}; depth ∈ {4, 16, 64, 256}; at most 24
@@ -147,7 +148,9 @@ BLACKWELL_GPU_INDEX=<physical-index> make preflight
 `BLACKWELL_GPU_INDEX` is mandatory. The project never selects a GPU
 automatically and never exposes all GPUs to a container.
 
-Phase 0 provides environment and tooling validation only. Experiments 1–3 have
-not started, and the repository contains no bandwidth, throughput, GEMM
-performance, or cuBLASLt comparison results yet. See `PLAN.md` for the
-remaining schedule and `AGENTS.md` for the mandatory shared-cluster rules.
+Phase 0 provides environment and tooling validation only. Experiment 1 has
+started with the P1.1 LDGSTS implementation, which remains pending re-audit
+and GB300 verification; P1.2 and experiments 2–3 have not started. The
+repository contains no bandwidth, throughput, GEMM performance, or cuBLASLt
+comparison results yet. See `PLAN.md` for the remaining schedule and
+`AGENTS.md` for the mandatory shared-cluster rules.
