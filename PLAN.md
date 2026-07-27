@@ -35,7 +35,7 @@ Gate: Phase 0 gate passed; correctness validated before any timing/profiling.
 |------|-------------|-------------|---------|-------------------|
 | P1.1 | Standalone LDGSTS baseline | YES | YES | YES |
 | P1.2 | Equivalent TMA path | YES | YES | YES |
-| P1.3 | Joint sweep (≤18 configurations) | NO | NO | NO |
+| P1.3 | Joint sweep (≤18 configurations) | YES | NO | NO |
 | P1.4 | Profiling, validation, analysis, pilot | NO | NO | NO |
 
 ## Phase 2 — BF16 UMMA throughput (27 July–2 August 2026)

@@ -4,22 +4,27 @@ Anatomy of BF16 GEMM performance on NVIDIA GB300: a small, reproducible,
 auditable measurement study.
 
 **Status: `Phase 0 — audited and verified on GB300`. `P1.1 (standalone LDGSTS
-baseline) — implemented, pending audit and GB300 verification`. `P1.2
-(standalone 2D unicast TMA path) — implemented, pending audit and GB300
-verification`.**
+baseline) — implemented, audited, functionally verified on GB300`. `P1.2
+(standalone 2D unicast TMA path) — implemented, audited, functionally
+verified on GB300`. `P1.3 (joint LDGSTS/TMA sweep infrastructure) —
+implemented, pending independent audit and GB300 verification`.**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
-hardware on 20 July 2026. No experimental performance results exist yet.
+hardware on 20 July 2026. The P1.1 and P1.2 GB300 runs were functional
+verification of the binaries and container plumbing (all nine
+specializations' `--self-test` correctness, plus one short `run_kind=smoke`
+measurement each); their smoke bandwidth values are not experimental results.
+No publishable experimental performance results exist yet.
 
 P1.1, the standalone LDGSTS arm of the "LDGSTS versus TMA" experiment
 (`src/memory/ldgsts.cu`), is implemented as a global-memory-to-SMEM effective
 copy benchmark. Its GPU-free SASS gate requires complete 16-byte LDGSTS groups
 and matching commit/wait dependency instructions for all nine frozen
 specializations, while allowing `ptxas` to duplicate whole groups when it
-unrolls or peels the loop (see `src/memory/README.md`). The corrected
-implementation still requires re-audit and execution on GB300 hardware, so
-`PLAN.md` records Audited=NO and Verified on GB300=NO for P1.1.
+unrolls or peels the loop (see `src/memory/README.md`). P1.1 has been
+independently audited and functionally verified on GB300, so `PLAN.md`
+records Audited=YES and Verified on GB300=YES for P1.1.
 
 P1.2, the standalone 2D unicast TMA arm (`src/memory/tma.cu`), is implemented
 as the TMA counterpart: it moves the exact same logical tiles as P1.1 through
@@ -29,11 +34,24 @@ pipeline (`cp.async.bulk.tensor.2d.shared::cta.global`), with the same
 Its GPU-free SASS gate requires a genuine `UTMALDG.2D` load, transaction-aware
 mbarrier arrival, phase/parity waits, and full mbarrier invalidation after the
 pipeline drains for all nine frozen specializations, with no LDGSTS, 1D, or
-multicast/cluster fallback (see `src/memory/README.md`). P1.2 is implemented
-but has not been independently audited or executed on GB300, so `PLAN.md`
-records Audited=NO and Verified on GB300=NO for P1.2 as well. P1.3 (the joint
-LDGSTS/TMA sweep) has not started and remains blocked until both arms are
-independently audited and verified on GB300.
+multicast/cluster fallback (see `src/memory/README.md`). P1.2 has likewise
+been independently audited and functionally verified on GB300, so `PLAN.md`
+records Audited=YES and Verified on GB300=YES for P1.2 as well.
+
+P1.3, the joint LDGSTS/TMA sweep infrastructure
+(`scripts/run_exp01_memory_paths.sh`, `scripts/aggregate_exp01_memory_paths.py`),
+is now implemented: a deterministic 18-invocation runner (2 methods x 3 stage
+counts x 3 bytes-in-flight values, alternating which method runs first per
+configuration pair), strict validation of both binaries' raw 37-column CSV,
+lossless consolidation into `combined_samples.csv`, and purely descriptive
+per-configuration statistics in `summary.csv` (mean/median/sample
+stdev/coefficient of variation — no speedups, no outlier filtering, no
+significance testing). P1.3 has not yet been independently audited or
+verified on GB300, so `PLAN.md` records Implemented=YES, Audited=NO, and
+Verified on GB300=NO for P1.3. P1.4 (profiling, Nsight Compute, the pilot
+performance campaign, and comparative LDGSTS/TMA interpretation) has not
+started and remains blocked until P1.3 is independently audited and verified
+on GB300.
 
 ## Research question
 
@@ -166,8 +184,12 @@ BLACKWELL_GPU_INDEX=<physical-index> make preflight
 automatically and never exposes all GPUs to a container.
 
 Phase 0 provides environment and tooling validation only. Experiment 1 has
-started with both the P1.1 LDGSTS and P1.2 TMA implementations, each pending
-independent audit and GB300 verification; P1.3, P1.4, and experiments 2–3
-have not started. The repository contains no bandwidth, throughput, GEMM
-performance, or cuBLASLt comparison results yet. See `PLAN.md` for the
-remaining schedule and `AGENTS.md` for the mandatory shared-cluster rules.
+started with the P1.1 LDGSTS and P1.2 TMA implementations, both independently
+audited and functionally verified on GB300, and P1.3 (the joint sweep
+infrastructure), which is implemented but still pending independent audit and
+GB300 verification. P1.4 and experiments 2–3 have not started. The repository
+contains no bandwidth, throughput, GEMM performance, or cuBLASLt comparison
+results yet; the P1.1/P1.2 GB300 verification runs and any future P1.3
+`run_kind=smoke` output are functional checks, not publishable results. See
+`PLAN.md` for the remaining schedule and `AGENTS.md` for the mandatory
+shared-cluster rules.

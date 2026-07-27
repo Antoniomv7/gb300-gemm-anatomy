@@ -2,7 +2,8 @@
 # Exposed targets: help, check-static, build-image, check-env, preflight,
 # memory-ldgsts-build, memory-ldgsts-sass, memory-ldgsts-self-test,
 # memory-ldgsts-smoke, memory-tma-build, memory-tma-sass,
-# memory-tma-self-test, memory-tma-smoke.
+# memory-tma-self-test, memory-tma-smoke, memory-paths-plan,
+# memory-paths-check, memory-paths-smoke.
 # No target selects a GPU automatically, elevates privileges, or exceeds two
 # build jobs.
 
@@ -22,6 +23,9 @@ MEMORY_TMA_SRC := src/memory/tma.cu
 MEMORY_TMA_BIN := build/memory/tma
 MEMORY_TMA_SASS := build/memory/tma.sass
 
+EXP01_RUNNER := scripts/run_exp01_memory_paths.sh
+EXP01_AGGREGATOR := scripts/aggregate_exp01_memory_paths.py
+
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
 	Dockerfile Makefile \
@@ -29,15 +33,17 @@ REQUIRED_FILES := \
 	scripts/check_tma_sass.py \
 	smoke/cuda_smoke.cu smoke/cutedsl_smoke.py \
 	src/memory/ldgsts.cu src/memory/tma.cu src/memory/README.md \
-	results/README.md
+	results/README.md \
+	$(EXP01_RUNNER) $(EXP01_AGGREGATOR)
 
 .DEFAULT_GOAL := help
 .PHONY: help check-static build-image check-env preflight \
 	memory-ldgsts-build memory-ldgsts-sass memory-ldgsts-self-test memory-ldgsts-smoke \
-	memory-tma-build memory-tma-sass memory-tma-self-test memory-tma-smoke
+	memory-tma-build memory-tma-sass memory-tma-self-test memory-tma-smoke \
+	memory-paths-plan memory-paths-check memory-paths-smoke
 
 help:
-	@echo "gb300-gemm-anatomy — Phase 0 + P1.1 (LDGSTS) + P1.2 (TMA) targets"
+	@echo "gb300-gemm-anatomy — Phase 0 + P1.1 (LDGSTS) + P1.2 (TMA) + P1.3 (sweep) targets"
 	@echo ""
 	@echo "  make help                     Show this help."
 	@echo "  make check-static             Static validation: no Docker, no GPU, no network."
@@ -71,6 +77,20 @@ help:
 	@echo "  make memory-tma-smoke         Self-test, then one short run_kind=smoke"
 	@echo "                                measurement (NOT a final result). Requires"
 	@echo "                                BLACKWELL_GPU_INDEX."
+	@echo ""
+	@echo "  -- P1.3 joint LDGSTS/TMA sweep infrastructure (exp01_memory_paths) --"
+	@echo "  GPU-free P1.3 planning/checking (no GPU, no Docker, no network):"
+	@echo "  make memory-paths-plan       Print the deterministic 18-invocation plan."
+	@echo "  make memory-paths-check      Shell/Python syntax, executable bits, GPU-free"
+	@echo "                               synthetic tests, and exact 18-way plan validation."
+	@echo "  GPU-executing 18-way functional smoke (uses the P1.1/P1.2 CUDA build/SASS"
+	@echo "  gates above, then both binary self-tests, then all 18 smoke configurations;"
+	@echo "  requires BLACKWELL_GPU_INDEX; never selects a GPU automatically):"
+	@echo "  make memory-paths-smoke      run_kind=smoke only; functional verification,"
+	@echo "                               NOT a publishable performance result."
+	@echo "  P1.3 never runs Nsight Compute and never collects run_kind=benchmark data;"
+	@echo "  a future, explicit benchmark-campaign target is P1.4 work and is not"
+	@echo "  performed by this Makefile today."
 	@echo ""
 	@echo "Pinned contract (VERSIONS.env): CUDA $(CUDA_VERSION), CUTLASS $(CUTLASS_VERSION),"
 	@echo "arch $(CUDA_ARCH), max build jobs $(MAX_BUILD_JOBS)."
@@ -153,10 +173,36 @@ check-static:
 	@grep -Fq 'mbarrier.inval.shared.b64' src/memory/tma.cu
 	@grep -Fq 'SYNCS.CCTL.IV' scripts/check_tma_sass.py
 	@echo "== documentation reports P1.2 as implemented, not unimplemented (P1.2 remediation) =="
-	@grep -Fq 'P1.2 | Equivalent TMA path | YES | NO | NO |' PLAN.md
 	@! grep -rnF 'has not been started' README.md src/memory/README.md
 	@! grep -rnF 'no TMA code exists yet' README.md src/memory/README.md
 	@! grep -nF 'P1.2 and experiments' README.md
+	@echo "== P1.3 required files present, executable, and syntactically valid =="
+	@test -x $(EXP01_RUNNER)
+	@test -x $(EXP01_AGGREGATOR)
+	bash -n $(EXP01_RUNNER)
+	python3 -m py_compile $(EXP01_AGGREGATOR)
+	@rm -rf scripts/__pycache__
+	@echo "== P1.3 GPU-free synthetic tests (self-test) =="
+	python3 $(EXP01_AGGREGATOR) --self-test
+	@echo "== P1.3 exact 18-way plan validation =="
+	@test "$$(python3 $(EXP01_AGGREGATOR) plan --format lines | wc -l | tr -d ' ')" -eq 18
+	@echo "== P1.3 forbidden patterns absent from the new scripts =="
+	@pat='--gpus[ =]+all|NVIDIA_VISIBLE_DEVICES=all|--privileged|--pid[ =]+host|docker\.sock|--cap-add|SYS_ADMIN|set -x'; \
+	pat="$$pat|\bs""udo\b|\$$\(np""roc\)|\bncu\b|nvidia-smi[^|]*(-pm|--persistence-mode|-lgc|--lock-gpu-clocks|-pl|--power-limit)"; \
+	! grep -nE -- "$$pat" $(EXP01_RUNNER) $(EXP01_AGGREGATOR)
+	@echo "== P1.3 runner uses the audited launcher and never selects a GPU automatically =="
+	@grep -Fq 'run_container.sh' $(EXP01_RUNNER)
+	@grep -Fq 'BLACKWELL_GPU_INDEX' $(EXP01_RUNNER)
+	@echo "== P1.3 raw campaign output is git-ignored =="
+	@grep -Fq 'results/raw/' .gitignore
+	@echo "== truthful P1.1-P1.4 status assertions =="
+	@grep -Fq 'P1.1 | Standalone LDGSTS baseline | YES | YES | YES |' PLAN.md
+	@grep -Fq 'P1.2 | Equivalent TMA path | YES | YES | YES |' PLAN.md
+	@grep -Fq 'P1.3 | Joint sweep (≤18 configurations) | YES | NO | NO |' PLAN.md
+	@grep -Fq 'P1.4 | Profiling, validation, analysis, pilot | NO | NO | NO |' PLAN.md
+	@! grep -F 'P1.3, P1.4, and experiments 2' README.md
+	@! grep -F 'P1.3 (the joint LDGSTS/TMA sweep) has not started' README.md
+	@! grep -F 'P1.3 (the joint sweep) and P1.4' src/memory/README.md
 	@echo "check-static: OK"
 
 build-image:
@@ -342,4 +388,45 @@ memory-tma-smoke: memory-tma-build
 	@echo "=============================================================================="
 	@echo "The run_kind=smoke output above is a functional smoke check only. It is NOT a"
 	@echo "final experimental result and must not be cited as a performance number."
+	@echo "=============================================================================="
+
+# --- P1.3: joint LDGSTS/TMA sweep infrastructure (exp01_memory_paths) -------
+# memory-paths-plan and memory-paths-check never touch a GPU or Docker: they
+# only exercise scripts/run_exp01_memory_paths.sh's and
+# scripts/aggregate_exp01_memory_paths.py's own GPU-free CLI paths and
+# synthetic self-tests. memory-paths-smoke is the only P1.3 target that
+# executes on GPU; it requires an explicit BLACKWELL_GPU_INDEX, reuses the
+# memory-ldgsts-sass/memory-tma-sass gates above, then runs both binaries'
+# full --self-test through scripts/run_container.sh before any of the 18
+# smoke configurations. No P1.3 target invokes Nsight Compute or collects
+# run_kind=benchmark data; that remains explicit P1.4 work.
+
+memory-paths-plan:
+	$(EXP01_RUNNER) --print-plan
+
+memory-paths-check:
+	bash -n $(EXP01_RUNNER)
+	@test -x $(EXP01_RUNNER)
+	@test -x $(EXP01_AGGREGATOR)
+	python3 -m py_compile $(EXP01_AGGREGATOR)
+	@rm -rf scripts/__pycache__
+	python3 $(EXP01_AGGREGATOR) --self-test
+	@test "$$(python3 $(EXP01_AGGREGATOR) plan --format lines | wc -l | tr -d ' ')" -eq 18
+	$(EXP01_RUNNER) --self-test
+	@echo "memory-paths-check: OK"
+
+memory-paths-smoke: memory-ldgsts-sass memory-tma-sass
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make memory-paths-smoke"; \
+		echo "       This project never selects a GPU automatically."; \
+		exit 2; \
+	fi
+	@echo "== memory-paths-smoke: both binary self-tests, then all 18 smoke configurations =="
+	$(EXP01_RUNNER) --run-kind smoke \
+		--working-set-mib 64 --passes 2 --warmup-ms 200 --repetitions 2
+	@echo "=============================================================================="
+	@echo "The run_kind=smoke output above is functional verification of the P1.3 sweep"
+	@echo "infrastructure only. It is NOT a final experimental result, computes no"
+	@echo "speedup, and must not be cited as a performance number."
 	@echo "=============================================================================="

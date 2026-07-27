@@ -32,6 +32,7 @@ venv/
 # (small CSV/JSON) are committed deliberately elsewhere under results/;
 # CSV/JSON are intentionally NOT blanket-ignored.
 results/preflight/
+results/raw/
 
 # Temporary / editor / container-local metadata
 *.tmp

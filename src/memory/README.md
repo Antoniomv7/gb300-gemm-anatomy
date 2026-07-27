@@ -8,12 +8,19 @@ global-memory-to-shared-memory software pipeline. Dynamic shared memory caps
 the maximum active residency at one CTA per SM for both; neither observes or
 guarantees runtime block placement.
 
-**Status: P1.1 implemented, pending audit and GB300 verification. P1.2
-implemented, pending audit and GB300 verification (see `PLAN.md`).** No
-experimental numbers from either binary have been published in `README.md`
-or anywhere else in the repository. P1.3 (the joint sweep) and P1.4
-(profiling/analysis) have not started and remain blocked until P1.1 and P1.2
-are both independently audited and verified on GB300.
+**Status: P1.1 implemented, audited, functionally verified on GB300. P1.2
+implemented, audited, functionally verified on GB300. P1.3 (the joint sweep
+infrastructure, `scripts/run_exp01_memory_paths.sh` and
+`scripts/aggregate_exp01_memory_paths.py`) implemented, pending independent
+audit and GB300 verification (see `PLAN.md`).** No experimental numbers from
+either binary have been published in `README.md` or anywhere else in the
+repository: the P1.1/P1.2 GB300 verification runs were functional checks
+(all nine `--self-test` specializations plus one short `run_kind=smoke`
+measurement each), not publishable results, and P1.3's own `run_kind=smoke`
+output carries the same caveat. P1.4 (profiling, Nsight Compute, the pilot
+performance campaign, and LDGSTS/TMA comparative interpretation) has not
+started and remains blocked until P1.3 is independently audited and verified
+on GB300.
 
 ## P1.1 — standalone LDGSTS baseline
 
@@ -368,6 +375,93 @@ build/memory/tma --self-test
 build/memory/tma --stages 4 --bytes-in-flight-kib 32 --run-kind benchmark \
     --working-set-mib 512 --passes 4 --warmup-ms 200 --repetitions 20
 ```
+
+## P1.3 — joint LDGSTS/TMA sweep infrastructure
+
+P1.3 (`scripts/run_exp01_memory_paths.sh`, `scripts/aggregate_exp01_memory_paths.py`)
+is reproducible infrastructure for running P1.1 and P1.2 together, validating
+their raw CSV strictly, and computing descriptive statistics. It adds no CUDA
+code and does not modify `ldgsts.cu`, `tma.cu`, or either SASS checker.
+
+**Status: implemented, pending independent audit and GB300 verification (see
+`PLAN.md`).** P1.3 does not itself collect publishable measurements: it does
+not run Nsight Compute, compute LDGSTS/TMA speedups, apply an outlier policy,
+or draw any performance conclusion. Whether the copied bytes actually came
+from DRAM/HBM (as opposed to L2) is still an open question that only Nsight
+Compute (P1.4) can answer; a `run_kind=smoke` campaign is a functional check
+of the sweep plumbing, never a performance number. All of that — the pilot
+performance campaign, Nsight Compute, DRAM/HBM traffic confirmation,
+variability/outlier judgment, and comparative LDGSTS/TMA interpretation — is
+P1.4, which has not started.
+
+### The frozen 18-invocation matrix
+
+Both methods run the same nine `(stages, bytes_in_flight_per_sm)`
+specializations from the frozen contract above (2/4/8 stages x 16/32/64 KiB),
+so the complete sweep is exactly `2 methods x 9 specializations = 18`
+invocations. Configuration pairs run in this fixed order, methods kept
+adjacent to limit temporal separation, and which method leads alternating by
+pair parity (even pair: `ldgsts` then `tma`; odd pair: `tma` then `ldgsts`):
+
+```
+(2,16) (2,32) (2,64) (4,16) (4,32) (4,64) (8,16) (8,32) (8,64)
+```
+
+`scripts/run_exp01_memory_paths.sh --print-plan` prints the resulting 18
+deterministic invocation indices (0-17); this order is fixed by P1.3 and not
+randomized, so P1.4 can assess or deliberately change it later. The runner
+passes identical `run_kind`, `working_set_mib` (when given), `passes`,
+`warmup_ms`, and `repetitions` to both methods for every configuration.
+
+### Runner CLI
+
+```bash
+scripts/run_exp01_memory_paths.sh --help
+scripts/run_exp01_memory_paths.sh --print-plan     # no GPU, no Docker
+scripts/run_exp01_memory_paths.sh --self-test      # no GPU, no Docker, no network
+
+scripts/run_exp01_memory_paths.sh \
+    --run-kind {smoke,benchmark} [--campaign-id ID] [--working-set-mib N] \
+    --passes N --warmup-ms N --repetitions N
+```
+
+A campaign additionally requires `BLACKWELL_GPU_INDEX=<physical-index>` in
+the environment (never selected automatically) and a clean Git worktree.
+Before any timed configuration, the runner requires a full 40-character Git
+commit and clean worktree, re-runs the existing GPU-free
+`memory-ldgsts-sass`/`memory-tma-sass` gates, requires both binaries and SASS
+files to exist, and runs both binaries' full `--self-test` (all nine
+specializations each) through `scripts/run_container.sh` — only after both
+pass does it start the 18 configurations, one GPU process at a time, never
+concurrently. Every GPU invocation goes through `scripts/run_container.sh`
+independently, with the same operator-provided `BLACKWELL_GPU_INDEX`; the
+runner never caches a GPU UUID, retries, or falls back to another device.
+
+Each binary's stdout is captured directly to a temporary per-case CSV inside
+the container (never through a shell-level redirect of the whole launcher
+invocation, which would otherwise mix in `scripts/run_container.sh`'s own
+allowlisted diagnostic lines and the base image's entrypoint banner); the
+temporary file is renamed to its final name only on a clean exit, and any
+non-empty output from a failed invocation is preserved with a `.partial` or
+`.invalid` suffix instead of being aggregated. See `results/README.md` for
+the campaign directory layout, manifest fields, strict CSV validation rules,
+and `summary.csv` formulas.
+
+### GPU-free checks
+
+```bash
+make memory-paths-plan     # print the 18-invocation plan; no GPU, no Docker
+make memory-paths-check    # shell/Python syntax, executable bits, synthetic
+                            # self-tests, exact 18-way plan validation; no GPU
+
+# Requires an explicit, operator-provided physical index:
+BLACKWELL_GPU_INDEX=<physical-index> make memory-paths-smoke
+```
+
+`make memory-paths-smoke` runs `run_kind=smoke`, `--working-set-mib 64`,
+`--passes 2`, `--warmup-ms 200`, `--repetitions 2` through the runner above.
+Its output is functional verification of the sweep plumbing only, exactly
+like `memory-ldgsts-smoke`/`memory-tma-smoke` — never a publishable result.
 
 ## LDGSTS/TMA equivalence table
 
