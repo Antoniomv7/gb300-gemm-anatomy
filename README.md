@@ -7,16 +7,20 @@ auditable measurement study.
 baseline) — implemented, audited, functionally verified on GB300`. `P1.2
 (standalone 2D unicast TMA path) — implemented, audited, functionally
 verified on GB300`. `P1.3 (joint LDGSTS/TMA sweep infrastructure) —
-implemented, remediation completed, pending a new independent audit and
-GB300 functional verification`.**
+implemented, remediation completed, independently audited, and functionally
+verified on GB300`. `P1.4 — not started`.**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
 hardware on 20 July 2026. The P1.1 and P1.2 GB300 runs were functional
 verification of the binaries and container plumbing (all nine
 specializations' `--self-test` correctness, plus one short `run_kind=smoke`
-measurement each); their smoke bandwidth values are not experimental results.
-No publishable experimental performance results exist yet.
+measurement each). The P1.3 joint smoke campaign `20260728T103315Z` completed
+on GB300 at Git commit `59777406b9454f00799c48bff8fa85cb03625cb6`, with
+both full-binary self-tests and all 18 planned invocations passing. These
+smoke runs establish functional verification only: their bandwidth values are
+not experimental results. No publishable experimental performance results
+exist yet.
 
 P1.1, the standalone LDGSTS arm of the "LDGSTS versus TMA" experiment
 (`src/memory/ldgsts.cu`), is implemented as a global-memory-to-SMEM effective
@@ -54,13 +58,15 @@ defects; a second audit found remaining blockers in synthetic-test
 isolation, symlink-safe finalization, loaded-manifest validation,
 no-clobber/rollback behavior, canonical CSV parsing, and progress telemetry.
 The second remediation is completed in the implementation and adversarial
-GPU-free tests (see `src/memory/README.md`), but author-side remediation and
-self-tests do not themselves constitute a new independent audit. `PLAN.md`
-therefore still records Implemented=YES, Audited=NO, and Verified on
-GB300=NO for P1.3. P1.4 (profiling, Nsight Compute, the pilot performance
-campaign, and comparative LDGSTS/TMA interpretation) has not started and
-remains blocked until P1.3 is independently (re-)audited and verified on
-GB300.
+GPU-free tests (see `src/memory/README.md`), and the remediated implementation
+subsequently passed a new independent GPU-free audit. Campaign
+`20260728T103315Z` then reached `COMPLETE` on GB300 after both binaries'
+full self-tests and all 18 smoke configurations passed. `PLAN.md` therefore
+records Implemented=YES, Audited=YES, and Verified on GB300=YES for P1.3.
+This closes the P1.3 infrastructure gate but does not create a publishable
+performance result. P1.4 (profiling, Nsight Compute, the pilot performance
+campaign, and comparative LDGSTS/TMA interpretation) has not started; it is
+now unblocked.
 
 ## Research question
 
@@ -193,12 +199,13 @@ BLACKWELL_GPU_INDEX=<physical-index> make preflight
 automatically and never exposes all GPUs to a container.
 
 Phase 0 provides environment and tooling validation only. Experiment 1 has
-started with the P1.1 LDGSTS and P1.2 TMA implementations, both independently
-audited and functionally verified on GB300, and P1.3 (the joint sweep
-infrastructure), which is implemented but still pending independent audit and
-GB300 verification. P1.4 and experiments 2–3 have not started. The repository
-contains no bandwidth, throughput, GEMM performance, or cuBLASLt comparison
-results yet; the P1.1/P1.2 GB300 verification runs and any future P1.3
-`run_kind=smoke` output are functional checks, not publishable results. See
-`PLAN.md` for the remaining schedule and `AGENTS.md` for the mandatory
-shared-cluster rules.
+completed P1.1, P1.2, and P1.3: all three units are implemented,
+independently audited, and functionally verified on GB300. P1.4 is unblocked
+but has not started, and experiments 2–3 have not started. The repository
+contains no publishable bandwidth, throughput, GEMM performance, or cuBLASLt
+comparison results; campaign `20260728T103315Z` and the earlier P1.1/P1.2
+smoke runs are functional checks only. A fresh preflight is still required
+before P1.4 because the host driver changed after the Phase 0 verification;
+the pinned CUDA 13.1 container contract remains unchanged. See `PLAN.md` for
+the remaining schedule and `AGENTS.md` for the mandatory shared-cluster
+rules.

@@ -202,7 +202,7 @@ check-static:
 	@echo "== truthful P1.1-P1.4 status assertions =="
 	@grep -Fq 'P1.1 | Standalone LDGSTS baseline | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P1.2 | Equivalent TMA path | YES | YES | YES |' PLAN.md
-	@grep -Fq 'P1.3 | Joint sweep (≤18 configurations) | YES | NO | NO |' PLAN.md
+	@grep -Fq 'P1.3 | Joint sweep (≤18 configurations) | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P1.4 | Profiling, validation, analysis, pilot | NO | NO | NO |' PLAN.md
 	@! grep -F 'P1.3, P1.4, and experiments 2' README.md
 	@! grep -F 'P1.3 (the joint LDGSTS/TMA sweep) has not started' README.md

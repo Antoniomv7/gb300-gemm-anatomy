@@ -11,16 +11,16 @@ guarantees runtime block placement.
 **Status: P1.1 implemented, audited, functionally verified on GB300. P1.2
 implemented, audited, functionally verified on GB300. P1.3 (the joint sweep
 infrastructure, `scripts/run_exp01_memory_paths.sh` and
-`scripts/aggregate_exp01_memory_paths.py`) implemented, pending independent
-audit and GB300 verification (see `PLAN.md`).** No experimental numbers from
-either binary have been published in `README.md` or anywhere else in the
-repository: the P1.1/P1.2 GB300 verification runs were functional checks
-(all nine `--self-test` specializations plus one short `run_kind=smoke`
-measurement each), not publishable results, and P1.3's own `run_kind=smoke`
-output carries the same caveat. P1.4 (profiling, Nsight Compute, the pilot
+`scripts/aggregate_exp01_memory_paths.py`) implemented, remediation completed,
+independently audited, and functionally verified on GB300 (see `PLAN.md`).**
+No experimental numbers from either binary have been published in `README.md`
+or anywhere else in the repository: the P1.1/P1.2 GB300 verification runs
+were functional checks (all nine `--self-test` specializations plus one short
+`run_kind=smoke` measurement each), not publishable results. P1.3 smoke
+campaign `20260728T103315Z` likewise verified the joint infrastructure
+functionally, not experimentally. P1.4 (profiling, Nsight Compute, the pilot
 performance campaign, and LDGSTS/TMA comparative interpretation) has not
-started and remains blocked until P1.3 is independently audited and verified
-on GB300.
+started and is now unblocked.
 
 ## P1.1 — standalone LDGSTS baseline
 
@@ -51,8 +51,8 @@ on GB300.
   audited, and functionally verified on GB300, same as P1.1. The joint sweep
   that runs both arms together, `scripts/run_exp01_memory_paths.sh` /
   `scripts/aggregate_exp01_memory_paths.py` (P1.3), is likewise implemented
-  but still pending its own independent audit and GB300 verification (see
-  `PLAN.md`); comparative LDGSTS/TMA interpretation itself remains P1.4.
+  independently audited, and functionally verified on GB300 (see `PLAN.md`);
+  comparative LDGSTS/TMA interpretation itself remains P1.4.
 - **Not a sweep or an analysis by itself.** This binary runs one
   specialization (or, under `--self-test`, validates all nine) per
   invocation. P1.3 (see below) provides the joint sweep, strict CSV
@@ -61,7 +61,8 @@ on GB300.
 - **Not a final result.** `run_kind=smoke` output exists only to prove the
   binary and container plumbing work end to end; it is never a publishable
   measurement. `run_kind=benchmark` output is raw, per-repetition CSV with
-  no statistics computed — still not a "result" until P1.3/P1.4 process it.
+  no statistics computed; even P1.3's descriptive aggregate remains
+  non-publishable input until P1.4 validates and interprets it.
 
 ## Frozen contract
 
@@ -103,7 +104,7 @@ template instantiation of two kernel templates (`ldgsts_validate_kernel`,
 `ldgsts_benchmark_kernel`); the kernel body is written once, not duplicated
 nine times.
 
-### 2D layout (shared with the future TMA arm)
+### 2D layout (shared with the TMA arm)
 
 - 128 BF16-width (2-byte) elements per row = 256 bytes/row
   (`tile_width_elements` / `tile_width_bytes`).
@@ -111,8 +112,7 @@ nine times.
   the specialization.
 - LDGSTS copies each tile as one contiguous linear region (row-major, no
   padding, so "2D tile" and "contiguous 16-byte-vector range" are the same
-  bytes). P1.2 must be able to express exactly the same tiles as 2D TMA
-  copies.
+  bytes). P1.2 expresses exactly the same tiles as 2D TMA copies.
 - The underlying buffer is raw 16-byte vectors (`uint4`), not a typed BF16
   array: this microbenchmark measures copied bytes, not arithmetic, so no
   BF16 arithmetic type is needed in memory.
@@ -259,13 +259,13 @@ functional check (all nine `--self-test` specializations plus one short
 Identical caveats to P1.1: not HBM/DRAM bandwidth (`effective_gbps` is
 *effective copy bandwidth*, not a claim about L2 vs DRAM traffic — that is
 an NCU question for P1.4); not an interpreted comparison against LDGSTS
-(P1.3, the joint sweep, is implemented and runs both arms together, but is
-itself still pending independent audit and GB300 verification, and
-comparative interpretation remains P1.4); not a sweep or an analysis by
-itself (this binary runs one specialization, or under `--self-test`
-validates all nine, per invocation — see "P1.3" below for the joint sweep);
-not a final result (`run_kind=smoke` is a functional check only, never a
-publishable measurement).
+(P1.3, the joint sweep, is implemented, independently audited, and
+functionally verified on GB300, while comparative interpretation remains
+P1.4); not a sweep or an analysis by itself (this binary runs one
+specialization, or under `--self-test` validates all nine, per invocation —
+see "P1.3" below for the joint sweep); not a final result
+(`run_kind=smoke` is a functional check only, never a publishable
+measurement).
 
 ### Frozen contract
 
@@ -392,25 +392,45 @@ is reproducible infrastructure for running P1.1 and P1.2 together, validating
 their raw CSV strictly, and computing descriptive statistics. It adds no CUDA
 code and does not modify `ldgsts.cu`, `tma.cu`, or either SASS checker.
 
-**Status: implemented, second remediation completed, pending a new
-independent audit and GB300 functional verification (see `PLAN.md`).** A
-first independent audit found fifteen defects; a second audit found
-remaining blockers in synthetic-test isolation, symlink-safe finalization,
-loaded-manifest validation, no-clobber/rollback behavior, canonical CSV
-parsing, and per-case progress telemetry. The implementation and adversarial
-GPU-free tests now address both rounds (see "Remediated audit findings"
-below), but author-side remediation and self-tests are not an independent
-audit — P1.3 remains Audited=NO / Verified on GB300=NO until an independent
-reviewer and a GB300 run both confirm the fix. P1.3 does not itself collect
-publishable measurements: it does not run Nsight Compute, compute
-LDGSTS/TMA speedups,
-apply an outlier policy, or draw any performance conclusion. Whether the
-copied bytes actually came from DRAM/HBM (as opposed to L2) is still an open
-question that only Nsight Compute (P1.4) can answer; a `run_kind=smoke`
-campaign is a functional check of the sweep plumbing, never a performance
-number. All of that — the pilot performance campaign, Nsight Compute,
-DRAM/HBM traffic confirmation, variability/outlier judgment, figures, tables,
-and comparative LDGSTS/TMA interpretation — is P1.4, which has not started.
+**Status: implemented, second remediation completed, independently audited,
+and functionally verified on GB300 (see `PLAN.md`).** A first independent
+audit found fifteen defects; a second audit found remaining blockers in
+synthetic-test isolation, symlink-safe finalization, loaded-manifest
+validation, no-clobber/rollback behavior, canonical CSV parsing, and per-case
+progress telemetry. The implementation and adversarial GPU-free tests address
+both rounds (see "Remediated audit findings" below), and the remediated
+implementation subsequently passed a new independent GPU-free audit. At Git
+commit `59777406b9454f00799c48bff8fa85cb03625cb6`, GB300 smoke campaign
+`20260728T103315Z` reached `COMPLETE` after both full-binary self-tests and
+all 18 planned invocations passed.
+
+That smoke campaign is functional verification of P1.3's sweep plumbing,
+strict validation, aggregation, and manifest lifecycle, never a performance
+number. P1.3 does not run Nsight Compute, compute LDGSTS/TMA speedups, apply
+an outlier policy, or draw a performance conclusion. Whether copied bytes
+actually came from DRAM/HBM rather than L2 remains an open question that only
+Nsight Compute can answer. The pilot benchmark campaign, HBM traffic
+validation, variability/outlier judgment, figures, tables, and comparative
+LDGSTS/TMA interpretation all remain P1.4 work. P1.4 has not started but is
+now unblocked.
+
+### GB300 functional verification record
+
+```text
+Date:                     2026-07-28
+Git commit:               59777406b9454f00799c48bff8fa85cb03625cb6
+Campaign:                 20260728T103315Z
+Run kind:                 smoke
+Binary self-tests:        PASS (LDGSTS and TMA)
+Configurations completed: 18/18
+Samples completed:        36
+Campaign status:          COMPLETE
+Publishable:              false
+```
+
+The raw campaign remains uncommitted under
+`results/raw/exp01_memory_paths/20260728T103315Z/`. Its bandwidth values must
+not be cited or interpreted as experimental results.
 
 ### Remediated audit findings
 
@@ -562,6 +582,8 @@ BLACKWELL_GPU_INDEX=<physical-index> make memory-paths-smoke
 `--passes 2`, `--warmup-ms 200`, `--repetitions 2` through the runner above.
 Its output is functional verification of the sweep plumbing only, exactly
 like `memory-ldgsts-smoke`/`memory-tma-smoke` — never a publishable result.
+Campaign `20260728T103315Z` successfully completed this exact functional gate
+on GB300.
 
 ## LDGSTS/TMA equivalence table
 

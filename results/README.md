@@ -2,10 +2,31 @@
 
 No publishable experimental performance results exist yet. Phase 0's
 diagnostic preflight, and the P1.1/P1.2 GB300 self-test plus one-shot
-`run_kind=smoke` runs, completed successfully as *functional* verification —
-none of those smoke bandwidth values are experimental results.
+`run_kind=smoke` runs, completed successfully as *functional* verification.
+P1.3 joint smoke campaign `20260728T103315Z` also completed both full-binary
+self-tests and all 18 planned invocations on GB300. None of those smoke
+bandwidth values are experimental results.
 
-## Future contents
+## Recorded P1.3 functional verification
+
+```text
+Git commit:               59777406b9454f00799c48bff8fa85cb03625cb6
+Campaign:                 20260728T103315Z
+Run kind:                 smoke
+Configurations completed: 18
+Samples completed:        36
+Status:                   COMPLETE
+Publishable:              false
+```
+
+The raw campaign is stored locally at
+`results/raw/exp01_memory_paths/20260728T103315Z/` and is intentionally
+ignored by Git. This record closes P1.3's functional GB300 verification only;
+it must not be cited as a performance measurement or used to compare LDGSTS
+against TMA. P1.4 owns the pilot benchmark campaign, Nsight Compute/HBM
+validation, figures, and interpretation, and has not started.
+
+## Storage layout
 
 ### `results/preflight/<UTC timestamp>/` (raw, not committed)
 
