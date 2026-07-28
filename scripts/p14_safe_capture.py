@@ -30,33 +30,48 @@ is a P1.4-only addition; it never modifies
 ``scripts/aggregate_exp01_memory_paths.py`` (P1.3, frozen) and is not
 imported by it.
 
+Every filename this module accepts from a caller (--stdout-name,
+--stderr-name, "write"/"publish-bundle"'s --name/--names, and --bundle-name)
+is validated as a strict single-component basename before anything is
+created or any child is launched: empty, ".", "..", any name containing "/"
+or NUL/control characters, and any absolute path are all rejected outright
+(Task 4 remediation E; a prior version accepted a caller-supplied name
+containing "../", which os.link()'s own dst_dir_fd-relative path resolution
+then walked one level above the anchored directory exactly like any other
+relative path with ".." components would).
+
 Subcommands:
-  run     Execute ARGV (after "--", shell=False) with stdout/stderr
-          connected directly to newly created, descriptor-anchored,
-          exclusive, no-follow partial files under
-          <campaign-dir>/<rel-dir>/; on a zero exit, publishes each
-          partial to its final name via no-clobber hard link; on a
-          non-zero exit, preserves a non-empty partial under its unique
-          name and removes only an empty owned partial. Exits with the
-          child's own return code (or 2 for a tool-level path-safety or
-          publish failure).
-  write   Reads bytes from stdin and safely publishes them as one new,
-          no-clobber file under <campaign-dir>/<rel-dir>/. Used for the
-          one P1.4 output that is not literally a command's own
-          stdout/stderr (the application CSV recovered from a profiled
-          binary's captured stdout).
-  verify  Confirms that one or more names already exist as genuine
-          non-symlink, non-empty regular files strictly within
-          <campaign-dir>/<rel-dir>/, reopening every directory component
-          the same descriptor-anchored way. Used after Nsight Compute
-          itself writes ".ncu-rep"/".ncu_tool.log" directly (via its own
-          "-o"/"--log-file" arguments, which this module cannot intercept
-          -- NCU resolves those paths itself) to confirm neither escaped
-          the anchored directory, instead of trusting a plain "test -f".
+  run             Execute ARGV (after "--", shell=False) with stdout/stderr
+                  connected directly to newly created, descriptor-anchored,
+                  exclusive, no-follow partial files under
+                  <campaign-dir>/<rel-dir>/; on a zero exit, publishes each
+                  partial to its final name via no-clobber hard link; on a
+                  non-zero exit -- or any failure before or during the
+                  child's own launch -- preserves a non-empty partial under
+                  its unique name and removes only an empty owned partial.
+                  Exits with the child's own return code (or 2 for a
+                  tool-level path-safety or publish failure).
+  write           Reads bytes from stdin and safely publishes them as one
+                  new, no-clobber file under <campaign-dir>/<rel-dir>/.
+                  Used for the one P1.4 output that is not literally a
+                  command's own stdout/stderr (the application CSV
+                  recovered from a profiled binary's captured stdout).
+  verify          Confirms that one or more names already exist as genuine
+                  non-symlink, non-empty regular files strictly within
+                  <campaign-dir>/<rel-dir>/, reopening every directory
+                  component the same descriptor-anchored way.
+  mkdir-case      Safely creates exactly one of the six frozen
+                  profiles/<case>/ directories via mkdirat()'s own EEXIST.
+  publish-bundle  Decodes an already-captured scripts/p14_ncu_bridge.py
+                  bundle (itself captured via a prior "run --stdout-name")
+                  and republishes its six fixed-order segments (Task 4
+                  remediation A/B) under caller-given names, no-clobber,
+                  then removes the raw transport bundle.
 
 Exit codes: 0 success; the child's own exit code for a "run" whose command
-ran but exited non-zero; 1 for "write"/"verify" content/evidence failures;
-2 for a path-safety, argument, or capture-mechanism failure.
+ran but exited non-zero; 1 for "write"/"verify"/"publish-bundle"
+content/evidence failures; 2 for a path-safety, argument, or
+capture-mechanism failure.
 """
 
 from __future__ import annotations
@@ -64,6 +79,7 @@ from __future__ import annotations
 import argparse
 import errno
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -81,6 +97,48 @@ import analyze_exp01_memory_paths_p14 as p14  # noqa: E402
 
 class UnsafeCaptureError(ValueError):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Strict single-component basename validation (Task 4 remediation,
+# Remediation E). Every filename this module accepts from a caller --
+# --stdout-name, --stderr-name, the "write"/"verify" --name -- must be a
+# single path component, never a multi-component relative path. Before this
+# check existed, publish_no_clobber(dir_fd, partial_name, final_name) passed
+# final_name directly to os.link(..., dst_dir_fd=dir_fd); linkat() resolves a
+# multi-component relative newpath against dst_dir_fd exactly like any other
+# relative path, including ".." components, so a final_name of
+# "../escape.bin" walked one level *above* the anchored directory (out of
+# logs/ into the campaign root, or out of profiles/<case>/ into profiles/) --
+# the directory-descriptor anchoring closes a *symlink* race on the
+# anchored directory itself, but never protected against a multi-component
+# *name* handed to it. verify_regular_file_in_dir and write_stdin_safely's
+# create_partial/publish_no_clobber calls had the identical exposure.
+# ---------------------------------------------------------------------------
+_BASENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _validate_basename(name: str, *, what: str) -> None:
+    if not isinstance(name, str) or not name:
+        raise UnsafeCaptureError(f"{what}: must be a non-empty string, got {name!r}")
+    if "\x00" in name or any(ord(ch) < 0x20 for ch in name):
+        raise UnsafeCaptureError(f"{what}: must not contain NUL or control characters, got {name!r}")
+    if os.path.isabs(name):
+        raise UnsafeCaptureError(f"{what}: must not be an absolute path, got {name!r}")
+    if name in (".", ".."):
+        raise UnsafeCaptureError(f"{what}: must not be '.' or '..', got {name!r}")
+    # Path(name).parts == (name,) rejects every multi-component relative
+    # path ("subdir/escape.bin", "../escape.bin", "a/../b", trailing/leading
+    # slashes, etc.) in addition to the conservative allowlist regex below;
+    # requiring *both* means a change to either check alone can never
+    # silently widen what is accepted.
+    if Path(name).parts != (name,):
+        raise UnsafeCaptureError(f"{what}: must be a single path component, not {name!r}")
+    if not _BASENAME_RE.fullmatch(name):
+        raise UnsafeCaptureError(
+            f"{what}: must match {_BASENAME_RE.pattern} (start with an alphanumeric character; "
+            f"only alphanumerics, '.', '_', '-' afterward), got {name!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +272,7 @@ def create_partial(dir_fd: int, final_name: str) -> tuple[int, str]:
     O_EXCL | O_NOFOLLOW (so it can never already exist and can never be a
     symlink), and returns (fd, partial_name). The caller must eventually
     publish_no_clobber() or discard_if_empty_owned() it."""
+    _validate_basename(final_name, what="output name")
     partial = _partial_name(final_name)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
@@ -229,6 +288,7 @@ def publish_no_clobber(dir_fd: int, partial_name: str, final_name: str) -> None:
     EEXIST is the sole, atomic no-clobber guarantee -- final_name is refused
     whether it is already a regular file, a directory, or a symlink
     (dangling or not), since all of those already occupy the name."""
+    _validate_basename(final_name, what="output name")
     try:
         os.link(partial_name, final_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
     except FileExistsError as exc:
@@ -259,6 +319,10 @@ def verify_regular_file_in_dir(dir_fd: int, name: str) -> str | None:
     dir_fd as a non-symlink, non-empty regular file. Never follows a
     symlink and never resolves name via any other path."""
     try:
+        _validate_basename(name, what="name")
+    except UnsafeCaptureError as exc:
+        return str(exc)
+    try:
         st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     except FileNotFoundError:
         return f"{name}: does not exist in the anchored directory"
@@ -271,6 +335,168 @@ def verify_regular_file_in_dir(dir_fd: int, name: str) -> str | None:
     if st.st_size == 0:
         return f"{name}: is empty"
     return None
+
+
+# ---------------------------------------------------------------------------
+# NCU bundle format (Task 4, blockers A/B). scripts/p14_ncu_bridge.py runs
+# entirely inside the container's own private, non-host-mounted /tmp and
+# never receives a campaign-relative pathname; it hands its results back to
+# the host as one versioned, length-delimited bundle on its own stdout,
+# which is captured here (via the ordinary "run" subcommand below) into an
+# anchored partial exactly like any other P1.4 child stdout. "publish-bundle"
+# then decodes that already-anchored file and republishes its six segments
+# under their real names via the same no-clobber primitives every other
+# P1.4 artifact uses.
+#
+# Length-prefixed, not delimiter-based, so arbitrary binary content (the
+# ".ncu-rep" bytes, or a metrics CSV containing any byte sequence at all)
+# can never be misparsed. Decoding tolerates leading bytes before the magic
+# marker: scripts/run_container.sh prints two allowlisted banner lines to
+# its own stdout before exec'ing the container command, which lands in the
+# same captured stream ahead of the bridge's real output -- this is the
+# same, already-accepted tolerance
+# scripts/run_exp01_memory_paths_p14.sh's extract_application_csv() already
+# relies on for the (unmodified) existing per-case application-CSV recovery.
+# ---------------------------------------------------------------------------
+NCU_BUNDLE_MAGIC = b"P14NCUBUNDLE1\n"
+NCU_BUNDLE_SEGMENT_NAMES = (
+    "app_stdout", "app_stderr", "ncu_tool_log", "ncu_rep", "metrics_csv", "metrics_export_stderr",
+)
+_NCU_BUNDLE_LENGTH_WIDTH = 20
+
+
+class NcuBundleParseError(ValueError):
+    pass
+
+
+def encode_ncu_bundle(segments: dict[str, bytes]) -> bytes:
+    missing = [name for name in NCU_BUNDLE_SEGMENT_NAMES if name not in segments]
+    if missing:
+        raise ValueError(f"encode_ncu_bundle: missing segment(s): {missing}")
+    parts = [NCU_BUNDLE_MAGIC]
+    for name in NCU_BUNDLE_SEGMENT_NAMES:
+        data = segments[name]
+        if not isinstance(data, (bytes, bytearray)):
+            raise ValueError(f"encode_ncu_bundle: segment {name!r} must be bytes, got {type(data).__name__}")
+        parts.append(f"{len(data):0{_NCU_BUNDLE_LENGTH_WIDTH}d}\n".encode("ascii"))
+        parts.append(bytes(data))
+    return b"".join(parts)
+
+
+def decode_ncu_bundle(raw: bytes) -> dict[str, bytes]:
+    idx = raw.find(NCU_BUNDLE_MAGIC)
+    if idx == -1:
+        raise NcuBundleParseError("bundle magic marker not found (captured stream is not a valid NCU bundle)")
+    pos = idx + len(NCU_BUNDLE_MAGIC)
+    segments: dict[str, bytes] = {}
+    for name in NCU_BUNDLE_SEGMENT_NAMES:
+        header_end = pos + _NCU_BUNDLE_LENGTH_WIDTH
+        if header_end + 1 > len(raw) or raw[header_end:header_end + 1] != b"\n":
+            raise NcuBundleParseError(f"segment {name!r}: malformed or truncated length header at offset {pos}")
+        length_field = raw[pos:header_end]
+        if not length_field.isdigit():
+            raise NcuBundleParseError(f"segment {name!r}: non-numeric length header {length_field!r}")
+        length = int(length_field)
+        data_start = header_end + 1
+        data_end = data_start + length
+        if data_end > len(raw):
+            raise NcuBundleParseError(
+                f"segment {name!r}: truncated (expected {length} bytes, only "
+                f"{len(raw) - data_start} available)"
+            )
+        segments[name] = raw[data_start:data_end]
+        pos = data_end
+    return segments
+
+
+def publish_ncu_bundle(
+    *, campaign_dir_rel: str, rel_dir: str, bundle_name: str, output_names: Sequence[str],
+) -> None:
+    """Decodes the already-captured, already-anchored bundle_name and
+    republishes its six fixed-order segments as output_names (same order as
+    NCU_BUNDLE_SEGMENT_NAMES), each via create_partial/publish_no_clobber,
+    then removes the raw bundle (its only purpose was transport). Every
+    name is validated as a strict basename before anything is opened;
+    directory resolution is re-done from scratch (never trusts an earlier
+    "run" call's resolution)."""
+    _validate_basename(bundle_name, what="--bundle-name")
+    if len(output_names) != len(NCU_BUNDLE_SEGMENT_NAMES):
+        raise UnsafeCaptureError(
+            f"--names requires exactly {len(NCU_BUNDLE_SEGMENT_NAMES)} value(s) in fixed order "
+            f"{NCU_BUNDLE_SEGMENT_NAMES!r}, got {len(output_names)}"
+        )
+    for output_name in output_names:
+        _validate_basename(output_name, what="--names")
+
+    dir_fd = resolve_campaign_rel_dir_fd(campaign_dir_rel, rel_dir)
+    try:
+        verify_err = verify_regular_file_in_dir(dir_fd, bundle_name)
+        if verify_err:
+            raise UnsafeCaptureError(f"{bundle_name}: {verify_err}")
+        bundle_fd = os.open(bundle_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+        try:
+            chunks = []
+            while True:
+                chunk = os.read(bundle_fd, 1 << 20)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+        finally:
+            os.close(bundle_fd)
+
+        try:
+            segments = decode_ncu_bundle(raw)
+        except NcuBundleParseError as exc:
+            raise UnsafeCaptureError(f"{bundle_name}: {exc}") from exc
+
+        published: list[str] = []
+        try:
+            for segment_name, output_name in zip(NCU_BUNDLE_SEGMENT_NAMES, output_names):
+                partial_fd, partial = create_partial(dir_fd, output_name)
+                handle = os.fdopen(partial_fd, "wb")
+                write_ok = False
+                try:
+                    handle.write(segments[segment_name])
+                    handle.flush()
+                    write_ok = True
+                finally:
+                    partial_stat = os.fstat(partial_fd)
+                    handle.close()
+                if not write_ok:
+                    try:
+                        discard_if_empty_owned(dir_fd, partial, partial_stat)
+                    except UnsafeCaptureError:
+                        pass
+                    raise UnsafeCaptureError(f"{output_name}: failed to write bundle segment {segment_name!r}")
+                publish_no_clobber(dir_fd, partial, output_name)
+                published.append(output_name)
+        except Exception:
+            for name in published:
+                try:
+                    st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                    if stat.S_ISREG(st.st_mode):
+                        os.unlink(name, dir_fd=dir_fd)
+                except OSError:
+                    pass
+            raise
+
+        os.unlink(bundle_name, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def cmd_publish_bundle(args: argparse.Namespace) -> int:
+    try:
+        publish_ncu_bundle(
+            campaign_dir_rel=args.campaign_dir, rel_dir=args.rel_dir,
+            bundle_name=args.bundle_name, output_names=args.names,
+        )
+    except UnsafeCaptureError as exc:
+        print(f"p14_safe_capture: publish-bundle: ERROR: {exc}", file=sys.stderr)
+        return 2
+    print(f"p14_safe_capture: publish-bundle: OK: {args.rel_dir}/{{{','.join(args.names)}}}", file=sys.stderr)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +533,10 @@ def run_capturing_outputs(
         raise UnsafeCaptureError("--combine-stderr and --stderr-name are mutually exclusive")
     if combine_stderr and stdout_name is None:
         raise UnsafeCaptureError("--combine-stderr requires --stdout-name")
+    if stdout_name is not None:
+        _validate_basename(stdout_name, what="--stdout-name")
+    if stderr_name is not None:
+        _validate_basename(stderr_name, what="--stderr-name")
     if not argv:
         raise UnsafeCaptureError("no command given after '--'")
 
@@ -315,6 +545,21 @@ def run_capturing_outputs(
         stdout_fd = stdout_partial = None
         stderr_fd = stderr_partial = None
         stdout_stat = stderr_stat = None
+        result = None
+        # pre_launch_error covers every failure that can happen before or
+        # during the child's own launch: creating the first output,
+        # creating the second output (after the first already exists on
+        # disk), the injectable test hook, or subprocess.run() itself
+        # failing to start the child (e.g. a nonexistent executable). Each
+        # of these previously propagated straight out of this function
+        # without ever reaching the cleanup logic below, so any partial
+        # already created (necessarily empty, since nothing had a chance to
+        # write to it) was silently orphaned rather than removed -- this
+        # single except clause routes every one of them through the exact
+        # same "did we already create an output? then discard it if still
+        # empty" cleanup a non-zero child exit already used, before
+        # re-raising the original failure.
+        pre_launch_error: Exception | None = None
         try:
             if stdout_name is not None:
                 stdout_fd, stdout_partial = create_partial(dir_fd, stdout_name)
@@ -326,20 +571,21 @@ def run_capturing_outputs(
             if _test_hook_after_open is not None:
                 _test_hook_after_open(dir_fd)
 
-            try:
-                result = subprocess.run(
-                    list(argv),
-                    stdout=stdout_fd,
-                    stderr=stderr_fd,
-                    stdin=subprocess.DEVNULL,
-                    shell=False,
-                )
-            except OSError as exc:
-                raise UnsafeCaptureError(f"could not launch command: {exc}") from exc
+            result = subprocess.run(
+                list(argv),
+                stdout=stdout_fd,
+                stderr=stderr_fd,
+                stdin=subprocess.DEVNULL,
+                shell=False,
+            )
+        except OSError as exc:
+            pre_launch_error = UnsafeCaptureError(f"could not launch command: {exc}")
+        except UnsafeCaptureError as exc:
+            pre_launch_error = exc
         finally:
             # fstat before close: a later "was the partial left empty?" check
-            # (only relevant on a non-zero exit) must not depend on a fd that
-            # is no longer open.
+            # (relevant on a non-zero exit or a pre-launch failure) must not
+            # depend on a fd that is no longer open.
             if stdout_fd is not None:
                 stdout_stat = os.fstat(stdout_fd)
                 os.close(stdout_fd)
@@ -348,7 +594,7 @@ def run_capturing_outputs(
                 os.close(stderr_fd)
 
         errors: list[str] = []
-        if result.returncode == 0:
+        if pre_launch_error is None and result.returncode == 0:
             if stdout_partial is not None:
                 publish_no_clobber(dir_fd, stdout_partial, stdout_name)
             if stderr_partial is not None:
@@ -361,6 +607,10 @@ def run_capturing_outputs(
                     discard_if_empty_owned(dir_fd, partial, partial_stat)
                 except UnsafeCaptureError as exc:
                     errors.append(str(exc))
+        if pre_launch_error is not None:
+            if errors:
+                raise UnsafeCaptureError(f"{pre_launch_error}; additionally: {'; '.join(errors)}")
+            raise pre_launch_error
         if errors:
             raise UnsafeCaptureError("; ".join(errors))
         return result.returncode
@@ -400,6 +650,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 def write_stdin_safely(
     *, campaign_dir_rel: str, rel_dir: str, name: str, content: bytes, allow_empty: bool = False,
 ) -> None:
+    _validate_basename(name, what="--name")
     if not content and not allow_empty:
         raise UnsafeCaptureError(f"{name}: refusing to publish empty content")
     dir_fd = resolve_campaign_rel_dir_fd(campaign_dir_rel, rel_dir)
@@ -849,6 +1100,374 @@ def run_self_test() -> int:
             profiles_root.unlink()
             profiles_backup.rename(profiles_root)
 
+            # -----------------------------------------------------------
+            # Task 4 remediation (Remediation E): strict single-component
+            # basename validation. Every one of these traversal attempts
+            # previously reached publish_no_clobber()/verify_regular_file_
+            # in_dir() with no rejection at all -- publish_no_clobber() in
+            # particular passed final_name straight to os.link(dst_dir_fd=
+            # dir_fd), and linkat() resolves a relative newpath with ".."
+            # components, or ignores dst_dir_fd outright for an absolute
+            # newpath, exactly like any other path argument. Demonstrated
+            # against the pre-remediation module (git commit 49be85b): a
+            # direct publish_no_clobber(dir_fd, <owned partial>,
+            # "../escape_relative.bin") call wrote a file one level *above*
+            # the anchored logs/ directory, and a --stdout-name of an
+            # absolute path wrote outside the campaign entirely -- both
+            # reproduced and confirmed during this remediation before the
+            # _validate_basename() checks below were added. For every case
+            # here, the assertion itself also proves no file was created
+            # anywhere outside the anchored directory.
+            # -----------------------------------------------------------
+            traversal_names = [
+                "../escape.bin",
+                "subdir/escape.bin",
+                "/absolute/escape.bin",
+                ".",
+                "..",
+                "",
+                "name\x00withnul",
+                "name\nwithnewline",
+            ]
+            outside_root = tmp_path / "traversal_outside_root"
+            outside_root.mkdir()
+            for bad_name in traversal_names:
+                before_outside = set(outside_root.iterdir())
+                before_logs = set(logs_dir.iterdir())
+                raised = False
+                try:
+                    write_stdin_safely(
+                        campaign_dir_rel=campaign_rel, rel_dir="logs", name=bad_name,
+                        content=b"attacker payload",
+                    )
+                except UnsafeCaptureError:
+                    raised = True
+                after_outside = set(outside_root.iterdir())
+                after_logs = set(logs_dir.iterdir()) - before_logs
+                rec.check(
+                    f"write_stdin_safely rejects traversal/invalid name {bad_name!r} and creates "
+                    f"nothing outside logs/ or anywhere unexpected inside it",
+                    raised and after_outside == before_outside and after_logs == set(),
+                    detail=f"raised={raised} after_outside={after_outside} after_logs={after_logs}",
+                )
+
+            # publish_no_clobber() itself (not just the higher-level
+            # write_stdin_safely/run_capturing_outputs wrappers) must
+            # refuse a traversal final_name -- this is the exact function
+            # and exact call shape the original audit finding reproduced.
+            dir_fd = resolve_campaign_rel_dir_fd(campaign_rel, "logs")
+            try:
+                _partial_fd, _partial_name_ = create_partial(dir_fd, "safe_output_for_traversal_test.log")
+                os.write(_partial_fd, b"attacker payload via relative traversal\n")
+                os.close(_partial_fd)
+                raised = False
+                try:
+                    publish_no_clobber(dir_fd, _partial_name_, "../escape_relative_direct.bin")
+                except UnsafeCaptureError:
+                    raised = True
+            finally:
+                os.close(dir_fd)
+            rec.check(
+                "publish_no_clobber() itself rejects a '../...' final_name and writes nothing "
+                "one level above the anchored directory",
+                raised and not (tmp_path / campaign_rel / "escape_relative_direct.bin").exists(),
+            )
+            # The owned (still-partial) evidence from the attempt above must
+            # not itself be treated as silently lost: it remains under its
+            # own partial name inside logs/, available as forensic evidence,
+            # since publish_no_clobber() only ever unlinks the partial on
+            # its own successful publish path.
+            leftover_partials = [p for p in logs_dir.iterdir() if "safe_output_for_traversal_test" in p.name]
+            rec.check(
+                "the owned partial from a rejected publish attempt is preserved, not silently lost",
+                len(leftover_partials) == 1,
+                detail=f"leftover_partials={leftover_partials}",
+            )
+            for p in leftover_partials:
+                p.unlink()
+
+            # An absolute --stdout-name reaches run_capturing_outputs's own
+            # basename check before resolve_campaign_rel_dir_fd or any
+            # output is ever created; linkat()/os.link() ignore dst_dir_fd
+            # entirely for an absolute newpath, so this was reachable even
+            # though create_partial()'s own accidental "." + name mangling
+            # happens to make some (not all) relative ".." attempts fail
+            # for an unrelated reason (a nonexistent intermediate
+            # directory component) rather than by design.
+            absolute_evil = outside_root / "escape_via_stdout_name.bin"
+            raised = False
+            try:
+                run_capturing_outputs(
+                    campaign_dir_rel=campaign_rel, rel_dir="logs", stdout_name=str(absolute_evil),
+                    stderr_name=None, combine_stderr=False,
+                    argv=[sys.executable, "-c", "print('attacker payload')"],
+                )
+            except UnsafeCaptureError:
+                raised = True
+            rec.check(
+                "run_capturing_outputs rejects an absolute --stdout-name before creating anything",
+                raised and not absolute_evil.exists(),
+            )
+
+            # -----------------------------------------------------------
+            # Task 4 remediation (Remediation E): failure-cleanup edge
+            # cases. Before this remediation, any exception raised before
+            # or during the child's own launch (a nonexistent executable,
+            # a failure creating the *second* output after the first
+            # already existed on disk, or the injectable test hook itself
+            # raising) propagated straight out of run_capturing_outputs
+            # without ever reaching the "was the partial left empty?"
+            # cleanup logic -- reproduced and confirmed against the
+            # pre-remediation module below via a nonexistent executable,
+            # which left a stale, empty, uniquely-named ".partial" file
+            # behind forever.
+            # -----------------------------------------------------------
+            before = set(logs_dir.iterdir())
+            raised = False
+            try:
+                run_capturing_outputs(
+                    campaign_dir_rel=campaign_rel, rel_dir="logs", stdout_name="never_launched.log",
+                    stderr_name="never_launched.stderr.log", combine_stderr=False,
+                    argv=["/definitely/does/not/exist/p14-self-test-binary-xyz"],
+                )
+            except UnsafeCaptureError:
+                raised = True
+            after = set(logs_dir.iterdir()) - before
+            rec.check(
+                "a nonexistent executable raises UnsafeCaptureError and leaves no stale partial "
+                "for either stdout or stderr",
+                raised and after == set(),
+                detail=f"after={sorted(p.name for p in after)}",
+            )
+
+            before = set(logs_dir.iterdir())
+            hook_calls = {"n": 0}
+
+            def _raising_hook(_dir_fd: int) -> None:
+                hook_calls["n"] += 1
+                raise UnsafeCaptureError("synthetic pre-launch hook failure (self-test)")
+
+            raised = False
+            try:
+                run_capturing_outputs(
+                    campaign_dir_rel=campaign_rel, rel_dir="logs", stdout_name="hook_failure.log",
+                    stderr_name=None, combine_stderr=False,
+                    argv=[sys.executable, "-c", "print('should never run')"],
+                    _test_hook_after_open=_raising_hook,
+                )
+            except UnsafeCaptureError:
+                raised = True
+            after = set(logs_dir.iterdir()) - before
+            rec.check(
+                "a pre-launch test hook that raises leaves no stale partial and the child never runs",
+                raised and hook_calls["n"] == 1 and after == set(),
+                detail=f"after={sorted(p.name for p in after)}",
+            )
+
+            real_create_partial = create_partial
+            flaky_state = {"n": 0}
+
+            def _flaky_create_partial(dir_fd_arg: int, final_name_arg: str):
+                flaky_state["n"] += 1
+                if flaky_state["n"] == 2:
+                    raise UnsafeCaptureError("synthetic second-output creation failure (self-test)")
+                return real_create_partial(dir_fd_arg, final_name_arg)
+
+            before = set(logs_dir.iterdir())
+            raised = False
+            with mock.patch.object(sys.modules[__name__], "create_partial", side_effect=_flaky_create_partial):
+                try:
+                    run_capturing_outputs(
+                        campaign_dir_rel=campaign_rel, rel_dir="logs", stdout_name="first_output_ok.log",
+                        stderr_name="second_output_fails.log", combine_stderr=False,
+                        argv=[sys.executable, "-c", "print('should never run')"],
+                    )
+                except UnsafeCaptureError:
+                    raised = True
+            after = set(logs_dir.iterdir()) - before
+            rec.check(
+                "a failure creating the second output after the first already exists cleans up "
+                "the first (now-empty) partial and leaves no stale file",
+                raised and flaky_state["n"] == 2 and after == set(),
+                detail=f"after={sorted(p.name for p in after)}",
+            )
+
+            # Concurrent final-target creation: something else creates the
+            # final name *after* this call's own descriptors are already
+            # open (via the same injectable, synchronous hook the race-
+            # window-2 test above uses) but *before* the child writes.
+            # publish_no_clobber()'s linkat()-based EEXIST is the sole,
+            # atomic guarantee here -- no separate existence pre-check to
+            # race against.
+            concurrent_target = logs_dir / "concurrent_final_target.log"
+
+            def _create_concurrent_target(_dir_fd: int) -> None:
+                concurrent_target.write_text("written by a concurrent process\n")
+
+            before = set(logs_dir.iterdir())
+            raised = False
+            try:
+                run_capturing_outputs(
+                    campaign_dir_rel=campaign_rel, rel_dir="logs",
+                    stdout_name="concurrent_final_target.log", stderr_name=None, combine_stderr=False,
+                    argv=[sys.executable, "-c", "print('our own successful output')"],
+                    _test_hook_after_open=_create_concurrent_target,
+                )
+            except UnsafeCaptureError:
+                raised = True
+            after = set(logs_dir.iterdir()) - before
+            surviving_partials = [p for p in after if p.name != "concurrent_final_target.log"]
+            rec.check(
+                "publication refused when the final target appeared concurrently; the "
+                "concurrently-written target is untouched and our own non-empty output survives "
+                "as partial evidence",
+                raised and concurrent_target.read_text() == "written by a concurrent process\n"
+                and len(surviving_partials) == 1
+                and surviving_partials[0].read_text() == "our own successful output\n",
+                detail=f"after={sorted(p.name for p in after)}",
+            )
+            for p in after:
+                p.unlink()
+
+            # -----------------------------------------------------------
+            # Task 4 remediation (Remediation A/B): the NCU bundle format
+            # and the "publish-bundle" subcommand that decodes an already-
+            # captured scripts/p14_ncu_bridge.py bundle and republishes its
+            # six segments under their real names, no-clobber.
+            # -----------------------------------------------------------
+            sample_segments = {
+                "app_stdout": b"application stdout bytes\n",
+                "app_stderr": b"",
+                "ncu_tool_log": b"fake ncu tool log\n",
+                "ncu_rep": b"\x00\x01FAKE_NCU_REP\xff\xfe" + NCU_BUNDLE_MAGIC,
+                "metrics_csv": b"ID,Kernel Name,Metric Name,Metric Unit,Metric Value\n0,k,m,byte,1\n",
+                "metrics_export_stderr": b"",
+            }
+            encoded = encode_ncu_bundle(sample_segments)
+            decoded = decode_ncu_bundle(encoded)
+            rec.check(
+                "encode_ncu_bundle/decode_ncu_bundle round-trip is exact, including an empty "
+                "segment and a segment whose own content contains the magic marker",
+                decoded == sample_segments, detail=f"decoded={decoded!r}",
+            )
+            noisy = b"run_container: selected index=3 uuid=GPU-xxxx name='fake' driver=1.0\n" + encoded
+            rec.check(
+                "decode_ncu_bundle tolerates leading bytes before the magic marker",
+                decode_ncu_bundle(noisy) == sample_segments,
+            )
+            raised = False
+            try:
+                decode_ncu_bundle(b"not a bundle at all")
+            except NcuBundleParseError:
+                raised = True
+            rec.check("decode_ncu_bundle rejects a stream with no magic marker at all", raised)
+            raised = False
+            try:
+                decode_ncu_bundle(encoded[: len(encoded) - 3])
+            except NcuBundleParseError:
+                raised = True
+            rec.check("decode_ncu_bundle rejects a truncated bundle", raised)
+
+            # Uses second_case_name's directory (created empty, above, by the
+            # mkdir_case_dir tests) rather than the first case_name's, whose
+            # directory already holds artifacts from the verify_regular_
+            # file_in_dir tests earlier in this self-test.
+            bundle_case_name = second_case_name
+            bundle_case_dir = tmp_path / campaign_rel / "profiles" / bundle_case_name
+            bundle_case_rel = f"profiles/{bundle_case_name}"
+            bundle_script = tmp_path / "fake_bundle_emitter.py"
+            bundle_script.write_text(
+                "import sys\n"
+                "sys.stdout.buffer.write(" + repr(encoded) + ")\n",
+                encoding="utf-8",
+            )
+            rc = run_capturing_outputs(
+                campaign_dir_rel=campaign_rel, rel_dir=bundle_case_rel, stdout_name="raw_bundle.bin",
+                stderr_name=None, combine_stderr=False, argv=[sys.executable, str(bundle_script)],
+            )
+            output_names = [
+                f"{bundle_case_name}.container_stdout.log", f"{bundle_case_name}.container_stderr.log",
+                f"{bundle_case_name}.ncu_tool.log", f"{bundle_case_name}_report.ncu-rep",
+                f"{bundle_case_name}.metrics_raw.csv", f"{bundle_case_name}.metrics_export_stderr.log",
+            ]
+            publish_ncu_bundle(
+                campaign_dir_rel=campaign_rel, rel_dir=bundle_case_rel,
+                bundle_name="raw_bundle.bin", output_names=output_names,
+            )
+            published_contents = {name: (bundle_case_dir / name).read_bytes() for name in output_names}
+            rec.check(
+                "publish-bundle republishes all six segments under their real names with exact "
+                "byte-for-byte content",
+                rc == 0
+                and published_contents[output_names[0]] == sample_segments["app_stdout"]
+                and published_contents[output_names[1]] == sample_segments["app_stderr"]
+                and published_contents[output_names[2]] == sample_segments["ncu_tool_log"]
+                and published_contents[output_names[3]] == sample_segments["ncu_rep"]
+                and published_contents[output_names[4]] == sample_segments["metrics_csv"]
+                and published_contents[output_names[5]] == sample_segments["metrics_export_stderr"],
+            )
+            rec.check(
+                "publish-bundle removes the raw transport bundle after successfully republishing it",
+                not (bundle_case_dir / "raw_bundle.bin").exists(),
+            )
+
+            # Malformed bundle: no output is created at all.
+            malformed_script = tmp_path / "fake_malformed_bundle_emitter.py"
+            malformed_script.write_text(
+                "import sys\nsys.stdout.buffer.write(b'not a real bundle')\n", encoding="utf-8",
+            )
+            run_capturing_outputs(
+                campaign_dir_rel=campaign_rel, rel_dir=bundle_case_rel, stdout_name="raw_bundle_bad.bin",
+                stderr_name=None, combine_stderr=False, argv=[sys.executable, str(malformed_script)],
+            )
+            before = set(bundle_case_dir.iterdir())
+            raised = False
+            try:
+                publish_ncu_bundle(
+                    campaign_dir_rel=campaign_rel, rel_dir=bundle_case_rel,
+                    bundle_name="raw_bundle_bad.bin", output_names=output_names,
+                )
+            except UnsafeCaptureError:
+                raised = True
+            after = set(bundle_case_dir.iterdir())
+            rec.check(
+                "publish-bundle rejects a malformed bundle and publishes none of the six outputs",
+                raised and after == before,
+                detail=f"before={sorted(p.name for p in before)} after={sorted(p.name for p in after)}",
+            )
+            (bundle_case_dir / "raw_bundle_bad.bin").unlink()
+
+            # --names must be exactly six values, and every bundle_name/
+            # output_name is itself validated as a strict basename.
+            raised = False
+            try:
+                publish_ncu_bundle(
+                    campaign_dir_rel=campaign_rel, rel_dir=bundle_case_rel,
+                    bundle_name="raw_bundle.bin", output_names=output_names[:5],
+                )
+            except UnsafeCaptureError:
+                raised = True
+            rec.check("publish-bundle rejects a --names list of the wrong length", raised)
+            raised = False
+            try:
+                publish_ncu_bundle(
+                    campaign_dir_rel=campaign_rel, rel_dir=bundle_case_rel,
+                    bundle_name="../escape_bundle.bin", output_names=output_names,
+                )
+            except UnsafeCaptureError:
+                raised = True
+            rec.check("publish-bundle rejects a traversal --bundle-name", raised)
+            raised = False
+            try:
+                publish_ncu_bundle(
+                    campaign_dir_rel=campaign_rel, rel_dir=bundle_case_rel,
+                    bundle_name="raw_bundle.bin",
+                    output_names=["../escape.log"] + output_names[1:],
+                )
+            except UnsafeCaptureError:
+                raised = True
+            rec.check("publish-bundle rejects a traversal entry inside --names", raised)
+
     if rec.failures:
         print(
             f"p14_safe_capture: self-test: FAILED ({len(rec.failures)}/{rec.total} case(s)): {rec.failures}",
@@ -898,6 +1517,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     mkdir_parser.add_argument("--campaign-dir", required=True)
     mkdir_parser.add_argument("--case-name", required=True)
     mkdir_parser.set_defaults(func=cmd_mkdir_case)
+
+    bundle_parser = subparsers.add_parser(
+        "publish-bundle",
+        help="Decode an already-captured scripts/p14_ncu_bridge.py bundle and publish its "
+             "six segments under their real names, no-clobber.",
+    )
+    bundle_parser.add_argument("--campaign-dir", required=True)
+    bundle_parser.add_argument("--rel-dir", required=True)
+    bundle_parser.add_argument("--bundle-name", required=True)
+    bundle_parser.add_argument(
+        "--names", required=True, nargs=len(NCU_BUNDLE_SEGMENT_NAMES),
+        metavar=tuple(n.upper() for n in NCU_BUNDLE_SEGMENT_NAMES),
+        help="Exactly " + str(len(NCU_BUNDLE_SEGMENT_NAMES)) + " output names, in fixed order "
+             + str(NCU_BUNDLE_SEGMENT_NAMES) + ".",
+    )
+    bundle_parser.set_defaults(func=cmd_publish_bundle)
 
     return parser
 

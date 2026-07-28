@@ -34,6 +34,7 @@ P13_RUNNER="${REPO_ROOT}/scripts/run_exp01_memory_paths.sh"
 P13_AGGREGATOR="${REPO_ROOT}/scripts/aggregate_exp01_memory_paths.py"
 P14_ANALYZER_HOST="${REPO_ROOT}/scripts/analyze_exp01_memory_paths_p14.py"
 P14_SAFE_CAPTURE="${REPO_ROOT}/scripts/p14_safe_capture.py"
+P14_NCU_BRIDGE_IN_CONTAINER="scripts/p14_ncu_bridge.py"
 RUN_CONTAINER="${REPO_ROOT}/scripts/run_container.sh"
 IMAGE_TAG="${IMAGE_TAG:-gb300-gemm-anatomy:phase0}"
 
@@ -435,7 +436,21 @@ CAMPAIGN_OUTCOME=""
 write_p14_manifest_status() {
     local status="$1" failure_stage="${2:-}"
     local merge_file rc
-    merge_file="$(mktemp "${CAMPAIGN_DIR}/manifest_merge.XXXXXX")"
+    # Task 4 remediation (Section 10): this temporary previously lived
+    # *inside* the campaign path (mktemp "${CAMPAIGN_DIR}/manifest_merge.
+    # XXXXXX"), created and written to (">|") by ordinary path-string
+    # operations rather than the descriptor-anchored primitives every other
+    # P1.4 raw-tree write goes through -- a symlink swap of any ancestor
+    # component between the mktemp and the later open() could redirect
+    # either. The manifest-merge content itself is not campaign evidence; it
+    # is a transient argument-passing mechanism between this script and
+    # "manifest-write" (which reads it once via a plain path and then
+    # publishes the *real* manifest revision through the existing
+    # descriptor-anchored, hash-chained, no-clobber writer). Moving the
+    # temporary to the system default temporary directory (plain "mktemp",
+    # no directory argument) takes it out of the raw tree entirely, so no
+    # raw-campaign path is ever mktemp'd or shell-redirected into.
+    merge_file="$(mktemp)"
     if [ -n "${failure_stage}" ]; then
         printf '{"failure_stage": "%s", "failure_detail": null}\n' "${failure_stage}" >| "${merge_file}"
     else
@@ -622,92 +637,69 @@ if [ "${PROFILE_COUNT}" -eq 1 ]; then
             fail_run "profile case directory already exists or could not be safely created: ${case_dir}"
         fi
 
-        report_base_rel="${rel_case_dir}/${p_case_name}_report"
         ncu_tool_log_name="${p_case_name}.ncu_tool.log"
         container_stdout_name="${p_case_name}.container_stdout.log"
         container_stderr_name="${p_case_name}.container_stderr.log"
         application_csv_name="${p_case_name}.application.csv"
         metrics_csv_name="${p_case_name}.metrics_raw.csv"
         metrics_export_stderr_name="${p_case_name}.metrics_export_stderr.log"
-        ncu_rep_abs="${REPO_ROOT}/${report_base_rel}.ncu-rep"
+        ncu_rep_name="${p_case_name}_report.ncu-rep"
+        bundle_name="${p_case_name}.ncu_bridge_bundle.bin"
+        bridge_stderr_name="${p_case_name}.ncu_bridge_stderr.log"
 
-        echo "run_exp01_memory_paths_p14: --profile: [${p_index}/5] collecting ${p_case_name} (${p_kernel})" >&2
+        # Task 4 remediation (blockers A/B): NCU never receives a
+        # campaign-relative pathname of any kind, for either the collection
+        # or the metrics-export step. scripts/p14_ncu_bridge.py runs
+        # entirely inside the container, stages every NCU "-o"/
+        # "--log-file"/"--import" argument inside its own private,
+        # non-host-mounted "/tmp", and emits a single versioned,
+        # length-delimited bundle on its own stdout -- captured here into
+        # an anchored partial exactly like any other P1.4 child-process
+        # output, then decoded/republished by "publish-bundle" below.
+        # (This replaces the previous design, which built
+        # "profiles/<case>/<case>_report" relative to /workspace instead of
+        # the campaign directory and handed that path to NCU's own "-o"/
+        # "--log-file" -- and separately handed "--import" a raw campaign
+        # ".ncu-rep" path in a second `docker run` -- so NCU itself opened
+        # a raw-tree path for writing in three different places.)
+        echo "run_exp01_memory_paths_p14: --profile: [${p_index}/5] collecting ${p_case_name} (${p_kernel}) via the NCU bridge" >&2
         if ! python3 "${P14_SAFE_CAPTURE}" run \
                 --campaign-dir "${CAMPAIGN_REL}" --rel-dir "${rel_case_dir}" \
-                --stdout-name "${container_stdout_name}" --stderr-name "${container_stderr_name}" \
-                -- "${RUN_CONTAINER}" ncu \
-                    --clock-control none \
-                    --pipeline-boost-state dynamic \
-                    --cache-control none \
-                    --kernel-name-base function \
-                    --kernel-name "${p_kernel}" \
-                    --launch-count 1 \
-                    --devices 0 \
-                    --replay-mode kernel \
-                    --metrics "${RESOLVED_METRICS}" \
-                    --print-summary none \
-                    --log-file "${report_base_rel}.ncu_tool.log" \
-                    -o "${report_base_rel}" \
+                --stdout-name "${bundle_name}" --stderr-name "${bridge_stderr_name}" \
+                -- "${RUN_CONTAINER}" python3 "${P14_NCU_BRIDGE_IN_CONTAINER}" \
+                    --metrics "${RESOLVED_METRICS}" --kernel-name "${p_kernel}" \
                     -- \
                     "${bin_rel}" --stages "${p_stages}" --bytes-in-flight-kib "${p_bif}" \
                     --run-kind benchmark --working-set-mib 512 --passes 32 --warmup-ms 0 --repetitions 1; then
             write_p14_manifest_status FAILED "profile_collect_${p_case_name}" || true
             CAMPAIGN_OUTCOME=FAILED
-            fail_run "NCU collection failed for ${p_case_name}; see ${case_dir}/${container_stderr_name}"
+            fail_run "NCU bridge failed for ${p_case_name}; see ${case_dir}/${bridge_stderr_name}"
+        fi
+
+        if ! python3 "${P14_SAFE_CAPTURE}" publish-bundle \
+                --campaign-dir "${CAMPAIGN_REL}" --rel-dir "${rel_case_dir}" \
+                --bundle-name "${bundle_name}" \
+                --names "${container_stdout_name}" "${container_stderr_name}" \
+                        "${ncu_tool_log_name}" "${ncu_rep_name}" \
+                        "${metrics_csv_name}" "${metrics_export_stderr_name}"; then
+            write_p14_manifest_status FAILED "profile_publish_bundle_${p_case_name}" || true
+            CAMPAIGN_OUTCOME=FAILED
+            fail_run "could not decode/publish the NCU bridge bundle for ${p_case_name}"
         fi
         container_stdout="${case_dir}/${container_stdout_name}"
-
-        # -o and --log-file were both given paths rooted at rel_case_dir
-        # (relative to /workspace, which scripts/run_container.sh binds to
-        # REPO_ROOT), so NCU writes .ncu-rep/.ncu_tool.log directly to their
-        # final host location itself -- this script cannot anchor those two
-        # writes via its own held descriptors the way it does its own
-        # stdout/stderr captures, since NCU resolves "-o"/"--log-file" itself.
-        # A zero exit code alone does not prove either file was actually
-        # produced inside the anchored directory (rather than, say, escaping
-        # through a symlink NCU itself would follow), so re-verify both via
-        # the same descriptor-anchored resolution p14_safe_capture.py uses
-        # for every other write, instead of trusting a plain "test -f".
-        if ! python3 "${P14_SAFE_CAPTURE}" verify \
-                --campaign-dir "${CAMPAIGN_REL}" --rel-dir "${rel_case_dir}" \
-                --name "${p_case_name}_report.ncu-rep" --name "${ncu_tool_log_name}"; then
-            write_p14_manifest_status FAILED "profile_missing_report_${p_case_name}" || true
-            CAMPAIGN_OUTCOME=FAILED
-            fail_run "expected .ncu-rep/.ncu_tool.log not verified strictly inside ${case_dir} after collection for ${p_case_name}"
-        fi
 
         if ! extract_application_csv "${container_stdout}" "${CAMPAIGN_REL}" "${rel_case_dir}" "${application_csv_name}"; then
             write_p14_manifest_status FAILED "profile_extract_csv_${p_case_name}" || true
             CAMPAIGN_OUTCOME=FAILED
             fail_run "could not extract the application CSV for ${p_case_name} from ${container_stdout}"
         fi
-        application_csv="${case_dir}/${application_csv_name}"
 
-        if ! python3 "${P14_SAFE_CAPTURE}" run \
-                --campaign-dir "${CAMPAIGN_REL}" --rel-dir "${rel_case_dir}" \
-                --stdout-name "${metrics_csv_name}" --stderr-name "${metrics_export_stderr_name}" \
-                -- docker run --rm \
-                    --network none \
-                    --security-opt no-new-privileges \
-                    --cap-drop ALL \
-                    --user "$(id -u):$(id -g)" \
-                    -e HOME=/tmp \
-                    -v "${REPO_ROOT}:/workspace" \
-                    -w /workspace \
-                    "${IMAGE_TAG}" \
-                    ncu --import "${report_base_rel}.ncu-rep" \
-                        --csv --page raw --print-metric-name name --print-units base \
-                        --print-kernel-base function; then
-            write_p14_manifest_status FAILED "profile_export_${p_case_name}" || true
-            CAMPAIGN_OUTCOME=FAILED
-            fail_run "NCU metrics export failed for ${p_case_name}; see ${case_dir}/${metrics_export_stderr_name}"
-        fi
-        metrics_csv="${case_dir}/${metrics_csv_name}"
-
+        # validate-profile-case derives every evidence path itself, from
+        # --campaign-dir and --index alone (the frozen plan's own case
+        # name), rather than trusting a caller-supplied --application-csv/
+        # --metrics-csv/--ncu-rep string (Task 4, Section 7).
         if ! python3 "${P14_ANALYZER_HOST}" validate-profile-case \
-                --campaign-dir "${CAMPAIGN_REL}" --index "${p_index}" \
-                --application-csv "${application_csv}" --metrics-csv "${metrics_csv}" \
-                --ncu-rep "${ncu_rep_abs}" --git-commit "${GIT_COMMIT}"; then
+                --campaign-dir "${CAMPAIGN_REL}" --index "${p_index}" --git-commit "${GIT_COMMIT}"; then
             write_p14_manifest_status FAILED "profile_validate_${p_case_name}" || true
             CAMPAIGN_OUTCOME=FAILED
             fail_run "validate-profile-case failed for ${p_case_name}; P1.4 campaign marked FAILED"

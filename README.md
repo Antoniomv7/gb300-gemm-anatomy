@@ -9,7 +9,7 @@ baseline) — implemented, audited, functionally verified on GB300`. `P1.2
 verified on GB300`. `P1.3 (joint LDGSTS/TMA sweep infrastructure) —
 implemented, remediation completed, independently audited, and functionally
 verified on GB300`. `P1.4 (profiling, HBM validation, analysis, pilot) —
-implemented, remediated after two independent GPU-free audits; a further
+implemented, remediated after THREE independent GPU-free audits; a further
 independent re-audit PENDING; verified on GB300: NO; pilot executed: NO;
 publishable results: NONE`.**
 
@@ -94,13 +94,27 @@ audit of the remediated implementation then found four further blockers
 (a residual raw-tree-write TOCTOU window, an uncompared/unplanned extra
 profile directory, cryptographically-chained-but-semantically-unvalidated
 manifest revisions, and an incomplete evidence-integrity comparison that
-missed some derived per-case fields). All nine blockers, across both
+missed some derived per-case fields); a **third** independent GPU-free audit
+of that twice-remediated implementation then found five further blockers
+(NCU itself still received a raw-campaign pathname for both profile
+collection and metrics export, via a path built relative to `/workspace`
+instead of the campaign directory; the evidence-integrity gate's field
+comparison used `dict.get()`-based equality, under which an unexpected
+null-valued field compared as identical to its absence; manifest fields
+were classified broadly but never bound to the one specific transition
+legally allowed to introduce them; and an unvalidated capture filename, a
+launch-failure cleanup gap, and a still-path-based profile inventory in
+`scripts/p14_safe_capture.py`). All fourteen blockers, across all three
 rounds, were remediated GPU-free, each with a new adversarial test that
 first demonstrably failed against the original behavior and then passed
-against the fix (see `src/memory/P1_4_PROTOCOL.md` for the closed design of
-each). P1.4 has not yet been independently re-audited, has not been
-verified on GB300, and its pilot has not been executed; no P1.4 performance
-result exists.
+against the fix — the third round's fix for the NCU path-escape blockers
+is a new container-side bridge (`scripts/p14_ncu_bridge.py`) that runs NCU
+entirely inside the container's own private, non-host-mounted `/tmp` and
+hands the host only a versioned bundle over its own stdout, so NCU never
+receives a campaign-relative pathname at all (see
+`src/memory/P1_4_PROTOCOL.md` for the closed design of every blocker). P1.4
+has not yet been independently re-audited, has not been verified on GB300,
+and its pilot has not been executed; no P1.4 performance result exists.
 
 ## Research question
 

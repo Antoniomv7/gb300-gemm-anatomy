@@ -733,7 +733,7 @@ one preceded by a symlink-aware precheck) still leaves open. See
 NCU command structure, the raw-directory/state-machine/manifest-chain
 design, and the statistical policy.
 
-**Status: implemented, remediated after two independent GPU-free audits; a
+**Status: implemented, remediated after THREE independent GPU-free audits; a
 further independent re-audit is PENDING; verified on GB300: NO; pilot
 executed: NO; NCU/HBM validation: NO; publishable results: NONE.** A first
 independent GPU-free audit found five blockers (preflight provenance,
@@ -743,10 +743,35 @@ second independent GPU-free audit of the remediated implementation then
 found four further blockers (a residual raw-tree-write TOCTOU window, an
 uncompared/unplanned extra profile directory, cryptographically-chained-but-
 semantically-unvalidated manifest revisions, and an incomplete
-evidence-integrity comparison that missed some derived per-case fields). All
-nine, across both rounds, were remediated GPU-free as described above, each
-with a new adversarial test that first demonstrably failed against the
-original behavior and then passed against the fix. `make memory-paths-p14-plan` and
+evidence-integrity comparison that missed some derived per-case fields); a
+**third** independent GPU-free audit of that twice-remediated implementation
+then found five further blockers: (A/B) NCU itself still received a
+raw-campaign pathname for both profile collection (`profiles/<case>/
+<case>_report`, built relative to `/workspace` instead of the campaign
+directory) and metrics export, and a corrected path string alone would not
+have fixed the structural problem; (C) the evidence-integrity gate's field
+comparison used `dict.get()`-based equality, under which an unexpected
+null-valued field compared as identical to its absence; (D) manifest fields
+were classified broadly (set-once/timestamp) but never bound to the one
+specific transition legally allowed to introduce them; (E) an unvalidated
+capture filename could escape the anchored directory, a launch failure
+orphaned an empty partial file, and `profiles/`'s own inventory/evidence
+reads were still lstat-then-listdir/open-by-path rather than
+descriptor-anchored. All fourteen, across all three rounds, were remediated
+GPU-free as described above, each with a new adversarial test that first
+demonstrably failed against the original behavior and then passed against
+the fix. The third round's fix for (A/B) is a new container-side bridge
+(`scripts/p14_ncu_bridge.py`) that runs NCU collection and metrics export
+entirely inside the container's own private, non-host-mounted `/tmp` and
+hands the host only a versioned, length-delimited bundle over its own
+stdout, so NCU never receives a campaign-relative pathname at all; (C) is
+closed by a strict recursive structural comparison (exact key sets, exact
+types, no tolerance); (D) by a new `validate_manifest_state_shape` function
+run alongside the existing transition validator; (E) by strict
+single-component basename validation, corrected failure-cleanup control
+flow, and extending descriptor-anchored, no-follow discipline to profile
+inventory, per-case evidence reads, and the manifest revision directory
+itself. `make memory-paths-p14-plan` and
 `make memory-paths-p14-check` are GPU-free (no Docker, no GPU, no network);
 `make memory-paths-p14-pilot` and `make memory-paths-p14-profile` require an
 explicit, operator-provided `BLACKWELL_GPU_INDEX`, `P1_4_CAMPAIGN_ID`, and

@@ -24,10 +24,11 @@ The raw campaign is stored locally at
 ignored by Git. This record closes P1.3's functional GB300 verification only;
 it must not be cited as a performance measurement or used to compare LDGSTS
 against TMA. P1.4 owns the pilot benchmark campaign, Nsight Compute/HBM
-validation, figures, and interpretation; it is implemented — and the nine
-blockers found by two independent GPU-free audits of that implementation
-have all been remediated GPU-free (see `src/memory/P1_4_PROTOCOL.md`) — but
-its pilot has not been executed, so no P1.4 raw campaign exists yet either.
+validation, figures, and interpretation; it is implemented — and the
+fourteen blockers found by three independent GPU-free audits of that
+implementation have all been remediated GPU-free (see
+`src/memory/P1_4_PROTOCOL.md`) — but its pilot has not been executed, so no
+P1.4 raw campaign exists yet either.
 
 ### `results/raw/exp01_memory_paths_p14/<campaign_id>/` (raw, not committed)
 
@@ -40,29 +41,42 @@ snapshots — `000000.json`, `000001.json`, ... — never a single mutable
 and never edited or replaced), `profile_plan.csv` (the frozen six-case
 Nsight Compute plan, written once), `profiles/` (one subdirectory per
 profiled case: its `.ncu-rep`, NCU tool log, captured container
-stdout/stderr, extracted application CSV, and exported raw metrics CSV),
-`logs/` (metric-discovery and NCU-help-capability-probe logs), and, once
-`make memory-paths-p14-analyze` has run against a `COMPLETE` campaign,
-`analysis/` (deterministic statistics/comparison/saturation/HBM-validation
-CSVs, `analysis.json`, `report.md`, and three SVG figures under
-`analysis/figures/`). The manifest's `state` field follows its own state
-machine
+stdout/stderr, extracted application CSV, and exported raw metrics CSV — NCU
+itself never receives any of these as a pathname to open; a container-side
+bridge, `scripts/p14_ncu_bridge.py`, stages every NCU output inside the
+container's own private, non-host-mounted `/tmp` and hands the host a single
+versioned bundle over its own stdout, which the host decodes and publishes
+into this directory), `logs/` (metric-discovery and
+NCU-help-capability-probe logs), and, once `make memory-paths-p14-analyze`
+has run against a `COMPLETE` campaign, `analysis/` (deterministic
+statistics/comparison/saturation/HBM-validation CSVs, `analysis.json`,
+`report.md`, and three SVG figures under `analysis/figures/`). The
+manifest's `state` field follows its own state machine
 (`PILOT_IN_PROGRESS`→`PILOT_COMPLETE`→`PROFILE_IN_PROGRESS`→`COMPLETE`→`ANALYZED`,
-or `FAILED`/`INTERRUPTED`); `COMPLETE` means the raw pilot-plus-profile
-collection succeeded, not that the result is publishable — `publishable` is
-always `false`. Every manifest revision is validated both cryptographically
-(the hash chain) and semantically (an explicit classification of every
-field as immutable/set-once/append-only/state-derived/timestamp, so a
-correctly-hashed revision that changes an immutable field or edits an
-earlier profiled case's result is still rejected). Before both `COMPLETE`
-and `ANALYZED`, `profiles/` is confirmed to contain exactly the six
-canonical case directories the frozen plan expects, every trusted artifact
-recorded in the manifest is re-hashed from disk, and every profiled case's
-complete recorded result is compared, field for field, against what its
-raw evidence alone reconstructs — so a validated artifact, or any single
-recorded derived value, modified after the fact is rejected rather than
-silently accepted. This raw tree is covered by the same blanket
-`results/raw/` Git-ignore rule as P1.3's own raw tree.
+or `FAILED`/`INTERRUPTED`; `PILOT_IN_PROGRESS` has no self-loop, since
+`--pilot` never reports incremental progress into this manifest);
+`COMPLETE` means the raw pilot-plus-profile collection succeeded, not that
+the result is publishable — `publishable` is always `false`. Every manifest
+revision is validated cryptographically (the hash chain) and through two
+explicit semantic layers: a state-shape check (every field is bound to the
+one specific state that may first introduce it — not just a broad
+immutable/set-once/append-only/state-derived/timestamp classification, and
+`case_results`'s key order is checked as an exact list, never reduced to a
+set comparison) and a transition check (a correctly-hashed revision that
+changes an immutable field, edits an earlier profiled case's result, or
+appends more than one case at once is still rejected). Before both
+`COMPLETE` and `ANALYZED`, the campaign directory, `profiles/`, and each
+case directory are opened once with descriptor-anchored, no-follow
+resolution and held open for the whole check; `profiles/` is confirmed to
+contain exactly the six canonical case directories the frozen plan expects,
+every trusted artifact recorded in the manifest is re-hashed from disk, and
+every profiled case's complete recorded result is compared — via a strict
+recursive structural comparison, never `dict.get()`-based equality — against
+what its raw evidence alone reconstructs, so a validated artifact, or any
+single recorded derived value (or an unexpected extra field, however it was
+set), modified after the fact is rejected rather than silently accepted.
+This raw tree is covered by the same blanket `results/raw/` Git-ignore rule
+as P1.3's own raw tree.
 
 ## Storage layout
 

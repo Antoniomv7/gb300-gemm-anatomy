@@ -88,6 +88,38 @@ semantically validated against an explicit per-field classification, not
 just cryptographically chained; and one canonical
 `reconstruct_case_result` function, shared by `validate-profile-case` and
 the gate, is now compared as a complete structure. See
+`src/memory/P1_4_PROTOCOL.md` for the full design of each. A **third**
+independent GPU-free audit of that twice-remediated implementation found
+five further blockers: (A) the runner built
+`profiles/<case>/<case>_report` relative to `/workspace` instead of the
+campaign directory, handing that path directly to NCU's own `-o`/
+`--log-file`; (B) a corrected path string alone would not fix the
+underlying problem, since NCU still opened a raw campaign path (including a
+second one for metrics-export `--import`) for writing itself; (C) the
+evidence-integrity gate's field comparison used `dict.get()`-based
+equality, under which an unexpected `null`-valued field compared as
+identical to its absence; (D) manifest fields were classified broadly
+(set-once/timestamp) but never bound to the one specific transition legally
+allowed to introduce them, so e.g. `resolved_ncu_metrics` could appear
+during `PILOT_IN_PROGRESS`; (E) several descriptor/helper defects — an
+unvalidated filename could escape the anchored capture directory, a launch
+failure orphaned an empty partial file, and `profiles/`'s own inventory and
+evidence reads were still lstat-then-listdir/open-by-path rather than
+descriptor-anchored. All five were remediated GPU-free, each with a new
+adversarial test that first demonstrably failed and then passed: a new
+container-side bridge (`scripts/p14_ncu_bridge.py`) runs NCU collection and
+metrics export entirely inside the container's own private, non-host-mounted
+`/tmp` and hands the host only a versioned, length-delimited bundle over its
+own stdout, so NCU never receives a campaign-relative pathname at all; the
+evidence-integrity gate now uses a strict recursive structural comparison
+(exact key sets, exact types, no `dict.get()` equality); a new
+`validate_manifest_state_shape` function binds every manifest field to the
+one state that may legally introduce it; and `scripts/p14_safe_capture.py`
+now validates every accepted filename as a strict single-component
+basename, fixes its failure-cleanup control flow, and — together with the
+central evidence-integrity gate and `load_p14_manifest_chain` — extends
+descriptor-anchored, no-follow discipline to profile-directory inventory,
+per-case evidence reads, and the manifest revision directory itself. See
 `src/memory/P1_4_PROTOCOL.md` for the full design of each. Independent
 re-audit, GB300 verification, and pilot execution are all still pending; no
 performance result exists yet. A fresh preflight is required before any

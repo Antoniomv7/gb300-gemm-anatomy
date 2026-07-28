@@ -61,6 +61,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import hashlib
 import json
 import math
 import os
@@ -160,9 +161,18 @@ ALLOWED_P14_STATES = frozenset({
     "COMPLETE", "ANALYZED", "FAILED", "INTERRUPTED",
 })
 P14_TERMINAL_STATES = frozenset({"ANALYZED", "FAILED", "INTERRUPTED"})
+# Task 4 remediation (Section 9): PILOT_IN_PROGRESS has no self-loop.
+# Unlike PROFILE_IN_PROGRESS (which legitimately repeats itself once per
+# validated case, six times, via _do_validate_profile_case), --pilot never
+# reports incremental progress into the P1.4 manifest -- record-pilot goes
+# directly from PILOT_IN_PROGRESS to PILOT_COMPLETE in one step. A same-
+# state PILOT_IN_PROGRESS revision is therefore not a transition the actual
+# workflow ever produces, so it is removed rather than left as an
+# unnecessarily permissive extra edge (only FAILED/INTERRUPTED remain
+# reachable from PILOT_IN_PROGRESS besides its one real next state).
 ALLOWED_P14_TRANSITIONS: dict[str | None, frozenset[str]] = {
     None: frozenset({"PILOT_IN_PROGRESS"}),
-    "PILOT_IN_PROGRESS": frozenset({"PILOT_IN_PROGRESS", "PILOT_COMPLETE", "FAILED", "INTERRUPTED"}),
+    "PILOT_IN_PROGRESS": frozenset({"PILOT_COMPLETE", "FAILED", "INTERRUPTED"}),
     "PILOT_COMPLETE": frozenset({"PROFILE_IN_PROGRESS", "FAILED"}),
     "PROFILE_IN_PROGRESS": frozenset({"PROFILE_IN_PROGRESS", "COMPLETE", "FAILED", "INTERRUPTED"}),
     "COMPLETE": frozenset({"ANALYZED"}),
@@ -748,6 +758,164 @@ assert _P14_FIELD_CLASSIFICATION_UNION == frozenset(ALLOWED_P14_MANIFEST_KEYS), 
 )
 
 
+# ---------------------------------------------------------------------------
+# Manifest state-shape validation (Task 4 remediation, Section 9). The
+# broad set-once/timestamp classification above proves a field never
+# *changes* once set, but never asserted that a field could not appear for
+# the *first* time at the wrong state -- e.g. a manifest with
+# state=PILOT_IN_PROGRESS that already carries resolved_ncu_metrics or
+# profile_completed_at_utc previously passed unnoticed, since nothing
+# checked that those fields were still absent this early. The exact
+# 7-row mutation matrix below binds every field to the ONE state at which
+# it may first go from absent/None to present (a small, empty-here
+# allowlist below documents anything that would ever need an exception).
+# validate_manifest_state_shape() is a pure function of one revision's own
+# content -- it needs no "previous" revision, since "which fields are legal
+# at state X" never depends on transition history, only on X itself.
+# load_p14_manifest_chain() runs this alongside (never instead of)
+# validate_manifest_revision_transition() for revision 0 and every later
+# revision.
+# ---------------------------------------------------------------------------
+P14_STATE_ORDER: tuple[str, ...] = ("PILOT_IN_PROGRESS", "PILOT_COMPLETE", "PROFILE_IN_PROGRESS", "COMPLETE", "ANALYZED")
+
+P14_FIELDS_INTRODUCED_BY_STATE: dict[str, frozenset[str]] = {
+    # None -> PILOT_IN_PROGRESS (revision 0): ONLY these initialization
+    # fields may be introduced; every later-phase/failure/analysis field
+    # must be absent.
+    "PILOT_IN_PROGRESS": frozenset({
+        "schema_version", "experiment_id", "campaign_id", "state", "publishable",
+        "started_at_utc", "frozen_protocol", "profile_plan_sha256",
+    }),
+    # PILOT_IN_PROGRESS -> PILOT_COMPLETE (record-pilot).
+    "PILOT_COMPLETE": frozenset({
+        "pilot_completed_at_utc", "pilot_campaign_reference",
+        "preflight_reference_pilot", "provenance",
+    }),
+    # PILOT_COMPLETE -> PROFILE_IN_PROGRESS (discover-metrics) introduces
+    # the first three; case_results/profile_count_completed are introduced
+    # by the first PROFILE_IN_PROGRESS -> PROFILE_IN_PROGRESS self-loop
+    # revision (the first validated case) in the actual workflow, but are
+    # also permitted at the entering transition itself (e.g. an explicit
+    # empty case_results / zero count) -- see
+    # _p14_cumulative_allowed_fields(), which treats both PROFILE_IN_PROGRESS
+    # and its own self-loop as one reachable state for this purpose.
+    "PROFILE_IN_PROGRESS": frozenset({
+        "profile_started_at_utc", "resolved_ncu_metrics", "preflight_reference_profile",
+        "case_results", "profile_count_completed",
+    }),
+    # PROFILE_IN_PROGRESS -> COMPLETE (finalize-profile).
+    "COMPLETE": frozenset({
+        "profile_completed_at_utc", "profile_order", "artifact_sha256",
+    }),
+    # COMPLETE -> ANALYZED (analyze). artifact_sha256 itself was already
+    # introduced at COMPLETE; analyze() only ever *adds* more entries to it
+    # (append-only, enforced by validate_manifest_revision_transition), so
+    # it is not repeated here.
+    "ANALYZED": frozenset({"analyzed_at_utc"}),
+}
+# failure_stage/failure_detail: the one pair of fields whose legal
+# "introducing state" is not a fixed point in P14_STATE_ORDER at all, but
+# "wherever the campaign transitions to FAILED or INTERRUPTED" -- which can
+# happen from any non-terminal state. Their own state-based presence rule
+# (must be None outside FAILED/INTERRUPTED) is already enforced in
+# _validate_p14_manifest_document(); no separate introducing-state entry is
+# needed above because "the transition's target is FAILED/INTERRUPTED" IS
+# their entire legality condition.
+P14_FAILURE_ONLY_FIELDS = frozenset({"failure_stage", "failure_detail"})
+
+_P14_FIELD_INTRODUCTION_UNION = frozenset().union(*P14_FIELDS_INTRODUCED_BY_STATE.values()) | P14_FAILURE_ONLY_FIELDS
+assert _P14_FIELD_INTRODUCTION_UNION == frozenset(ALLOWED_P14_MANIFEST_KEYS), (
+    "every P1.4 manifest field must be bound to exactly one legal introducing state (or the "
+    "failure-only exception) in the Task 4 Section 9 mutation matrix -- an unbound field must "
+    "never be able to appear at an arbitrary state unnoticed: "
+    f"missing={frozenset(ALLOWED_P14_MANIFEST_KEYS) - _P14_FIELD_INTRODUCTION_UNION!r} "
+    f"extra={_P14_FIELD_INTRODUCTION_UNION - frozenset(ALLOWED_P14_MANIFEST_KEYS)!r}"
+)
+assert len(P14_FIELDS_INTRODUCED_BY_STATE) == 5 and len(ALLOWED_P14_STATES) == 7, (
+    "the mutation matrix is documented as exactly 7 rows (one per P1.4 state: the 5 "
+    "non-terminal/analysis states above, plus FAILED and INTERRUPTED, whose shared rule is the "
+    "P14_FAILURE_ONLY_FIELDS exception rather than a P14_STATE_ORDER entry) -- update this "
+    "assertion deliberately if that count ever changes"
+)
+
+
+def _p14_cumulative_allowed_fields(state: str) -> frozenset[str]:
+    """Fields permitted to be present (non-None) once a manifest revision's
+    own state is `state`, per the mutation matrix above: the union of every
+    state's own introduced fields up to and including `state` in the fixed
+    linear progression P14_STATE_ORDER. FAILED/INTERRUPTED may retain any
+    subset of the fields introduced through COMPLETE -- the campaign can
+    fail at any point up to (but never after) ANALYZED, which is terminal
+    with no outgoing FAILED/INTERRUPTED edge -- plus the two failure-only
+    fields."""
+    if state in ("FAILED", "INTERRUPTED"):
+        cumulative: frozenset[str] = frozenset()
+        for s in P14_STATE_ORDER:
+            cumulative = cumulative | P14_FIELDS_INTRODUCED_BY_STATE[s]
+            if s == "COMPLETE":
+                break
+        return cumulative | P14_FAILURE_ONLY_FIELDS
+    cumulative = frozenset()
+    for s in P14_STATE_ORDER:
+        cumulative = cumulative | P14_FIELDS_INTRODUCED_BY_STATE[s]
+        if s == state:
+            return cumulative
+    raise AssertionError(f"unreachable: state {state!r} is not in P14_STATE_ORDER or the failure states")
+
+
+def validate_manifest_state_shape(current: dict, expected_campaign_id: str) -> list[str]:
+    """Validates ONE manifest revision's shape in complete isolation from
+    any other revision (Task 4, Section 9). Returns a list of violated-
+    invariant messages, empty iff fully compliant. Complementary to
+    validate_manifest_revision_transition(): that function checks a
+    revision is a legitimate continuation of its predecessor; this function
+    checks a revision is well-formed for its own declared state, with no
+    knowledge of history at all."""
+    errors: list[str] = []
+    state = current.get("state")
+    if state not in ALLOWED_P14_STATES:
+        return [f"state={state!r} is not a recognized P1.4 state"]
+
+    if current.get("campaign_id") != expected_campaign_id:
+        errors.append(
+            f"campaign_id={current.get('campaign_id')!r} != campaign directory basename "
+            f"{expected_campaign_id!r}"
+        )
+
+    allowed = _p14_cumulative_allowed_fields(state)
+    for key in ALLOWED_P14_MANIFEST_KEYS:
+        present = key in current and current[key] is not None
+        if present and key not in allowed:
+            errors.append(
+                f"{key} is present but state={state!r} has not yet reached the state that may "
+                f"introduce it (Task 4 Section 9 mutation matrix)"
+            )
+
+    case_results = current.get("case_results")
+    if isinstance(case_results, dict):
+        frozen_order = [entry["case_name"] for entry in build_ncu_plan()]
+        # The frozen order is checked as an exact ordered list, never
+        # reduced to a set comparison: list(case_results) preserves the
+        # dict's own JSON-loaded insertion order, so a *reordered* (but
+        # otherwise identical) case_results -- same keys, different
+        # sequence -- is caught here even though a naive
+        # set(case_results) == set(frozen_order[:k]) check would consider
+        # the two identical.
+        actual_order = list(case_results)
+        if actual_order != frozen_order[: len(actual_order)]:
+            errors.append(
+                f"case_results key order {actual_order!r} is not an exact ordered prefix of the "
+                f"frozen six-case order {frozen_order!r} (checked as an ordered list, never a set)"
+            )
+        if "profile_count_completed" in current and current["profile_count_completed"] != len(case_results):
+            errors.append(
+                f"profile_count_completed={current.get('profile_count_completed')!r} != "
+                f"len(case_results)={len(case_results)}"
+            )
+
+    return errors
+
+
 def validate_manifest_revision_transition(
     previous: dict | None, current: dict, expected_campaign_id: str,
 ) -> list[str]:
@@ -851,14 +1019,34 @@ def validate_manifest_revision_transition(
         if isinstance(prev_count, int) and isinstance(curr_count, int) and curr_count < prev_count:
             errors.append(f"profile_count_completed regressed: {prev_count} -> {curr_count}")
 
+        prev_state_for_loop = previous.get("state")
+        curr_state_for_loop = current.get("state")
+        # Task 4 (Section 9): the ONLY same-state revision the actual
+        # workflow ever produces is PROFILE_IN_PROGRESS -> PROFILE_IN_PROGRESS,
+        # once per validated case -- it must append *exactly* one new case
+        # each time. Without this, neither a same-state "no-op" revision
+        # (case_results unchanged) nor a revision that appends two cases at
+        # once was previously rejected: curr_k >= prev_k alone (the check
+        # above only rejects *shrinking*) permits both.
+        if (
+            prev_state_for_loop == "PROFILE_IN_PROGRESS" and curr_state_for_loop == "PROFILE_IN_PROGRESS"
+            and prev_k is not None and curr_k is not None and curr_k != prev_k + 1
+        ):
+            errors.append(
+                f"a PROFILE_IN_PROGRESS -> PROFILE_IN_PROGRESS revision must append exactly one "
+                f"new case result; case_results went from {prev_k} to {curr_k} entrie(s)"
+            )
+
         # Same-state ("self-loop") revisions are only legitimate where
         # ALLOWED_P14_TRANSITIONS itself lists the state as its own valid
-        # next state (PILOT_IN_PROGRESS, PROFILE_IN_PROGRESS -- e.g.
-        # appending the next validated profile case); every other state
-        # (PILOT_COMPLETE, COMPLETE, ANALYZED, FAILED, INTERRUPTED) has no
-        # self-loop entry and so cannot legally repeat, exactly like any
-        # other disallowed transition -- there is deliberately no special
-        # case for curr_state == prev_state here.
+        # next state (only PROFILE_IN_PROGRESS does, e.g. appending the next
+        # validated profile case -- PILOT_IN_PROGRESS has no self-loop
+        # either: the real --pilot workflow never reports incremental
+        # progress into the P1.4 manifest); every other state (PILOT_COMPLETE,
+        # COMPLETE, ANALYZED, FAILED, INTERRUPTED) has no self-loop entry and
+        # so cannot legally repeat, exactly like any other disallowed
+        # transition -- there is deliberately no special case for
+        # curr_state == prev_state here.
         prev_state = previous.get("state")
         allowed_next_states = ALLOWED_P14_TRANSITIONS.get(prev_state, frozenset())
         if curr_state not in allowed_next_states:
@@ -893,91 +1081,131 @@ def load_p14_manifest_chain(campaign_dir: Path) -> tuple[dict, int]:
     link; or a revision whose content fails the ordinary P1.4 manifest
     schema (_validate_p14_manifest_document). Every revision is reopened
     and its hash is recomputed fresh from disk on every call -- nothing
-    about an earlier revision is ever trusted from memory."""
-    manifest_dir = _p14_manifest_dir(campaign_dir)
-    try:
-        p13._reject_if_symlink_or_wrong_type(manifest_dir, expect_dir=True)
-    except p13.UnsafePathError as exc:
-        raise p13.ManifestTransitionError(str(exc)) from exc
+    about an earlier revision is ever trusted from memory.
+
+    Descriptor-anchored (Task 4, Section 7/13): manifest/ is opened exactly
+    once, with O_DIRECTORY|O_NOFOLLOW relative to the campaign directory,
+    and every subsequent enumeration/open/read/hash in this function uses
+    that one held descriptor (or a file descriptor opened relative to it) --
+    never a second, independent resolution of "campaign_dir/manifest" or
+    "campaign_dir/manifest/<name>" by path string. This closes the same
+    class of lstat-then-listdir gap Section 7 closes for profiles/: an
+    earlier version of this function called
+    p13._reject_if_symlink_or_wrong_type(manifest_dir, ...) (one lstat by
+    path) and then a *separate* os.listdir(manifest_dir) (a second,
+    independent resolution of the same path)."""
+    manifest_dir = _p14_manifest_dir(campaign_dir)  # used only for diagnostic message text below
     if not os.path.lexists(manifest_dir):
         return {}, -1
 
     try:
-        names = sorted(os.listdir(manifest_dir))
-    except OSError as exc:
-        raise p13.ManifestTransitionError(f"{manifest_dir}: cannot list revisions: {exc}") from exc
-    revision_names = [n for n in names if MANIFEST_REVISION_RE.fullmatch(n)]
-    other_names = [n for n in names if n not in revision_names and n != MANIFEST_REVISION_TMP_NAME]
-    if other_names:
-        raise p13.ManifestTransitionError(
-            f"{manifest_dir}: unexpected entries in manifest revision directory: {sorted(other_names)}"
-        )
-    if not revision_names:
-        return {}, -1
-    expected_names = [f"{i:06d}.json" for i in range(len(revision_names))]
-    if revision_names != expected_names:
-        raise p13.ManifestTransitionError(
-            f"{manifest_dir}: manifest revisions are not exactly contiguous "
-            f"000000..{len(revision_names) - 1:06d}.json: found {revision_names!r}"
-        )
-
-    # Never trusts campaign_id recorded inside any revision by itself: the
-    # expected value comes from the safely resolved campaign directory's own
-    # basename, established once here, before any revision content is read.
-    expected_campaign_id = campaign_dir.name
-
-    previous_hash: str | None = None
-    previous_content: dict | None = None
-    current_content: dict = {}
-    for i, name in enumerate(expected_names):
-        path = manifest_dir / name
+        campaign_parts = campaign_dir.relative_to(REPO_ROOT).parts
+        manifest_fd = _open_dir_component_chain(*campaign_parts, "manifest")
+    except p13.UnsafePathError as exc:
+        raise p13.ManifestTransitionError(str(exc)) from exc
+    try:
         try:
-            p13._reject_if_symlink_or_wrong_type(path, expect_dir=False)
-            with p13._open_regular_nofollow(path, binary=False) as handle:
-                text = handle.read()
-        except (OSError, p13.UnsafePathError, UnicodeError) as exc:
-            raise p13.ManifestTransitionError(f"{path}: cannot load manifest revision: {exc}") from exc
-        try:
-            doc = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise p13.ManifestTransitionError(f"{path}: invalid JSON: {exc}") from exc
-        if not isinstance(doc, dict):
-            raise p13.ManifestTransitionError(f"{path}: revision root is not a JSON object")
-        if doc.get("manifest_revision") != i:
+            names = sorted(os.listdir(manifest_fd))
+        except OSError as exc:
+            raise p13.ManifestTransitionError(f"{manifest_dir}: cannot list revisions: {exc}") from exc
+        revision_names = [n for n in names if MANIFEST_REVISION_RE.fullmatch(n)]
+        other_names = [n for n in names if n not in revision_names and n != MANIFEST_REVISION_TMP_NAME]
+        if other_names:
             raise p13.ManifestTransitionError(
-                f"{path}: manifest_revision={doc.get('manifest_revision')!r} != expected {i}"
+                f"{manifest_dir}: unexpected entries in manifest revision directory: {sorted(other_names)}"
             )
-        expected_previous_hash = None if i == 0 else previous_hash
-        if doc.get("previous_manifest_sha256") != expected_previous_hash:
+        if not revision_names:
+            return {}, -1
+        expected_names = [f"{i:06d}.json" for i in range(len(revision_names))]
+        if revision_names != expected_names:
             raise p13.ManifestTransitionError(
-                f"{path}: previous_manifest_sha256={doc.get('previous_manifest_sha256')!r} != "
-                f"expected {expected_previous_hash!r} (hash chain broken or tampered)"
+                f"{manifest_dir}: manifest revisions are not exactly contiguous "
+                f"000000..{len(revision_names) - 1:06d}.json: found {revision_names!r}"
             )
-        content = {k: v for k, v in doc.items() if k not in MANIFEST_REVISION_KEYS}
-        try:
-            _validate_p14_manifest_document(content)
-        except p13.ManifestTransitionError as exc:
-            raise p13.ManifestTransitionError(f"{path}: {exc}") from exc
-        # Semantic transition validation (Remediation C): the hash chain
-        # above only proves this revision was appended without altering an
-        # earlier byte; it says nothing about whether *this* revision's
-        # content is a legitimate continuation of the previous one (or, for
-        # revision 0, of the campaign directory itself).
-        transition_errors = validate_manifest_revision_transition(
-            previous_content, content, expected_campaign_id,
-        )
-        if transition_errors:
-            raise p13.ManifestTransitionError(
-                f"{path}: semantic transition validation failed: {transition_errors}"
-            )
-        previous_content = content
-        current_content = content
-        try:
-            previous_hash = p13.sha256_of(path)
-        except p13.UnsafePathError as exc:
-            raise p13.ManifestTransitionError(f"{path}: cannot hash revision: {exc}") from exc
 
-    return current_content, len(expected_names) - 1
+        # Never trusts campaign_id recorded inside any revision by itself: the
+        # expected value comes from the safely resolved campaign directory's
+        # own basename, established once here, before any revision content is
+        # read.
+        expected_campaign_id = campaign_dir.name
+
+        previous_hash: str | None = None
+        previous_content: dict | None = None
+        current_content: dict = {}
+        for i, name in enumerate(expected_names):
+            path = manifest_dir / name  # diagnostic message text only; never reopened by this path
+            try:
+                st = os.stat(name, dir_fd=manifest_fd, follow_symlinks=False)
+                if stat.S_ISLNK(st.st_mode):
+                    raise p13.UnsafePathError(f"{path}: is a symlink; refusing")
+                if not stat.S_ISREG(st.st_mode):
+                    raise p13.UnsafePathError(f"{path}: is not a regular file")
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=manifest_fd)
+                try:
+                    fst = os.fstat(fd)
+                    if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(fst.st_mode):
+                        raise p13.UnsafePathError(f"{path}: changed identity while being opened")
+                    raw = b"".join(iter(lambda: os.read(fd, 1 << 20), b""))
+                finally:
+                    os.close(fd)
+            except (OSError, p13.UnsafePathError) as exc:
+                raise p13.ManifestTransitionError(f"{path}: cannot load manifest revision: {exc}") from exc
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeError as exc:
+                raise p13.ManifestTransitionError(f"{path}: cannot load manifest revision: {exc}") from exc
+            try:
+                doc = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise p13.ManifestTransitionError(f"{path}: invalid JSON: {exc}") from exc
+            if not isinstance(doc, dict):
+                raise p13.ManifestTransitionError(f"{path}: revision root is not a JSON object")
+            if doc.get("manifest_revision") != i:
+                raise p13.ManifestTransitionError(
+                    f"{path}: manifest_revision={doc.get('manifest_revision')!r} != expected {i}"
+                )
+            expected_previous_hash = None if i == 0 else previous_hash
+            if doc.get("previous_manifest_sha256") != expected_previous_hash:
+                raise p13.ManifestTransitionError(
+                    f"{path}: previous_manifest_sha256={doc.get('previous_manifest_sha256')!r} != "
+                    f"expected {expected_previous_hash!r} (hash chain broken or tampered)"
+                )
+            content = {k: v for k, v in doc.items() if k not in MANIFEST_REVISION_KEYS}
+            try:
+                _validate_p14_manifest_document(content)
+            except p13.ManifestTransitionError as exc:
+                raise p13.ManifestTransitionError(f"{path}: {exc}") from exc
+            # Two explicit semantic validation layers (Task 4, Section 9), run
+            # for revision 0 and every later revision alike: shape validation
+            # (is this revision well-formed for its own declared state, taken
+            # in isolation -- e.g. no field introduced before the one state
+            # that may legally introduce it) and transition validation (is
+            # this revision a legitimate continuation of the previous one).
+            # The hash chain alone only proves a revision was appended
+            # without altering an earlier byte; neither says anything the
+            # other already checks, and together they are what "semantically
+            # valid" means here.
+            shape_errors = validate_manifest_state_shape(content, expected_campaign_id)
+            if shape_errors:
+                raise p13.ManifestTransitionError(
+                    f"{path}: manifest state-shape validation failed: {shape_errors}"
+                )
+            transition_errors = validate_manifest_revision_transition(
+                previous_content, content, expected_campaign_id,
+            )
+            if transition_errors:
+                raise p13.ManifestTransitionError(
+                    f"{path}: semantic transition validation failed: {transition_errors}"
+                )
+            previous_content = content
+            current_content = content
+            # Hashed from the exact same bytes already read via the held fd
+            # above -- never a second, independent p13.sha256_of(path) open.
+            previous_hash = hashlib.sha256(raw).hexdigest()
+
+        return current_content, len(expected_names) - 1
+    finally:
+        os.close(manifest_fd)
 
 
 def write_next_p14_manifest_revision(campaign_dir: Path, manifest_content: dict) -> dict:
@@ -1011,16 +1239,22 @@ def write_next_p14_manifest_revision(campaign_dir: Path, manifest_content: dict)
     if os.path.lexists(tmp_path):
         raise p13.UnsafePathError(f"{tmp_path}: stale manifest-revision temporary already exists")
 
-    # Defense in depth (Remediation C): re-validate the candidate revision's
-    # transition here too, before ever writing it, using the exact same
-    # function load_p14_manifest_chain re-applies on every future read. This
-    # never replaces the read-side check (an attacker could always bypass
-    # this function and write a revision file directly), but it does catch
-    # a bug in this codebase's own callers before it is ever persisted. Runs
-    # after the stale-tmp check above: a leftover temporary from an
-    # interrupted write is a filesystem-hygiene defect independent of the
-    # new content's own semantic validity, and should fail with that more
-    # specific diagnosis first.
+    # Defense in depth (Remediation C, extended by Task 4/Section 9 to both
+    # semantic layers): re-validate the candidate revision's shape and
+    # transition here too, before ever writing it, using the exact same two
+    # functions load_p14_manifest_chain re-applies on every future read.
+    # This never replaces the read-side check (an attacker could always
+    # bypass this function and write a revision file directly), but it does
+    # catch a bug in this codebase's own callers before it is ever
+    # persisted. Runs after the stale-tmp check above: a leftover temporary
+    # from an interrupted write is a filesystem-hygiene defect independent
+    # of the new content's own semantic validity, and should fail with that
+    # more specific diagnosis first.
+    shape_errors = validate_manifest_state_shape(manifest_content, campaign_dir.name)
+    if shape_errors:
+        raise p13.ManifestTransitionError(
+            f"refusing to write a manifest revision with an invalid shape: {shape_errors}"
+        )
     transition_errors = validate_manifest_revision_transition(
         current if current_revision >= 0 else None, manifest_content, campaign_dir.name,
     )
@@ -1358,35 +1592,36 @@ EXPECTED_METRIC_UNITS = {
 }
 
 
-def parse_ncu_raw_csv(path: Path) -> dict:
-    """Parses an NCU `--page raw --csv` export. Returns a dict with keys
-    'metrics' (metric name -> float value), 'units' (metric name -> the
-    exact unit string recorded for it), 'kernel_name' (the single distinct
-    kernel name found), and 'launch_id' (the single distinct launch ID
-    found). Raises NcuCsvParseError on any defect -- see the module
-    docstring above for the complete list of rejected conditions."""
-    try:
-        with p13._open_regular_nofollow(path, binary=False) as handle:
-            rows_raw = list(csv.reader(handle))
-    except (OSError, p13.UnsafePathError, UnicodeError) as exc:
-        raise NcuCsvParseError(f"{path}: unable to read: {exc}") from exc
+def _parse_ncu_raw_csv_rows(rows_raw: list[list[str]], *, label: str) -> dict:
+    """Pure-data core of parse_ncu_raw_csv(): validates and parses an
+    already-read NCU `--page raw --csv` export given as a list of row
+    lists. `label` is used only for diagnostic messages (a path when the
+    caller read from a path, or a descriptor-anchored "profiles/<case>/..."
+    description when the caller read from an already-open fd -- see
+    parse_ncu_raw_csv() and _reconstruct_case_result_from_fds()). Returns a
+    dict with keys 'metrics' (metric name -> float value), 'units' (metric
+    name -> the exact unit string recorded for it), 'kernel_name' (the
+    single distinct kernel name found), and 'launch_id' (the single
+    distinct launch ID found). Raises NcuCsvParseError on any defect -- see
+    the module docstring above for the complete list of rejected
+    conditions."""
     if not rows_raw:
-        raise NcuCsvParseError(f"{path}: empty file (no header)")
+        raise NcuCsvParseError(f"{label}: empty file (no header)")
 
     header = rows_raw[0]
     if len(header) != len(set(header)):
         duplicates = sorted({h for h in header if header.count(h) > 1})
-        raise NcuCsvParseError(f"{path}: duplicate header column name(s): {duplicates}")
+        raise NcuCsvParseError(f"{label}: duplicate header column name(s): {duplicates}")
     missing_columns = [c for c in REQUIRED_NCU_CSV_COLUMNS if c not in header]
     if missing_columns:
         raise NcuCsvParseError(
-            f"{path}: missing required column(s) {missing_columns} in header {header!r}"
+            f"{label}: missing required column(s) {missing_columns} in header {header!r}"
         )
     col_index = {name: header.index(name) for name in REQUIRED_NCU_CSV_COLUMNS}
 
     data_rows = rows_raw[1:]
     if not data_rows:
-        raise NcuCsvParseError(f"{path}: no data rows")
+        raise NcuCsvParseError(f"{label}: no data rows")
 
     launch_ids: set[str] = set()
     kernel_names: set[str] = set()
@@ -1395,7 +1630,7 @@ def parse_ncu_raw_csv(path: Path) -> dict:
     for line_no, row in enumerate(data_rows, start=2):
         if len(row) != len(header):
             raise NcuCsvParseError(
-                f"{path}: line {line_no}: expected {len(header)} field(s), got {len(row)}"
+                f"{label}: line {line_no}: expected {len(header)} field(s), got {len(row)}"
             )
         launch_id = row[col_index["ID"]].strip()
         kernel_name = row[col_index["Kernel Name"]].strip()
@@ -1404,35 +1639,35 @@ def parse_ncu_raw_csv(path: Path) -> dict:
         raw_value = row[col_index["Metric Value"]].strip()
 
         if not launch_id:
-            raise NcuCsvParseError(f"{path}: line {line_no}: empty launch ID")
+            raise NcuCsvParseError(f"{label}: line {line_no}: empty launch ID")
         if not kernel_name:
-            raise NcuCsvParseError(f"{path}: line {line_no}: empty kernel name")
+            raise NcuCsvParseError(f"{label}: line {line_no}: empty kernel name")
         if not metric_name:
-            raise NcuCsvParseError(f"{path}: line {line_no}: empty metric name")
+            raise NcuCsvParseError(f"{label}: line {line_no}: empty metric name")
         if not metric_unit:
-            raise NcuCsvParseError(f"{path}: line {line_no}: empty metric unit for {metric_name!r}")
+            raise NcuCsvParseError(f"{label}: line {line_no}: empty metric unit for {metric_name!r}")
         if not raw_value:
-            raise NcuCsvParseError(f"{path}: line {line_no}: empty metric value for {metric_name!r}")
+            raise NcuCsvParseError(f"{label}: line {line_no}: empty metric value for {metric_name!r}")
 
         try:
             value = float(raw_value)
         except ValueError as exc:
             raise NcuCsvParseError(
-                f"{path}: line {line_no}: metric {metric_name!r} value {raw_value!r} is not a number"
+                f"{label}: line {line_no}: metric {metric_name!r} value {raw_value!r} is not a number"
             ) from exc
         if not math.isfinite(value):
             raise NcuCsvParseError(
-                f"{path}: line {line_no}: metric {metric_name!r} value {raw_value!r} is not finite"
+                f"{label}: line {line_no}: metric {metric_name!r} value {raw_value!r} is not finite"
             )
         if value < 0:
             raise NcuCsvParseError(
-                f"{path}: line {line_no}: metric {metric_name!r} value {value!r} is negative"
+                f"{label}: line {line_no}: metric {metric_name!r} value {value!r} is negative"
             )
 
         expected_unit = EXPECTED_METRIC_UNITS.get(metric_name)
         if expected_unit is not None and metric_unit.strip().lower() != expected_unit.strip().lower():
             raise NcuCsvParseError(
-                f"{path}: line {line_no}: metric {metric_name!r} has unit {metric_unit!r}, "
+                f"{label}: line {line_no}: metric {metric_name!r} has unit {metric_unit!r}, "
                 f"expected exactly {expected_unit!r} (base units are matched case/whitespace-"
                 f"insensitively but never scaled or converted)"
             )
@@ -1441,7 +1676,7 @@ def parse_ncu_raw_csv(path: Path) -> dict:
         kernel_names.add(kernel_name)
         if metric_name in metrics:
             raise NcuCsvParseError(
-                f"{path}: metric {metric_name!r} appears more than once "
+                f"{label}: metric {metric_name!r} appears more than once "
                 f"(duplicate rows for a resolved metric are rejected even when values agree)"
             )
         metrics[metric_name] = value
@@ -1449,12 +1684,12 @@ def parse_ncu_raw_csv(path: Path) -> dict:
 
     if len(launch_ids) > 1:
         raise NcuCsvParseError(
-            f"{path}: {len(launch_ids)} distinct launch IDs found ({sorted(launch_ids)!r}), "
+            f"{label}: {len(launch_ids)} distinct launch IDs found ({sorted(launch_ids)!r}), "
             f"expected exactly 1 (--launch-count 1 should guarantee this)"
         )
     if len(kernel_names) > 1:
         raise NcuCsvParseError(
-            f"{path}: {len(kernel_names)} distinct kernel names found ({sorted(kernel_names)!r}), "
+            f"{label}: {len(kernel_names)} distinct kernel names found ({sorted(kernel_names)!r}), "
             f"expected exactly 1"
         )
 
@@ -1465,6 +1700,136 @@ def parse_ncu_raw_csv(path: Path) -> dict:
         "launch_id": next(iter(launch_ids)),
         "launch_count": len(launch_ids),
     }
+
+
+def parse_ncu_raw_csv(path: Path) -> dict:
+    """Path-based entry point: reads path (symlink-safe, non-empty-regular
+    only) and hands the parsed rows to _parse_ncu_raw_csv_rows(). Used by
+    validate-profile-case's one-shot validation of freshly-produced
+    evidence via reconstruct_case_result()."""
+    try:
+        with p13._open_regular_nofollow(path, binary=False) as handle:
+            rows_raw = list(csv.reader(handle))
+    except (OSError, p13.UnsafePathError, UnicodeError) as exc:
+        raise NcuCsvParseError(f"{path}: unable to read: {exc}") from exc
+    return _parse_ncu_raw_csv_rows(rows_raw, label=str(path))
+
+
+# ---------------------------------------------------------------------------
+# Descriptor-anchored directory/file resolution (Task 4, Section 7). Every
+# P1.4-owned raw-tree *read* used for a terminal decision (profiles/'s own
+# inventory, and each case's application/metrics/.ncu-rep evidence) must
+# hash/parse the exact bytes behind an already-open file descriptor, never
+# re-open a pathname after a descriptor for it (or an ancestor of it) is
+# already held. This mirrors scripts/p14_safe_capture.py's own
+# O_DIRECTORY|O_NOFOLLOW discipline for writes, applied here to reads; it is
+# intentionally duplicated in miniature rather than imported, since
+# p14_safe_capture.py itself imports this module (importing it back would
+# be circular) and the primitive is a handful of lines.
+# ---------------------------------------------------------------------------
+def _open_dir_nofollow_p14(name: str, *, dir_fd: int | None) -> int:
+    flags = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        return os.open(name, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise p13.UnsafePathError(f"{name}: cannot open as a non-symlink directory: {exc}") from exc
+
+
+def _open_dir_component_chain(*parts: str) -> int:
+    """Opens REPO_ROOT/parts[0]/parts[1]/... as a directory, one component
+    at a time (including the repository root itself), each via
+    O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC relative to the previously opened
+    descriptor -- never re-resolving a pathname afterward, so nothing that
+    happens to an intermediate *name* after this call returns can affect
+    the returned, already-open descriptor. Caller must os.close() the
+    result."""
+    fd = _open_dir_nofollow_p14(str(REPO_ROOT), dir_fd=None)
+    try:
+        for part in parts:
+            next_fd = _open_dir_nofollow_p14(part, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _open_profiles_fd_anchored(campaign_dir: Path) -> int:
+    """Descriptor-anchored, no-follow open of campaign_dir/profiles, one
+    path component at a time from the repository root. Caller must
+    os.close() the result."""
+    campaign_parts = campaign_dir.relative_to(REPO_ROOT).parts
+    return _open_dir_component_chain(*campaign_parts, "profiles")
+
+
+def _open_case_evidence_fds(profiles_fd: int, case_name: str) -> dict[str, int]:
+    """Opens profiles_fd/<case_name>/ (O_DIRECTORY|O_NOFOLLOW) and then each
+    of the three evidence files relative to *that* case descriptor
+    (O_RDONLY|O_NOFOLLOW), never re-resolving a pathname. Verifies each
+    evidence file is a non-symlink, non-empty regular file at open time.
+    Returns a dict of open fds (including the case directory itself, under
+    key "_case_dir") the caller must close; raises p13.UnsafePathError
+    (closing any fd already opened in this call first) on any failure."""
+    case_fd = None
+    try:
+        case_fd = _open_dir_nofollow_p14(case_name, dir_fd=profiles_fd)
+    except p13.UnsafePathError as exc:
+        raise p13.UnsafePathError(f"profiles/{case_name}: {exc}") from exc
+    fds: dict[str, int] = {"_case_dir": case_fd}
+    try:
+        for label, filename in (
+            ("application_csv", f"{case_name}.application.csv"),
+            ("metrics_csv", f"{case_name}.metrics_raw.csv"),
+            ("ncu_rep", f"{case_name}_report.ncu-rep"),
+        ):
+            file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+            try:
+                fd = os.open(filename, file_flags, dir_fd=case_fd)
+            except OSError as exc:
+                raise p13.UnsafePathError(f"profiles/{case_name}/{filename}: cannot open: {exc}") from exc
+            try:
+                st = os.fstat(fd)
+            except OSError:
+                os.close(fd)
+                raise
+            if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
+                os.close(fd)
+                raise p13.UnsafePathError(f"profiles/{case_name}/{filename}: not a non-empty regular file")
+            fds[label] = fd
+    except Exception:
+        for fd in fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+    return fds
+
+
+def _sha256_of_fd(fd: int) -> str:
+    """Hashes the exact bytes behind an already-open, read-only fd; never
+    re-opens by name. Seeks to the start first so this can safely run more
+    than once (or after _read_csv_rows_from_fd()) against the same fd."""
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(fd, 1 << 20)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_csv_rows_from_fd(fd: int) -> list[list[str]]:
+    """Parses the exact bytes behind an already-open fd as CSV; never
+    re-opens by name. Operates on a dup()'d fd so the text-mode wrapper's
+    own close() (at the end of the "with" block) never closes the caller's
+    original fd, which the caller may still need (e.g. to hash afterward)."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    dup_fd = os.dup(fd)
+    with os.fdopen(dup_fd, "r", encoding="utf-8", newline="") as handle:
+        return list(csv.reader(handle))
 
 
 # ---------------------------------------------------------------------------
@@ -2288,15 +2653,89 @@ def cmd_validate_profile_preconditions(args: argparse.Namespace) -> int:
 # dram_read_bytes or a resolved_metric_values entry -- can never go
 # undetected merely because some other field still happens to agree.
 # ---------------------------------------------------------------------------
-def reconstruct_case_result(
-    *, entry: dict, application_csv: Path, metrics_csv: Path, ncu_rep: Path,
+def p14_validate_case_rows(rows: list[list[str]], expect: dict, *, label: str) -> tuple[list[dict[str, str]], list[str]]:
+    """P1.4-local adapter mirroring p13.validate_case_file()'s own
+    validation body exactly (header/row-shape/per-field/sample-index
+    checks via the frozen, unmodified p13.CSV_HEADER/p13.FIELD_VALIDATORS),
+    but operating on already-parsed `rows` (e.g. from
+    _read_csv_rows_from_fd()) instead of opening a path itself.
+    scripts/aggregate_exp01_memory_paths.py only exposes a Path-based
+    validate_case_file(); this adapter exists so the descriptor-anchored
+    evidence layer (Task 4, Section 7) can validate bytes read from an
+    already-open fd without ever reopening a pathname, while never
+    modifying or weakening the frozen P1.3 module itself."""
+    errors: list[str] = []
+    if not rows:
+        return [], [f"{label}: empty file (no header)"]
+    header, data_rows_raw = rows[0], rows[1:]
+    if header != p13.CSV_HEADER:
+        return [], [f"{label}: header mismatch (wrong or reordered CSV header): {header!r}"]
+
+    parsed_rows: list[dict[str, str]] = []
+    for line_no, row in enumerate(data_rows_raw, start=2):
+        if len(row) == 0:
+            errors.append(f"{label}: line {line_no}: blank row")
+            continue
+        if row == p13.CSV_HEADER:
+            errors.append(f"{label}: line {line_no}: repeated header row")
+            continue
+        if len(row) != len(p13.CSV_HEADER):
+            errors.append(f"{label}: line {line_no}: expected {len(p13.CSV_HEADER)} fields, got {len(row)}")
+            continue
+        parsed_rows.append(dict(zip(p13.CSV_HEADER, row)))
+
+    if errors:
+        return parsed_rows, errors
+
+    repetitions = expect["repetitions"]
+    if len(parsed_rows) != repetitions:
+        errors.append(f"{label}: has {len(parsed_rows)} data row(s), expected exactly repetitions={repetitions}")
+        return parsed_rows, errors
+
+    sample_indices: list[int] = []
+    for row_num, row in enumerate(parsed_rows):
+        ctx = f"{label}: data row {row_num} (line {row_num + 2})"
+        validated_fields: set[str] = set()
+        for field in p13.CSV_HEADER:
+            validator = p13.FIELD_VALIDATORS[field]
+            value = validator(row, expect, errors, ctx)
+            validated_fields.add(field)
+            if field == "sample_index" and value is not None:
+                sample_indices.append(value)
+        assert validated_fields == set(p13.CSV_HEADER), (
+            f"internal error: row {row_num} did not run every field validator"
+        )
+
+    index_counts: dict[int, int] = {}
+    for value in sample_indices:
+        index_counts[value] = index_counts.get(value, 0) + 1
+    expected_indices = set(range(repetitions))
+    found_indices = set(index_counts)
+    for missing in sorted(expected_indices - found_indices):
+        errors.append(f"{label}: sample_index={missing} is missing")
+    for unexpected in sorted(found_indices - expected_indices):
+        errors.append(f"{label}: unexpected sample_index={unexpected} (expected 0..{repetitions - 1})")
+    for value, count in sorted(index_counts.items()):
+        if count > 1:
+            errors.append(f"{label}: sample_index={value} appears {count} times, expected exactly once")
+
+    return parsed_rows, errors
+
+
+def _reconstruct_case_result_core(
+    *, entry: dict, application_rows: list[list[str]], metrics_rows: list[list[str]],
+    application_label: str, metrics_label: str,
+    application_hash: str, metrics_hash: str, ncu_rep_hash: str,
     provenance: dict, resolved_ncu_metrics: dict, git_commit: str,
 ) -> tuple[dict | None, list[str]]:
+    """Pure-data canonical core (Task 4, Section 7/8): every input is
+    already-read content (rows, hashes) rather than a path or fd, so this
+    one function is the single place both entry points below (path-based
+    and descriptor-anchored) converge -- and the single place
+    validate-profile-case, finalize-profile, and analyze ultimately share,
+    since the central evidence-integrity gate calls the descriptor-anchored
+    entry point immediately before both COMPLETE and ANALYZED."""
     errors: list[str] = []
-
-    ncu_rep_err = p13._verify_artifact(ncu_rep)
-    if ncu_rep_err:
-        errors.append(ncu_rep_err)
 
     expect = {
         "method": entry["method"], "stages": entry["stages"], "bif_kib": entry["bif_kib"],
@@ -2304,7 +2743,7 @@ def reconstruct_case_result(
         "passes": FROZEN_PROFILE_PARAMS["passes"], "warmup_ms": FROZEN_PROFILE_PARAMS["warmup_ms"],
         "working_set_mib": FROZEN_PROFILE_PARAMS["working_set_mib"], "git_commit": git_commit,
     }
-    app_rows, app_errors = p13.validate_case_file(application_csv, expect)
+    app_rows, app_errors = p14_validate_case_rows(application_rows, expect, label=application_label)
     errors.extend(app_errors)
     app_row = app_rows[0] if (app_rows and not app_errors) else None
 
@@ -2321,7 +2760,7 @@ def reconstruct_case_result(
 
     parsed_metrics = None
     try:
-        parsed_metrics = parse_ncu_raw_csv(metrics_csv)
+        parsed_metrics = _parse_ncu_raw_csv_rows(metrics_rows, label=metrics_label)
     except NcuCsvParseError as exc:
         errors.append(str(exc))
 
@@ -2353,13 +2792,6 @@ def reconstruct_case_result(
     useful_bytes = float(app_row["useful_bytes"])
     classification, flags, ratio = classify_hbm(dram_read_bytes, useful_bytes)
 
-    try:
-        app_hash = p13.sha256_of(application_csv)
-        metrics_hash = p13.sha256_of(metrics_csv)
-        ncu_rep_hash = p13.sha256_of(ncu_rep)
-    except p13.UnsafePathError as exc:
-        return None, [str(exc)]
-
     case_result = {
         "case_name": entry["case_name"],
         "method": entry["method"],
@@ -2374,11 +2806,73 @@ def reconstruct_case_result(
         "diagnostic_flags": list(flags),
         "resolved_metric_values": {m: parsed_metrics["metrics"].get(m) for m in resolved_names},
         "resolved_metric_units": {m: parsed_metrics["units"].get(m) for m in resolved_names},
-        "application_csv_sha256": app_hash,
+        "application_csv_sha256": application_hash,
         "metrics_csv_sha256": metrics_hash,
         "ncu_rep_sha256": ncu_rep_hash,
     }
     return case_result, []
+
+
+def reconstruct_case_result(
+    *, entry: dict, application_csv: Path, metrics_csv: Path, ncu_rep: Path,
+    provenance: dict, resolved_ncu_metrics: dict, git_commit: str,
+) -> tuple[dict | None, list[str]]:
+    """Path-based entry point: used by validate-profile-case's one-shot
+    validation of a case's freshly-produced evidence (this campaign's own
+    just-created case directory, safely re-derived by the caller from
+    --campaign-dir + --index via _resolve_case_evidence_paths(), never a
+    caller-supplied path)."""
+    ncu_rep_err = p13._verify_artifact(ncu_rep)
+    if ncu_rep_err:
+        return None, [ncu_rep_err]
+    try:
+        with p13._open_regular_nofollow(application_csv, binary=False) as handle:
+            application_rows = list(csv.reader(handle))
+    except (OSError, p13.UnsafePathError, UnicodeError) as exc:
+        return None, [f"{application_csv}: unable to read: {exc}"]
+    try:
+        with p13._open_regular_nofollow(metrics_csv, binary=False) as handle:
+            metrics_rows = list(csv.reader(handle))
+    except (OSError, p13.UnsafePathError, UnicodeError) as exc:
+        return None, [f"{metrics_csv}: unable to read: {exc}"]
+    try:
+        application_hash = p13.sha256_of(application_csv)
+        metrics_hash = p13.sha256_of(metrics_csv)
+        ncu_rep_hash = p13.sha256_of(ncu_rep)
+    except p13.UnsafePathError as exc:
+        return None, [str(exc)]
+    return _reconstruct_case_result_core(
+        entry=entry, application_rows=application_rows, metrics_rows=metrics_rows,
+        application_label=str(application_csv), metrics_label=str(metrics_csv),
+        application_hash=application_hash, metrics_hash=metrics_hash, ncu_rep_hash=ncu_rep_hash,
+        provenance=provenance, resolved_ncu_metrics=resolved_ncu_metrics, git_commit=git_commit,
+    )
+
+
+def _reconstruct_case_result_from_fds(
+    *, entry: dict, case_name: str, fds: dict[str, int],
+    provenance: dict, resolved_ncu_metrics: dict, git_commit: str,
+) -> tuple[dict | None, list[str]]:
+    """Descriptor-anchored entry point (Task 4, Section 7): used
+    exclusively by the central evidence-integrity gate
+    (verify_campaign_evidence_integrity), whose caller keeps every relevant
+    directory descriptor (the campaign directory, "profiles/", and this
+    specific case directory) open for the *entire* inventory+evidence
+    check. Reads bytes only from the exact fds that check already opened
+    and verified as non-symlink non-empty regular files (see
+    _open_case_evidence_fds()) -- never by reopening a pathname."""
+    application_rows = _read_csv_rows_from_fd(fds["application_csv"])
+    metrics_rows = _read_csv_rows_from_fd(fds["metrics_csv"])
+    application_hash = _sha256_of_fd(fds["application_csv"])
+    metrics_hash = _sha256_of_fd(fds["metrics_csv"])
+    ncu_rep_hash = _sha256_of_fd(fds["ncu_rep"])
+    return _reconstruct_case_result_core(
+        entry=entry, application_rows=application_rows, metrics_rows=metrics_rows,
+        application_label=f"profiles/{case_name}/{case_name}.application.csv",
+        metrics_label=f"profiles/{case_name}/{case_name}.metrics_raw.csv",
+        application_hash=application_hash, metrics_hash=metrics_hash, ncu_rep_hash=ncu_rep_hash,
+        provenance=provenance, resolved_ncu_metrics=resolved_ncu_metrics, git_commit=git_commit,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2392,8 +2886,7 @@ def reconstruct_case_result(
 # same-state PROFILE_IN_PROGRESS -> PROFILE_IN_PROGRESS manifest merge.
 # ---------------------------------------------------------------------------
 def _do_validate_profile_case(
-    *, campaign_dir: Path, index: int, application_csv: Path, metrics_csv: Path,
-    ncu_rep: Path, git_commit: str,
+    *, campaign_dir: Path, index: int, git_commit: str,
 ) -> tuple[bool, list[str]]:
     plan = build_ncu_plan()
     entry = next((e for e in plan if e["index"] == index), None)
@@ -2412,11 +2905,24 @@ def _do_validate_profile_case(
     if entry["case_name"] in existing_results:
         return False, [f"case {entry['case_name']} was already validated and recorded; refusing to redo it"]
 
+    # Task 4 remediation (Section 7): evidence paths are re-derived from the
+    # safely resolved campaign directory, the frozen plan, and this case's
+    # own canonical name alone -- never trusted from a caller-supplied
+    # --application-csv/--metrics-csv/--ncu-rep argument (the previous CLI
+    # accepted, and used verbatim, any path the invoking shell happened to
+    # pass). This is the exact same derivation
+    # verify_campaign_evidence_integrity uses for its own re-check.
+    path_errors: list[str] = []
+    paths = _resolve_case_evidence_paths(campaign_dir, entry["case_name"], path_errors)
+    if paths is None:
+        return False, path_errors
+
     provenance = manifest.get("provenance", {}) if isinstance(manifest.get("provenance"), dict) else {}
     resolved_ncu_metrics = manifest.get("resolved_ncu_metrics", {})
     case_result, errors = reconstruct_case_result(
-        entry=entry, application_csv=application_csv, metrics_csv=metrics_csv, ncu_rep=ncu_rep,
-        provenance=provenance, resolved_ncu_metrics=resolved_ncu_metrics, git_commit=git_commit,
+        entry=entry, application_csv=paths["application_csv"], metrics_csv=paths["metrics_csv"],
+        ncu_rep=paths["ncu_rep"], provenance=provenance, resolved_ncu_metrics=resolved_ncu_metrics,
+        git_commit=git_commit,
     )
     if case_result is None:
         return False, errors
@@ -2441,9 +2947,7 @@ def cmd_validate_profile_case(args: argparse.Namespace) -> int:
         print(f"analyze_exp01_memory_paths_p14: validate-profile-case: ERROR: {exc}", file=sys.stderr)
         return 2
     success, errors = _do_validate_profile_case(
-        campaign_dir=campaign_dir, index=args.index,
-        application_csv=Path(args.application_csv), metrics_csv=Path(args.metrics_csv),
-        ncu_rep=Path(args.ncu_rep), git_commit=args.git_commit,
+        campaign_dir=campaign_dir, index=args.index, git_commit=args.git_commit,
     )
     if not success:
         print(f"analyze_exp01_memory_paths_p14: validate-profile-case: FAIL: index {args.index}", file=sys.stderr)
@@ -2540,37 +3044,25 @@ def _read_profile_plan_case_names(profile_plan_path: Path) -> tuple[list[str], l
     return case_names, []
 
 
-def verify_profiles_directory_inventory(campaign_dir: Path) -> list[str]:
-    """Confirms profiles/ contains *exactly* the canonical case directory
-    names in campaign_dir/profile_plan.csv -- no more, no less -- rejecting
-    any extra entry (directory, regular file, or symlink, dangling or not),
-    any missing canonical directory, and any non-directory or symlinked
-    canonical case entry. Filesystem enumeration order is irrelevant.
-    Reused unmodified before both COMPLETE and ANALYZED (Remediation B,
-    second audit, blocker B: an unplanned extra profiles/<name>/ directory
-    was previously never compared against anything and so was silently
-    ignored, regardless of state)."""
-    profile_plan_path = campaign_dir / "profile_plan.csv"
-    case_names, plan_errors = _read_profile_plan_case_names(profile_plan_path)
-    if plan_errors:
-        return plan_errors
-    if len(set(case_names)) != len(case_names):
-        return [f"{profile_plan_path}: contains a duplicate case name: {case_names!r}"]
-    expected_names = set(case_names)
-
-    profiles_dir = campaign_dir / "profiles"
+def _list_and_check_profiles_inventory(profiles_fd: int, expected_names: set[str]) -> list[str]:
+    """fd-anchored inventory check (Task 4, Section 7/blocker E-1): both
+    os.listdir(profiles_fd) and every os.stat(name, dir_fd=profiles_fd,
+    follow_symlinks=False) resolve against the *same* already-open
+    descriptor, never a path string. The previous design called
+    p13._reject_if_symlink_or_wrong_type(profiles_dir, ...) (one lstat by
+    path) and, afterward, a *separate* os.listdir(profiles_dir) (a second,
+    independent resolution of the same path) -- replacing profiles/ with a
+    symlink in the gap between those two calls produced errors=[] (the
+    listdir silently followed the new symlink's target, which could easily
+    be empty or otherwise "look compliant" instead of failing closed). An
+    fd, once open, is bound to the inode -- not the name -- so nothing that
+    happens to the name "profiles" afterward can change what
+    os.listdir(profiles_fd) enumerates."""
+    errors: list[str] = []
     try:
-        p13._reject_if_symlink_or_wrong_type(profiles_dir, expect_dir=True)
-    except p13.UnsafePathError as exc:
-        return [f"profiles/: {exc}"]
-    if not os.path.lexists(profiles_dir):
-        return ["profiles/: does not exist"]
-    try:
-        actual_names = set(os.listdir(profiles_dir))
+        actual_names = set(os.listdir(profiles_fd))
     except OSError as exc:
         return [f"profiles/: cannot list directory: {exc}"]
-
-    errors: list[str] = []
     for extra in sorted(actual_names - expected_names):
         errors.append(
             f"profiles/{extra}: unplanned entry not present in profile_plan.csv "
@@ -2579,18 +3071,191 @@ def verify_profiles_directory_inventory(campaign_dir: Path) -> list[str]:
     for missing in sorted(expected_names - actual_names):
         errors.append(f"profiles/{missing}: missing canonical case directory")
     for name in sorted(actual_names & expected_names):
-        case_path = profiles_dir / name
         try:
-            p13._reject_if_symlink_or_wrong_type(case_path, expect_dir=True)
-        except p13.UnsafePathError as exc:
-            errors.append(f"profiles/{name}: {exc}")
+            st = os.stat(name, dir_fd=profiles_fd, follow_symlinks=False)
+        except OSError as exc:
+            errors.append(f"profiles/{name}: cannot stat: {exc}")
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            errors.append(f"profiles/{name}: is a symlink; refusing")
+        elif not stat.S_ISDIR(st.st_mode):
+            errors.append(f"profiles/{name}: is not a directory")
+    return errors
+
+
+def verify_profiles_directory_inventory(campaign_dir: Path) -> list[str]:
+    """Standalone, path-based-entry convenience wrapper around
+    _list_and_check_profiles_inventory(): opens profiles/ fresh via a
+    single descriptor-anchored resolution, runs the fd-anchored check, and
+    closes it. verify_campaign_evidence_integrity() below does not call
+    this function -- it performs the equivalent open+check itself so the
+    same profiles_fd can stay open for the rest of the evidence check
+    (Section 7's "keep descriptors open for the entire inventory+evidence
+    check")."""
+    profile_plan_path = campaign_dir / "profile_plan.csv"
+    case_names, plan_errors = _read_profile_plan_case_names(profile_plan_path)
+    if plan_errors:
+        return plan_errors
+    if len(set(case_names)) != len(case_names):
+        return [f"{profile_plan_path}: contains a duplicate case name: {case_names!r}"]
+    expected_names = set(case_names)
+
+    try:
+        profiles_fd = _open_profiles_fd_anchored(campaign_dir)
+    except p13.UnsafePathError as exc:
+        return [f"profiles/: {exc}"]
+    try:
+        return _list_and_check_profiles_inventory(profiles_fd, expected_names)
+    finally:
+        os.close(profiles_fd)
+
+
+# ---------------------------------------------------------------------------
+# Strict recursive case-result comparison (Task 4, Section 8; blocker C).
+# Replaces the previous "for key in sorted(set(a)|set(b)): if a.get(key) ==
+# b.get(key): continue" loop, whose dict.get()-based equality made {} and
+# {"unexpected_evidence_field": None} compare as identical (an unexpected
+# key with a null value was silently accepted) and never distinguished "key
+# absent" from "key present with value None". This walks recorded (the
+# manifest's own case_results entry) against canonical (freshly
+# reconstructed from evidence) structurally: exact key sets first (missing
+# vs. unexpected reported as distinct conditions), then exact list
+# length/order, then exact scalar type (type(x) is type(y), so True is
+# never accepted in place of canonical 1) and exact value, with NaN/
+# infinity rejected outright on either side. There is no tolerance
+# permitting a manifest value to differ from what its own evidence
+# reconstructs.
+# ---------------------------------------------------------------------------
+# Small, explicit allowlist for genuinely non-reconstructable operational
+# metadata that may be compared with a declared, immutable-once-recorded
+# type instead of exact structural equality. Deliberately empty: every
+# field of a P1.4 case_results entry is derived from its own evidence (the
+# whole point of reconstruct_case_result()), so nothing here qualifies as
+# "non-reconstructable" -- this constant exists so a future field that
+# genuinely cannot be reconstructed (and only such a field) has one
+# documented, reviewed place to be added, rather than a silent exception
+# carved into the comparison logic itself.
+CASE_RESULT_COMPARISON_ALLOWLIST: frozenset[str] = frozenset()
+
+
+def _strict_compare_values(path: str, recorded: object, canonical: object, errors: list[str]) -> None:
+    if isinstance(canonical, dict) or isinstance(recorded, dict):
+        if not isinstance(canonical, dict) or not isinstance(recorded, dict):
+            errors.append(
+                f"{path}: recorded is {type(recorded).__name__} ({recorded!r}), reconstructed is "
+                f"{type(canonical).__name__} ({canonical!r})"
+            )
+            return
+        recorded_keys, canonical_keys = set(recorded), set(canonical)
+        missing = sorted(canonical_keys - recorded_keys)
+        unexpected = sorted(recorded_keys - canonical_keys)
+        if missing:
+            errors.append(
+                f"{path}: missing key(s) {missing} (present in reconstructed evidence, absent from "
+                f"the recorded manifest)"
+            )
+        if unexpected:
+            errors.append(
+                f"{path}: unexpected key(s) {unexpected} (present in the recorded manifest, absent "
+                f"from reconstructed evidence)"
+            )
+        for key in sorted(recorded_keys & canonical_keys):
+            _strict_compare_values(f"{path}.{key}", recorded[key], canonical[key], errors)
+        return
+
+    if isinstance(canonical, list) or isinstance(recorded, list):
+        if not isinstance(canonical, list) or not isinstance(recorded, list):
+            errors.append(
+                f"{path}: recorded is {type(recorded).__name__} ({recorded!r}), reconstructed is "
+                f"{type(canonical).__name__} ({canonical!r})"
+            )
+            return
+        if len(recorded) != len(canonical):
+            errors.append(
+                f"{path}: recorded has {len(recorded)} entry(ies), reconstructed has "
+                f"{len(canonical)} (exact list length/order is required): recorded={recorded!r} "
+                f"reconstructed={canonical!r}"
+            )
+            return
+        for i, (r_item, c_item) in enumerate(zip(recorded, canonical)):
+            _strict_compare_values(f"{path}[{i}]", r_item, c_item, errors)
+        return
+
+    # Scalars. bool is a subclass of int in Python, so "type(x) is type(y)"
+    # -- never isinstance() -- is required to catch True/False masquerading
+    # as canonical 1/0, and to catch an int masquerading as a canonical
+    # float (or vice versa).
+    if type(recorded) is not type(canonical):
+        errors.append(
+            f"{path}: type mismatch: recorded is {type(recorded).__name__} ({recorded!r}), "
+            f"reconstructed is {type(canonical).__name__} ({canonical!r})"
+        )
+        return
+    if isinstance(canonical, float):
+        if not math.isfinite(canonical) or not math.isfinite(recorded):
+            errors.append(
+                f"{path}: NaN/infinite value rejected outright: recorded={recorded!r} "
+                f"reconstructed={canonical!r}"
+            )
+            return
+    if recorded != canonical:
+        suffix = "tampered or corrupted since it was first validated" if path.endswith("_sha256") else "recomputed fresh from disk"
+        errors.append(f"{path}: recorded {recorded!r} != reconstructed {canonical!r} ({suffix})")
+
+
+def _recheck_inode_identity(campaign_fd: int, profiles_fd: int, case_fds: dict[str, int]) -> list[str]:
+    """Immediately before verify_campaign_evidence_integrity() returns its
+    verdict -- which licenses the caller to publish a terminal manifest
+    revision -- re-confirms that "profiles" and every case name this check
+    trusted still refer to the exact same (device, inode) they did when
+    first opened (Task 4, Section 7, step 9/10). A change here means a name
+    was rebound (deleted and recreated, or symlink-swapped) during this
+    very validation; this fails closed rather than let a later reader trust
+    a name whose target has since moved -- it never re-opens or re-trusts
+    the new target itself."""
+    errors: list[str] = []
+    try:
+        fresh_profiles = os.stat("profiles", dir_fd=campaign_fd, follow_symlinks=False)
+        held_profiles = os.fstat(profiles_fd)
+    except OSError as exc:
+        return [f"profiles/: cannot re-check identity before terminal publication: {exc}"]
+    if stat.S_ISLNK(fresh_profiles.st_mode) or (fresh_profiles.st_dev, fresh_profiles.st_ino) != (
+        held_profiles.st_dev, held_profiles.st_ino,
+    ):
+        errors.append(
+            "profiles/: name-to-inode binding changed during validation; failing closed rather "
+            "than trust a name whose target moved"
+        )
+        return errors  # profiles/ itself rebound: per-case rechecks below would be meaningless
+    for case_name, case_fd in sorted(case_fds.items()):
+        try:
+            fresh_case = os.stat(case_name, dir_fd=profiles_fd, follow_symlinks=False)
+            held_case = os.fstat(case_fd)
+        except OSError as exc:
+            errors.append(f"profiles/{case_name}: cannot re-check identity before terminal publication: {exc}")
+            continue
+        if stat.S_ISLNK(fresh_case.st_mode) or (fresh_case.st_dev, fresh_case.st_ino) != (
+            held_case.st_dev, held_case.st_ino,
+        ):
+            errors.append(
+                f"profiles/{case_name}: name-to-inode binding changed during validation; failing "
+                f"closed rather than trust a name whose target moved"
+            )
     return errors
 
 
 def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> list[str]:
     """Returns a list of errors (empty iff every trusted artifact still
     matches its recorded evidence and every reparsed value still agrees
-    with what was recorded). Never mutates the manifest or the campaign."""
+    with what was recorded). Never mutates the manifest or the campaign.
+
+    The profiles/ inventory and every case's evidence read (Task 4, Section
+    7) are descriptor-anchored: the campaign directory, profiles/, and each
+    of the six case directories are opened exactly once, with
+    O_DIRECTORY|O_NOFOLLOW relative to the previously opened descriptor,
+    and every one of those descriptors is kept open for the *entire*
+    inventory+evidence check below -- including the final inode-identity
+    re-check immediately before this function returns its verdict."""
     errors: list[str] = []
 
     pilot_ref = manifest.get("pilot_campaign_reference")
@@ -2630,23 +3295,9 @@ def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> li
     if plan_errors:
         return errors + [f"internal NCU plan contract violation: {plan_errors}"]
 
-    # Remediation B (blocker B): confirm profiles/ contains *exactly* the six
-    # canonical case directories in profile_plan.csv -- no unplanned extra
-    # entry, none missing, none the wrong type -- before ever trusting
-    # case_results at all. The previous gate never enumerated profiles/'s
-    # actual contents, so an unplanned profiles/99_unplanned_profile/ (or
-    # any other stray entry) was silently ignored regardless of state.
-    errors.extend(verify_profiles_directory_inventory(campaign_dir))
-
     case_results = manifest.get("case_results")
     if not isinstance(case_results, dict):
         return errors + ["case_results is missing or not an object"]
-    expected_case_names = {entry["case_name"] for entry in plan}
-    found_case_names = set(case_results)
-    for missing in sorted(expected_case_names - found_case_names):
-        errors.append(f"profile case {missing} is missing from case_results")
-    for extra in sorted(found_case_names - expected_case_names):
-        errors.append(f"case_results contains unexpected case {extra}")
 
     provenance = manifest.get("provenance")
     if not isinstance(provenance, dict):
@@ -2656,51 +3307,72 @@ def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> li
     if not isinstance(resolved_ncu_metrics, dict):
         resolved_ncu_metrics = {}
 
-    # Remediation D (blocker D): reconstruct each case's complete result from
-    # its authoritative evidence alone -- the same canonical function
-    # validate-profile-case itself used to build it -- and compare the
-    # reconstruction against what is currently recorded as a complete typed
-    # structure (every key), never a hand-picked subset. The previous gate
-    # recomputed several derived values but never compared its own
-    # dram_read_bytes reconstruction (or any resolved_metric_values entry)
-    # against the recorded case_results at all, so either could be silently
-    # tampered without the classification/ratio checks (computed from the
-    # untouched CSV) ever disagreeing with anything.
-    for entry in plan:
-        case_name = entry["case_name"]
-        recorded = case_results.get(case_name)
-        if recorded is None:
-            continue  # already reported as missing above
-        if not isinstance(recorded, dict):
-            errors.append(f"{case_name}: recorded case_results entry is not an object")
-            continue
+    expected_names = {entry["case_name"] for entry in plan}
 
-        paths = _resolve_case_evidence_paths(campaign_dir, case_name, errors)
-        if paths is None:
-            continue
+    # Descriptor-anchored inventory + evidence (Task 4, Section 7): open the
+    # campaign directory and profiles/ exactly once, hold both descriptors
+    # (plus one per case actually opened below) for the whole check, and
+    # only release them after the final inode-identity re-check.
+    try:
+        campaign_parts = campaign_dir.relative_to(REPO_ROOT).parts
+        campaign_fd = _open_dir_component_chain(*campaign_parts)
+    except p13.UnsafePathError as exc:
+        return errors + [f"campaign directory: {exc}"]
+    try:
+        try:
+            profiles_fd = _open_dir_nofollow_p14("profiles", dir_fd=campaign_fd)
+        except p13.UnsafePathError as exc:
+            return errors + [f"profiles/: {exc}"]
+        try:
+            inventory_errors = _list_and_check_profiles_inventory(profiles_fd, expected_names)
+            if inventory_errors:
+                return errors + inventory_errors
 
-        reconstructed, case_errors = reconstruct_case_result(
-            entry=entry, application_csv=paths["application_csv"], metrics_csv=paths["metrics_csv"],
-            ncu_rep=paths["ncu_rep"], provenance=provenance, resolved_ncu_metrics=resolved_ncu_metrics,
-            git_commit=provenance.get("git_commit"),
-        )
-        if reconstructed is None:
-            errors.extend(f"{case_name}: {e}" for e in case_errors)
-            continue
+            found_case_names = set(case_results)
+            for missing in sorted(expected_names - found_case_names):
+                errors.append(f"profile case {missing} is missing from case_results")
+            for extra in sorted(found_case_names - expected_names):
+                errors.append(f"case_results contains unexpected case {extra}")
 
-        for key in sorted(set(reconstructed) | set(recorded)):
-            if reconstructed.get(key) == recorded.get(key):
-                continue
-            if key.endswith("_sha256"):
-                errors.append(
-                    f"{case_name}.{key}: SHA-256 {reconstructed.get(key)!r} != recorded "
-                    f"{recorded.get(key)!r} (tampered or corrupted since it was first validated)"
-                )
-            else:
-                errors.append(
-                    f"{case_name}.{key}: recorded {recorded.get(key)!r} != reconstructed "
-                    f"{reconstructed.get(key)!r} (recomputed fresh from disk)"
-                )
+            case_fds: dict[str, int] = {}
+            try:
+                for entry in plan:
+                    case_name = entry["case_name"]
+                    recorded = case_results.get(case_name)
+                    if recorded is None:
+                        continue  # already reported as missing above
+                    if not isinstance(recorded, dict):
+                        errors.append(f"{case_name}: recorded case_results entry is not an object")
+                        continue
+
+                    try:
+                        evidence_fds = _open_case_evidence_fds(profiles_fd, case_name)
+                    except p13.UnsafePathError as exc:
+                        errors.append(f"{case_name}: {exc}")
+                        continue
+                    case_fds[case_name] = evidence_fds["_case_dir"]
+
+                    reconstructed, case_errors = _reconstruct_case_result_from_fds(
+                        entry=entry, case_name=case_name, fds=evidence_fds, provenance=provenance,
+                        resolved_ncu_metrics=resolved_ncu_metrics, git_commit=provenance.get("git_commit"),
+                    )
+                    for label in ("application_csv", "metrics_csv", "ncu_rep"):
+                        os.close(evidence_fds[label])
+                    if reconstructed is None:
+                        errors.extend(f"{case_name}: {e}" for e in case_errors)
+                        continue
+
+                    _strict_compare_values(case_name, recorded, reconstructed, errors)
+
+                if not errors:
+                    errors.extend(_recheck_inode_identity(campaign_fd, profiles_fd, case_fds))
+            finally:
+                for fd in case_fds.values():
+                    os.close(fd)
+        finally:
+            os.close(profiles_fd)
+    finally:
+        os.close(campaign_fd)
 
     return errors
 
@@ -3402,13 +4074,12 @@ def _run_profile_pipeline(
         raise AssertionError(f"self-test fixture: discover-metrics failed: {errors}")
     for entry in build_ncu_plan():
         dram_bytes = dram_read_bytes_fn(entry) if dram_read_bytes_fn is not None else None
-        app_csv, metrics_csv, ncu_rep, _row = _build_ncu_case_fixture(
+        _build_ncu_case_fixture(
             tmp_path, entry, dram_read_bytes=dram_bytes,
             case_dir=p14_campaign_dir / "profiles" / entry["case_name"],
         )
         ok, errors = _do_validate_profile_case(
-            campaign_dir=p14_campaign_dir, index=entry["index"], application_csv=app_csv,
-            metrics_csv=metrics_csv, ncu_rep=ncu_rep, git_commit=_FIXED_GIT_COMMIT,
+            campaign_dir=p14_campaign_dir, index=entry["index"], git_commit=_FIXED_GIT_COMMIT,
         )
         if not ok:
             raise AssertionError(f"self-test fixture: validate-profile-case {entry['case_name']} failed: {errors}")
@@ -4119,10 +4790,9 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 detail=f"ok={ok} resolved={resolved}",
             )
             case0 = build_ncu_plan()[0]
-            app_csv0, metrics_csv0, ncu_rep0, _ = _build_ncu_case_fixture(tmp_path, case0)
+            _build_ncu_case_fixture(tmp_path, case0, case_dir=p14_dm2 / "profiles" / case0["case_name"])
             case_ok, case_errors = _do_validate_profile_case(
-                campaign_dir=p14_dm2, index=0, application_csv=app_csv0, metrics_csv=metrics_csv0,
-                ncu_rep=ncu_rep0, git_commit=_FIXED_GIT_COMMIT,
+                campaign_dir=p14_dm2, index=0, git_commit=_FIXED_GIT_COMMIT,
             )
             classification_when_unavailable = load_p14_manifest_chain(p14_dm2)[0]["case_results"][case0["case_name"]]["hbm_classification"]
             rec.check(
@@ -4151,20 +4821,22 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             assert ok, errors
 
             case_wrong_kernel = build_ncu_plan()[0]  # ldgsts case
-            app_wk, metrics_wk, rep_wk, _ = _build_ncu_case_fixture(
+            _build_ncu_case_fixture(
                 tmp_path, case_wrong_kernel, kernel_name_in_csv="tma_benchmark_kernel<2,4>(...)",
+                case_dir=p14_vc2 / "profiles" / case_wrong_kernel["case_name"],
             )
             ok, errors = _do_validate_profile_case(
-                campaign_dir=p14_vc2, index=0, application_csv=app_wk, metrics_csv=metrics_wk,
-                ncu_rep=rep_wk, git_commit=_FIXED_GIT_COMMIT,
+                campaign_dir=p14_vc2, index=0, git_commit=_FIXED_GIT_COMMIT,
             )
             rec.expect_error_containing("validate-profile-case rejects a wrong kernel name (item 11)", errors, "kernel name")
 
             case_dup_launch = build_ncu_plan()[1]
-            app_dl, metrics_dl, rep_dl, _ = _build_ncu_case_fixture(tmp_path, case_dup_launch, extra_kernel_row=True)
+            _build_ncu_case_fixture(
+                tmp_path, case_dup_launch, extra_kernel_row=True,
+                case_dir=p14_vc2 / "profiles" / case_dup_launch["case_name"],
+            )
             ok, errors = _do_validate_profile_case(
-                campaign_dir=p14_vc2, index=1, application_csv=app_dl, metrics_csv=metrics_dl,
-                ncu_rep=rep_dl, git_commit=_FIXED_GIT_COMMIT,
+                campaign_dir=p14_vc2, index=1, git_commit=_FIXED_GIT_COMMIT,
             )
             rec.expect_error_containing(
                 "validate-profile-case rejects more than one distinct profiled launch (item 11)", errors,
@@ -4172,13 +4844,13 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             )
 
             case_dup_kernel = build_ncu_plan()[2]
-            app_dk, metrics_dk, rep_dk, _ = _build_ncu_case_fixture(
+            _build_ncu_case_fixture(
                 tmp_path, case_dup_kernel,
                 extra_metric_rows=[["0", "some_other_kernel", "nsecond", "some_other_kernel__metric.sum", "1"]],
+                case_dir=p14_vc2 / "profiles" / case_dup_kernel["case_name"],
             )
             ok, errors = _do_validate_profile_case(
-                campaign_dir=p14_vc2, index=2, application_csv=app_dk, metrics_csv=metrics_dk,
-                ncu_rep=rep_dk, git_commit=_FIXED_GIT_COMMIT,
+                campaign_dir=p14_vc2, index=2, git_commit=_FIXED_GIT_COMMIT,
             )
             rec.expect_error_containing(
                 "validate-profile-case rejects more than one distinct kernel name, same launch ID (item 11)",
@@ -4188,13 +4860,13 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             # Kernel name containing the expected name plus extra text: exact
             # equality only, never substring/prefix/suffix matching.
             case_superset_kernel = build_ncu_plan()[3]
-            app_sk, metrics_sk, rep_sk, _ = _build_ncu_case_fixture(
+            _build_ncu_case_fixture(
                 tmp_path, case_superset_kernel,
                 kernel_name_in_csv=f"{case_superset_kernel['kernel_name']}_v2",
+                case_dir=p14_vc2 / "profiles" / case_superset_kernel["case_name"],
             )
             ok, errors = _do_validate_profile_case(
-                campaign_dir=p14_vc2, index=3, application_csv=app_sk, metrics_csv=metrics_sk,
-                ncu_rep=rep_sk, git_commit=_FIXED_GIT_COMMIT,
+                campaign_dir=p14_vc2, index=3, git_commit=_FIXED_GIT_COMMIT,
             )
             rec.check(
                 "a kernel name containing the expected name plus extra text is rejected, not substring-matched",
@@ -4205,12 +4877,12 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             # A metric recorded as *resolved* during discovery but missing from
             # this case's own CSV is a hard integrity failure, never INCONCLUSIVE.
             case_missing_dram = build_ncu_plan()[4]
-            app_md, metrics_md, rep_md, _ = _build_ncu_case_fixture(
+            _build_ncu_case_fixture(
                 tmp_path, case_missing_dram, omit_metrics=(MANDATORY_DRAM_METRIC,),
+                case_dir=p14_vc2 / "profiles" / case_missing_dram["case_name"],
             )
             ok, errors = _do_validate_profile_case(
-                campaign_dir=p14_vc2, index=4, application_csv=app_md, metrics_csv=metrics_md,
-                ncu_rep=rep_md, git_commit=_FIXED_GIT_COMMIT,
+                campaign_dir=p14_vc2, index=4, git_commit=_FIXED_GIT_COMMIT,
             )
             rec.expect_error_containing(
                 "a resolved-but-missing DRAM metric is a hard validation failure, not INCONCLUSIVE",
@@ -4218,12 +4890,12 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             )
 
             case_missing_optional = build_ncu_plan()[5]
-            app_mo, metrics_mo, rep_mo, _ = _build_ncu_case_fixture(
+            _build_ncu_case_fixture(
                 tmp_path, case_missing_optional, omit_metrics=("lts__t_bytes.sum",),
+                case_dir=p14_vc2 / "profiles" / case_missing_optional["case_name"],
             )
             ok, errors = _do_validate_profile_case(
-                campaign_dir=p14_vc2, index=5, application_csv=app_mo, metrics_csv=metrics_mo,
-                ncu_rep=rep_mo, git_commit=_FIXED_GIT_COMMIT,
+                campaign_dir=p14_vc2, index=5, git_commit=_FIXED_GIT_COMMIT,
             )
             rec.expect_error_containing(
                 "a resolved-but-missing optional metric is also a hard validation failure",
@@ -4231,15 +4903,15 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             )
 
             case_redo = build_ncu_plan()[0]
-            app_redo, metrics_redo, rep_redo, _ = _build_ncu_case_fixture(tmp_path, case_redo)
+            _build_ncu_case_fixture(
+                tmp_path, case_redo, case_dir=p14_vc2 / "profiles" / case_redo["case_name"],
+            )
             ok, errors = _do_validate_profile_case(
-                campaign_dir=p14_vc2, index=0, application_csv=app_redo, metrics_csv=metrics_redo,
-                ncu_rep=rep_redo, git_commit=_FIXED_GIT_COMMIT,
+                campaign_dir=p14_vc2, index=0, git_commit=_FIXED_GIT_COMMIT,
             )
             rec.check("validate-profile-case accepts case 0 on its first, correct submission", ok, detail=f"{errors}")
             ok, errors = _do_validate_profile_case(
-                campaign_dir=p14_vc2, index=0, application_csv=app_redo, metrics_csv=metrics_redo,
-                ncu_rep=rep_redo, git_commit=_FIXED_GIT_COMMIT,
+                campaign_dir=p14_vc2, index=0, git_commit=_FIXED_GIT_COMMIT,
             )
             rec.expect_error_containing(
                 "validate-profile-case refuses to silently re-record an already-validated case (items 24/25)",
@@ -4306,9 +4978,19 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             )
 
             # --- append-only, hash-chained P1.4 manifest revisions (Remediation E) --
+            # The second revision uses a real, legal transition
+            # (PILOT_IN_PROGRESS -> FAILED) rather than an artificial
+            # same-state repeat: PILOT_IN_PROGRESS has no self-loop (Task 4,
+            # Section 9 -- the real --pilot workflow never reports
+            # incremental progress into the P1.4 manifest, so that
+            # same-state edge was removed from ALLOWED_P14_TRANSITIONS).
+            # FAILED/INTERRUPTED are the only transitions reachable from
+            # PILOT_IN_PROGRESS that require no additional manifest fields,
+            # so they exercise the identical two-revision hash-chain
+            # mechanics these tests are actually about.
             def _build_two_revision_campaign(campaign_id: str) -> Path:
                 p14_c = _do_init_campaign(campaign_id=campaign_id, started_at_utc=campaign_id)
-                p14_merge_manifest(p14_c, {}, state="PILOT_IN_PROGRESS")
+                p14_merge_manifest(p14_c, {"failure_stage": "self_test_synthetic"}, state="FAILED")
                 return p14_c
 
             p14_mrev = _do_init_campaign(campaign_id="20260728T170500Z", started_at_utc="20260728T170500Z")
@@ -4325,7 +5007,7 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             merge_raised = False
             with mock.patch.object(p13, "write_manifest_atomic", side_effect=_poison_write_manifest_atomic):
                 try:
-                    p14_merge_manifest(p14_mrev, {}, state="PILOT_IN_PROGRESS")
+                    p14_merge_manifest(p14_mrev, {"failure_stage": "self_test_synthetic"}, state="FAILED")
                 except AssertionError:
                     merge_raised = True
             rec.check(
@@ -4435,12 +5117,11 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 )
                 assert ok, errors
                 for entry in build_ncu_plan():
-                    app_csv, metrics_csv, ncu_rep, _row = _build_ncu_case_fixture(
+                    _build_ncu_case_fixture(
                         tmp_path, entry, case_dir=p14_det / "profiles" / entry["case_name"],
                     )
                     ok, errors = _do_validate_profile_case(
-                        campaign_dir=p14_det, index=entry["index"], application_csv=app_csv,
-                        metrics_csv=metrics_csv, ncu_rep=ncu_rep, git_commit=_FIXED_GIT_COMMIT,
+                        campaign_dir=p14_det, index=entry["index"], git_commit=_FIXED_GIT_COMMIT,
                     )
                     assert ok, errors
                 ok, errors = _do_finalize_profile(campaign_dir=p14_det, completed_at_utc=det_campaign_id)
@@ -4534,12 +5215,11 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             )
             assert ok, errors
             for entry in build_ncu_plan():
-                app_csv, metrics_csv, ncu_rep, _row = _build_ncu_case_fixture(
+                _build_ncu_case_fixture(
                     tmp_path, entry, case_dir=p14_broken / "profiles" / entry["case_name"],
                 )
                 ok, errors = _do_validate_profile_case(
-                    campaign_dir=p14_broken, index=entry["index"], application_csv=app_csv,
-                    metrics_csv=metrics_csv, ncu_rep=ncu_rep, git_commit=_FIXED_GIT_COMMIT,
+                    campaign_dir=p14_broken, index=entry["index"], git_commit=_FIXED_GIT_COMMIT,
                 )
                 assert ok, errors
             ok, errors = _do_finalize_profile(campaign_dir=p14_broken, completed_at_utc="20260728T190300Z")
@@ -4589,12 +5269,11 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             )
             assert ok, errors
             for entry in build_ncu_plan():
-                app_csv, metrics_csv, ncu_rep, _row = _build_ncu_case_fixture(
+                _build_ncu_case_fixture(
                     tmp_path, entry, case_dir=p14_tp / "profiles" / entry["case_name"],
                 )
                 ok, errors = _do_validate_profile_case(
-                    campaign_dir=p14_tp, index=entry["index"], application_csv=app_csv,
-                    metrics_csv=metrics_csv, ncu_rep=ncu_rep, git_commit=_FIXED_GIT_COMMIT,
+                    campaign_dir=p14_tp, index=entry["index"], git_commit=_FIXED_GIT_COMMIT,
                 )
                 assert ok, errors
             ok, errors = _do_finalize_profile(campaign_dir=p14_tp, completed_at_utc="20260728T200300Z")
@@ -5101,6 +5780,257 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 raised,
             )
 
+            # --- Task 4 remediation (Section 9): manifest state-shape validation
+            # -- the exact one-legal-introducing-state mutation matrix, and the
+            # explicit ordered-list case_results check ------------------------
+            def _rewrite_revision_in_place(campaign_dir: Path, revision: int, mutate_fn) -> None:
+                """Overwrites an *existing* revision file in place with a
+                mutated copy of its own content (same revision number,
+                same previous_manifest_sha256) -- used to introduce a pure
+                *shape* defect (a field present too early for its own
+                declared state) without needing a legal state transition to
+                reach a new revision at all; contrast with
+                _append_tampered_manifest_revision, which appends revision
+                N+1 and therefore also exercises transition validation."""
+                path = _manifest_revision_path(campaign_dir, revision)
+                doc = json.loads(path.read_text(encoding="utf-8"))
+                mutate_fn(doc)
+                path.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+            def _check_shape_rejected_at_rev0(label: str, campaign_id: str, mutate_fn, expect_substr: str) -> None:
+                p14_shape = _do_init_campaign(campaign_id=campaign_id, started_at_utc=campaign_id)
+                _rewrite_revision_in_place(p14_shape, 0, mutate_fn)
+                raised_shape, errmsg = False, ""
+                try:
+                    load_p14_manifest_chain(p14_shape)
+                except p13.ManifestTransitionError as exc:
+                    raised_shape, errmsg = True, str(exc)
+                rec.check(
+                    f"manifest state-shape validation rejects {label} (Task 4, Section 9)",
+                    raised_shape and expect_substr in errmsg,
+                    detail=f"raised={raised_shape} errmsg={errmsg}",
+                )
+
+            _check_shape_rejected_at_rev0(
+                "resolved_ncu_metrics present while state=PILOT_IN_PROGRESS", "20260728T230100Z",
+                lambda d: d.__setitem__("resolved_ncu_metrics", {
+                    "requested": [], "resolved": [], "missing": [],
+                    "dram_read_metric": None, "dram_read_metric_available": False,
+                }),
+                "resolved_ncu_metrics",
+            )
+            _check_shape_rejected_at_rev0(
+                "profile_completed_at_utc present while state=PILOT_IN_PROGRESS", "20260728T230200Z",
+                lambda d: d.__setitem__("profile_completed_at_utc", "20260728T230200Z"),
+                "profile_completed_at_utc",
+            )
+            _check_shape_rejected_at_rev0(
+                "preflight_reference_profile present while state=PILOT_IN_PROGRESS", "20260728T230300Z",
+                lambda d: d.__setitem__("preflight_reference_profile", {}),
+                "preflight_reference_profile",
+            )
+            _check_shape_rejected_at_rev0(
+                "failure_stage/failure_detail present while state=PILOT_IN_PROGRESS (not FAILED/INTERRUPTED)",
+                "20260728T230400Z",
+                lambda d: d.__setitem__("failure_stage", "some_stage"),
+                "failure_stage",
+            )
+            # case_results ordering is tested directly against
+            # validate_manifest_state_shape() rather than through a JSON
+            # round-trip: json.dumps(..., sort_keys=True) (used by both
+            # write_next_p14_manifest_revision and this self-test's own
+            # _rewrite_revision_in_place/_append_tampered_manifest_revision
+            # helpers) recursively re-sorts every nested dict's keys,
+            # including case_results itself -- and the frozen case names
+            # ("00_...", "01_...", ..., "05_...") happen to already sort
+            # alphabetically into the correct frozen order, so a reordering
+            # attempt written through any of those helpers would be silently
+            # undone before ever reaching disk. Calling the pure function
+            # directly with an in-memory dict (never serialized) is the
+            # only way to observe a genuinely reordered case_results at all.
+            p14_reorder_base, _ = _run_profile_pipeline(tmp_path, "20260728T230500Z")
+            reorder_manifest, _reorder_rev = load_p14_manifest_chain(p14_reorder_base)
+            reordered_case_results = {
+                name: reorder_manifest["case_results"][name]
+                for name in reversed(list(reorder_manifest["case_results"]))
+            }
+            reordered_manifest = dict(reorder_manifest)
+            reordered_manifest["case_results"] = reordered_case_results
+            shape_errors = validate_manifest_state_shape(reordered_manifest, reorder_manifest["campaign_id"])
+            rec.check(
+                "validate_manifest_state_shape rejects a reordered (but set-identical) "
+                "case_results -- list(case_results) is checked explicitly, never reduced to a "
+                "set comparison (Task 4, Section 9)",
+                any("case_results key order" in e for e in shape_errors),
+                detail=f"errors={shape_errors}",
+            )
+            rec.check(
+                "validate_manifest_state_shape finds no ordering error on the untampered, "
+                "correctly-ordered manifest",
+                not any("case_results key order" in e for e in validate_manifest_state_shape(
+                    reorder_manifest, reorder_manifest["campaign_id"],
+                )),
+            )
+            # End-to-end confirmation through the full load_p14_manifest_chain
+            # pipeline: hand-write the revision file's raw JSON text with
+            # sort_keys=False (an attacker with direct filesystem access is
+            # not obligated to route through json.dumps(sort_keys=True) the
+            # way this codebase's own writer does), so the on-disk bytes
+            # genuinely preserve the reversed case_results order.
+            reorder_rev_path = _manifest_revision_path(p14_reorder_base, _reorder_rev)
+            reorder_doc = json.loads(reorder_rev_path.read_text(encoding="utf-8"))
+            reorder_doc["case_results"] = reordered_case_results
+            reorder_rev_path.write_text(
+                json.dumps(reorder_doc, indent=2, sort_keys=False) + "\n", encoding="utf-8",
+            )
+            raised, errmsg = False, ""
+            try:
+                load_p14_manifest_chain(p14_reorder_base)
+            except p13.ManifestTransitionError as exc:
+                raised, errmsg = True, str(exc)
+            rec.check(
+                "load_p14_manifest_chain end-to-end rejects a manifest revision file whose "
+                "on-disk case_results are genuinely reordered (Task 4, Section 9)",
+                raised and "case_results key order" in errmsg,
+                detail=f"raised={raised} errmsg={errmsg}",
+            )
+
+            p14_count_base, _ = _run_profile_pipeline(tmp_path, "20260728T230600Z")
+            count_rev = load_p14_manifest_chain(p14_count_base)[1]
+            _rewrite_revision_in_place(
+                p14_count_base, count_rev,
+                lambda d: d.__setitem__("profile_count_completed", 99),
+            )
+            raised, errmsg = False, ""
+            try:
+                load_p14_manifest_chain(p14_count_base)
+            except p13.ManifestTransitionError as exc:
+                raised, errmsg = True, str(exc)
+            rec.check(
+                "profile_count_completed disagreeing with len(case_results) is rejected "
+                "(Task 4, Section 9)",
+                raised and "profile_count_completed" in errmsg,
+                detail=f"raised={raised} errmsg={errmsg}",
+            )
+
+            # "analysis hash before ANALYZED": artifact_sha256 gaining an
+            # "analysis/"-prefixed key while state is still COMPLETE (not yet
+            # ANALYZED) -- rewriting the COMPLETE campaign's own latest
+            # revision in place, since COMPLETE has no self-loop to append a
+            # same-state revision through.
+            p14_analysis_early, _ = _run_profile_pipeline(tmp_path, "20260728T230700Z")
+            ok, errors = _do_finalize_profile(campaign_dir=p14_analysis_early, completed_at_utc="20260728T230701Z")
+            assert ok, errors
+            _latest_manifest, _latest_rev = load_p14_manifest_chain(p14_analysis_early)
+            _rewrite_revision_in_place(
+                p14_analysis_early, _latest_rev,
+                lambda d: d.setdefault("artifact_sha256", {}).__setitem__("analysis/early.csv", "0" * 64),
+            )
+            raised, errmsg = False, ""
+            try:
+                load_p14_manifest_chain(p14_analysis_early)
+            except p13.ManifestTransitionError as exc:
+                raised, errmsg = True, str(exc)
+            rec.check(
+                "an analysis/-prefixed artifact_sha256 entry while state=COMPLETE (not yet "
+                "ANALYZED) is rejected (Task 4, Section 9: analysis hash before ANALYZED)",
+                raised and "analysis" in errmsg,
+                detail=f"raised={raised} errmsg={errmsg}",
+            )
+
+            # Same-state no-op revision, and two cases appended in one revision:
+            # both would previously pass ("curr_k >= prev_k" alone permits
+            # curr_k == prev_k and curr_k == prev_k + 2, not just the correct
+            # curr_k == prev_k + 1); appended (not rewritten in place) since
+            # PROFILE_IN_PROGRESS -> PROFILE_IN_PROGRESS *is* otherwise legal.
+            p14_noop = _do_init_campaign(campaign_id="20260728T230800Z", started_at_utc="20260728T230800Z")
+            ok, errors = _do_record_pilot(
+                campaign_dir=p14_noop, p13_campaign_dir=_build_p13_pilot_campaign_fixture(tmp_path, "noop_base")[0],
+                preflight_path=good_preflight_rp, git_commit=_FIXED_GIT_COMMIT,
+                completed_at_utc="20260728T230801Z", now_utc=now_rp,
+            )
+            assert ok, errors
+            disc_noop = tmp_path / "disc_noop.log"
+            disc_noop.write_text("\n".join(CANDIDATE_METRICS) + "\n", encoding="utf-8")
+            ok, errors, _ = _do_discover_metrics(
+                campaign_dir=p14_noop, discovery_log=disc_noop, preflight_path=good_preflight_rp,
+                git_commit=_FIXED_GIT_COMMIT, started_at_utc="20260728T230802Z", now_utc=now_rp,
+            )
+            assert ok, errors
+            noop_entry0 = build_ncu_plan()[0]
+            _build_ncu_case_fixture(tmp_path, noop_entry0, case_dir=p14_noop / "profiles" / noop_entry0["case_name"])
+            ok, errors = _do_validate_profile_case(campaign_dir=p14_noop, index=0, git_commit=_FIXED_GIT_COMMIT)
+            assert ok, errors
+
+            _append_tampered_manifest_revision(p14_noop, lambda m: None)  # no-op: case_results unchanged
+            raised, errmsg = False, ""
+            try:
+                load_p14_manifest_chain(p14_noop)
+            except p13.ManifestTransitionError as exc:
+                raised, errmsg = True, str(exc)
+            rec.check(
+                "a same-state PROFILE_IN_PROGRESS no-op revision (case_results unchanged) is "
+                "rejected (Task 4, Section 9)",
+                raised and "exactly one" in errmsg,
+                detail=f"raised={raised} errmsg={errmsg}",
+            )
+
+            p14_twocase = _do_init_campaign(campaign_id="20260728T230900Z", started_at_utc="20260728T230900Z")
+            ok, errors = _do_record_pilot(
+                campaign_dir=p14_twocase,
+                p13_campaign_dir=_build_p13_pilot_campaign_fixture(tmp_path, "twocase_base")[0],
+                preflight_path=good_preflight_rp, git_commit=_FIXED_GIT_COMMIT,
+                completed_at_utc="20260728T230901Z", now_utc=now_rp,
+            )
+            assert ok, errors
+            disc_twocase = tmp_path / "disc_twocase.log"
+            disc_twocase.write_text("\n".join(CANDIDATE_METRICS) + "\n", encoding="utf-8")
+            ok, errors, _ = _do_discover_metrics(
+                campaign_dir=p14_twocase, discovery_log=disc_twocase, preflight_path=good_preflight_rp,
+                git_commit=_FIXED_GIT_COMMIT, started_at_utc="20260728T230902Z", now_utc=now_rp,
+            )
+            assert ok, errors
+            twocase_entry0 = build_ncu_plan()[0]
+            twocase_entry1 = build_ncu_plan()[1]
+            twocase_dir0 = p14_twocase / "profiles" / twocase_entry0["case_name"]
+            twocase_dir1 = p14_twocase / "profiles" / twocase_entry1["case_name"]
+            _build_ncu_case_fixture(tmp_path, twocase_entry0, case_dir=twocase_dir0)
+            _build_ncu_case_fixture(tmp_path, twocase_entry1, case_dir=twocase_dir1)
+            # Starting from zero validated cases (no legitimate
+            # validate-profile-case call at all), the tampered revision
+            # below jumps directly from 0 to 2 case_results entries in one
+            # step -- skipping the one legitimate intermediate revision the
+            # real workflow always produces (one case at a time).
+            twocase_manifest, _rev = load_p14_manifest_chain(p14_twocase)
+            assert twocase_manifest.get("case_results", {}) == {}, "fixture must start with zero validated cases"
+
+            def _add_two_cases_at_once(m: dict) -> None:
+                for entry, case_dir in ((twocase_entry0, twocase_dir0), (twocase_entry1, twocase_dir1)):
+                    result, recon_errs = reconstruct_case_result(
+                        entry=entry,
+                        application_csv=case_dir / f"{entry['case_name']}.application.csv",
+                        metrics_csv=case_dir / f"{entry['case_name']}.metrics_raw.csv",
+                        ncu_rep=case_dir / f"{entry['case_name']}_report.ncu-rep",
+                        provenance=m["provenance"], resolved_ncu_metrics=m["resolved_ncu_metrics"],
+                        git_commit=_FIXED_GIT_COMMIT,
+                    )
+                    assert result is not None, f"self-test fixture: reconstruct_case_result failed: {recon_errs}"
+                    m.setdefault("case_results", {})[entry["case_name"]] = result
+                m["profile_count_completed"] = len(m["case_results"])
+
+            _append_tampered_manifest_revision(p14_twocase, _add_two_cases_at_once)
+            raised, errmsg = False, ""
+            try:
+                load_p14_manifest_chain(p14_twocase)
+            except p13.ManifestTransitionError as exc:
+                raised, errmsg = True, str(exc)
+            rec.check(
+                "a PROFILE_IN_PROGRESS revision that appends two new cases at once (skipping the "
+                "one-case-at-a-time intermediate revision) is rejected (Task 4, Section 9)",
+                raised and "exactly one" in errmsg,
+                detail=f"raised={raised} errmsg={errmsg}",
+            )
+
     if rec.failures:
         print(
             f"analyze_exp01_memory_paths_p14: self-test: FAILED ({len(rec.failures)}/{rec.total} case(s)): "
@@ -5168,9 +6098,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     vc_parser = subparsers.add_parser("validate-profile-case", help="Validate one captured NCU profile case.")
     vc_parser.add_argument("--campaign-dir", required=True)
     vc_parser.add_argument("--index", required=True, type=int)
-    vc_parser.add_argument("--application-csv", required=True)
-    vc_parser.add_argument("--metrics-csv", required=True)
-    vc_parser.add_argument("--ncu-rep", required=True)
     vc_parser.add_argument("--git-commit", required=True)
     vc_parser.set_defaults(func=cmd_validate_profile_case)
 
