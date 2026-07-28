@@ -112,7 +112,7 @@ check_ncu_help_capability() {
         '--kernel-name-base' '--kernel-name' '--launch-count' \
         '--devices' '--replay-mode' '--query-metrics' '--metrics' \
         '--csv' '--page' '--print-metric-name' '--print-units' \
-        '--log-file' '--import' '--export'
+        '--print-kernel-base' '--log-file' '--import' '--export'
     do
         [ "${pat}" = "--" ] && continue
         if ! grep -qF -- "${pat}" "${help_file}"; then
@@ -129,7 +129,8 @@ check_ncu_help_capability() {
     # multi-line dot-matches-newline behavior.
     for pat in \
         "clock-control:none" "pipeline-boost-state:dynamic" \
-        "cache-control:none" "kernel-name-base:function"
+        "cache-control:none" "kernel-name-base:function" \
+        "print-kernel-base:function"
     do
         flag="${pat%%:*}"
         val="${pat##*:}"
@@ -140,6 +141,29 @@ check_ncu_help_capability() {
     done
 
     [ "${missing}" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# Safe-capture precondition (Remediation D): a log/output target this script
+# is about to write via plain shell redirection must not already lexist --
+# as a regular file, directory, or symlink, dangling or not. `-e` alone
+# follows symlinks and reports false for a dangling one, so a target that is
+# a symlink to a not-yet-existing path would pass an `-e`-only check; `-L`
+# (lstat) catches a symlink regardless of whether its target exists. This
+# script's global `set -o noclobber` already refuses to redirect onto an
+# existing regular file, but that is a separate, implicit, shell/OS-specific
+# guarantee this script does not want to depend on for its own safety
+# argument; the explicit check here makes the property self-contained and
+# auditable, mirroring the analyzer's own lstat-based path-safety primitives.
+# Factored out as a pure function (like check_ncu_help_capability) so
+# --self-test can exercise it without any real campaign tree or Docker.
+# ---------------------------------------------------------------------------
+capture_target_is_safe() {
+    local target="$1"
+    if [ -L "${target}" ] || [ -e "${target}" ]; then
+        return 1
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -278,6 +302,10 @@ run_self_test() {
   --page arg (=details)                 Select report page to output.
   --print-metric-name arg (=label)      Select one of the option to show it in the Metric Name column.
   --print-units arg (=auto)             Set scaling of metric units.
+  --print-kernel-base arg (=demangled)  Set the basis for kernel name output. See --kernel-name-base:
+                                          function
+                                          demangled
+                                          mangled
 EOF
     if check_ncu_help_capability "${ncu_tmp}/good_help.txt"; then
         echo "run_exp01_memory_paths_p14: self-test: PASS: NCU capability gate accepts a complete synthetic --help" >&2
@@ -299,13 +327,67 @@ EOF
     else
         echo "run_exp01_memory_paths_p14: self-test: PASS: NCU capability gate rejects a --help missing the 'dynamic' value" >&2
     fi
+    grep -v -- 'print-kernel-base' "${ncu_tmp}/good_help.txt" > "${ncu_tmp}/missing_print_kernel_base.txt"
+    if check_ncu_help_capability "${ncu_tmp}/missing_print_kernel_base.txt"; then
+        echo "run_exp01_memory_paths_p14: self-test: FAIL: NCU capability gate accepted a --help missing --print-kernel-base" >&2
+        failures=$((failures + 1))
+    else
+        echo "run_exp01_memory_paths_p14: self-test: PASS: NCU capability gate rejects a --help missing --print-kernel-base" >&2
+    fi
     rm -rf "${ncu_tmp}"
+    trap - RETURN
+
+    # --- safe-capture precondition (Remediation D): a pure-function test
+    # against a real temp directory, never a real campaign tree or Docker.
+    # The dangling-symlink case is the one a bare `[ -e ]` check (used before
+    # this remediation) gets wrong: `-e` follows the symlink and reports
+    # false when its target does not exist, so it would treat a dangling
+    # symlink as "safe to write" -- exactly the case `-L` must catch.
+    local capture_tmp
+    capture_tmp="$(mktemp -d)"
+    trap 'rm -rf "${capture_tmp}"' RETURN
+    if capture_target_is_safe "${capture_tmp}/fresh.log"; then
+        echo "run_exp01_memory_paths_p14: self-test: PASS: capture_target_is_safe accepts a fresh, nonexistent target" >&2
+    else
+        echo "run_exp01_memory_paths_p14: self-test: FAIL: capture_target_is_safe rejected a fresh, nonexistent target" >&2
+        failures=$((failures + 1))
+    fi
+    : > "${capture_tmp}/existing.log"
+    if capture_target_is_safe "${capture_tmp}/existing.log"; then
+        echo "run_exp01_memory_paths_p14: self-test: FAIL: capture_target_is_safe accepted an already-existing regular file" >&2
+        failures=$((failures + 1))
+    else
+        echo "run_exp01_memory_paths_p14: self-test: PASS: capture_target_is_safe rejects an already-existing regular file" >&2
+    fi
+    mkdir "${capture_tmp}/existing_dir"
+    if capture_target_is_safe "${capture_tmp}/existing_dir"; then
+        echo "run_exp01_memory_paths_p14: self-test: FAIL: capture_target_is_safe accepted an already-existing directory" >&2
+        failures=$((failures + 1))
+    else
+        echo "run_exp01_memory_paths_p14: self-test: PASS: capture_target_is_safe rejects an already-existing directory" >&2
+    fi
+    ln -s "${capture_tmp}/existing.log" "${capture_tmp}/symlink_to_existing.log"
+    if capture_target_is_safe "${capture_tmp}/symlink_to_existing.log"; then
+        echo "run_exp01_memory_paths_p14: self-test: FAIL: capture_target_is_safe accepted a symlink to an existing file" >&2
+        failures=$((failures + 1))
+    else
+        echo "run_exp01_memory_paths_p14: self-test: PASS: capture_target_is_safe rejects a symlink to an existing file" >&2
+    fi
+    ln -s "${capture_tmp}/does_not_exist_target.log" "${capture_tmp}/broken_symlink.log"
+    if capture_target_is_safe "${capture_tmp}/broken_symlink.log"; then
+        echo "run_exp01_memory_paths_p14: self-test: FAIL: capture_target_is_safe accepted a broken (dangling) symlink" >&2
+        failures=$((failures + 1))
+    else
+        echo "run_exp01_memory_paths_p14: self-test: PASS: capture_target_is_safe rejects a broken (dangling) symlink" >&2
+    fi
+    rm -rf "${capture_tmp}"
     trap - RETURN
 
     _check_rejected_cli "'--help --help'" --help --help || failures=$((failures + 1))
     _check_rejected_cli "'-h --help'" -h --help || failures=$((failures + 1))
     _check_rejected_cli "'--print-plan --print-plan'" --print-plan --print-plan || failures=$((failures + 1))
     _check_rejected_cli "'--self-test --self-test'" --self-test --self-test || failures=$((failures + 1))
+    _check_rejected_cli "'--self-test' followed by positional argument 'plan'" --self-test plan || failures=$((failures + 1))
     _check_rejected_cli "'--pilot --pilot'" --pilot --pilot || failures=$((failures + 1))
     _check_rejected_cli "'--profile --profile'" --profile --profile || failures=$((failures + 1))
     _check_rejected_cli "'--help --print-plan'" --help --print-plan || failures=$((failures + 1))
@@ -486,13 +568,32 @@ fi
 # check-env/memory-*-build.
 # ---------------------------------------------------------------------------
 if [ "${PROFILE_COUNT}" -eq 1 ]; then
-    [ -d "${CAMPAIGN_DIR}" ] \
-        || fail_precondition "P1.4 campaign ${P1_4_CAMPAIGN_ID} does not exist at ${CAMPAIGN_REL}; run --pilot first"
+    # Safely resolve the complete P1.4 campaign tree (symlink-safe at every
+    # component, exactly as the Python analyzer's own resolve_p14_campaign_dir
+    # requires: campaign_dir plus profiles/, analysis/, logs/, manifest/) and
+    # confirm the campaign is PILOT_COMPLETE with a profiling preflight whose
+    # GPU/driver/commit matches the pilot's -- all *before* any Docker/NCU
+    # invocation or raw-tree log write (audit blockers #1 and #4). A plain
+    # `[ -d ... ]` check would follow a symlinked campaign directory instead
+    # of rejecting it, so this reuses the same audited, symlink-safe
+    # resolution and preflight-provenance comparison the Python analyzer
+    # itself enforces again (as a hard gate) inside discover-metrics.
+    echo "run_exp01_memory_paths_p14: --profile: safely resolving the P1.4 campaign tree and checking profiling preconditions (GPU-free)" >&2
+    VPP_RC=0
+    python3 "${P14_ANALYZER_HOST}" validate-profile-preconditions \
+        --campaign-dir "${CAMPAIGN_REL}" --preflight "${P1_4_PREFLIGHT_SUMMARY}" \
+        --git-commit "${GIT_COMMIT}" >&2 || VPP_RC=$?
+    if [ "${VPP_RC}" -eq 2 ]; then
+        fail_precondition "P1.4 campaign ${P1_4_CAMPAIGN_ID} at ${CAMPAIGN_REL} does not safely resolve (missing, never completed --pilot, or an unsafe/symlinked campaign path); see errors above"
+    elif [ "${VPP_RC}" -ne 0 ]; then
+        fail_run "profiling preconditions not met (preflight validation failed, or its GPU/driver/commit does not match the pilot's); see errors above; refusing to start profiling"
+    fi
+    echo "run_exp01_memory_paths_p14: --profile: campaign tree and profiling preconditions verified" >&2
 
     echo "run_exp01_memory_paths_p14: --profile: verifying NCU CLI capability (GPU-free)" >&2
     NCU_HELP_LOG="${CAMPAIGN_DIR}/logs/ncu_help_capability_probe.log"
-    if [ -e "${NCU_HELP_LOG}" ]; then
-        fail_run "stale NCU capability probe log already exists: ${NCU_HELP_LOG}"
+    if ! capture_target_is_safe "${NCU_HELP_LOG}"; then
+        fail_run "stale or symlinked NCU capability probe log already exists: ${NCU_HELP_LOG}"
     fi
     if ! docker run --rm \
             --network none \
@@ -509,17 +610,11 @@ if [ "${PROFILE_COUNT}" -eq 1 ]; then
     fi
     echo "run_exp01_memory_paths_p14: --profile: NCU CLI capability verified" >&2
 
-    echo "run_exp01_memory_paths_p14: --profile: validating a fresh preflight ${P1_4_PREFLIGHT_SUMMARY}" >&2
-    if ! python3 "${P14_ANALYZER_HOST}" validate-preflight \
-            --preflight "${P1_4_PREFLIGHT_SUMMARY}" --expected-git-commit "${GIT_COMMIT}" >&2; then
-        fail_run "preflight validation failed; see errors above; refusing to start profiling"
-    fi
-
     echo "run_exp01_memory_paths_p14: --profile: discovering supported NCU metrics on logical device 0" >&2
     DISCOVERY_STDOUT="${CAMPAIGN_DIR}/logs/metric_discovery.stdout.log"
     DISCOVERY_STDERR="${CAMPAIGN_DIR}/logs/metric_discovery.stderr.log"
-    if [ -e "${DISCOVERY_STDOUT}" ] || [ -e "${DISCOVERY_STDERR}" ]; then
-        fail_run "stale metric discovery log(s) already exist under ${CAMPAIGN_DIR}/logs/"
+    if ! capture_target_is_safe "${DISCOVERY_STDOUT}" || ! capture_target_is_safe "${DISCOVERY_STDERR}"; then
+        fail_run "stale or symlinked metric discovery log(s) already exist under ${CAMPAIGN_DIR}/logs/"
     fi
     export BLACKWELL_GPU_INDEX
     if ! "${RUN_CONTAINER}" ncu --query-metrics --query-metrics-mode all --devices 0 \
@@ -629,6 +724,7 @@ if [ "${PROFILE_COUNT}" -eq 1 ]; then
                 "${IMAGE_TAG}" \
                 ncu --import "${report_base_rel}.ncu-rep" \
                     --csv --page raw --print-metric-name name --print-units base \
+                    --print-kernel-base function \
                 >"${metrics_csv}" 2>"${metrics_export_stderr}"; then
             write_p14_manifest_status FAILED "profile_export_${p_case_name}" || true
             CAMPAIGN_OUTCOME=FAILED

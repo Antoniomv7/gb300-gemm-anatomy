@@ -181,6 +181,7 @@ ALLOWED_P14_MANIFEST_KEYS: dict[str, object] = {
     "profile_completed_at_utc": (str, type(None)),
     "analyzed_at_utc": (str, type(None)),
     "frozen_protocol": dict,
+    "profile_plan_sha256": str,
     "pilot_campaign_reference": dict,
     "preflight_reference_pilot": dict,
     "preflight_reference_profile": dict,
@@ -401,6 +402,38 @@ def validate_preflight_file(
     return [], snapshot
 
 
+# Fields both preflight snapshots share, by construction, since both come
+# from validate_preflight_file/validate_preflight_fields. gpu_driver_version
+# here is always the NVIDIA display-driver string reported by
+# scripts/preflight.sh's gpu.driver_version -- never compare it against the
+# separate, integer-encoded cuda_driver_version/cuda_runtime_version fields
+# recorded elsewhere in P1.3 provenance; those are a different representation
+# of a different thing (the CUDA driver/runtime API version, not the NVIDIA
+# kernel driver package) and crossing that boundary would be comparing
+# incomparable values. This function only ever takes two same-shaped preflight
+# snapshots, so that boundary cannot be crossed by construction.
+PREFLIGHT_PROVENANCE_FIELDS = ("git_commit", "gpu_uuid", "gpu_name", "gpu_compute_cap", "gpu_driver_version")
+
+
+def compare_preflight_provenance(pilot_snapshot: dict, profile_snapshot: dict) -> list[str]:
+    """Fail-closed comparison of the pilot-phase and profiling-phase preflight
+    snapshots recorded for the same P1.4 campaign (audit blocker #1: a
+    profiling preflight with a different GPU UUID/name/driver from the pilot
+    preflight must never be silently accepted). Returns one error per
+    differing field; empty iff every field matches exactly."""
+    errors: list[str] = []
+    for field in PREFLIGHT_PROVENANCE_FIELDS:
+        pilot_value = pilot_snapshot.get(field)
+        profile_value = profile_snapshot.get(field)
+        if pilot_value != profile_value:
+            errors.append(
+                f"profile preflight {field}={profile_value!r} != pilot preflight "
+                f"{field}={pilot_value!r} (the pilot and profiling phases of one "
+                f"campaign must run on the identical GPU/driver/commit)"
+            )
+    return errors
+
+
 # ---------------------------------------------------------------------------
 # P1.4 campaign-ID validation and symlink-safe raw-tree primitives. Reuses
 # p13's generic lstat-based path-safety helpers (they only ever reference
@@ -427,10 +460,12 @@ def validate_p14_campaign_id(campaign_id: str) -> None:
 
 def create_p14_campaign_dir(campaign_id: str) -> Path:
     """Centralized, symlink-safe P1.4 campaign creation. Walks
-    results/raw/exp01_memory_paths_p14/<campaign_id>/{profiles,analysis,logs}
+    results/raw/exp01_memory_paths_p14/<campaign_id>/{profiles,analysis,logs,manifest}
     one component at a time via lstat (p13._mkdir_component), refusing a
     symlink or wrong-type object at any level (including the raw root
-    itself), and fails if the campaign directory already exists."""
+    itself), and fails if the campaign directory already exists. `manifest/`
+    holds the append-only, immutable manifest revision chain (see
+    load_p14_manifest_chain / write_next_p14_manifest_revision)."""
     validate_p14_campaign_id(campaign_id)
     current = REPO_ROOT
     for part in RAW_ROOT_PARTS_P14:
@@ -438,7 +473,7 @@ def create_p14_campaign_dir(campaign_id: str) -> Path:
         p13._mkdir_component(current, must_not_exist=False)
     campaign_dir = current / campaign_id
     p13._mkdir_component(campaign_dir, must_not_exist=True)
-    for sub in ("profiles", "analysis", "logs"):
+    for sub in ("profiles", "analysis", "logs", "manifest"):
         p13._mkdir_component(campaign_dir / sub, must_not_exist=False)
     return campaign_dir
 
@@ -468,7 +503,7 @@ def resolve_p14_campaign_dir(campaign_dir_rel: str) -> Path:
         if not os.path.lexists(current):
             raise p13.UnsafePathError(f"{current}: does not exist")
     p13._confirm_contained(current, REPO_ROOT)
-    for subdir_name in ("profiles", "analysis", "logs"):
+    for subdir_name in ("profiles", "analysis", "logs", "manifest"):
         subdir = current / subdir_name
         p13._reject_if_symlink_or_wrong_type(subdir, expect_dir=True)
         if not os.path.lexists(subdir):
@@ -550,11 +585,18 @@ def validate_profile_plan_file(path: Path, plan: list[dict]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# P1.4 manifest: allowlisted keys/types, enforced state machine. Reuses
-# p13.write_manifest_atomic (generic: writes <campaign_dir>/manifest.json
-# with the same no-clobber-except-verified-prior-identity discipline),
-# p13.load_manifest (generic JSON load with the same symlink/regular-file
-# safety), p13._manifest_type_matches, and p13._validate_compact_timestamp.
+# P1.4 manifest: allowlisted keys/types, enforced state machine. P1.4's own
+# manifest state is published as an append-only, immutable revision chain
+# (campaign_dir/manifest/000000.json, 000001.json, ...; see
+# load_p14_manifest_chain / write_next_p14_manifest_revision below) -- it
+# never calls p13.write_manifest_atomic (which uses os.replace() to
+# atomically *replace* manifest.json in place; P1.3's own campaign manifest
+# is a separate, frozen, audited input that keeps using that mechanism
+# unmodified). This module reuses p13._manifest_type_matches and
+# p13._validate_compact_timestamp (generic schema-type helpers), and the
+# generic lstat-based path-safety/no-clobber primitives (_open_exclusive,
+# _publish_no_clobber, _reject_if_symlink_or_wrong_type, _mkdir_component,
+# _open_regular_nofollow, sha256_of) for the revision files themselves.
 # ---------------------------------------------------------------------------
 def _validate_p14_manifest_updates(updates: dict) -> None:
     unknown = set(updates) - set(ALLOWED_P14_MANIFEST_KEYS)
@@ -608,7 +650,7 @@ def _validate_p14_manifest_document(manifest: dict, *, require_initialized: bool
     required_by_state = {
         "PILOT_IN_PROGRESS": {
             "schema_version", "experiment_id", "campaign_id", "state", "publishable",
-            "started_at_utc", "frozen_protocol",
+            "started_at_utc", "frozen_protocol", "profile_plan_sha256",
         },
         "PILOT_COMPLETE": {
             "pilot_completed_at_utc", "pilot_campaign_reference", "preflight_reference_pilot",
@@ -638,14 +680,153 @@ def _validate_p14_manifest_document(manifest: dict, *, require_initialized: bool
         raise p13.ManifestTransitionError(f"P1.4 manifest state={state!r} cannot retain failure_stage")
 
 
+MANIFEST_REVISION_RE = re.compile(r"^(\d{6})\.json$")
+MANIFEST_REVISION_TMP_NAME = ".manifest_revision.tmp"
+MANIFEST_REVISION_KEYS = ("manifest_revision", "previous_manifest_sha256")
+
+
+def _p14_manifest_dir(campaign_dir: Path) -> Path:
+    return campaign_dir / "manifest"
+
+
+def _manifest_revision_path(campaign_dir: Path, revision: int) -> Path:
+    return _p14_manifest_dir(campaign_dir) / f"{revision:06d}.json"
+
+
+def load_p14_manifest_chain(campaign_dir: Path) -> tuple[dict, int]:
+    """Safely reopens, hash-chains, and validates every manifest revision
+    under campaign_dir/manifest/. Returns (current_manifest_content,
+    highest_valid_revision_index); ({}, -1) if no revision exists yet.
+
+    Raises ManifestTransitionError on any chain defect: an extra, missing,
+    reordered, malformed, or symlinked revision; a broken previous-hash
+    link; or a revision whose content fails the ordinary P1.4 manifest
+    schema (_validate_p14_manifest_document). Every revision is reopened
+    and its hash is recomputed fresh from disk on every call -- nothing
+    about an earlier revision is ever trusted from memory."""
+    manifest_dir = _p14_manifest_dir(campaign_dir)
+    try:
+        p13._reject_if_symlink_or_wrong_type(manifest_dir, expect_dir=True)
+    except p13.UnsafePathError as exc:
+        raise p13.ManifestTransitionError(str(exc)) from exc
+    if not os.path.lexists(manifest_dir):
+        return {}, -1
+
+    try:
+        names = sorted(os.listdir(manifest_dir))
+    except OSError as exc:
+        raise p13.ManifestTransitionError(f"{manifest_dir}: cannot list revisions: {exc}") from exc
+    revision_names = [n for n in names if MANIFEST_REVISION_RE.fullmatch(n)]
+    other_names = [n for n in names if n not in revision_names and n != MANIFEST_REVISION_TMP_NAME]
+    if other_names:
+        raise p13.ManifestTransitionError(
+            f"{manifest_dir}: unexpected entries in manifest revision directory: {sorted(other_names)}"
+        )
+    if not revision_names:
+        return {}, -1
+    expected_names = [f"{i:06d}.json" for i in range(len(revision_names))]
+    if revision_names != expected_names:
+        raise p13.ManifestTransitionError(
+            f"{manifest_dir}: manifest revisions are not exactly contiguous "
+            f"000000..{len(revision_names) - 1:06d}.json: found {revision_names!r}"
+        )
+
+    previous_hash: str | None = None
+    current_content: dict = {}
+    for i, name in enumerate(expected_names):
+        path = manifest_dir / name
+        try:
+            p13._reject_if_symlink_or_wrong_type(path, expect_dir=False)
+            with p13._open_regular_nofollow(path, binary=False) as handle:
+                text = handle.read()
+        except (OSError, p13.UnsafePathError, UnicodeError) as exc:
+            raise p13.ManifestTransitionError(f"{path}: cannot load manifest revision: {exc}") from exc
+        try:
+            doc = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise p13.ManifestTransitionError(f"{path}: invalid JSON: {exc}") from exc
+        if not isinstance(doc, dict):
+            raise p13.ManifestTransitionError(f"{path}: revision root is not a JSON object")
+        if doc.get("manifest_revision") != i:
+            raise p13.ManifestTransitionError(
+                f"{path}: manifest_revision={doc.get('manifest_revision')!r} != expected {i}"
+            )
+        expected_previous_hash = None if i == 0 else previous_hash
+        if doc.get("previous_manifest_sha256") != expected_previous_hash:
+            raise p13.ManifestTransitionError(
+                f"{path}: previous_manifest_sha256={doc.get('previous_manifest_sha256')!r} != "
+                f"expected {expected_previous_hash!r} (hash chain broken or tampered)"
+            )
+        content = {k: v for k, v in doc.items() if k not in MANIFEST_REVISION_KEYS}
+        try:
+            _validate_p14_manifest_document(content)
+        except p13.ManifestTransitionError as exc:
+            raise p13.ManifestTransitionError(f"{path}: {exc}") from exc
+        current_content = content
+        try:
+            previous_hash = p13.sha256_of(path)
+        except p13.UnsafePathError as exc:
+            raise p13.ManifestTransitionError(f"{path}: cannot hash revision: {exc}") from exc
+
+    return current_content, len(expected_names) - 1
+
+
+def write_next_p14_manifest_revision(campaign_dir: Path, manifest_content: dict) -> dict:
+    """Appends one new, immutable manifest revision under campaign_dir/manifest/.
+
+    Never overwrites an existing revision and never calls os.replace(): the
+    new revision is written to a fixed-name temporary via exclusive, no-follow
+    creation, then published as the next contiguous revision number via
+    hard-link-then-unlink no-clobber (mirrors every other P1.4 result
+    artifact). Re-derives the next revision number and the previous
+    revision's hash by re-reading the chain from disk immediately before
+    writing, so a concurrent publication attempt for the same next revision
+    fails closed at the final hard-link step (only one writer's os.link()
+    can ever succeed for a given revision path); an interrupted write leaves
+    only a harmless, unrecognized temporary name, never a partial or
+    replaced revision."""
+    manifest_dir = _p14_manifest_dir(campaign_dir)
+    p13._mkdir_component(manifest_dir, must_not_exist=False)
+    _current, current_revision = load_p14_manifest_chain(campaign_dir)
+    new_revision = current_revision + 1
+    previous_hash = None
+    if current_revision >= 0:
+        previous_hash = p13.sha256_of(_manifest_revision_path(campaign_dir, current_revision))
+
+    doc = dict(manifest_content)
+    doc["manifest_revision"] = new_revision
+    doc["previous_manifest_sha256"] = previous_hash
+    text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
+
+    tmp_path = manifest_dir / MANIFEST_REVISION_TMP_NAME
+    if os.path.lexists(tmp_path):
+        raise p13.UnsafePathError(f"{tmp_path}: stale manifest-revision temporary already exists")
+    final_path = _manifest_revision_path(campaign_dir, new_revision)
+    try:
+        with p13._open_exclusive(tmp_path, binary=False) as handle:
+            handle.write(text)
+    except Exception:
+        if os.path.lexists(tmp_path):
+            p13._safe_unlink_owned(tmp_path)
+        raise
+    try:
+        p13._publish_no_clobber(tmp_path, final_path)
+    except p13.UnsafePathError:
+        if os.path.lexists(tmp_path):
+            p13._safe_unlink_owned(tmp_path)
+        raise
+    return manifest_content
+
+
 def p14_merge_manifest(campaign_dir: Path, updates: dict, state: str) -> dict:
-    """Merges `updates` into manifest.json and sets `state`, enforcing the
-    P1.4 state machine (ALLOWED_P14_TRANSITIONS): a terminal campaign can
-    never be reopened/rewritten, and every key in `updates` must be
-    allowlisted with the correct type. Mirrors p13.merge_manifest's
-    discipline for its own, separate schema."""
+    """Merges `updates` into the P1.4 manifest and sets `state`, enforcing
+    the P1.4 state machine (ALLOWED_P14_TRANSITIONS): a terminal campaign
+    can never be reopened/rewritten, and every key in `updates` must be
+    allowlisted with the correct type. Publication uses the append-only,
+    immutable revision chain (write_next_p14_manifest_revision) -- never
+    p13.write_manifest_atomic / os.replace()."""
     _validate_p14_manifest_updates(updates)
-    manifest = p13.load_manifest(campaign_dir)
+    manifest, _revision = load_p14_manifest_chain(campaign_dir)
     _validate_p14_manifest_document(manifest)
     current_state = manifest.get("state")
     allowed = ALLOWED_P14_TRANSITIONS.get(current_state, frozenset())
@@ -668,7 +849,7 @@ def p14_merge_manifest(campaign_dir: Path, updates: dict, state: str) -> dict:
     manifest["state"] = state
     manifest["publishable"] = False
     _validate_p14_manifest_document(manifest, require_initialized=True)
-    p13.write_manifest_atomic(campaign_dir, manifest)
+    write_next_p14_manifest_revision(campaign_dir, manifest)
     return manifest
 
 
@@ -911,98 +1092,150 @@ def classify_hbm(dram_read_bytes: float | None, useful_bytes: float) -> tuple[st
 # NCU raw-CSV metrics parsing.
 #
 # ASSUMPTION (documented, not directly testable without a live GPU — see
-# src/memory/P1_4_PROTOCOL.md and the implementation handoff): NCU
-# 2025.4.0.0's `--page raw --csv --print-metric-name name --print-units
-# base` export is a long-form table with one row per (kernel launch,
-# metric), including literal columns "Kernel Name", "Metric Name", and
-# "Metric Value" (well-established, stable NCU CSV conventions). The parser
-# below is deliberately defensive: it locates the metric-name/value columns
-# by exact header name first, falls back to a structural heuristic (a metric
-# identifier always contains "__"), and fails closed (raises) rather than
-# guessing if it cannot confidently locate both columns. The very first real
-# profiling run should sanity-check metrics_raw.csv against this parser
-# before trusting its HBM_VALIDATED/INCONCLUSIVE output.
+# src/memory/P1_4_PROTOCOL.md and the remediation handoff): NCU 2025.4.0.0's
+# `--page raw --csv --print-metric-name name --print-units base
+# --print-kernel-base function` export is a long-form table with one row per
+# (kernel launch, metric), including literal columns "ID", "Kernel Name",
+# "Metric Name", "Metric Unit", and "Metric Value" (well-established, stable
+# NCU CSV conventions; --print-kernel-base's allowed values mirror
+# --kernel-name-base, confirmed against the pinned image's real `ncu --help`).
+# The parser below is fail-closed: it requires these five columns to be
+# present, unique, and non-empty per row; a single distinct launch ID; a
+# single distinct kernel name; exactly one row per metric name (never two,
+# even with equal values); finite, non-negative metric values; and an exact
+# (case/whitespace-normalized, never scaled) unit match against
+# EXPECTED_METRIC_UNITS for each of the five candidate metrics. It never
+# invents a default, never falls back to a structural heuristic, and never
+# accepts substring/partial evidence. The very first real profiling run
+# should sanity-check metrics_raw.csv against this parser before trusting
+# its HBM_VALIDATED/INCONCLUSIVE output.
 # ---------------------------------------------------------------------------
 class NcuCsvParseError(ValueError):
     pass
 
 
-def _find_column(fieldnames: list[str], *, exact_names: tuple[str, ...]) -> str | None:
-    lower_map = {name.strip().lower(): name for name in fieldnames}
-    for candidate in exact_names:
-        if candidate.lower() in lower_map:
-            return lower_map[candidate.lower()]
-    return None
+REQUIRED_NCU_CSV_COLUMNS = ("ID", "Kernel Name", "Metric Name", "Metric Unit", "Metric Value")
+
+# Documented, NCU-2025.4-specific assumption for the one percentage-valued
+# candidate metric: base-unit CSV export reports it as "%". This has not
+# been verified against a live GPU collection (see P1_4_PROTOCOL.md); the
+# first real profiling run should confirm it before trusting a mismatch (or
+# lack of one) for dram__throughput.avg.pct_of_peak_sustained_elapsed.
+EXPECTED_METRIC_UNITS = {
+    "dram__bytes_read.sum": "byte",
+    "dram__bytes_write.sum": "byte",
+    "lts__t_bytes.sum": "byte",
+    "gpu__time_duration.sum": "nsecond",
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": "%",
+}
 
 
 def parse_ncu_raw_csv(path: Path) -> dict:
     """Parses an NCU `--page raw --csv` export. Returns a dict with keys
-    'metrics' (metric name -> float value), 'kernel_names' (sorted set of
-    distinct kernel-name strings seen), and 'launch_count' (number of
-    distinct launch identifiers seen, best-effort). Raises NcuCsvParseError
-    if the file cannot be confidently parsed."""
+    'metrics' (metric name -> float value), 'units' (metric name -> the
+    exact unit string recorded for it), 'kernel_name' (the single distinct
+    kernel name found), and 'launch_id' (the single distinct launch ID
+    found). Raises NcuCsvParseError on any defect -- see the module
+    docstring above for the complete list of rejected conditions."""
     try:
         with p13._open_regular_nofollow(path, binary=False) as handle:
-            reader = csv.DictReader(handle)
-            fieldnames = reader.fieldnames
-            rows = list(reader)
+            rows_raw = list(csv.reader(handle))
     except (OSError, p13.UnsafePathError, UnicodeError) as exc:
         raise NcuCsvParseError(f"{path}: unable to read: {exc}") from exc
-    if not fieldnames:
-        raise NcuCsvParseError(f"{path}: no header row")
-    if not rows:
+    if not rows_raw:
+        raise NcuCsvParseError(f"{path}: empty file (no header)")
+
+    header = rows_raw[0]
+    if len(header) != len(set(header)):
+        duplicates = sorted({h for h in header if header.count(h) > 1})
+        raise NcuCsvParseError(f"{path}: duplicate header column name(s): {duplicates}")
+    missing_columns = [c for c in REQUIRED_NCU_CSV_COLUMNS if c not in header]
+    if missing_columns:
+        raise NcuCsvParseError(
+            f"{path}: missing required column(s) {missing_columns} in header {header!r}"
+        )
+    col_index = {name: header.index(name) for name in REQUIRED_NCU_CSV_COLUMNS}
+
+    data_rows = rows_raw[1:]
+    if not data_rows:
         raise NcuCsvParseError(f"{path}: no data rows")
 
-    name_col = _find_column(fieldnames, exact_names=("Metric Name",))
-    value_col = _find_column(fieldnames, exact_names=("Metric Value",))
-    kernel_col = _find_column(fieldnames, exact_names=("Kernel Name",))
-    id_col = _find_column(fieldnames, exact_names=("ID",))
-
-    if name_col is None or value_col is None:
-        # Structural fallback: a metric identifier always contains "__".
-        for field in fieldnames:
-            sample_values = [row.get(field, "") for row in rows]
-            if name_col is None and any("__" in (v or "") for v in sample_values):
-                name_col = field
-        if name_col is not None and value_col is None:
-            idx = fieldnames.index(name_col)
-            if idx + 1 < len(fieldnames):
-                value_col = fieldnames[idx + 1]
-    if name_col is None or value_col is None:
-        raise NcuCsvParseError(
-            f"{path}: could not locate both a metric-name and metric-value column "
-            f"in header {fieldnames!r}"
-        )
-
+    launch_ids: set[str] = set()
+    kernel_names: set[str] = set()
     metrics: dict[str, float] = {}
-    for row in rows:
-        metric_name = (row.get(name_col) or "").strip()
+    units: dict[str, str] = {}
+    for line_no, row in enumerate(data_rows, start=2):
+        if len(row) != len(header):
+            raise NcuCsvParseError(
+                f"{path}: line {line_no}: expected {len(header)} field(s), got {len(row)}"
+            )
+        launch_id = row[col_index["ID"]].strip()
+        kernel_name = row[col_index["Kernel Name"]].strip()
+        metric_name = row[col_index["Metric Name"]].strip()
+        metric_unit = row[col_index["Metric Unit"]].strip()
+        raw_value = row[col_index["Metric Value"]].strip()
+
+        if not launch_id:
+            raise NcuCsvParseError(f"{path}: line {line_no}: empty launch ID")
+        if not kernel_name:
+            raise NcuCsvParseError(f"{path}: line {line_no}: empty kernel name")
         if not metric_name:
-            continue
-        raw_value = row.get(value_col)
-        if raw_value is None or raw_value.strip() == "":
-            raise NcuCsvParseError(f"{path}: metric {metric_name!r} has an empty value")
+            raise NcuCsvParseError(f"{path}: line {line_no}: empty metric name")
+        if not metric_unit:
+            raise NcuCsvParseError(f"{path}: line {line_no}: empty metric unit for {metric_name!r}")
+        if not raw_value:
+            raise NcuCsvParseError(f"{path}: line {line_no}: empty metric value for {metric_name!r}")
+
         try:
             value = float(raw_value)
         except ValueError as exc:
             raise NcuCsvParseError(
-                f"{path}: metric {metric_name!r} value {raw_value!r} is not a number"
+                f"{path}: line {line_no}: metric {metric_name!r} value {raw_value!r} is not a number"
             ) from exc
         if not math.isfinite(value):
-            raise NcuCsvParseError(f"{path}: metric {metric_name!r} value {raw_value!r} is not finite")
-        if metric_name in metrics and metrics[metric_name] != value:
             raise NcuCsvParseError(
-                f"{path}: metric {metric_name!r} appears more than once with different values "
-                f"({metrics[metric_name]!r} vs {value!r}) -- more than one profiled launch?"
+                f"{path}: line {line_no}: metric {metric_name!r} value {raw_value!r} is not finite"
+            )
+        if value < 0:
+            raise NcuCsvParseError(
+                f"{path}: line {line_no}: metric {metric_name!r} value {value!r} is negative"
+            )
+
+        expected_unit = EXPECTED_METRIC_UNITS.get(metric_name)
+        if expected_unit is not None and metric_unit.strip().lower() != expected_unit.strip().lower():
+            raise NcuCsvParseError(
+                f"{path}: line {line_no}: metric {metric_name!r} has unit {metric_unit!r}, "
+                f"expected exactly {expected_unit!r} (base units are matched case/whitespace-"
+                f"insensitively but never scaled or converted)"
+            )
+
+        launch_ids.add(launch_id)
+        kernel_names.add(kernel_name)
+        if metric_name in metrics:
+            raise NcuCsvParseError(
+                f"{path}: metric {metric_name!r} appears more than once "
+                f"(duplicate rows for a resolved metric are rejected even when values agree)"
             )
         metrics[metric_name] = value
+        units[metric_name] = metric_unit
 
-    kernel_names = sorted({(row.get(kernel_col) or "").strip() for row in rows if kernel_col}) if kernel_col else []
-    launch_ids = sorted({(row.get(id_col) or "").strip() for row in rows if id_col}) if id_col else []
+    if len(launch_ids) > 1:
+        raise NcuCsvParseError(
+            f"{path}: {len(launch_ids)} distinct launch IDs found ({sorted(launch_ids)!r}), "
+            f"expected exactly 1 (--launch-count 1 should guarantee this)"
+        )
+    if len(kernel_names) > 1:
+        raise NcuCsvParseError(
+            f"{path}: {len(kernel_names)} distinct kernel names found ({sorted(kernel_names)!r}), "
+            f"expected exactly 1"
+        )
+
     return {
         "metrics": metrics,
-        "kernel_names": [k for k in kernel_names if k],
-        "launch_count": len(launch_ids) if launch_ids else 1,
+        "units": units,
+        "kernel_name": next(iter(kernel_names)),
+        "launch_id": next(iter(launch_ids)),
+        "launch_count": len(launch_ids),
     }
 
 
@@ -1387,7 +1620,11 @@ def _do_init_campaign(*, campaign_id: str, started_at_utc: str) -> Path:
     ncu_errors = check_ncu_plan_contract(ncu_plan)
     if ncu_errors:
         raise ValueError(f"internal NCU plan contract violation: {ncu_errors}")
-    write_profile_plan(campaign_dir, ncu_plan)
+    profile_plan_path = write_profile_plan(campaign_dir, ncu_plan)
+    # Recorded once, here, as the trusted reference hash the central evidence-
+    # integrity gate (verify_campaign_evidence_integrity) re-derives and
+    # compares profile_plan.csv against before COMPLETE and before ANALYZED.
+    profile_plan_sha256 = p13.sha256_of(profile_plan_path)
     frozen_protocol = {
         "pilot_params": dict(FROZEN_PILOT_PARAMS),
         "profile_params": dict(FROZEN_PROFILE_PARAMS),
@@ -1405,6 +1642,7 @@ def _do_init_campaign(*, campaign_id: str, started_at_utc: str) -> Path:
         "campaign_id": campaign_id,
         "started_at_utc": started_at_utc,
         "frozen_protocol": frozen_protocol,
+        "profile_plan_sha256": profile_plan_sha256,
     }
     p14_merge_manifest(campaign_dir, updates, state="PILOT_IN_PROGRESS")
     return campaign_dir
@@ -1449,7 +1687,7 @@ def cmd_validate_preflight(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 def _fail_p14(campaign_dir: Path, stage: str, errors: list[str]) -> tuple[bool, list[str]]:
     try:
-        manifest = p13.load_manifest(campaign_dir)
+        manifest, _revision = load_p14_manifest_chain(campaign_dir)
         current_state = manifest.get("state")
         if current_state in ALLOWED_P14_TRANSITIONS and "FAILED" in ALLOWED_P14_TRANSITIONS[current_state]:
             p14_merge_manifest(
@@ -1465,7 +1703,7 @@ def _do_record_pilot(
     git_commit: str, completed_at_utc: str, now_utc: _datetime,
 ) -> tuple[bool, list[str]]:
     try:
-        manifest = p13.load_manifest(campaign_dir)
+        manifest, _revision = load_p14_manifest_chain(campaign_dir)
         _validate_p14_manifest_document(manifest, require_initialized=True)
     except (p13.ManifestTransitionError, p13.UnsafePathError) as exc:
         return False, [f"P1.4 manifest: {exc}"]
@@ -1649,7 +1887,7 @@ def _do_discover_metrics(
     git_commit: str, started_at_utc: str, now_utc: _datetime,
 ) -> tuple[bool, list[str], dict | None]:
     try:
-        manifest = p13.load_manifest(campaign_dir)
+        manifest, _revision = load_p14_manifest_chain(campaign_dir)
         _validate_p14_manifest_document(manifest, require_initialized=True)
     except (p13.ManifestTransitionError, p13.UnsafePathError) as exc:
         return False, [f"P1.4 manifest: {exc}"], None
@@ -1663,6 +1901,19 @@ def _do_discover_metrics(
         preflight_path, expected_git_commit=git_commit, now_utc=now_utc,
     )
     errors.extend(f"preflight: {e}" for e in preflight_errors)
+
+    # Audit blocker #1: a profiling preflight from a different GPU/driver/
+    # commit than the one the pilot ran on must never be silently accepted,
+    # regardless of whether the bash orchestrator already ran
+    # validate-profile-preconditions first -- this is the hard gate at the
+    # exact point preflight_reference_profile is recorded and the campaign
+    # commits to PROFILE_IN_PROGRESS.
+    if not preflight_errors:
+        pilot_preflight_snapshot = manifest.get("preflight_reference_pilot")
+        if not isinstance(pilot_preflight_snapshot, dict):
+            errors.append("manifest preflight_reference_pilot is missing or incomplete")
+        else:
+            errors.extend(compare_preflight_provenance(pilot_preflight_snapshot, preflight_snapshot))
 
     try:
         discovered = parse_metric_discovery_log(discovery_log)
@@ -1724,6 +1975,76 @@ def cmd_discover_metrics(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: validate-profile-preconditions (Remediation A, audit blocker #1)
+#
+# GPU-free, side-effect-free precondition gate for entering the profiling
+# phase: confirms the campaign is PILOT_COMPLETE, validates a freshly
+# captured preflight snapshot, and fail-closed compares it against the
+# pilot-phase preflight already recorded in the manifest. Writes nothing --
+# run_exp01_memory_paths_p14.sh calls this immediately after capturing the
+# fresh preflight and before any Docker/NCU invocation or raw-tree log write
+# (Remediation D), so a GPU/driver swap between the pilot and profiling runs
+# aborts before any expensive or irreversible work happens. discover-metrics
+# also runs the same compare_preflight_provenance check itself as a hard gate
+# at the point preflight_reference_profile is actually recorded, so this
+# subcommand is an early, cheap check -- not the only enforcement point.
+# ---------------------------------------------------------------------------
+def _do_validate_profile_preconditions(
+    *, campaign_dir: Path, preflight_path: Path, git_commit: str, now_utc: _datetime,
+) -> tuple[bool, list[str]]:
+    try:
+        manifest, _revision = load_p14_manifest_chain(campaign_dir)
+        _validate_p14_manifest_document(manifest, require_initialized=True)
+    except (p13.ManifestTransitionError, p13.UnsafePathError) as exc:
+        return False, [f"P1.4 manifest: {exc}"]
+    if manifest.get("state") != "PILOT_COMPLETE":
+        return False, [
+            f"P1.4 manifest state={manifest.get('state')!r} != 'PILOT_COMPLETE'; "
+            f"cannot check profiling preconditions"
+        ]
+    pilot_snapshot = manifest.get("preflight_reference_pilot")
+    if not isinstance(pilot_snapshot, dict):
+        return False, ["manifest preflight_reference_pilot is missing or incomplete"]
+
+    preflight_errors, profile_snapshot = validate_preflight_file(
+        preflight_path, expected_git_commit=git_commit, now_utc=now_utc,
+    )
+    if preflight_errors:
+        return False, [f"preflight: {e}" for e in preflight_errors]
+
+    provenance_errors = compare_preflight_provenance(pilot_snapshot, profile_snapshot)
+    if provenance_errors:
+        return False, provenance_errors
+    return True, []
+
+
+def cmd_validate_profile_preconditions(args: argparse.Namespace) -> int:
+    try:
+        campaign_dir = resolve_p14_campaign_dir(args.campaign_dir)
+    except p13.UnsafePathError as exc:
+        print(f"analyze_exp01_memory_paths_p14: validate-profile-preconditions: ERROR: {exc}", file=sys.stderr)
+        return 2
+    now_utc = _datetime.now(_timezone.utc)
+    if args.now is not None:
+        try:
+            now_utc = parse_now_arg(args.now)
+        except ValueError as exc:
+            print(f"analyze_exp01_memory_paths_p14: validate-profile-preconditions: ERROR: {exc}", file=sys.stderr)
+            return 2
+    ok, errors = _do_validate_profile_preconditions(
+        campaign_dir=campaign_dir, preflight_path=Path(args.preflight),
+        git_commit=args.git_commit, now_utc=now_utc,
+    )
+    if not ok:
+        print("analyze_exp01_memory_paths_p14: validate-profile-preconditions: ERROR:", file=sys.stderr)
+        for error in errors:
+            print(f"analyze_exp01_memory_paths_p14: validate-profile-preconditions:   - {error}", file=sys.stderr)
+        return 1
+    print("analyze_exp01_memory_paths_p14: validate-profile-preconditions: OK", file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: validate-profile-case
 #
 # Mirrors p13's cmd_validate_case: a single-case validator that never
@@ -1743,7 +2064,7 @@ def _do_validate_profile_case(
         return False, [f"index {index} is not one of the frozen NCU case indices 0..{EXPECTED_NCU_CASE_COUNT - 1}"]
 
     try:
-        manifest = p13.load_manifest(campaign_dir)
+        manifest, _revision = load_p14_manifest_chain(campaign_dir)
         _validate_p14_manifest_document(manifest, require_initialized=True)
     except (p13.ManifestTransitionError, p13.UnsafePathError) as exc:
         return False, [f"P1.4 manifest: {exc}"]
@@ -1788,27 +2109,29 @@ def _do_validate_profile_case(
     except NcuCsvParseError as exc:
         errors.append(str(exc))
 
+    resolved_ncu_metrics = manifest.get("resolved_ncu_metrics", {})
     if parsed_metrics is not None:
-        if parsed_metrics["launch_count"] > 1:
+        # Exact function-name match only -- never substring/regex matching.
+        # The only accepted values are the two frozen benchmark kernel names.
+        if parsed_metrics["kernel_name"] != entry["kernel_name"]:
             errors.append(
-                f"metrics CSV records {parsed_metrics['launch_count']} distinct profiled launches, "
-                f"expected exactly 1 (--launch-count 1 should guarantee this)"
+                f"metrics CSV kernel name {parsed_metrics['kernel_name']!r} != expected exact "
+                f"function name {entry['kernel_name']!r} (no substring/regex matching is permitted)"
             )
-        if len(parsed_metrics["kernel_names"]) > 1:
-            errors.append(
-                f"metrics CSV records more than one distinct kernel name: "
-                f"{parsed_metrics['kernel_names']!r}, expected exactly one"
-            )
-        elif parsed_metrics["kernel_names"] and entry["kernel_name"] not in parsed_metrics["kernel_names"][0]:
-            errors.append(
-                f"metrics CSV kernel name {parsed_metrics['kernel_names'][0]!r} does not contain "
-                f"expected base function name {entry['kernel_name']!r}"
-            )
+        # A metric recorded as *resolved* during discovery but absent, duplicated,
+        # malformed, or wrong-unit in this case's own CSV is an integrity failure --
+        # never silently reclassified as INCONCLUSIVE.
+        for resolved_metric in resolved_ncu_metrics.get("resolved", []):
+            if resolved_metric not in parsed_metrics["metrics"]:
+                errors.append(
+                    f"metrics CSV is missing resolved metric {resolved_metric!r} "
+                    f"(recorded as resolved during metric discovery; this is an evidence "
+                    f"integrity failure, not an INCONCLUSIVE HBM classification)"
+                )
 
     if errors:
         return False, errors
 
-    resolved_ncu_metrics = manifest.get("resolved_ncu_metrics", {})
     dram_available = bool(resolved_ncu_metrics.get("dram_read_metric_available"))
     dram_read_bytes = parsed_metrics["metrics"].get(MANDATORY_DRAM_METRIC) if dram_available else None
     useful_bytes = float(app_row["useful_bytes"])
@@ -1872,13 +2195,217 @@ def cmd_validate_profile_case(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Central evidence-integrity gate (Remediation B). One function, used
+# unmodified immediately before both PROFILE_IN_PROGRESS -> COMPLETE
+# (finalize-profile) and COMPLETE -> ANALYZED (analyze): safely reopens,
+# recomputes, and compares the hashes of every trusted input the P1.4
+# manifest depends on (pilot preflight, profile preflight, P1.3 terminal
+# manifest, P1.3 combined_samples.csv/summary.csv, this campaign's own
+# profile_plan.csv, and each of the six frozen cases' application CSV /
+# metrics_raw.csv / .ncu-rep), and reparses every application CSV and NCU
+# metrics CSV to confirm the reconstructed values still match the recorded
+# case_results. Never trusts a hash sitting in memory from an earlier
+# manifest transition -- every hash is recomputed fresh from disk on every
+# call. Per-case paths are derived only from the frozen NCU plan and
+# canonical case names, never from any stored path string.
+# ---------------------------------------------------------------------------
+def _verify_hash(label: str, path: Path, expected_sha256: object, errors: list[str]) -> None:
+    if not isinstance(expected_sha256, str) or not p13._is_sha256_hex(expected_sha256):
+        errors.append(f"{label}: no valid recorded SHA-256 to verify against (got {expected_sha256!r})")
+        return
+    try:
+        actual = p13.sha256_of(path)
+    except p13.UnsafePathError as exc:
+        errors.append(f"{label}: {exc}")
+        return
+    if actual != expected_sha256:
+        errors.append(
+            f"{label}: {path} SHA-256 {actual} != recorded {expected_sha256} "
+            f"(tampered or corrupted since it was first validated)"
+        )
+
+
+def _resolve_case_evidence_paths(campaign_dir: Path, case_name: str, errors: list[str]) -> dict[str, Path] | None:
+    """Derives the three per-case artifact paths from the frozen plan and
+    canonical case name alone (never a stored path), and verifies the case
+    directory and each artifact are non-symlink regular files contained
+    within campaign_dir/profiles/ before returning them."""
+    profiles_dir = campaign_dir / "profiles"
+    case_dir = profiles_dir / case_name
+    try:
+        p13._reject_if_symlink_or_wrong_type(case_dir, expect_dir=True)
+        if not os.path.lexists(case_dir):
+            errors.append(f"{case_name}: profile case directory does not exist: {case_dir}")
+            return None
+        p13._confirm_contained(case_dir, profiles_dir)
+    except p13.UnsafePathError as exc:
+        errors.append(f"{case_name}: {exc}")
+        return None
+
+    paths = {
+        "application_csv": case_dir / f"{case_name}.application.csv",
+        "metrics_csv": case_dir / f"{case_name}.metrics_raw.csv",
+        "ncu_rep": case_dir / f"{case_name}_report.ncu-rep",
+    }
+    for label, path in paths.items():
+        artifact_err = p13._verify_artifact(path)
+        if artifact_err:
+            errors.append(f"{case_name}.{label}: {artifact_err}")
+            return None
+        try:
+            p13._confirm_contained(path, case_dir)
+        except p13.UnsafePathError as exc:
+            errors.append(f"{case_name}.{label}: {exc}")
+            return None
+    return paths
+
+
+def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> list[str]:
+    """Returns a list of errors (empty iff every trusted artifact still
+    matches its recorded evidence and every reparsed value still agrees
+    with what was recorded). Never mutates the manifest or the campaign."""
+    errors: list[str] = []
+
+    pilot_ref = manifest.get("pilot_campaign_reference")
+    if not isinstance(pilot_ref, dict) or "path" not in pilot_ref:
+        return ["pilot_campaign_reference is missing or incomplete; cannot verify pilot evidence"]
+    try:
+        p13_campaign_dir = resolve_p13_campaign_dir_arg(pilot_ref["path"])
+    except p13.UnsafePathError as exc:
+        return [f"pilot_campaign_reference.path: {exc}"]
+
+    _verify_hash("P1.3 manifest.json", p13_campaign_dir / "manifest.json",
+                 pilot_ref.get("manifest_sha256"), errors)
+    _verify_hash("P1.3 combined_samples.csv", p13_campaign_dir / "combined_samples.csv",
+                 pilot_ref.get("combined_samples_sha256"), errors)
+    _verify_hash("P1.3 summary.csv", p13_campaign_dir / "summary.csv",
+                 pilot_ref.get("summary_sha256"), errors)
+
+    preflight_pilot = manifest.get("preflight_reference_pilot", {})
+    if isinstance(preflight_pilot, dict) and preflight_pilot.get("path"):
+        _verify_hash("pilot preflight summary", Path(preflight_pilot["path"]),
+                     preflight_pilot.get("sha256"), errors)
+    else:
+        errors.append("preflight_reference_pilot is missing or incomplete")
+
+    preflight_profile = manifest.get("preflight_reference_profile", {})
+    if isinstance(preflight_profile, dict) and preflight_profile.get("path"):
+        _verify_hash("profile preflight summary", Path(preflight_profile["path"]),
+                     preflight_profile.get("sha256"), errors)
+    else:
+        errors.append("preflight_reference_profile is missing or incomplete")
+
+    _verify_hash("P1.4 profile_plan.csv", campaign_dir / "profile_plan.csv",
+                 manifest.get("profile_plan_sha256"), errors)
+
+    plan = build_ncu_plan()
+    plan_errors = check_ncu_plan_contract(plan)
+    if plan_errors:
+        return errors + [f"internal NCU plan contract violation: {plan_errors}"]
+
+    case_results = manifest.get("case_results")
+    if not isinstance(case_results, dict):
+        return errors + ["case_results is missing or not an object"]
+    expected_case_names = {entry["case_name"] for entry in plan}
+    found_case_names = set(case_results)
+    for missing in sorted(expected_case_names - found_case_names):
+        errors.append(f"profile case {missing} is missing from case_results")
+    for extra in sorted(found_case_names - expected_case_names):
+        errors.append(f"case_results contains unexpected case {extra}")
+
+    provenance = manifest.get("provenance")
+    if not isinstance(provenance, dict):
+        provenance = {}
+        errors.append("provenance is missing or not an object")
+    resolved_ncu_metrics = manifest.get("resolved_ncu_metrics", {})
+    dram_available = bool(resolved_ncu_metrics.get("dram_read_metric_available"))
+    resolved_metrics = resolved_ncu_metrics.get("resolved", [])
+
+    for entry in plan:
+        case_name = entry["case_name"]
+        recorded = case_results.get(case_name)
+        if recorded is None:
+            continue  # already reported as missing above
+
+        paths = _resolve_case_evidence_paths(campaign_dir, case_name, errors)
+        if paths is None:
+            continue
+
+        _verify_hash(f"{case_name} application CSV", paths["application_csv"],
+                     recorded.get("application_csv_sha256"), errors)
+        _verify_hash(f"{case_name} metrics CSV", paths["metrics_csv"],
+                     recorded.get("metrics_csv_sha256"), errors)
+        _verify_hash(f"{case_name} .ncu-rep", paths["ncu_rep"],
+                     recorded.get("ncu_rep_sha256"), errors)
+
+        expect = {
+            "method": entry["method"], "stages": entry["stages"], "bif_kib": entry["bif_kib"],
+            "run_kind": FROZEN_PROFILE_PARAMS["run_kind"], "repetitions": FROZEN_PROFILE_PARAMS["repetitions"],
+            "passes": FROZEN_PROFILE_PARAMS["passes"], "warmup_ms": FROZEN_PROFILE_PARAMS["warmup_ms"],
+            "working_set_mib": FROZEN_PROFILE_PARAMS["working_set_mib"],
+            "git_commit": provenance.get("git_commit"),
+        }
+        app_rows, app_errors = p13.validate_case_file(paths["application_csv"], expect)
+        if app_errors:
+            errors.extend(f"{case_name} application CSV: {e}" for e in app_errors)
+            continue
+        app_row = app_rows[0]
+        for field in (
+            "gpu_uuid", "gpu_name", "compute_capability", "cuda_driver_version",
+            "cuda_runtime_version", "working_set_bytes", "passes",
+        ):
+            if str(app_row.get(field)) != str(provenance.get(field)):
+                errors.append(
+                    f"{case_name} application CSV {field}={app_row.get(field)!r} != pilot "
+                    f"provenance {field}={provenance.get(field)!r}"
+                )
+        if str(app_row.get("useful_bytes")) != str(recorded.get("useful_bytes")):
+            errors.append(
+                f"{case_name}: reparsed useful_bytes={app_row.get('useful_bytes')!r} != "
+                f"recorded case_results useful_bytes={recorded.get('useful_bytes')!r}"
+            )
+
+        try:
+            parsed_metrics = parse_ncu_raw_csv(paths["metrics_csv"])
+        except NcuCsvParseError as exc:
+            errors.append(f"{case_name} metrics CSV: {exc}")
+            continue
+        if parsed_metrics["kernel_name"] != entry["kernel_name"]:
+            errors.append(
+                f"{case_name}: reparsed kernel name {parsed_metrics['kernel_name']!r} != "
+                f"expected exact {entry['kernel_name']!r}"
+            )
+        for resolved_metric in resolved_metrics:
+            if resolved_metric not in parsed_metrics["metrics"]:
+                errors.append(f"{case_name}: reparsed metrics CSV is missing resolved metric {resolved_metric!r}")
+
+        reparsed_dram_bytes = parsed_metrics["metrics"].get(MANDATORY_DRAM_METRIC) if dram_available else None
+        reparsed_useful_bytes = float(app_row["useful_bytes"])
+        reparsed_classification, _reparsed_flags, reparsed_ratio = classify_hbm(
+            reparsed_dram_bytes, reparsed_useful_bytes,
+        )
+        if reparsed_classification != recorded.get("hbm_classification"):
+            errors.append(
+                f"{case_name}: reparsed hbm_classification={reparsed_classification!r} != "
+                f"recorded {recorded.get('hbm_classification')!r}"
+            )
+        if reparsed_ratio != recorded.get("dram_read_ratio"):
+            errors.append(
+                f"{case_name}: reparsed dram_read_ratio={reparsed_ratio!r} != "
+                f"recorded {recorded.get('dram_read_ratio')!r}"
+            )
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: finalize-profile
 # ---------------------------------------------------------------------------
 def _do_finalize_profile(
     *, campaign_dir: Path, completed_at_utc: str,
 ) -> tuple[bool, list[str]]:
     try:
-        manifest = p13.load_manifest(campaign_dir)
+        manifest, _revision = load_p14_manifest_chain(campaign_dir)
         _validate_p14_manifest_document(manifest, require_initialized=True)
     except (p13.ManifestTransitionError, p13.UnsafePathError) as exc:
         return False, [f"P1.4 manifest: {exc}"]
@@ -1917,13 +2444,15 @@ def _do_finalize_profile(
     if errors:
         return _fail_p14(campaign_dir, "profile_finalize", errors)
 
-    try:
-        profile_plan_hash = p13.sha256_of(profile_plan_path)
-    except p13.UnsafePathError as exc:
-        return _fail_p14(campaign_dir, "profile_finalize_hashing", [str(exc)])
+    # Central evidence-integrity gate: re-reads and recomputes every trusted
+    # hash and reparses every application/metrics CSV from disk, rejecting
+    # any tampering that happened after validate-profile-case recorded it.
+    integrity_errors = verify_campaign_evidence_integrity(campaign_dir, manifest)
+    if integrity_errors:
+        return _fail_p14(campaign_dir, "profile_finalize_integrity", integrity_errors)
 
     artifact_sha256 = dict(manifest.get("artifact_sha256", {}))
-    artifact_sha256["profile_plan.csv"] = profile_plan_hash
+    artifact_sha256["profile_plan.csv"] = manifest["profile_plan_sha256"]
     pilot_ref = manifest.get("pilot_campaign_reference", {})
     for key in ("manifest_sha256", "combined_samples_sha256", "summary_sha256"):
         if key in pilot_ref:
@@ -2077,12 +2606,20 @@ def _write_text_no_clobber(path: Path, text: str) -> None:
 
 def _do_analyze(*, campaign_dir: Path, analyzed_at_utc: str) -> tuple[bool, list[str]]:
     try:
-        manifest = p13.load_manifest(campaign_dir)
+        manifest, _revision = load_p14_manifest_chain(campaign_dir)
         _validate_p14_manifest_document(manifest, require_initialized=True)
     except (p13.ManifestTransitionError, p13.UnsafePathError) as exc:
         return False, [f"P1.4 manifest: {exc}"]
     if manifest.get("state") != "COMPLETE":
         return False, [f"P1.4 manifest state={manifest.get('state')!r} != 'COMPLETE'; cannot analyze"]
+
+    # Central evidence-integrity gate: the exact same function finalize-profile
+    # calls before COMPLETE, re-run here before ANALYZED. Re-reads and
+    # recomputes every trusted hash and reparses every application/metrics
+    # CSV from disk; rejects any tampering that happened after finalize-profile.
+    integrity_errors = verify_campaign_evidence_integrity(campaign_dir, manifest)
+    if integrity_errors:
+        return False, integrity_errors
 
     errors: list[str] = []
     pilot_ref = manifest.get("pilot_campaign_reference", {})
@@ -2090,15 +2627,6 @@ def _do_analyze(*, campaign_dir: Path, analyzed_at_utc: str) -> tuple[bool, list
         return False, ["manifest pilot_campaign_reference is missing or incomplete"]
     p13_campaign_dir = REPO_ROOT / pilot_ref["path"]
     combined_path = p13_campaign_dir / "combined_samples.csv"
-    try:
-        combined_hash = p13.sha256_of(combined_path)
-    except p13.UnsafePathError as exc:
-        return False, [str(exc)]
-    if combined_hash != pilot_ref.get("combined_samples_sha256"):
-        return False, [
-            "combined_samples.csv no longer matches the SHA-256 recorded at record-pilot time "
-            "(tampered or corrupted since); refusing to analyze"
-        ]
 
     samples_by_config = _read_combined_samples(combined_path)
     expected_configs = {(m, s, b) for m in p13.METHODS for (s, b) in p13.CONFIG_PAIRS}
@@ -2335,8 +2863,8 @@ def _default_preflight_doc(
     *, timestamp_utc: str = "20260728T100000Z", overall_status: str = "PASS",
     git_dirty: bool = False, git_commit: str = _FIXED_GIT_COMMIT,
     gpu_uuid: str = _FIXED_GPU_UUID, gpu_name: str = _FIXED_GPU_NAME,
-    compute_cap: str = "10.3", gpu_visibility_status: str = "PASS",
-    ncu_profile_status: str = "PASS",
+    compute_cap: str = "10.3", driver_version: str = "580.95.05",
+    gpu_visibility_status: str = "PASS", ncu_profile_status: str = "PASS",
 ) -> dict:
     return {
         "schema_version": "1",
@@ -2347,7 +2875,7 @@ def _default_preflight_doc(
         "tool_versions": {"nvcc": "release 13.1", "ncu": "version 2025.4.0.0"},
         "gpu": {
             "logical_index": "0", "name": gpu_name, "uuid": gpu_uuid,
-            "driver_version": "580.95.05", "compute_cap": compute_cap, "memory_total": "288 GiB",
+            "driver_version": driver_version, "compute_cap": compute_cap, "memory_total": "288 GiB",
         },
         "checks": [
             {"name": "gpu_visibility", "required": True, "status": gpu_visibility_status, "reason_code": "OK"},
@@ -2382,10 +2910,17 @@ def _build_p13_pilot_campaign_fixture(
     benchmark campaign directly on disk, reusing p13's own fixture/aggregate
     helpers (_default_row, write_execution_order, write_combined_samples,
     write_summary, merge_manifest, sha256_of) so it is byte-for-byte the
-    shape a real P1.3 finalize produces. Returns (campaign_dir, manifest)."""
+    shape a real P1.3 finalize produces. Placed at the same canonical
+    results/raw/exp01_memory_paths/<campaign_id> path a real P1.3 campaign
+    occupies (relative to the patched REPO_ROOT) so that the recorded
+    pilot_campaign_reference.path later re-resolves through the same strict
+    resolve_p13_campaign_dir_arg the evidence-integrity gate uses -- this
+    fixture must model production layout, not a synthetic shortcut. Returns
+    (campaign_dir, manifest)."""
     plan = p13.build_plan()
-    campaign_dir = tmp_path / "p13_campaigns" / campaign_id
+    campaign_dir = tmp_path.joinpath(*p13.RAW_ROOT_PARTS, campaign_id)
     (campaign_dir / "cases").mkdir(parents=True)
+    (campaign_dir / "logs").mkdir(parents=True)
     cases: list[tuple[dict, list[dict]]] = []
     for entry in plan:
         rows = []
@@ -2462,35 +2997,70 @@ def _build_ncu_case_fixture(
     gpu_uuid: str = _FIXED_GPU_UUID, gpu_name: str = _FIXED_GPU_NAME,
     dram_read_bytes: float | None = None, extra_metric_rows: list[list[str]] | None = None,
     kernel_name_in_csv: str | None = None, extra_kernel_row: bool = False,
+    omit_metrics: tuple[str, ...] = (), unit_overrides: dict[str, str] | None = None,
+    value_overrides: dict[str, str] | None = None, header_override: list[str] | None = None,
+    duplicate_header: bool = False, resolved_metrics: tuple[str, ...] = CANDIDATE_METRICS,
+    case_dir: Path | None = None,
 ) -> tuple[Path, Path, Path, dict]:
     """Builds one application CSV + metrics_raw.csv + .ncu-rep for a given
-    NCU_PLAN entry. Returns (application_csv, metrics_csv, ncu_rep, row)."""
+    NCU_PLAN entry. By default writes exactly one row per metric in
+    `resolved_metrics` (all five candidates, matching a campaign where every
+    candidate metric resolved) with correct exact base units, and the exact
+    un-templated kernel name --print-kernel-base function would produce.
+    `case_dir`, when given, is the directory the three artifacts are written
+    into -- pass campaign_dir/"profiles"/case_name so the fixture matches the
+    real layout _resolve_case_evidence_paths re-derives paths from (required
+    for any caller that goes on to finalize-profile/analyze successfully);
+    omit it (default: tmp_path directly) for standalone parser-only cases
+    that never reach finalize-profile. Returns
+    (application_csv, metrics_csv, ncu_rep, row)."""
     row = p13._default_row(
         entry, 0, repetitions=1, run_kind="benchmark", passes=32, warmup_ms=0,
         git_commit=git_commit, working_set_mib=512,
         overrides={"gpu_uuid": gpu_uuid, "gpu_name": gpu_name},
     )
-    app_csv = tmp_path / f"{entry['case_name']}.application.csv"
+    out_dir = case_dir if case_dir is not None else tmp_path
+    out_dir.mkdir(parents=True, exist_ok=True)
+    app_csv = out_dir / f"{entry['case_name']}.application.csv"
     p13._write_case_csv(app_csv, [row])
     useful_bytes = int(row["useful_bytes"])
     if dram_read_bytes is None:
         dram_read_bytes = useful_bytes * 0.95
-    metrics_csv = tmp_path / f"{entry['case_name']}.metrics_raw.csv"
-    kernel_name_field = kernel_name_in_csv or f"{entry['kernel_name']}<2,4>(...)"
+    default_values: dict[str, str] = {
+        MANDATORY_DRAM_METRIC: f"{dram_read_bytes}",
+        "dram__bytes_write.sum": f"{useful_bytes * 0.1}",
+        "dram__throughput.avg.pct_of_peak_sustained_elapsed": "72.5",
+        "lts__t_bytes.sum": f"{useful_bytes * 1.02}",
+        "gpu__time_duration.sum": "123456",
+    }
+    unit_overrides = unit_overrides or {}
+    value_overrides = value_overrides or {}
+    metrics_csv = out_dir / f"{entry['case_name']}.metrics_raw.csv"
+    kernel_name_field = kernel_name_in_csv or entry["kernel_name"]
+    header = header_override if header_override is not None else [
+        "ID", "Kernel Name", "Metric Unit", "Metric Name", "Metric Value",
+    ]
     with open(metrics_csv, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["ID", "Kernel Name", "Metric Unit", "Metric Name", "Metric Value"])
-        writer.writerow(["0", kernel_name_field, "byte", "dram__bytes_read.sum", f"{dram_read_bytes}"])
-        writer.writerow(["0", kernel_name_field, "nsecond", "gpu__time_duration.sum", "123456"])
+        if duplicate_header:
+            writer.writerow(header + [header[0]])
+        else:
+            writer.writerow(header)
+        for metric_name in resolved_metrics:
+            if metric_name in omit_metrics:
+                continue
+            unit = unit_overrides.get(metric_name, EXPECTED_METRIC_UNITS[metric_name])
+            value = value_overrides.get(metric_name, default_values[metric_name])
+            writer.writerow(["0", kernel_name_field, unit, metric_name, value])
         if extra_kernel_row:
-            # Same metric name and value as the row above (no value conflict in
-            # parse_ncu_raw_csv), but a distinct kernel name/ID: this isolates
-            # the "more than one distinct profiled launch" check from the
-            # separate "conflicting metric value" check.
-            writer.writerow(["1", "some_other_kernel(...)", "nsecond", "gpu__time_duration.sum", "123456"])
+            # A distinct kernel name/ID with its own, otherwise-unused metric
+            # name (never one of the five candidates), so this row triggers
+            # only the "more than one distinct kernel/launch" check -- never
+            # also the separate "duplicate metric name" check.
+            writer.writerow(["1", "some_other_kernel", "nsecond", "some_other_kernel__metric.sum", "1"])
         for extra in extra_metric_rows or []:
             writer.writerow(extra)
-    ncu_rep = tmp_path / f"{entry['case_name']}_report.ncu-rep"
+    ncu_rep = out_dir / f"{entry['case_name']}_report.ncu-rep"
     ncu_rep.write_bytes(b"synthetic ncu report bytes, never a real profile\n")
     return app_csv, metrics_csv, ncu_rep, row
 
@@ -2527,6 +3097,7 @@ def _run_profile_pipeline(
         dram_bytes = dram_read_bytes_fn(entry) if dram_read_bytes_fn is not None else None
         app_csv, metrics_csv, ncu_rep, _row = _build_ncu_case_fixture(
             tmp_path, entry, dram_read_bytes=dram_bytes,
+            case_dir=p14_campaign_dir / "profiles" / entry["case_name"],
         )
         ok, errors = _do_validate_profile_case(
             campaign_dir=p14_campaign_dir, index=entry["index"], application_csv=app_csv,
@@ -2643,33 +3214,144 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             except OSError:
                 rec.check("symlinked preflight input is rejected (item 23)", True, detail="symlink unsupported; skipped")
 
-            # --- malformed units, negative, empty, NaN/infinite metrics (item 13) --
+            # --- fail-closed NCU CSV parser (Remediation C / spec Section 7) -------
             plan0 = ncu_plan[0]
-            good_csv = tmp_path / "metrics_good.csv"
-            with open(good_csv, "w", newline="", encoding="utf-8") as fh:
-                w = csv.writer(fh)
-                w.writerow(["ID", "Kernel Name", "Metric Unit", "Metric Name", "Metric Value"])
-                w.writerow(["0", f"{plan0['kernel_name']}<2,4>(...)", "byte", "dram__bytes_read.sum", "1000000"])
+            _NCU_HEADER = ["ID", "Kernel Name", "Metric Unit", "Metric Name", "Metric Value"]
+
+            def _write_ncu_csv(path: Path, header: list[str], rows: list[list[str]]) -> Path:
+                with open(path, "w", newline="", encoding="utf-8") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(header)
+                    for row in rows:
+                        w.writerow(row)
+                return path
+
+            good_csv = _write_ncu_csv(
+                tmp_path / "metrics_good.csv", _NCU_HEADER,
+                [["0", plan0["kernel_name"], "byte", "dram__bytes_read.sum", "1000000"]],
+            )
             parsed = parse_ncu_raw_csv(good_csv)
             rec.check(
-                "well-formed metrics CSV parses to a float value",
-                parsed["metrics"].get("dram__bytes_read.sum") == 1000000.0,
+                "well-formed metrics CSV parses to a float value with the exact kernel name and unit",
+                parsed["metrics"].get("dram__bytes_read.sum") == 1000000.0
+                and parsed["kernel_name"] == plan0["kernel_name"]
+                and parsed["units"]["dram__bytes_read.sum"] == "byte",
                 detail=f"parsed={parsed}",
             )
+
             for label, value in (
-                ("empty", ""), ("NaN", "nan"), ("infinite", "inf"), ("non-numeric", "not-a-number"),
+                ("empty", ""), ("NaN", "nan"), ("infinite", "inf"), ("negative-infinite", "-inf"),
+                ("non-numeric", "not-a-number"), ("negative", "-5"),
             ):
-                bad_csv = tmp_path / f"metrics_bad_{label}.csv"
-                with open(bad_csv, "w", newline="", encoding="utf-8") as fh:
-                    w = csv.writer(fh)
-                    w.writerow(["ID", "Kernel Name", "Metric Unit", "Metric Name", "Metric Value"])
-                    w.writerow(["0", f"{plan0['kernel_name']}<2,4>(...)", "byte", "dram__bytes_read.sum", value])
+                bad_csv = _write_ncu_csv(
+                    tmp_path / f"metrics_bad_{label}.csv", _NCU_HEADER,
+                    [["0", plan0["kernel_name"], "byte", "dram__bytes_read.sum", value]],
+                )
                 raised = False
                 try:
                     parse_ncu_raw_csv(bad_csv)
                 except NcuCsvParseError:
                     raised = True
                 rec.check(f"metrics CSV with {label} value is rejected", raised)
+
+            # missing ID / Kernel Name / Metric Unit column (item: "missing X column")
+            for missing_col in ("ID", "Kernel Name", "Metric Unit"):
+                header_without = [c for c in _NCU_HEADER if c != missing_col]
+                row_without = [v for c, v in zip(_NCU_HEADER, ["0", plan0["kernel_name"], "byte", "dram__bytes_read.sum", "1000000"]) if c != missing_col]
+                missing_csv = _write_ncu_csv(
+                    tmp_path / f"metrics_missing_{missing_col.replace(' ', '_')}.csv",
+                    header_without, [row_without],
+                )
+                raised = False
+                try:
+                    parse_ncu_raw_csv(missing_csv)
+                except NcuCsvParseError:
+                    raised = True
+                rec.check(f"metrics CSV missing the {missing_col!r} column is rejected", raised)
+
+            # duplicate required header
+            dup_header_csv = _write_ncu_csv(
+                tmp_path / "metrics_dup_header.csv", _NCU_HEADER + ["ID"],
+                [["0", plan0["kernel_name"], "byte", "dram__bytes_read.sum", "1000000", "0"]],
+            )
+            raised = False
+            try:
+                parse_ncu_raw_csv(dup_header_csv)
+            except NcuCsvParseError:
+                raised = True
+            rec.check("metrics CSV with a duplicate header column name is rejected", raised)
+
+            # empty launch ID
+            empty_id_csv = _write_ncu_csv(
+                tmp_path / "metrics_empty_id.csv", _NCU_HEADER,
+                [["", plan0["kernel_name"], "byte", "dram__bytes_read.sum", "1000000"]],
+            )
+            raised = False
+            try:
+                parse_ncu_raw_csv(empty_id_csv)
+            except NcuCsvParseError:
+                raised = True
+            rec.check("metrics CSV with an empty launch ID is rejected", raised)
+
+            # two launch IDs (unit-level, complementing the validate-profile-case test below)
+            two_launch_csv = _write_ncu_csv(
+                tmp_path / "metrics_two_launch.csv", _NCU_HEADER,
+                [
+                    ["0", plan0["kernel_name"], "byte", "dram__bytes_read.sum", "1000000"],
+                    ["1", plan0["kernel_name"], "nsecond", "gpu__time_duration.sum", "1"],
+                ],
+            )
+            raised = False
+            try:
+                parse_ncu_raw_csv(two_launch_csv)
+            except NcuCsvParseError:
+                raised = True
+            rec.check("metrics CSV with two distinct launch IDs is rejected (unit-level)", raised)
+
+            # duplicate resolved metric, equal values -- still rejected
+            dup_metric_csv = _write_ncu_csv(
+                tmp_path / "metrics_dup_metric.csv", _NCU_HEADER,
+                [
+                    ["0", plan0["kernel_name"], "byte", "dram__bytes_read.sum", "1000000"],
+                    ["0", plan0["kernel_name"], "byte", "dram__bytes_read.sum", "1000000"],
+                ],
+            )
+            raised = False
+            try:
+                parse_ncu_raw_csv(dup_metric_csv)
+            except NcuCsvParseError:
+                raised = True
+            rec.check(
+                "metrics CSV with a duplicate row for a resolved metric is rejected, even with equal values",
+                raised,
+            )
+
+            # dram unit = kilobyte / Kbyte -- rejected (never scaled/converted)
+            for bad_unit in ("kilobyte", "Kbyte", "KB"):
+                bad_unit_csv = _write_ncu_csv(
+                    tmp_path / f"metrics_unit_{bad_unit}.csv", _NCU_HEADER,
+                    [["0", plan0["kernel_name"], bad_unit, "dram__bytes_read.sum", "1000"]],
+                )
+                raised = False
+                try:
+                    parse_ncu_raw_csv(bad_unit_csv)
+                except NcuCsvParseError:
+                    raised = True
+                rec.check(f"metrics CSV with dram unit={bad_unit!r} is rejected", raised)
+            # dram unit = byte (any case) -- accepted
+            byte_case_csv = _write_ncu_csv(
+                tmp_path / "metrics_unit_Byte.csv", _NCU_HEADER,
+                [["0", plan0["kernel_name"], "Byte", "dram__bytes_read.sum", "1000"]],
+            )
+            byte_case_parsed = None
+            try:
+                byte_case_parsed = parse_ncu_raw_csv(byte_case_csv)
+            except NcuCsvParseError:
+                pass
+            rec.check(
+                "metrics CSV with dram unit='Byte' (case-normalized) is accepted",
+                byte_case_parsed is not None and byte_case_parsed["metrics"]["dram__bytes_read.sum"] == 1000.0,
+            )
 
             # --- HBM classification thresholds (items 14, 15, 16) -------------------
             classification, flags, ratio = classify_hbm(900.0, 1000.0)
@@ -2883,7 +3565,7 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 git_commit=_FIXED_GIT_COMMIT, completed_at_utc="20260728T160500Z", now_utc=now_rp,
             )
             rec.check("record-pilot accepts a valid COMPLETE benchmark P1.3 campaign", ok, detail=f"errors={errors}")
-            manifest_good = p13.load_manifest(p14_good)
+            manifest_good, _rev = load_p14_manifest_chain(p14_good)
             rec.check("record-pilot transitions to PILOT_COMPLETE", manifest_good.get("state") == "PILOT_COMPLETE")
 
             p13_smoke, _ = _build_p13_pilot_campaign_fixture(tmp_path, "rp_smoke", run_kind="smoke")
@@ -2894,7 +3576,7 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             )
             rec.expect_error_containing("record-pilot rejects a smoke P1.3 campaign (item 5)", errors, "run_kind")
             rec.check("record-pilot smoke rejection leaves campaign FAILED, not PILOT_COMPLETE",
-                      not ok and p13.load_manifest(p14_smoke).get("state") == "FAILED")
+                      not ok and load_p14_manifest_chain(p14_smoke)[0].get("state") == "FAILED")
 
             p13_inprog_dir = tmp_path / "p13_campaigns" / "rp_inprog_raw"
             plan_inprog = p13._build_valid_campaign(p13_inprog_dir, repetitions=30, run_kind="benchmark", passes=32, warmup_ms=2000)
@@ -2975,8 +3657,137 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             rec.check(
                 "discover-metrics resolves all five candidate metrics and transitions to PROFILE_IN_PROGRESS",
                 ok and resolved["dram_read_metric_available"]
-                and p13.load_manifest(p14_dm).get("state") == "PROFILE_IN_PROGRESS",
+                and load_p14_manifest_chain(p14_dm)[0].get("state") == "PROFILE_IN_PROGRESS",
                 detail=f"ok={ok} resolved={resolved}",
+            )
+
+            # --- pilot vs profile preflight provenance mismatch is rejected
+            # (Remediation A, audit blocker #1) -----------------------------------
+            def _build_mismatched_profile_case(suffix: str, campaign_id: str, **preflight_overrides):
+                p13_c, _ = _build_p13_pilot_campaign_fixture(tmp_path, f"prov_{suffix}")
+                p14_c = _do_init_campaign(campaign_id=campaign_id, started_at_utc=campaign_id)
+                ok_inner, errors_inner = _do_record_pilot(
+                    campaign_dir=p14_c, p13_campaign_dir=p13_c, preflight_path=good_preflight_rp,
+                    git_commit=_FIXED_GIT_COMMIT, completed_at_utc=campaign_id, now_utc=now_rp,
+                )
+                assert ok_inner, errors_inner
+                mismatched_preflight = tmp_path / f"preflight_prov_{suffix}.json"
+                _write_preflight_json(mismatched_preflight, _default_preflight_doc(**preflight_overrides))
+                disc_log = tmp_path / f"disc_prov_{suffix}.log"
+                disc_log.write_text("\n".join(CANDIDATE_METRICS) + "\n", encoding="utf-8")
+                return p14_c, mismatched_preflight, disc_log
+
+            p14_prov_uuid, preflight_prov_uuid, disc_prov_uuid = _build_mismatched_profile_case(
+                "uuid", "20260728T164000Z", gpu_uuid="GPU-99999999-8888-7777-6666-555555555555",
+            )
+            ok, errors, _ = _do_discover_metrics(
+                campaign_dir=p14_prov_uuid, discovery_log=disc_prov_uuid, preflight_path=preflight_prov_uuid,
+                git_commit=_FIXED_GIT_COMMIT, started_at_utc="20260728T164001Z", now_utc=now_rp,
+            )
+            rec.expect_error_containing(
+                "discover-metrics rejects a profiling preflight with a different GPU UUID "
+                "than the pilot (Remediation A)", errors, "gpu_uuid",
+            )
+
+            p14_prov_name, preflight_prov_name, disc_prov_name = _build_mismatched_profile_case(
+                "name", "20260728T164100Z", gpu_name="NVIDIA B300 (impostor)",
+            )
+            ok, errors, _ = _do_discover_metrics(
+                campaign_dir=p14_prov_name, discovery_log=disc_prov_name, preflight_path=preflight_prov_name,
+                git_commit=_FIXED_GIT_COMMIT, started_at_utc="20260728T164101Z", now_utc=now_rp,
+            )
+            rec.expect_error_containing(
+                "discover-metrics rejects a profiling preflight with a different GPU name "
+                "than the pilot (Remediation A)", errors, "gpu_name",
+            )
+
+            p14_prov_drv, preflight_prov_drv, disc_prov_drv = _build_mismatched_profile_case(
+                "driver", "20260728T164200Z", driver_version="570.00.01",
+            )
+            ok, errors, _ = _do_discover_metrics(
+                campaign_dir=p14_prov_drv, discovery_log=disc_prov_drv, preflight_path=preflight_prov_drv,
+                git_commit=_FIXED_GIT_COMMIT, started_at_utc="20260728T164201Z", now_utc=now_rp,
+            )
+            rec.expect_error_containing(
+                "discover-metrics rejects a profiling preflight with a different driver version "
+                "than the pilot (Remediation A)", errors, "gpu_driver_version",
+            )
+
+            # Direct unit coverage of compare_preflight_provenance for every field,
+            # independent of whether a real captured preflight can currently
+            # produce that particular mismatch (compute_cap is separately pinned
+            # to '10.3' and git_commit to the caller's expected commit by
+            # validate_preflight_fields itself -- this confirms the comparison
+            # function still catches every field if either constraint is ever
+            # relaxed).
+            base_snapshot = {
+                "git_commit": _FIXED_GIT_COMMIT, "gpu_uuid": _FIXED_GPU_UUID,
+                "gpu_name": _FIXED_GPU_NAME, "gpu_compute_cap": "10.3",
+                "gpu_driver_version": "580.95.05",
+            }
+            for field, other_value in (
+                ("git_commit", "f" * 40), ("gpu_uuid", "GPU-99999999-8888-7777-6666-555555555555"),
+                ("gpu_name", "NVIDIA B300 (impostor)"), ("gpu_compute_cap", "9.0"),
+                ("gpu_driver_version", "570.00.01"),
+            ):
+                mismatched_snapshot = dict(base_snapshot, **{field: other_value})
+                prov_errors = compare_preflight_provenance(base_snapshot, mismatched_snapshot)
+                rec.check(
+                    f"compare_preflight_provenance catches a {field} mismatch",
+                    len(prov_errors) == 1 and field in prov_errors[0],
+                    detail=f"errors={prov_errors}",
+                )
+            rec.check(
+                "compare_preflight_provenance returns no errors when every field matches",
+                compare_preflight_provenance(base_snapshot, dict(base_snapshot)) == [],
+            )
+
+            # --- validate-profile-preconditions: the standalone, side-effect-free
+            # early gate (Remediation A) -------------------------------------------
+            p13_vpp, _ = _build_p13_pilot_campaign_fixture(tmp_path, "vpp_base")
+            p14_vpp = _do_init_campaign(campaign_id="20260728T164300Z", started_at_utc="20260728T164300Z")
+            ok, errors = _do_record_pilot(
+                campaign_dir=p14_vpp, p13_campaign_dir=p13_vpp, preflight_path=good_preflight_rp,
+                git_commit=_FIXED_GIT_COMMIT, completed_at_utc="20260728T164301Z", now_utc=now_rp,
+            )
+            assert ok, errors
+            manifest_before_vpp, revision_before_vpp = load_p14_manifest_chain(p14_vpp)
+
+            ok, errors = _do_validate_profile_preconditions(
+                campaign_dir=p14_vpp, preflight_path=good_preflight_rp,
+                git_commit=_FIXED_GIT_COMMIT, now_utc=now_rp,
+            )
+            rec.check(
+                "validate-profile-preconditions accepts a matching profiling preflight", ok, detail=f"{errors}",
+            )
+            manifest_after_vpp, revision_after_vpp = load_p14_manifest_chain(p14_vpp)
+            rec.check(
+                "validate-profile-preconditions writes nothing to the manifest (pure precondition check)",
+                manifest_after_vpp == manifest_before_vpp and revision_after_vpp == revision_before_vpp,
+            )
+
+            mismatched_vpp_preflight = tmp_path / "preflight_vpp_mismatch.json"
+            _write_preflight_json(
+                mismatched_vpp_preflight, _default_preflight_doc(gpu_name="NVIDIA B300 (impostor)"),
+            )
+            ok, errors = _do_validate_profile_preconditions(
+                campaign_dir=p14_vpp, preflight_path=mismatched_vpp_preflight,
+                git_commit=_FIXED_GIT_COMMIT, now_utc=now_rp,
+            )
+            rec.expect_error_containing(
+                "validate-profile-preconditions rejects a mismatched profiling preflight", errors, "gpu_name",
+            )
+
+            p14_vpp_wrongstate = _do_init_campaign(
+                campaign_id="20260728T164400Z", started_at_utc="20260728T164400Z",
+            )
+            ok, errors = _do_validate_profile_preconditions(
+                campaign_dir=p14_vpp_wrongstate, preflight_path=good_preflight_rp,
+                git_commit=_FIXED_GIT_COMMIT, now_utc=now_rp,
+            )
+            rec.expect_error_containing(
+                "validate-profile-preconditions refuses a campaign that is not yet PILOT_COMPLETE",
+                errors, "PILOT_COMPLETE",
             )
 
             p13_dm2, _ = _build_p13_pilot_campaign_fixture(tmp_path, "dm_missing")
@@ -3006,7 +3817,7 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 campaign_dir=p14_dm2, index=0, application_csv=app_csv0, metrics_csv=metrics_csv0,
                 ncu_rep=ncu_rep0, git_commit=_FIXED_GIT_COMMIT,
             )
-            classification_when_unavailable = p13.load_manifest(p14_dm2)["case_results"][case0["case_name"]]["hbm_classification"]
+            classification_when_unavailable = load_p14_manifest_chain(p14_dm2)[0]["case_results"][case0["case_name"]]["hbm_classification"]
             rec.check(
                 "a case is INCONCLUSIVE whenever the campaign's DRAM metric was never resolved (item 12)",
                 case_ok and classification_when_unavailable == "INCONCLUSIVE",
@@ -3049,8 +3860,67 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 ncu_rep=rep_dl, git_commit=_FIXED_GIT_COMMIT,
             )
             rec.expect_error_containing(
-                "validate-profile-case rejects more than one distinct profiled kernel (item 11)", errors,
-                "more than one distinct",
+                "validate-profile-case rejects more than one distinct profiled launch (item 11)", errors,
+                "distinct launch IDs found",
+            )
+
+            case_dup_kernel = build_ncu_plan()[2]
+            app_dk, metrics_dk, rep_dk, _ = _build_ncu_case_fixture(
+                tmp_path, case_dup_kernel,
+                extra_metric_rows=[["0", "some_other_kernel", "nsecond", "some_other_kernel__metric.sum", "1"]],
+            )
+            ok, errors = _do_validate_profile_case(
+                campaign_dir=p14_vc2, index=2, application_csv=app_dk, metrics_csv=metrics_dk,
+                ncu_rep=rep_dk, git_commit=_FIXED_GIT_COMMIT,
+            )
+            rec.expect_error_containing(
+                "validate-profile-case rejects more than one distinct kernel name, same launch ID (item 11)",
+                errors, "distinct kernel names found",
+            )
+
+            # Kernel name containing the expected name plus extra text: exact
+            # equality only, never substring/prefix/suffix matching.
+            case_superset_kernel = build_ncu_plan()[3]
+            app_sk, metrics_sk, rep_sk, _ = _build_ncu_case_fixture(
+                tmp_path, case_superset_kernel,
+                kernel_name_in_csv=f"{case_superset_kernel['kernel_name']}_v2",
+            )
+            ok, errors = _do_validate_profile_case(
+                campaign_dir=p14_vc2, index=3, application_csv=app_sk, metrics_csv=metrics_sk,
+                ncu_rep=rep_sk, git_commit=_FIXED_GIT_COMMIT,
+            )
+            rec.check(
+                "a kernel name containing the expected name plus extra text is rejected, not substring-matched",
+                not ok and any("!= expected exact" in e for e in errors),
+                detail=f"ok={ok} errors={errors}",
+            )
+
+            # A metric recorded as *resolved* during discovery but missing from
+            # this case's own CSV is a hard integrity failure, never INCONCLUSIVE.
+            case_missing_dram = build_ncu_plan()[4]
+            app_md, metrics_md, rep_md, _ = _build_ncu_case_fixture(
+                tmp_path, case_missing_dram, omit_metrics=(MANDATORY_DRAM_METRIC,),
+            )
+            ok, errors = _do_validate_profile_case(
+                campaign_dir=p14_vc2, index=4, application_csv=app_md, metrics_csv=metrics_md,
+                ncu_rep=rep_md, git_commit=_FIXED_GIT_COMMIT,
+            )
+            rec.expect_error_containing(
+                "a resolved-but-missing DRAM metric is a hard validation failure, not INCONCLUSIVE",
+                errors, "is missing resolved metric 'dram__bytes_read.sum'",
+            )
+
+            case_missing_optional = build_ncu_plan()[5]
+            app_mo, metrics_mo, rep_mo, _ = _build_ncu_case_fixture(
+                tmp_path, case_missing_optional, omit_metrics=("lts__t_bytes.sum",),
+            )
+            ok, errors = _do_validate_profile_case(
+                campaign_dir=p14_vc2, index=5, application_csv=app_mo, metrics_csv=metrics_mo,
+                ncu_rep=rep_mo, git_commit=_FIXED_GIT_COMMIT,
+            )
+            rec.expect_error_containing(
+                "a resolved-but-missing optional metric is also a hard validation failure",
+                errors, "is missing resolved metric 'lts__t_bytes.sum'",
             )
 
             case_redo = build_ncu_plan()[0]
@@ -3078,7 +3948,8 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             ok, errors = _do_finalize_profile(campaign_dir=p14_vc, completed_at_utc="20260728T163100Z")
             rec.check("finalize-profile accepts a complete, correctly-ordered six-case set", ok, detail=f"{errors}")
             rec.check(
-                "finalize-profile transitions to COMPLETE", p13.load_manifest(p14_vc).get("state") == "COMPLETE",
+                "finalize-profile transitions to COMPLETE",
+                load_p14_manifest_chain(p14_vc)[0].get("state") == "COMPLETE",
             )
 
             reordered_plan_path = p14_vc / "profile_plan.csv"
@@ -3127,6 +3998,106 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 not os.path.lexists(broken_row_csv) and not os.path.lexists(broken_tmp),
             )
 
+            # --- append-only, hash-chained P1.4 manifest revisions (Remediation E) --
+            def _build_two_revision_campaign(campaign_id: str) -> Path:
+                p14_c = _do_init_campaign(campaign_id=campaign_id, started_at_utc=campaign_id)
+                p14_merge_manifest(p14_c, {}, state="PILOT_IN_PROGRESS")
+                return p14_c
+
+            p14_mrev = _do_init_campaign(campaign_id="20260728T170500Z", started_at_utc="20260728T170500Z")
+            rev0_path = p14_mrev / "manifest" / "000000.json"
+            rev0_bytes_at_write_time = rev0_path.read_bytes()
+
+            atomic_write_called = False
+
+            def _poison_write_manifest_atomic(*_args, **_kwargs):
+                nonlocal atomic_write_called
+                atomic_write_called = True
+                raise AssertionError("p13.write_manifest_atomic must never be called for a P1.4 manifest")
+
+            merge_raised = False
+            with mock.patch.object(p13, "write_manifest_atomic", side_effect=_poison_write_manifest_atomic):
+                try:
+                    p14_merge_manifest(p14_mrev, {}, state="PILOT_IN_PROGRESS")
+                except AssertionError:
+                    merge_raised = True
+            rec.check(
+                "p14_merge_manifest never calls p13.write_manifest_atomic, even when it "
+                "would raise if called (Remediation E)",
+                not merge_raised and not atomic_write_called,
+            )
+            rec.check(
+                "revision 000000.json is still byte-for-byte identical after a later "
+                "revision is published (Remediation E)",
+                rev0_path.read_bytes() == rev0_bytes_at_write_time,
+            )
+
+            p14_tamper_prev = _build_two_revision_campaign("20260728T170600Z")
+            rev0_tp = p14_tamper_prev / "manifest" / "000000.json"
+            rev0_doc = json.loads(rev0_tp.read_text(encoding="utf-8"))
+            rev0_doc["started_at_utc"] = "20260728T170601Z"
+            rev0_tp.write_text(json.dumps(rev0_doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            chain_raised = False
+            try:
+                load_p14_manifest_chain(p14_tamper_prev)
+            except p13.ManifestTransitionError:
+                chain_raised = True
+            rec.check(
+                "load_p14_manifest_chain rejects a campaign whose earlier revision "
+                "content was modified after the fact (Remediation E)",
+                chain_raised,
+            )
+
+            p14_broken_chain = _build_two_revision_campaign("20260728T170700Z")
+            rev1_bc = p14_broken_chain / "manifest" / "000001.json"
+            rev1_doc = json.loads(rev1_bc.read_text(encoding="utf-8"))
+            rev1_doc["previous_manifest_sha256"] = "0" * 64
+            rev1_bc.write_text(json.dumps(rev1_doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            chain_raised = False
+            try:
+                load_p14_manifest_chain(p14_broken_chain)
+            except p13.ManifestTransitionError:
+                chain_raised = True
+            rec.check(
+                "load_p14_manifest_chain rejects a revision whose previous_manifest_sha256 "
+                "does not match the actual previous revision's hash (Remediation E)",
+                chain_raised,
+            )
+
+            p14_symlink_rev = _build_two_revision_campaign("20260728T170800Z")
+            rev0_sr = p14_symlink_rev / "manifest" / "000000.json"
+            decoy_target = tmp_path / "decoy_manifest_revision.json"
+            decoy_target.write_text(rev0_sr.read_text(encoding="utf-8"), encoding="utf-8")
+            rev0_sr.unlink()
+            rev0_sr.symlink_to(decoy_target)
+            chain_raised = False
+            try:
+                load_p14_manifest_chain(p14_symlink_rev)
+            except p13.ManifestTransitionError:
+                chain_raised = True
+            rec.check(
+                "load_p14_manifest_chain rejects a symlinked revision file, even one "
+                "whose target has otherwise-valid content (Remediation E)",
+                chain_raised,
+            )
+
+            p14_stale_tmp = _build_two_revision_campaign("20260728T170900Z")
+            stale_tmp_path = p14_stale_tmp / "manifest" / MANIFEST_REVISION_TMP_NAME
+            stale_tmp_path.write_text("stale leftover from an interrupted write\n", encoding="utf-8")
+            stale_tmp_bytes = stale_tmp_path.read_bytes()
+            next_revision_path = p14_stale_tmp / "manifest" / "000002.json"
+            write_raised = False
+            try:
+                write_next_p14_manifest_revision(p14_stale_tmp, {"state": "PILOT_IN_PROGRESS"})
+            except p13.UnsafePathError:
+                write_raised = True
+            rec.check(
+                "write_next_p14_manifest_revision refuses to write over a stale "
+                "temporary file and creates no new revision (Remediation E)",
+                write_raised and stale_tmp_path.read_bytes() == stale_tmp_bytes
+                and not next_revision_path.exists(),
+            )
+
             # --- full pipeline: determinism (items 17, 26), hash presence (item 27) --
             def _fixed_gbps(entry: dict, sample_index: int) -> float:
                 base = {"ldgsts": 900.0, "tma": 1000.0}[entry["method"]] + entry["stages"] * 2.0 + entry["bif_kib"] * 0.1
@@ -3157,7 +4128,9 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 )
                 assert ok, errors
                 for entry in build_ncu_plan():
-                    app_csv, metrics_csv, ncu_rep, _row = _build_ncu_case_fixture(tmp_path, entry)
+                    app_csv, metrics_csv, ncu_rep, _row = _build_ncu_case_fixture(
+                        tmp_path, entry, case_dir=p14_det / "profiles" / entry["case_name"],
+                    )
                     ok, errors = _do_validate_profile_case(
                         campaign_dir=p14_det, index=entry["index"], application_csv=app_csv,
                         metrics_csv=metrics_csv, ncu_rep=ncu_rep, git_commit=_FIXED_GIT_COMMIT,
@@ -3194,7 +4167,7 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                         well_formed = False
                     rec.check(f"{svg_name} (run {det_run}) is well-formed XML", well_formed)
                 det_reports.append(snapshot)
-                manifest_det = p13.load_manifest(p14_det)
+                manifest_det, _rev = load_p14_manifest_chain(p14_det)
                 # analysis.json/report.md legitimately embed this run's own
                 # campaign_id, so their real on-disk hashes differ between runs;
                 # only the CSV/SVG artifacts (which never mention campaign_id)
@@ -3225,7 +4198,7 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 "analysis/figures/effective_gbps.svg", "analysis/figures/tma_to_ldgsts_ratio.svg",
                 "analysis/figures/dram_read_ratio.svg",
             }
-            last_manifest = p13.load_manifest(p14_det)
+            last_manifest, _rev = load_p14_manifest_chain(p14_det)
             all_hashes = last_manifest["artifact_sha256"]
             rec.check(
                 "every final analysis artifact has a non-null recorded SHA-256 hash (item 27)",
@@ -3254,7 +4227,9 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             )
             assert ok, errors
             for entry in build_ncu_plan():
-                app_csv, metrics_csv, ncu_rep, _row = _build_ncu_case_fixture(tmp_path, entry)
+                app_csv, metrics_csv, ncu_rep, _row = _build_ncu_case_fixture(
+                    tmp_path, entry, case_dir=p14_broken / "profiles" / entry["case_name"],
+                )
                 ok, errors = _do_validate_profile_case(
                     campaign_dir=p14_broken, index=entry["index"], application_csv=app_csv,
                     metrics_csv=metrics_csv, ncu_rep=ncu_rep, git_commit=_FIXED_GIT_COMMIT,
@@ -3281,7 +4256,102 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             )
             rec.check(
                 "a failed analyze() leaves the campaign state COMPLETE (retriable, not FAILED)",
-                p13.load_manifest(p14_broken).get("state") == "COMPLETE",
+                load_p14_manifest_chain(p14_broken)[0].get("state") == "COMPLETE",
+            )
+
+            # --- evidence-integrity gate: independent tamper-then-reject coverage
+            # for every artifact verify_campaign_evidence_integrity re-verifies
+            # (Remediation B, audit blocker #2) --------------------------------
+            p13_tp, _ = _build_p13_pilot_campaign_fixture(tmp_path, "tp_base")
+            p14_tp = _do_init_campaign(campaign_id="20260728T200000Z", started_at_utc="20260728T200000Z")
+            preflight_tp_pilot = tmp_path / "preflight_tp_pilot.json"
+            preflight_tp_profile = tmp_path / "preflight_tp_profile.json"
+            _write_preflight_json(preflight_tp_pilot, _default_preflight_doc())
+            _write_preflight_json(preflight_tp_profile, _default_preflight_doc())
+            now_tp = _datetime(2026, 7, 28, 11, 0, tzinfo=_timezone.utc)
+            ok, errors = _do_record_pilot(
+                campaign_dir=p14_tp, p13_campaign_dir=p13_tp, preflight_path=preflight_tp_pilot,
+                git_commit=_FIXED_GIT_COMMIT, completed_at_utc="20260728T200100Z", now_utc=now_tp,
+            )
+            assert ok, errors
+            disc_tp = tmp_path / "disc_tp.log"
+            disc_tp.write_text("\n".join(CANDIDATE_METRICS) + "\n", encoding="utf-8")
+            ok, errors, _ = _do_discover_metrics(
+                campaign_dir=p14_tp, discovery_log=disc_tp, preflight_path=preflight_tp_profile,
+                git_commit=_FIXED_GIT_COMMIT, started_at_utc="20260728T200200Z", now_utc=now_tp,
+            )
+            assert ok, errors
+            for entry in build_ncu_plan():
+                app_csv, metrics_csv, ncu_rep, _row = _build_ncu_case_fixture(
+                    tmp_path, entry, case_dir=p14_tp / "profiles" / entry["case_name"],
+                )
+                ok, errors = _do_validate_profile_case(
+                    campaign_dir=p14_tp, index=entry["index"], application_csv=app_csv,
+                    metrics_csv=metrics_csv, ncu_rep=ncu_rep, git_commit=_FIXED_GIT_COMMIT,
+                )
+                assert ok, errors
+            ok, errors = _do_finalize_profile(campaign_dir=p14_tp, completed_at_utc="20260728T200300Z")
+            assert ok, errors
+
+            case0_name = build_ncu_plan()[0]["case_name"]
+            case0_dir = p14_tp / "profiles" / case0_name
+
+            def _check_tamper_rejected(label: str, path: Path) -> None:
+                original = path.read_bytes()
+                path.write_bytes(original + b"\ntampered\n")
+                try:
+                    ok, errors = _do_analyze(campaign_dir=p14_tp, analyzed_at_utc="20260728T200400Z")
+                    published = list((p14_tp / "analysis").rglob("*")) if (p14_tp / "analysis").exists() else []
+                    rec.check(
+                        f"analyze() rejects a tampered {label} and publishes nothing (Remediation B)",
+                        not ok and not published,
+                        detail=f"ok={ok} errors={errors} published={published}",
+                    )
+                finally:
+                    path.write_bytes(original)
+
+            _check_tamper_rejected("case metrics_raw.csv", case0_dir / f"{case0_name}.metrics_raw.csv")
+            _check_tamper_rejected("case application.csv", case0_dir / f"{case0_name}.application.csv")
+            _check_tamper_rejected("case .ncu-rep", case0_dir / f"{case0_name}_report.ncu-rep")
+            _check_tamper_rejected("profile_plan.csv", p14_tp / "profile_plan.csv")
+            _check_tamper_rejected("pilot preflight summary", preflight_tp_pilot)
+            _check_tamper_rejected("profile preflight summary", preflight_tp_profile)
+            _check_tamper_rejected("P1.3 manifest.json", p13_tp / "manifest.json")
+            _check_tamper_rejected("P1.3 combined_samples.csv", p13_tp / "combined_samples.csv")
+            _check_tamper_rejected("P1.3 summary.csv", p13_tp / "summary.csv")
+
+            # Once every tampered artifact above is restored to its original
+            # bytes, analyze() must succeed -- proving each rejection above was
+            # caused by that iteration's own tamper, not leftover corruption.
+            ok, errors = _do_analyze(campaign_dir=p14_tp, analyzed_at_utc="20260728T200400Z")
+            rec.check("analyze() succeeds once all tampered artifacts are restored", ok, detail=f"{errors}")
+
+            # --- the exact originally-audited sequence (audit blocker #2):
+            # validate-profile-case -> modify metrics_raw.csv -> finalize-profile
+            # rejected -> analyze cannot accept -----------------------------------
+            p14_audit_seq, _ = _run_profile_pipeline(tmp_path, "20260728T210000Z")
+            audit_case0_name = build_ncu_plan()[0]["case_name"]
+            audit_metrics_path = (
+                p14_audit_seq / "profiles" / audit_case0_name / f"{audit_case0_name}.metrics_raw.csv"
+            )
+            audit_metrics_path.write_bytes(audit_metrics_path.read_bytes() + b"\ntampered\n")
+            ok, errors = _do_finalize_profile(campaign_dir=p14_audit_seq, completed_at_utc="20260728T210100Z")
+            rec.check(
+                "audited sequence: finalize-profile rejects a metrics_raw.csv modified "
+                "after validate-profile-case recorded it",
+                not ok and any("SHA-256" in e and "tampered" in e for e in errors),
+                detail=f"ok={ok} errors={errors}",
+            )
+            rec.check(
+                "audited sequence: the rejected campaign never reaches COMPLETE",
+                load_p14_manifest_chain(p14_audit_seq)[0].get("state") != "COMPLETE",
+            )
+            ok, errors = _do_analyze(campaign_dir=p14_audit_seq, analyzed_at_utc="20260728T210200Z")
+            rec.check(
+                "audited sequence: analyze() cannot accept a campaign whose "
+                "finalize-profile was rejected",
+                not ok,
+                detail=f"ok={ok} errors={errors}",
             )
 
     if rec.failures:
@@ -3337,6 +4407,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     dm_parser.add_argument("--started-at-utc", required=True)
     dm_parser.add_argument("--now", default=None)
     dm_parser.set_defaults(func=cmd_discover_metrics)
+
+    vpp_parser = subparsers.add_parser(
+        "validate-profile-preconditions",
+        help="GPU-free check that a fresh profiling preflight matches the recorded pilot preflight.",
+    )
+    vpp_parser.add_argument("--campaign-dir", required=True)
+    vpp_parser.add_argument("--preflight", required=True)
+    vpp_parser.add_argument("--git-commit", required=True)
+    vpp_parser.add_argument("--now", default=None)
+    vpp_parser.set_defaults(func=cmd_validate_profile_preconditions)
 
     vc_parser = subparsers.add_parser("validate-profile-case", help="Validate one captured NCU profile case.")
     vc_parser.add_argument("--campaign-dir", required=True)

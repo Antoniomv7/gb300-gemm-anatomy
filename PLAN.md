@@ -51,9 +51,25 @@ comparative interpretation) is now implemented: a GPU-free layer
 `src/memory/P1_4_PROTOCOL.md`) that reuses the audited P1.3 runner unmodified
 for the frozen 18-configuration pilot and adds Nsight Compute validation of
 six frozen cases, deterministic statistics/bootstrap/saturation analysis,
-and report/figure generation. Independent audit, GB300 verification, and
-pilot execution are all still pending; no performance result exists yet. A
-fresh preflight is required before any P1.4 GPU work because the host driver
+and report/figure generation. An independent GPU-free audit of that first
+implementation found five blockers (a profiling preflight from a different
+GPU/driver than the pilot's could be accepted; a validated `metrics_raw.csv`
+could be modified after validation and still reach `COMPLETE`/`ANALYZED`; the
+NCU raw-CSV parser accepted malformed/wrong-unit/substring-matched evidence;
+`--profile` wrote diagnostic logs before safely resolving the campaign tree;
+and P1.4 manifest updates delegated to P1.3's overwrite-based writer). All
+five were remediated GPU-free, each with a new adversarial test that first
+demonstrably failed against the original behavior and then passed against
+the fix: preflight provenance is now cross-checked field-by-field before any
+Docker/NCU work; a central evidence-integrity gate re-hashes and reparses
+every trusted input immediately before both `COMPLETE` and `ANALYZED`; the
+NCU CSV parser is now fail-closed on schema/unit/kernel-identity; raw-tree
+log writes are symlink-safe and ordered after the safety check; and the P1.4
+manifest now publishes as an append-only, hash-chained revision history
+(`campaign_dir/manifest/000000.json`, `000001.json`, ...) that never calls
+`os.replace()`. Independent re-audit, GB300 verification, and pilot
+execution are all still pending; no performance result exists yet. A fresh
+preflight is required before any P1.4 GPU work because the host driver
 changed after the Phase 0 verification.
 
 ## Phase 2 — BF16 UMMA throughput (27 July–2 August 2026)

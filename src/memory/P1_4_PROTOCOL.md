@@ -1,7 +1,27 @@
 # P1.4 frozen protocol — profiling, HBM validation, analysis, pilot
 
-**Status: implemented, independent audit PENDING, GB300 verification NO, pilot
-NOT executed, NCU/HBM validation NO. No performance result exists yet.**
+**Status: implemented, remediated after an independent GPU-free audit;
+independent re-audit PENDING, GB300 verification NO, pilot NOT executed,
+NCU/HBM validation NO. No performance result exists yet.**
+
+An independent GPU-free audit of the first implementation found five
+blockers, each closed with a GPU-free fix plus a new adversarial test that
+first demonstrably failed against the original behavior and then passed
+against the fix: (1) a profiling preflight from a different GPU/driver/commit
+than the pilot's could be accepted — closed by `compare_preflight_provenance`
+(Section 7); (2) a validated `metrics_raw.csv` (or any other trusted input)
+could be modified after validation and still reach `COMPLETE`/`ANALYZED` —
+closed by the central evidence-integrity gate (Section 8); (3) the NCU
+raw-CSV parser accepted malformed, wrong-unit, or substring-matched evidence
+— closed by the fail-closed parser (Section 4); (4) `--profile` wrote
+diagnostic logs before safely resolving the campaign tree — closed by
+reordering `--profile` and adding symlink-safe capture checks (Section 8);
+(5) P1.4 manifest updates delegated to P1.3's overwrite-based writer,
+contrary to the no-overwrite requirement — closed by the append-only,
+hash-chained manifest revision design (Section 8). None of these fixes
+changed the frozen pilot matrix, the six-case NCU plan, the statistical
+calculations, the bootstrap seed/resample count, the outlier-retention
+policy, the saturation rule, or the HBM thresholds below.
 
 This document is the single frozen reference for P1.4
 (`scripts/run_exp01_memory_paths_p14.sh`,
@@ -123,8 +143,16 @@ protocol.
 | `--pipeline-boost-state` | `stable`, `dynamic` | `dynamic` |
 | `--cache-control` | `all`, `none` | `none` |
 | `--kernel-name-base` | `function`, `demangled`, `mangled` | `function` |
+| `--print-kernel-base` | `function`, `demangled`, `mangled` | `function` |
 | `--replay-mode` | `kernel`, ... | `kernel` |
 | `--devices` | comma-separated device list | `0` |
+
+`--print-kernel-base function` (metrics export step, below) makes the
+exported CSV's `Kernel Name` column the same un-templated function name
+`--kernel-name-base function` filters on at collection time, so the parser
+can require exact string equality against the frozen kernel name — never a
+substring/prefix/suffix match — with no risk of the two flags disagreeing on
+representation.
 
 Never used, and mechanically grepped for in the diff (`git diff --check`
 target, see `Makefile`/CI note): `--force-overwrite`/`-f`, `--set full`,
@@ -220,15 +248,46 @@ docker run --rm --network none --security-opt no-new-privileges --cap-drop ALL \
     -v "$PWD:/workspace" -w /workspace gb300-gemm-anatomy:phase0 \
     ncu --import <profiles>/<case>_report.ncu-rep \
         --csv --page raw --print-metric-name name --print-units base \
+        --print-kernel-base function \
     > <profiles>/<case>.metrics_raw.csv
 ```
 
 `--print-metric-name name` selects the raw metric identifier (e.g.
 `dram__bytes_read.sum`) as the CSV column header instead of NCU's
-human-readable label; `--print-units base` keeps units unscaled. This step
-never touches a GPU (it reads an already-collected `.ncu-rep`), so it does
-not need `BLACKWELL_GPU_INDEX` or the idle-device proof — only the
-GPU-touching collection step above does.
+human-readable label; `--print-units base` keeps units unscaled;
+`--print-kernel-base function` makes the `Kernel Name` column the bare
+function name (see the flag table above). This step never touches a GPU (it
+reads an already-collected `.ncu-rep`), so it does not need
+`BLACKWELL_GPU_INDEX` or the idle-device proof — only the GPU-touching
+collection step above does.
+
+### Fail-closed raw-CSV parsing
+
+`metrics_raw.csv` is read with `csv.reader` (never `DictReader`, so a
+duplicate header column name is itself detected) and rejected outright,
+before any value is trusted, unless all of the following hold:
+
+* the header contains exactly the five required columns `ID`, `Kernel Name`,
+  `Metric Name`, `Metric Unit`, `Metric Value`, with no duplicate column name;
+* every row has that same column count;
+* the file contains exactly one distinct `ID` (launch) and exactly one
+  distinct `Kernel Name` — never invented as `launch_count=1`, and never
+  averaged/summed across multiple launches or kernels;
+* the one `Kernel Name` present equals the frozen case's kernel name exactly
+  (see above) — never a substring, prefix, or regex match;
+* every metric's `Metric Unit` equals its expected unit exactly, after only
+  case/whitespace normalization — `byte`, `Byte`, and `BYTE` are the same
+  unit; `kilobyte`/`Kbyte`/`KB` are a **different**, rejected unit, never
+  silently rescaled to bytes;
+* every metric value is present, numeric, and finite (no empty/NaN/±infinity
+  value is ever treated as zero or missing-but-ignorable);
+* no metric name appears more than once, even with an identical value.
+
+A metric NCU discovery recorded as *resolved* (`resolved_ncu_metrics.resolved`
+in the manifest) but absent from this case's own `metrics_raw.csv` is a hard
+validation failure, never a silent downgrade to `INCONCLUSIVE` — that
+downgrade path is reserved exclusively for `dram__bytes_read.sum` never
+having resolved for the whole campaign in the first place (Section 5).
 
 ### Preserved, never-overwritten artifacts per case
 
@@ -371,6 +430,22 @@ working-set parameters (working_set_mib=512, and the resulting working_set_bytes
 passes                 (32)
 ```
 
+The pilot-versus-profile preflight fields (`git_commit`, `gpu_uuid`,
+`gpu_name`, `gpu_compute_cap`, `gpu_driver_version`) are compared by one
+reusable function, `compare_preflight_provenance`, enforced at two points:
+first, `--profile` calls the GPU-free, side-effect-free
+`validate-profile-preconditions` subcommand immediately after safely
+resolving the campaign tree and before any Docker/NCU invocation or raw-tree
+log write, so a GPU/driver swap between the pilot and profiling runs aborts
+before any expensive or irreversible work happens; second, `discover-metrics`
+itself re-runs the identical comparison as a hard gate at the exact point
+`preflight_reference_profile` is recorded and the campaign commits to
+`PROFILE_IN_PROGRESS`, so the guarantee holds even if the orchestrating shell
+script were bypassed. `compare_preflight_provenance` only ever takes two
+preflight snapshots of identical shape (both produced by the same
+`validate_preflight_file`), so it can never cross into the CUDA
+driver/runtime integer encoding described next.
+
 `scripts/preflight.sh`'s `gpu.driver_version` is the NVIDIA display-driver
 package string (e.g. `580.95.05`, from `nvidia-smi`); a benchmark binary's
 own `cuda_driver_version` CSV column is `cudaDriverGetVersion()`'s integer
@@ -392,7 +467,10 @@ no `.gitignore` change needed):
 
 ```text
 results/raw/exp01_memory_paths_p14/<campaign_id>/
-    manifest.json
+    manifest/
+        000000.json
+        000001.json
+        ...
     profile_plan.csv
     profiles/
     analysis/
@@ -405,16 +483,64 @@ it is still checked (imported `validate_campaign_id`). Every path component
 from the raw root down is created/resolved with the same `lstat`-based,
 symlink-refusing, no-`resolve()`-alone primitives P1.3 uses (imported, not
 reimplemented): a real or dangling symlink at any level — including the raw
-root itself, `profiles/<case>/`, or any individual artifact path — is
-refused. No result, report, CSV, log, manifest temporary, analysis file,
-figure, partial file, or failure artifact is ever overwritten; publication
-uses hard-link-then-unlink no-clobber (never `os.replace()`) except for
-`manifest.json` itself, whose atomic-replace lifecycle mirrors P1.3's (a
-`.tmp` created exclusively, never following a symlink, replacing only after
-verifying the prior file's identity was unchanged). NCU's own
+root itself, `profiles/<case>/`, `manifest/`, or any individual artifact path
+— is refused. No result, report, CSV, log, manifest revision, analysis file,
+figure, partial file, or failure artifact is ever overwritten; every
+publication uses hard-link-then-unlink no-clobber (`_publish_no_clobber`) —
+**never** `os.replace()`, anywhere, including for the manifest. NCU's own
 `--force-overwrite` is never used. A failed launch leaves no stale `.tmp`;
 non-empty partial evidence is preserved under a fresh `.invalid`/`.partial`
 name, exactly like P1.3's capture step.
+
+### Append-only, hash-chained manifest (never `os.replace()`)
+
+Unlike P1.3's own `manifest.json` (a separate, frozen, already-audited input
+this file never modifies, and which correctly keeps its own
+atomic-replace-in-place lifecycle), the P1.4 manifest is never a single
+mutable file. Each state transition appends one complete, immutable snapshot
+to `manifest/` as the next contiguous revision file
+(`000000.json`, `000001.json`, ...); nothing already on disk is ever edited
+or replaced. Every revision document carries two extra fields beyond the
+ordinary P1.4 manifest schema: `manifest_revision` (its own index) and
+`previous_manifest_sha256` (the SHA-256 of the immediately preceding revision
+file, or `null` for revision 0). Loading the manifest
+(`load_p14_manifest_chain`) re-opens and re-validates *every* revision from
+`000000.json` forward on every call — never trusting anything about an
+earlier revision from memory — and rejects the whole campaign as invalid if:
+any revision is a symlink (dangling or not); the revision filenames are not
+exactly contiguous `000000.json..NNNNNN.json` with no extra or missing
+entries; a revision's `manifest_revision` field does not match its own
+position; a revision's `previous_manifest_sha256` does not match the
+freshly-recomputed hash of the file that precedes it; or a revision's content
+fails the ordinary P1.4 manifest schema. Writing the next revision
+(`write_next_p14_manifest_revision`) re-derives the next revision number and
+the previous revision's hash by re-reading the chain immediately before
+writing, then publishes the new revision file via exclusive-create-to-a-
+fixed-name-temporary followed by hard-link-then-unlink no-clobber — so a
+concurrent writer racing for the same next revision number fails closed at
+the final hard-link step, and a stale leftover temporary from an interrupted
+write blocks (rather than silently overwrites) the next attempt. This is
+strictly additive to P1.3's own manifest discipline: P1.4 never calls
+P1.3's `write_manifest_atomic`/`os.replace()`-based writer for its own
+manifest.
+
+### Evidence-integrity gate (re-verified before `COMPLETE` and before `ANALYZED`)
+
+A validated artifact (any of: a case's `application.csv`, `metrics_raw.csv`,
+or `.ncu-rep`; `profile_plan.csv`; either preflight summary; the P1.3
+campaign's `manifest.json`, `combined_samples.csv`, or `summary.csv`) must
+never be modifiable after validation and still reach a completing state.
+`finalize-profile` (before `PROFILE_IN_PROGRESS -> COMPLETE`) and `analyze`
+(before `COMPLETE -> ANALYZED`) both call the same function,
+`verify_campaign_evidence_integrity`, unmodified: it re-derives every
+artifact's path from the frozen NCU plan and canonical case names alone
+(never from a stored path string), recomputes every SHA-256 fresh from disk
+and compares it against the hash recorded when that artifact was first
+validated, and reparses every application CSV and `metrics_raw.csv` to
+cross-check the reconstructed kernel name, resolved metrics, and HBM
+classification against what was originally recorded. Any mismatch — however
+it arose — fails the transition closed; nothing about an earlier validation
+is ever trusted without re-verification.
 
 ### State machine
 

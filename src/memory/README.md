@@ -22,9 +22,11 @@ functionally, not experimentally. P1.4 (profiling, Nsight Compute HBM
 validation, the pilot benchmark campaign, and LDGSTS/TMA comparative
 interpretation, `scripts/run_exp01_memory_paths_p14.sh` and
 `scripts/analyze_exp01_memory_paths_p14.py`, see
-`src/memory/P1_4_PROTOCOL.md`) is implemented but not yet independently
-audited, not yet verified on GB300, and its pilot has not been executed;
-no P1.4 performance result exists.
+`src/memory/P1_4_PROTOCOL.md`) is implemented, and the five blockers an
+independent GPU-free audit found in that implementation have been
+remediated GPU-free (see `src/memory/P1_4_PROTOCOL.md`'s status note for the
+list); it is not yet independently re-audited, not yet verified on GB300,
+and its pilot has not been executed; no P1.4 performance result exists.
 
 ## P1.1 — standalone LDGSTS baseline
 
@@ -667,18 +669,26 @@ pilot P1.3 itself never runs. `--profile` profiles exactly six predefined
 `(method, stages, bytes_in_flight_kib)` cases with Nsight Compute 2025.4.0.0,
 using profiler controls (`--clock-control none`, `--pipeline-boost-state
 dynamic`, `--cache-control none`, `--kernel-name-base function`,
-`--launch-count 1`, `--replay-mode kernel`) verified against the pinned
-image's own `ncu --help` output — never NCU defaults that could lock or
-boost clocks, never `--force-overwrite`, never `--set full`. The analyzer
-validates the frozen preflight/provenance contract (Git commit, GPU UUID,
-compute capability, driver/runtime versions, working-set parameters, and
-`passes` must agree across the preflight, the P1.3 pilot, and all six
-profiled cases), discovers the exact supported NCU metric names on the
-profiled device rather than assuming them, and classifies each of the six
-cases' `dram_read_bytes / useful_bytes` ratio as `HBM_VALIDATED` (`>= 0.90`,
-flagged `READ_AMPLIFICATION` above `1.10`) or `INCONCLUSIVE` — a
+`--print-kernel-base function`, `--launch-count 1`, `--replay-mode kernel`)
+verified against the pinned image's own `ncu --help` output — never NCU
+defaults that could lock or boost clocks, never `--force-overwrite`, never
+`--set full`. The analyzer validates the frozen preflight/provenance
+contract (Git commit, GPU UUID, compute capability, driver/runtime
+versions, working-set parameters, and `passes` must agree across the
+preflight, the P1.3 pilot, and all six profiled cases) — including a
+fail-closed comparison between the pilot-phase and profiling-phase preflight
+snapshots, checked before any Docker/NCU work and again as a hard gate
+inside metric discovery — discovers the exact supported NCU metric names on
+the profiled device rather than assuming them, and classifies each of the
+six cases' `dram_read_bytes / useful_bytes` ratio as `HBM_VALIDATED` (`>=
+0.90`, flagged `READ_AMPLIFICATION` above `1.10`) or `INCONCLUSIVE` — a
 classification that applies only to those six cases, never extrapolated to
-the other twelve pilot configurations. Statistics (mean/median/sample
+the other twelve pilot configurations. The exported raw NCU metrics CSV is
+parsed fail-closed: exact required columns, exact-unit validation (never
+scaled), exact kernel-name equality (never substring-matched), and exactly
+one launch/kernel per case, with a metric NCU discovery marked resolved but
+absent from a case's own CSV treated as a hard validation failure rather
+than a silent `INCONCLUSIVE`. Statistics (mean/median/sample
 stdev/CV/min/max, a 95% bootstrap CI for the median with a fixed seed and
 10,000 resamples, IQR diagnostics that flag but never remove a sample) cover
 all 30 retained repetitions of all 18 pilot configurations; a paired
@@ -687,20 +697,34 @@ bytes_in_flight_kib)` pair is reported with its own independently-resampled
 CI and an explicit ratio-direction interpretation, never a p-value or a
 "winner"; a candidate-saturation search is limited to the three tested
 bytes-in-flight values per `(method, stages)` group and is never called a
-universal architectural threshold. `scripts/analyze_exp01_memory_paths_p14.py`
-reuses `scripts/aggregate_exp01_memory_paths.py`'s path-safety primitives,
-37-column CSV schema/validators, geometry formulas, and manifest atomic-write
-helper directly (imported, never reimplemented). See
-`src/memory/P1_4_PROTOCOL.md` for the complete frozen protocol, the exact
-future NCU command structure, the raw-directory/state-machine design, and
-the statistical policy.
+universal architectural threshold. Before both `COMPLETE` and `ANALYZED`, a
+central evidence-integrity gate re-hashes every trusted artifact (each
+case's application/metrics/`.ncu-rep`, both preflights, `profile_plan.csv`,
+and the P1.3 pilot's own manifest/CSVs) from disk and reparses every CSV,
+rejecting any modification made after it was first validated.
+`scripts/analyze_exp01_memory_paths_p14.py` reuses
+`scripts/aggregate_exp01_memory_paths.py`'s path-safety primitives,
+37-column CSV schema/validators, and geometry formulas directly (imported,
+never reimplemented), but publishes its own manifest as an append-only,
+hash-chained revision history (`campaign_dir/manifest/000000.json`,
+`000001.json`, ...) rather than reusing P1.3's atomic-replace manifest
+writer, since a single mutable `manifest.json` cannot make the same
+no-overwrite guarantee. See `src/memory/P1_4_PROTOCOL.md` for the complete
+frozen protocol, the exact NCU command structure, the raw-directory/
+state-machine/manifest-chain design, and the statistical policy.
 
-**Status: implemented; independent audit PENDING; verified on GB300: NO;
-pilot executed: NO; NCU/HBM validation: NO; publishable results: NONE.**
-`make memory-paths-p14-plan` and `make memory-paths-p14-check` are GPU-free
-(no Docker, no GPU, no network); `make memory-paths-p14-pilot` and
-`make memory-paths-p14-profile` require an explicit, operator-provided
-`BLACKWELL_GPU_INDEX`, `P1_4_CAMPAIGN_ID`, and `P1_4_PREFLIGHT_SUMMARY`, and
-have not been executed as part of this implementation. `make
-memory-paths-p14-analyze` is GPU-free and validates/analyzes an already-
-`COMPLETE` P1.4 campaign.
+**Status: implemented, remediated after an independent GPU-free audit;
+independent re-audit PENDING; verified on GB300: NO; pilot executed: NO;
+NCU/HBM validation: NO; publishable results: NONE.** An independent
+GPU-free audit of the first implementation found five blockers (preflight
+provenance, post-validation tamper detection, NCU CSV parsing, raw-tree/log
+write ordering and safety, and the manifest's overwrite-based publication);
+all five were remediated GPU-free as described above, each with a new
+adversarial test that first demonstrably failed against the original
+behavior and then passed against the fix. `make memory-paths-p14-plan` and
+`make memory-paths-p14-check` are GPU-free (no Docker, no GPU, no network);
+`make memory-paths-p14-pilot` and `make memory-paths-p14-profile` require an
+explicit, operator-provided `BLACKWELL_GPU_INDEX`, `P1_4_CAMPAIGN_ID`, and
+`P1_4_PREFLIGHT_SUMMARY`, and have not been executed as part of this
+remediation. `make memory-paths-p14-analyze` is GPU-free and
+validates/analyzes an already-`COMPLETE` P1.4 campaign.

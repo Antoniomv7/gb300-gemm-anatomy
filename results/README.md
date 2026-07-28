@@ -24,29 +24,37 @@ The raw campaign is stored locally at
 ignored by Git. This record closes P1.3's functional GB300 verification only;
 it must not be cited as a performance measurement or used to compare LDGSTS
 against TMA. P1.4 owns the pilot benchmark campaign, Nsight Compute/HBM
-validation, figures, and interpretation; it is implemented (see
-`src/memory/P1_4_PROTOCOL.md`) but its pilot has not been executed, so no
-P1.4 raw campaign exists yet either.
+validation, figures, and interpretation; it is implemented — and the five
+blockers an independent GPU-free audit found in that implementation have
+been remediated GPU-free (see `src/memory/P1_4_PROTOCOL.md`) — but its pilot
+has not been executed, so no P1.4 raw campaign exists yet either.
 
 ### `results/raw/exp01_memory_paths_p14/<campaign_id>/` (raw, not committed)
 
 Each P1.4 campaign (`scripts/run_exp01_memory_paths_p14.sh --pilot` /
 `--profile`, an explicit canonical UTC timestamp `--campaign-id`) creates
 exactly one directory, symlink-safe like the P1.3 raw tree above, containing
-`manifest.json`, `profile_plan.csv` (the frozen six-case Nsight Compute plan,
-written once), `profiles/` (one subdirectory per profiled case: its
-`.ncu-rep`, NCU tool log, captured container stdout/stderr, extracted
-application CSV, and exported raw metrics CSV), `logs/` (metric-discovery and
-NCU-help-capability-probe logs), and, once `make memory-paths-p14-analyze`
-has run against a `COMPLETE` campaign, `analysis/` (deterministic
-statistics/comparison/saturation/HBM-validation CSVs, `analysis.json`,
-`report.md`, and three SVG figures under `analysis/figures/`). The manifest's
-`state` field follows its own state machine
+`manifest/` (an append-only, hash-chained sequence of complete manifest
+snapshots — `000000.json`, `000001.json`, ... — never a single mutable
+`manifest.json`; each revision is published once, hard-link-then-unlink,
+and never edited or replaced), `profile_plan.csv` (the frozen six-case
+Nsight Compute plan, written once), `profiles/` (one subdirectory per
+profiled case: its `.ncu-rep`, NCU tool log, captured container
+stdout/stderr, extracted application CSV, and exported raw metrics CSV),
+`logs/` (metric-discovery and NCU-help-capability-probe logs), and, once
+`make memory-paths-p14-analyze` has run against a `COMPLETE` campaign,
+`analysis/` (deterministic statistics/comparison/saturation/HBM-validation
+CSVs, `analysis.json`, `report.md`, and three SVG figures under
+`analysis/figures/`). The manifest's `state` field follows its own state
+machine
 (`PILOT_IN_PROGRESS`→`PILOT_COMPLETE`→`PROFILE_IN_PROGRESS`→`COMPLETE`→`ANALYZED`,
 or `FAILED`/`INTERRUPTED`); `COMPLETE` means the raw pilot-plus-profile
 collection succeeded, not that the result is publishable — `publishable` is
-always `false`. This raw tree is covered by the same blanket `results/raw/`
-Git-ignore rule as P1.3's own raw tree.
+always `false`. Before both `COMPLETE` and `ANALYZED`, every trusted
+artifact recorded in the manifest is re-hashed from disk and every CSV is
+reparsed, so a validated artifact modified after the fact is rejected rather
+than silently accepted. This raw tree is covered by the same blanket
+`results/raw/` Git-ignore rule as P1.3's own raw tree.
 
 ## Storage layout
 
