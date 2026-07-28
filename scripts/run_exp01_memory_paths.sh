@@ -5,9 +5,9 @@
 # bytes-in-flight values, see scripts/aggregate_exp01_memory_paths.py)
 # through scripts/run_container.sh, one GPU process at a time, then
 # validates and aggregates the raw CSV. This script only orchestrates: plan
-# generation, CSV parsing/validation, manifest handling, consolidation, and
-# aggregation all live in scripts/aggregate_exp01_memory_paths.py (Python
-# standard library only).
+# generation, symlink-safe campaign initialization, CSV parsing/validation,
+# manifest handling, consolidation, and aggregation all live in
+# scripts/aggregate_exp01_memory_paths.py (Python standard library only).
 #
 # Output is functional/descriptive infrastructure only: no speedups, no
 # Nsight Compute, no performance conclusions. See src/memory/README.md and
@@ -17,12 +17,13 @@
 # correctness, CSV-validation, or aggregation failure; 2 CLI,
 # repository-state, or safety-precondition failure.
 set -Eeuo pipefail
+set -o noclobber
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+SELF_PATH="${REPO_ROOT}/scripts/run_exp01_memory_paths.sh"
 AGGREGATOR_HOST="${REPO_ROOT}/scripts/aggregate_exp01_memory_paths.py"
 AGGREGATOR_IN_CONTAINER="scripts/aggregate_exp01_memory_paths.py"
 RUN_CONTAINER="${REPO_ROOT}/scripts/run_container.sh"
-CASES_ROOT_REL="results/raw/exp01_memory_paths"
 
 usage() {
     cat <<'EOF'
@@ -40,15 +41,17 @@ aggregation. Functional/descriptive output only: no speedups, no Nsight
 Compute, no performance conclusions (that is P1.4).
 
 Options:
-  --help                        Show this help and exit 0.
+  --help                        Show this help and exit 0. Standalone only.
   --print-plan                  Print the deterministic 18-invocation plan
-                                 and exit 0. No GPU, no Docker.
+                                 and exit 0. No GPU, no Docker. Standalone.
   --self-test                   Run GPU-free synthetic checks and exit. No
                                  GPU, no Docker, no nvidia-smi, no network.
+                                 Standalone.
   --run-kind {smoke,benchmark}   Required for a campaign.
   --campaign-id ID               Optional; default is the current UTC
                                  timestamp (YYYYMMDDTHHMMSSZ). Must match
-                                 [A-Za-z0-9][A-Za-z0-9._-]{0,63}.
+                                 [A-Za-z0-9][A-Za-z0-9._-]{0,63} and contain
+                                 no ".." substring.
   --working-set-mib N             Optional, forwarded verbatim to both
                                  binaries, in [1, 1048576]. If omitted, both
                                  binaries apply their own default (>= 4x
@@ -57,10 +60,16 @@ Options:
   --warmup-ms N                  Required for a campaign, in [0, 3600000].
   --repetitions N                Required for a campaign, in [1, 1000000].
 
+--help, --print-plan, and --self-test are mutually exclusive with each other
+and with every campaign option, and each may be given at most once.
+
 A real campaign additionally requires BLACKWELL_GPU_INDEX=<physical-index>
 in the environment (never selected automatically) and a clean Git worktree
 at a full 40-character commit. Every GPU invocation goes through
 scripts/run_container.sh independently; methods never run concurrently.
+Campaign initialization (directory creation, execution_order.csv, the
+initial manifest) is centralized and symlink-safe in
+scripts/aggregate_exp01_memory_paths.py's init-campaign subcommand.
 
 Exit codes: 0 success/--help/--print-plan/--self-test; 1 execution,
 correctness, CSV-validation, or aggregation failure; 2 CLI,
@@ -91,6 +100,25 @@ validate_range() {
     fi
 }
 
+# _check_rejected_cli LABEL ARGS...: recursively invokes this same script
+# with ARGS and asserts it exits 2 (a CLI-rejection path only) without
+# touching Docker, nvidia-smi, or results/raw/. Used exclusively by the
+# GPU-free self-test below for duplicate/mutually-exclusive special-mode
+# checks; every ARGS combination it is called with is one this script's own
+# parser rejects before any GPU/Docker/results-directory code runs.
+_check_rejected_cli() {
+    local label="$1"
+    shift
+    "${SELF_PATH}" "$@" >/dev/null 2>&1
+    local rc=$?
+    if [ "${rc}" -eq 2 ]; then
+        echo "run_exp01_memory_paths: self-test: PASS: rejects ${label} (exit 2)" >&2
+        return 0
+    fi
+    echo "run_exp01_memory_paths: self-test: FAIL: ${label} exited ${rc}, expected 2" >&2
+    return 1
+}
+
 run_self_test() {
     local failures=0
 
@@ -118,6 +146,16 @@ run_self_test() {
         failures=$((failures + 1))
     fi
 
+    _check_rejected_cli "'--help --help'" --help --help || failures=$((failures + 1))
+    _check_rejected_cli "'-h --help'" -h --help || failures=$((failures + 1))
+    _check_rejected_cli "'--print-plan --print-plan'" --print-plan --print-plan || failures=$((failures + 1))
+    _check_rejected_cli "'--self-test --self-test'" --self-test --self-test || failures=$((failures + 1))
+    _check_rejected_cli "'--help --print-plan'" --help --print-plan || failures=$((failures + 1))
+    _check_rejected_cli "'--self-test --run-kind smoke'" --self-test --run-kind smoke || failures=$((failures + 1))
+    _check_rejected_cli "'--print-plan --passes 1'" --print-plan --passes 1 || failures=$((failures + 1))
+    _check_rejected_cli "'--campaign-id a..b'" --campaign-id a..b \
+        --run-kind smoke --passes 1 --warmup-ms 0 --repetitions 1 || failures=$((failures + 1))
+
     if [ "${failures}" -eq 0 ]; then
         echo "run_exp01_memory_paths: SELF_TEST_RESULT=PASS" >&2
         return 0
@@ -131,9 +169,9 @@ run_self_test() {
 # construction. Every branch below must be reachable without touching the
 # GPU, Docker, or nvidia-smi.
 # ---------------------------------------------------------------------------
-HELP=0
-PRINT_PLAN=0
-SELF_TEST=0
+HELP_COUNT=0
+PRINT_PLAN_COUNT=0
+SELF_TEST_COUNT=0
 HAS_RUN_KIND=0; RUN_KIND=""
 HAS_CAMPAIGN_ID=0; CAMPAIGN_ID=""
 HAS_WORKING_SET_MIB=0; WORKING_SET_MIB=""
@@ -144,11 +182,11 @@ HAS_REPETITIONS=0; REPETITIONS=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --help|-h)
-            HELP=1; shift ;;
+            HELP_COUNT=$((HELP_COUNT + 1)); shift ;;
         --print-plan)
-            PRINT_PLAN=1; shift ;;
+            PRINT_PLAN_COUNT=$((PRINT_PLAN_COUNT + 1)); shift ;;
         --self-test)
-            SELF_TEST=1; shift ;;
+            SELF_TEST_COUNT=$((SELF_TEST_COUNT + 1)); shift ;;
         --run-kind)
             [ "${HAS_RUN_KIND}" -eq 0 ] || fail_cli "duplicate --run-kind"
             [ "$#" -ge 2 ] || fail_cli "--run-kind requires a value"
@@ -180,17 +218,31 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-if [ "${HELP}" -eq 1 ]; then
+if [ "${HELP_COUNT}" -gt 1 ] || [ "${PRINT_PLAN_COUNT}" -gt 1 ] || [ "${SELF_TEST_COUNT}" -gt 1 ]; then
+    fail_cli "--help, --print-plan, and --self-test may each be given at most once"
+fi
+SPECIAL_MODE_COUNT=$((HELP_COUNT + PRINT_PLAN_COUNT + SELF_TEST_COUNT))
+if [ "${SPECIAL_MODE_COUNT}" -gt 1 ]; then
+    fail_cli "--help, --print-plan, and --self-test are mutually exclusive"
+fi
+if [ "${SPECIAL_MODE_COUNT}" -eq 1 ]; then
+    if [ "${HAS_RUN_KIND}" -eq 1 ] || [ "${HAS_CAMPAIGN_ID}" -eq 1 ] || [ "${HAS_WORKING_SET_MIB}" -eq 1 ] \
+       || [ "${HAS_PASSES}" -eq 1 ] || [ "${HAS_WARMUP_MS}" -eq 1 ] || [ "${HAS_REPETITIONS}" -eq 1 ]; then
+        fail_cli "--help, --print-plan, and --self-test cannot be combined with campaign options"
+    fi
+fi
+
+if [ "${HELP_COUNT}" -eq 1 ]; then
     usage
     exit 0
 fi
 
-if [ "${PRINT_PLAN}" -eq 1 ]; then
+if [ "${PRINT_PLAN_COUNT}" -eq 1 ]; then
     python3 "${AGGREGATOR_HOST}" plan --format text
     exit 0
 fi
 
-if [ "${SELF_TEST}" -eq 1 ]; then
+if [ "${SELF_TEST_COUNT}" -eq 1 ]; then
     if run_self_test; then
         exit 0
     fi
@@ -216,6 +268,9 @@ fi
 if [ "${HAS_CAMPAIGN_ID}" -eq 1 ]; then
     [[ "${CAMPAIGN_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
         || fail_cli "--campaign-id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}, got '${CAMPAIGN_ID}'"
+    case "${CAMPAIGN_ID}" in
+        *..*) fail_cli "--campaign-id must not contain '..', got '${CAMPAIGN_ID}'" ;;
+    esac
 else
     CAMPAIGN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 fi
@@ -235,13 +290,17 @@ GIT_COMMIT="$(cd "${REPO_ROOT}" && git rev-parse HEAD)"
 [[ "${GIT_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
     || fail_precondition "unable to resolve a full 40-character Git commit SHA (got '${GIT_COMMIT}')"
 
-CAMPAIGN_REL="${CASES_ROOT_REL}/${CAMPAIGN_ID}"
-CAMPAIGN_DIR="${REPO_ROOT}/${CAMPAIGN_REL}"
-mkdir -p "${REPO_ROOT}/${CASES_ROOT_REL}"
-if ! mkdir "${CAMPAIGN_DIR}" 2>/dev/null; then
-    fail_precondition "campaign directory already exists, refusing to overwrite: ${CAMPAIGN_DIR}"
+STARTED_AT="$(date -u +%Y%m%dT%H%M%SZ)"
+init_args=(init-campaign --campaign-id "${CAMPAIGN_ID}" --run-kind "${RUN_KIND}"
+    --passes "${PASSES}" --warmup-ms "${WARMUP_MS}" --repetitions "${REPETITIONS}"
+    --git-commit "${GIT_COMMIT}" --gpu-index "${BLACKWELL_GPU_INDEX}" --started-at-utc "${STARTED_AT}")
+if [ "${HAS_WORKING_SET_MIB}" -eq 1 ]; then
+    init_args+=(--working-set-mib "${WORKING_SET_MIB}")
 fi
-mkdir -p "${CAMPAIGN_DIR}/cases" "${CAMPAIGN_DIR}/logs"
+if ! CAMPAIGN_REL="$(python3 "${AGGREGATOR_HOST}" "${init_args[@]}")"; then
+    fail_precondition "campaign initialization failed (unsafe campaign ID, symlink, or existing campaign directory)"
+fi
+CAMPAIGN_DIR="${REPO_ROOT}/${CAMPAIGN_REL}"
 
 CAMPAIGN_OUTCOME=""
 on_exit() {
@@ -272,47 +331,14 @@ write_manifest_status() {
     merge_file="$(mktemp "${CAMPAIGN_DIR}/manifest_merge.XXXXXX")"
     if [ -n "${failure_stage}" ]; then
         printf '{"failure_stage": "%s", "failure_exit_code": %s}\n' \
-            "${failure_stage}" "${failure_exit_code:-null}" > "${merge_file}"
+            "${failure_stage}" "${failure_exit_code:-null}" >| "${merge_file}"
     else
-        printf '{}' > "${merge_file}"
+        printf '{}' >| "${merge_file}"
     fi
     python3 "${AGGREGATOR_HOST}" manifest-write --campaign-dir "${CAMPAIGN_REL}" \
         --status "${status}" --merge-json "${merge_file}" >/dev/null
     rm -f "${merge_file}"
 }
-
-if [ "${HAS_WORKING_SET_MIB}" -eq 1 ]; then
-    WORKING_SET_MIB_JSON="${WORKING_SET_MIB}"
-else
-    WORKING_SET_MIB_JSON="null"
-fi
-STARTED_AT="$(date -u +%Y%m%dT%H%M%SZ)"
-INIT_MERGE_FILE="$(mktemp "${CAMPAIGN_DIR}/manifest_merge.XXXXXX")"
-cat > "${INIT_MERGE_FILE}" <<EOF
-{
-  "campaign_id": "${CAMPAIGN_ID}",
-  "run_kind": "${RUN_KIND}",
-  "started_at_utc": "${STARTED_AT}",
-  "configuration_count_expected": 18,
-  "configuration_count_completed": 0,
-  "sample_count_expected": $((18 * REPETITIONS)),
-  "sample_count_completed": 0,
-  "requested": {
-    "run_kind": "${RUN_KIND}",
-    "working_set_mib": ${WORKING_SET_MIB_JSON},
-    "passes": ${PASSES},
-    "warmup_ms": ${WARMUP_MS},
-    "repetitions": ${REPETITIONS},
-    "campaign_id": "${CAMPAIGN_ID}"
-  },
-  "selected_gpu_index": ${BLACKWELL_GPU_INDEX},
-  "git_commit": "${GIT_COMMIT}",
-  "git_dirty": false
-}
-EOF
-python3 "${AGGREGATOR_HOST}" manifest-write --campaign-dir "${CAMPAIGN_REL}" \
-    --status IN_PROGRESS --merge-json "${INIT_MERGE_FILE}" >/dev/null
-rm -f "${INIT_MERGE_FILE}"
 
 echo "run_exp01_memory_paths: campaign ${CAMPAIGN_ID} IN_PROGRESS at ${CAMPAIGN_DIR}" >&2
 
@@ -355,7 +381,7 @@ SELF_TEST_TMA=PASS
 
 SELFTEST_MERGE_FILE="$(mktemp "${CAMPAIGN_DIR}/manifest_merge.XXXXXX")"
 printf '{"self_test_outcomes": {"ldgsts": "%s", "tma": "%s"}}\n' \
-    "${SELF_TEST_LDGSTS}" "${SELF_TEST_TMA}" > "${SELFTEST_MERGE_FILE}"
+    "${SELF_TEST_LDGSTS}" "${SELF_TEST_TMA}" >| "${SELFTEST_MERGE_FILE}"
 python3 "${AGGREGATOR_HOST}" manifest-write --campaign-dir "${CAMPAIGN_REL}" \
     --status IN_PROGRESS --merge-json "${SELFTEST_MERGE_FILE}" >/dev/null
 rm -f "${SELFTEST_MERGE_FILE}"
@@ -392,11 +418,13 @@ while IFS=$'\t' read -r p_index p_method p_stages p_bif p_case_name; do
         exit 1
     fi
 
-    if ! python3 "${AGGREGATOR_HOST}" validate-case \
-            --campaign-dir "${CAMPAIGN_REL}" --index "${p_index}" \
-            --run-kind "${RUN_KIND}" --repetitions "${REPETITIONS}" \
-            --passes "${PASSES}" --warmup-ms "${WARMUP_MS}" --git-commit "${GIT_COMMIT}" \
-            2>>"${stderr_log}"; then
+    validate_args=(validate-case --campaign-dir "${CAMPAIGN_REL}" --index "${p_index}"
+        --run-kind "${RUN_KIND}" --repetitions "${REPETITIONS}"
+        --passes "${PASSES}" --warmup-ms "${WARMUP_MS}" --git-commit "${GIT_COMMIT}")
+    if [ "${HAS_WORKING_SET_MIB}" -eq 1 ]; then
+        validate_args+=(--working-set-mib "${WORKING_SET_MIB}")
+    fi
+    if ! python3 "${AGGREGATOR_HOST}" "${validate_args[@]}" 2>>"${stderr_log}"; then
         write_manifest_status FAILED "validate_${p_case_name}" 1
         CAMPAIGN_OUTCOME=FAILED
         echo "run_exp01_memory_paths: ERROR: validation failed at index ${p_index} (${p_case_name}); see ${stderr_log}" >&2

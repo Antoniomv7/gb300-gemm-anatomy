@@ -7,7 +7,8 @@ auditable measurement study.
 baseline) — implemented, audited, functionally verified on GB300`. `P1.2
 (standalone 2D unicast TMA path) — implemented, audited, functionally
 verified on GB300`. `P1.3 (joint LDGSTS/TMA sweep infrastructure) —
-implemented, pending independent audit and GB300 verification`.**
+implemented, remediation completed, pending a new independent audit and
+GB300 functional verification`.**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -40,18 +41,23 @@ records Audited=YES and Verified on GB300=YES for P1.2 as well.
 
 P1.3, the joint LDGSTS/TMA sweep infrastructure
 (`scripts/run_exp01_memory_paths.sh`, `scripts/aggregate_exp01_memory_paths.py`),
-is now implemented: a deterministic 18-invocation runner (2 methods x 3 stage
+is implemented: a deterministic 18-invocation runner (2 methods x 3 stage
 counts x 3 bytes-in-flight values, alternating which method runs first per
-configuration pair), strict validation of both binaries' raw 37-column CSV,
+configuration pair), strict validation of every field of every repetition of
+both binaries' raw 37-column CSV, symlink-safe centralized campaign
+initialization, no-clobber publication of every result/log/evidence file,
 lossless consolidation into `combined_samples.csv`, and purely descriptive
 per-configuration statistics in `summary.csv` (mean/median/sample
 stdev/coefficient of variation — no speedups, no outlier filtering, no
-significance testing). P1.3 has not yet been independently audited or
-verified on GB300, so `PLAN.md` records Implemented=YES, Audited=NO, and
-Verified on GB300=NO for P1.3. P1.4 (profiling, Nsight Compute, the pilot
-performance campaign, and comparative LDGSTS/TMA interpretation) has not
-started and remains blocked until P1.3 is independently audited and verified
-on GB300.
+significance testing). A first independent audit found fifteen confirmed
+defects (incomplete field validation, symlink-escape and overwrite risks,
+manifest integrity gaps, and CLI edge cases); this remediation fixes all
+fifteen (see `src/memory/README.md`), but fixing them does not itself
+constitute a new audit, so `PLAN.md` still records Implemented=YES,
+Audited=NO, and Verified on GB300=NO for P1.3. P1.4 (profiling, Nsight
+Compute, the pilot performance campaign, and comparative LDGSTS/TMA
+interpretation) has not started and remains blocked until P1.3 is
+independently (re-)audited and verified on GB300.
 
 ## Research question
 

@@ -203,6 +203,11 @@ check-static:
 	@! grep -F 'P1.3, P1.4, and experiments 2' README.md
 	@! grep -F 'P1.3 (the joint LDGSTS/TMA sweep) has not started' README.md
 	@! grep -F 'P1.3 (the joint sweep) and P1.4' src/memory/README.md
+	@! grep -rnF 'P1.2 is implemented but unaudited' README.md src/memory/README.md
+	@! grep -nF 'Status: implemented, pending audit and GB300 verification (see' src/memory/README.md
+	@! grep -nF 'not a comparison against LDGSTS (P1.3 is the' src/memory/README.md
+	@grep -Fq 'remediation completed' README.md
+	@grep -Fq 'remediation completed' src/memory/README.md
 	@echo "check-static: OK"
 
 build-image:

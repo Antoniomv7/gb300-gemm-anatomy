@@ -25,7 +25,12 @@ committed.
 
 Each P1.3 sweep (`scripts/run_exp01_memory_paths.sh --run-kind ... --campaign-id ...`,
 default campaign ID is the current UTC timestamp) creates exactly one
-directory, once, and refuses to overwrite an existing one:
+directory, once, via `aggregate_exp01_memory_paths.py`'s centralized
+`init-campaign` subcommand, which walks every path component
+(`results/`, `raw/`, `exp01_memory_paths/`, `<campaign_id>/`, `cases/`,
+`logs/`) with `lstat` — never a `resolve()`/`is_dir()` check alone — refusing
+a symlink (including a dangling one) at any level, including the raw root
+itself, and refuses to overwrite an existing campaign directory:
 
 ```
 manifest.json           # schema/status/provenance, see below
@@ -54,22 +59,35 @@ Git commit with `git_dirty=false`; and, across the whole campaign, identical
 `gpu_name`/`gpu_uuid`/`compute_capability`/driver+runtime versions/`git_commit`/
 `git_dirty`/`sm_count`/`l2_bytes`/`working_set_bytes`/`passes`/`warmup_ms`/
 `run_kind`/repetition count — deliberately excluding `smem_reservation_bytes`,
-since TMA also reserves mbarrier storage). On any invocation, validation,
-aggregation, signal, or I/O failure the campaign is marked `FAILED` or
-`INTERRUPTED`, completed raw cases and logs are preserved, and no
-`summary.csv` is produced.
+since TMA also reserves mbarrier storage; this comparison covers every
+repetition of every case against one single validated reference row, not
+just each case's first sample, so a value that only changes in a later
+repetition is caught too). `execution_order.csv` must also independently
+re-validate exactly (see `src/memory/README.md`), and all four build
+artifacts (`build/memory/{ldgsts,tma}` and their `.sass` disassembly) must
+exist as non-symlink, non-empty regular files with a real SHA-256 hash —
+never `null`. On any invocation, validation, aggregation, signal, or I/O
+failure the campaign is marked `FAILED` or `INTERRUPTED`, completed raw cases
+and logs are preserved, and no `summary.csv` is produced. `manifest.json`'s
+`status` follows an enforced state machine: the only legal transitions are
+unset→`IN_PROGRESS`, `IN_PROGRESS`→`IN_PROGRESS`/`COMPLETE`/`FAILED`/
+`INTERRUPTED`; a terminal campaign (`COMPLETE`, `FAILED`, or `INTERRUPTED`)
+can never be reopened or rewritten, and only the validated `finalize`
+subcommand — never the generic manifest-update path — may set `COMPLETE`.
+Every manifest field is allowlisted by name and type; an unrecognized field
+or a value of the wrong type is rejected.
 
 `manifest.json` contains only safe, experiment-relevant, non-publishable
 metadata: schema/experiment/campaign identifiers, status, requested and
 observed common values, the exact invocation order, the selected physical GPU
 index, allowlisted GPU/toolchain identity already reported by the binaries
 themselves, the pinned `VERSIONS.env` contract, SHA-256 hashes of the
-binaries/SASS/raw case files/aggregate files, self-test outcomes, and
-`publishable: false`. It never stores full environment dumps, usernames, home
-paths, SSH material, credentials, hostnames, process command lines, or
-dynamic GPU telemetry (power/clock/temperature/utilization, Nsight counters) —
-P1.3 "telemetry" means allowlisted provenance and execution outcomes, not
-performance monitoring.
+binaries/SASS/raw case files/`execution_order.csv`/aggregate files, self-test
+outcomes, and `publishable: false`. It never stores full environment dumps,
+usernames, home paths, SSH material, credentials, hostnames, process command
+lines, or dynamic GPU telemetry (power/clock/temperature/utilization, Nsight
+counters) — P1.3 "telemetry" means allowlisted provenance and execution
+outcomes, not performance monitoring.
 
 `summary.csv` is purely descriptive: arithmetic mean, median, sample standard
 deviation (`n-1`, zero when `n=1`), and coefficient of variation
@@ -81,6 +99,16 @@ summary is functional/non-publishable by definition; a `run_kind=benchmark`
 summary produced by P1.3 is still unreviewed raw input for P1.4, not a
 publishable result, and does not by itself establish that the measured bytes
 came from DRAM/HBM rather than L2 (that requires Nsight Compute, P1.4).
+
+No result, log, or failure-evidence path is ever silently overwritten.
+`combined_samples.csv`, `summary.csv`, `execution_order.csv`, and each
+captured case `.csv` are all published with a hard-link-then-unlink
+no-clobber operation (never `os.replace()`, which would overwrite): if the
+final name already exists, publication fails outright rather than replacing
+it. A failed or interrupted capture preserves any non-empty partial stdout
+under a fresh `.invalid` or `.partial` name — never overwriting earlier
+evidence — and a launch failure (e.g. an `OSError` starting the binary)
+leaves no stale temporary file behind.
 
 To reproduce aggregation from an existing campaign's raw `cases/` directory
 without rerunning any GPU work, see `scripts/aggregate_exp01_memory_paths.py`'s

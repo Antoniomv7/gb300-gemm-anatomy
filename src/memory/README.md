@@ -44,16 +44,20 @@ on GB300.
   by measured kernel time. It says nothing about where those bytes actually
   came from (L2 vs DRAM) — that requires Nsight Compute, which is out of
   scope until P1.4.
-- **Not yet a TMA comparison.** TMA / `cp.async.bulk.tensor` is now
+- **Not yet an interpreted TMA comparison.** TMA / `cp.async.bulk.tensor` is
   implemented in `src/memory/tma.cu` (P1.2, `method=tma`), which expresses
   this file's exact 2D tile layout as 2D unicast TMA loads (see "P1.2 —
-  standalone 2D unicast TMA path" below). The two arms are still not
-  compared, aggregated, or run jointly: P1.2 is implemented but unaudited
-  and unverified on GB300 (see `PLAN.md`), and the joint sweep that would
-  actually compare them is P1.3, which has not started.
-- **Not a sweep or an analysis.** This binary runs one specialization (or,
-  under `--self-test`, validates all nine) per invocation. Aggregation,
-  statistics, plots, and conclusions are P1.3/P1.4.
+  standalone 2D unicast TMA path" below); P1.2 is implemented, independently
+  audited, and functionally verified on GB300, same as P1.1. The joint sweep
+  that runs both arms together, `scripts/run_exp01_memory_paths.sh` /
+  `scripts/aggregate_exp01_memory_paths.py` (P1.3), is likewise implemented
+  but still pending its own independent audit and GB300 verification (see
+  `PLAN.md`); comparative LDGSTS/TMA interpretation itself remains P1.4.
+- **Not a sweep or an analysis by itself.** This binary runs one
+  specialization (or, under `--self-test`, validates all nine) per
+  invocation. P1.3 (see below) provides the joint sweep, strict CSV
+  validation, and descriptive aggregation; comparative statistics, plots,
+  and conclusions remain P1.4.
 - **Not a final result.** `run_kind=smoke` output exists only to prove the
   binary and container plumbing work end to end; it is never a publishable
   measurement. `run_kind=benchmark` output is raw, per-repetition CSV with
@@ -233,9 +237,11 @@ completion) moving the exact same logical tiles as P1.1, from a host-encoded
 rank-2 `CUtensorMap` descriptor, into the same per-SM shared-memory ring
 buffer shape.
 
-**Status: implemented, pending audit and GB300 verification (see
+**Status: implemented, audited, functionally verified on GB300 (see
 `PLAN.md`).** No experimental numbers from this code have been published in
-`README.md` or anywhere else in the repository.
+`README.md` or anywhere else in the repository: the GB300 run was a
+functional check (all nine `--self-test` specializations plus one short
+`run_kind=smoke` measurement), not a publishable result.
 
 ### What P1.2 measures
 
@@ -252,11 +258,14 @@ buffer shape.
 
 Identical caveats to P1.1: not HBM/DRAM bandwidth (`effective_gbps` is
 *effective copy bandwidth*, not a claim about L2 vs DRAM traffic — that is
-an NCU question for P1.4); not a comparison against LDGSTS (P1.3 is the
-joint sweep; it has not started); not a sweep or an analysis (this binary
-runs one specialization, or under `--self-test` validates all nine, per
-invocation); not a final result (`run_kind=smoke` is a functional check
-only, never a publishable measurement).
+an NCU question for P1.4); not an interpreted comparison against LDGSTS
+(P1.3, the joint sweep, is implemented and runs both arms together, but is
+itself still pending independent audit and GB300 verification, and
+comparative interpretation remains P1.4); not a sweep or an analysis by
+itself (this binary runs one specialization, or under `--self-test`
+validates all nine, per invocation — see "P1.3" below for the joint sweep);
+not a final result (`run_kind=smoke` is a functional check only, never a
+publishable measurement).
 
 ### Frozen contract
 
@@ -383,16 +392,71 @@ is reproducible infrastructure for running P1.1 and P1.2 together, validating
 their raw CSV strictly, and computing descriptive statistics. It adds no CUDA
 code and does not modify `ldgsts.cu`, `tma.cu`, or either SASS checker.
 
-**Status: implemented, pending independent audit and GB300 verification (see
-`PLAN.md`).** P1.3 does not itself collect publishable measurements: it does
-not run Nsight Compute, compute LDGSTS/TMA speedups, apply an outlier policy,
-or draw any performance conclusion. Whether the copied bytes actually came
-from DRAM/HBM (as opposed to L2) is still an open question that only Nsight
-Compute (P1.4) can answer; a `run_kind=smoke` campaign is a functional check
-of the sweep plumbing, never a performance number. All of that — the pilot
-performance campaign, Nsight Compute, DRAM/HBM traffic confirmation,
-variability/outlier judgment, and comparative LDGSTS/TMA interpretation — is
-P1.4, which has not started.
+**Status: implemented, remediation completed, pending a new independent
+audit and GB300 functional verification (see `PLAN.md`).** A first
+independent audit of P1.3 found and confirmed fifteen defects spanning
+validation completeness, symlink safety, no-clobber I/O, manifest integrity,
+and CLI edge cases; this remediation fixes all fifteen (see "Remediated
+audit findings" below), but fixing them is not itself a new audit — P1.3
+remains Audited=NO / Verified on GB300=NO until an independent reviewer and
+a GB300 run both confirm the fix. P1.3 does not itself collect publishable
+measurements: it does not run Nsight Compute, compute LDGSTS/TMA speedups,
+apply an outlier policy, or draw any performance conclusion. Whether the
+copied bytes actually came from DRAM/HBM (as opposed to L2) is still an open
+question that only Nsight Compute (P1.4) can answer; a `run_kind=smoke`
+campaign is a functional check of the sweep plumbing, never a performance
+number. All of that — the pilot performance campaign, Nsight Compute,
+DRAM/HBM traffic confirmation, variability/outlier judgment, figures, tables,
+and comparative LDGSTS/TMA interpretation — is P1.4, which has not started.
+
+### Remediated audit findings
+
+* **Strict validation of every field, every repetition.** A central
+  `FIELD_VALIDATORS` contract (asserted at import time to cover exactly the
+  37-column `CSV_HEADER`, so a future edit cannot silently drop a column)
+  validates every field of every row, not a `rows[0]` sample: canonical
+  integer/float parsing (rejects empty values, whitespace, unexpected signs,
+  decimal points on integer fields, non-decimal syntax, signed-64-bit
+  overflow, and — for the two floating-point measurement fields plus the
+  working-set/L2 ratio — NaN and ±infinity), a real-calendar
+  `YYYY-MM-DDTHH:MM:SSZ` timestamp, a non-empty control-character-free GPU
+  name, and a canonical `GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` UUID.
+* **Explicit and implicit working-set formulas are both checked.**
+  `requested_working_set_bytes` must equal `--working-set-mib * 1024*1024`
+  when that flag was given, or `4 * l2_bytes` when it was not; `working_set_bytes`
+  must equal the same `round_up_to_multiple(requested, sm_count*32KiB)`
+  the binaries themselves use; `run_kind=benchmark` additionally requires
+  `working_set_bytes > 2*l2_bytes`.
+* **Cross-case consistency compares every repetition, not each case's first
+  row.** A `gpu_uuid`, `git_commit`, or any other required-identical field
+  that only changes in sample_index 1 or 2 of one otherwise-valid case is
+  rejected, exactly like a change in sample_index 0.
+* **`execution_order.csv`** (see below) is created once, before any GPU work,
+  and strictly re-validated — header, all 18 rows, exact order — at
+  finalize time; it can never be missing, reordered, or a symlink at
+  `COMPLETE`.
+* **Symlink-safe, centralized campaign initialization.** Campaign creation
+  and lookup walk `results/raw/exp01_memory_paths/<campaign_id>/{cases,logs}`
+  one path component at a time using `lstat` (never a `resolve()`/`is_dir()`
+  check alone), refusing a symlink — including a dangling one — at any
+  level, including the raw root itself.
+* **No result, log, or failure-evidence path can ever be silently
+  overwritten.** Publishing `combined_samples.csv`, `summary.csv`,
+  `execution_order.csv`, and a captured case CSV all use a hard-link-then-
+  unlink no-clobber publish, never `os.replace()`. A binary-launch `OSError`
+  or a nonzero exit leaves either genuine `.invalid`/`.partial` evidence or
+  no temporary file at all — never both a stale `.tmp` and lost evidence.
+* **Manifest integrity.** Every manifest field is allowlisted by name and
+  type; only `finalize` may set `status=COMPLETE`; a terminal campaign
+  (`COMPLETE`/`FAILED`/`INTERRUPTED`) can never be reopened or rewritten; and
+  `COMPLETE` requires all four binary/SASS artifacts to exist as non-symlink,
+  non-empty regular files (never a `null` hash) plus all 18 case hashes, the
+  `execution_order.csv` hash, and both aggregate-file hashes.
+* **CLI duplicate/mutual-exclusion checks.** `--help`, `-h`, `--print-plan`,
+  and `--self-test` may each be given at most once and are mutually
+  exclusive with each other and with every campaign option; every rejection
+  path still completes before `BLACKWELL_GPU_INDEX`, Docker, or
+  `nvidia-smi` are ever touched.
 
 ### The frozen 18-invocation matrix
 
@@ -413,6 +477,25 @@ randomized, so P1.4 can assess or deliberately change it later. The runner
 passes identical `run_kind`, `working_set_mib` (when given), `passes`,
 `warmup_ms`, and `repetitions` to both methods for every configuration.
 
+### `execution_order.csv`
+
+Written exactly once, before either binary's `--self-test` or any timed
+configuration, by `aggregate_exp01_memory_paths.py`'s `init-campaign`
+subcommand (the same call that creates the campaign directory itself — see
+"Symlink-safe, centralized campaign initialization" above). Header:
+
+```
+invocation_index,method,stages,bytes_in_flight_kib,stage_bytes,bytes_in_flight_per_sm,tile_height,copies_per_thread_per_stage,case_file
+```
+
+Exactly 18 rows, in the exact order above, `case_file` holding the canonical
+relative path (e.g. `cases/00_ldgsts_s2_bif16.csv`). `finalize` re-reads and
+strictly re-validates this file — exact header, all 18 rows, exact
+values — before producing any aggregate; a missing, reordered, malformed,
+duplicated, extra-row, or symlinked `execution_order.csv` prevents
+`COMPLETE`. Its SHA-256 hash is recorded in the manifest alongside the
+binary/SASS/case/aggregate hashes.
+
 ### Runner CLI
 
 ```bash
@@ -424,6 +507,12 @@ scripts/run_exp01_memory_paths.sh \
     --run-kind {smoke,benchmark} [--campaign-id ID] [--working-set-mib N] \
     --passes N --warmup-ms N --repetitions N
 ```
+
+`--help`, `--print-plan`, and `--self-test` (and `-h`) are each accepted at
+most once and are mutually exclusive with each other and with every
+campaign option (`--help --help`, `-h --help`, `--self-test --run-kind
+smoke`, etc. all reject with exit 2 before touching `BLACKWELL_GPU_INDEX`,
+Docker, or `nvidia-smi`).
 
 A campaign additionally requires `BLACKWELL_GPU_INDEX=<physical-index>` in
 the environment (never selected automatically) and a clean Git worktree.
