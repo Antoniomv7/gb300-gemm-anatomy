@@ -52,8 +52,9 @@ been strictly validated (37-column header and order; exact `repetitions`
 rows with `sample_index=0..repetitions-1` each exactly once; `schema_version`,
 `method`, `stages`, `run_kind`, `correctness=OK`, `mismatches=0`, and the
 frozen occupancy/tile/vector constants; the stage/BIF/tile-height/useful-bytes
-formulas; positive finite `kernel_time_ms`/`effective_gbps` consistent with
-each other within a documented six-decimal-formatting tolerance;
+formulas; canonical fixed-six-decimal positive finite
+`kernel_time_ms`/`effective_gbps`, with the latter inside the mathematical
+interval implied by independent half-ULP rounding of both values;
 `working_set_bytes > 2*l2_bytes` for `run_kind=benchmark`; the exact runner
 Git commit with `git_dirty=false`; and, across the whole campaign, identical
 `gpu_name`/`gpu_uuid`/`compute_capability`/driver+runtime versions/`git_commit`/
@@ -74,8 +75,13 @@ unset→`IN_PROGRESS`, `IN_PROGRESS`→`IN_PROGRESS`/`COMPLETE`/`FAILED`/
 `INTERRUPTED`; a terminal campaign (`COMPLETE`, `FAILED`, or `INTERRUPTED`)
 can never be reopened or rewritten, and only the validated `finalize`
 subcommand — never the generic manifest-update path — may set `COMPLETE`.
-Every manifest field is allowlisted by name and type; an unrecognized field
-or a value of the wrong type is rejected.
+Every field in the complete loaded manifest is allowlisted by name and type,
+nested objects have exact schemas, immutable provenance cannot change,
+progress counters cannot decrease, and an unrecognized field or a value of
+the wrong type is rejected. Both self-test values must be `PASS`; the pinned
+`VERSIONS.env` must be present, non-empty, non-symlink, and contain every
+required key. Configuration/sample counters are updated after each validated
+case, so a failure or interruption records actual progress.
 
 `manifest.json` contains only safe, experiment-relevant, non-publishable
 metadata: schema/experiment/campaign identifiers, status, requested and
@@ -108,7 +114,11 @@ final name already exists, publication fails outright rather than replacing
 it. A failed or interrupted capture preserves any non-empty partial stdout
 under a fresh `.invalid` or `.partial` name — never overwriting earlier
 evidence — and a launch failure (e.g. an `OSError` starting the binary)
-leaves no stale temporary file behind.
+leaves no stale temporary file behind. Finalization checks both aggregate
+targets and their temporaries before creating either output and removes only
+its own new aggregate files if the final `COMPLETE` manifest update fails.
+`manifest.json` is the sole intentional replacement lifecycle, but its
+temporary is created exclusively with no symlink following.
 
 To reproduce aggregation from an existing campaign's raw `cases/` directory
 without rerunning any GPU work, see `scripts/aggregate_exp01_memory_paths.py`'s

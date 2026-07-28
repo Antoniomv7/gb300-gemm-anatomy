@@ -193,6 +193,10 @@ check-static:
 	@echo "== P1.3 runner uses the audited launcher and never selects a GPU automatically =="
 	@grep -Fq 'run_container.sh' $(EXP01_RUNNER)
 	@grep -Fq 'BLACKWELL_GPU_INDEX' $(EXP01_RUNNER)
+	@echo "== P1.3 runner records progress after every validated case =="
+	@grep -Fq 'write_manifest_progress' $(EXP01_RUNNER)
+	@grep -Fq 'configurations_completed=$$((p_index + 1))' $(EXP01_RUNNER)
+	@grep -Fq 'samples_completed=$$((configurations_completed * REPETITIONS))' $(EXP01_RUNNER)
 	@echo "== P1.3 raw campaign output is git-ignored =="
 	@grep -Fq 'results/raw/' .gitignore
 	@echo "== truthful P1.1-P1.4 status assertions =="

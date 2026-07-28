@@ -340,6 +340,20 @@ write_manifest_status() {
     rm -f "${merge_file}"
 }
 
+write_manifest_progress() {
+    local configurations_completed="$1"
+    local samples_completed="$2"
+    local merge_file
+    merge_file="$(mktemp "${CAMPAIGN_DIR}/manifest_merge.XXXXXX")"
+    printf '{"configuration_count_completed": %s, "sample_count_completed": %s}\n' \
+        "${configurations_completed}" "${samples_completed}" >| "${merge_file}"
+    python3 "${AGGREGATOR_HOST}" manifest-write --campaign-dir "${CAMPAIGN_REL}" \
+        --status IN_PROGRESS --merge-json "${merge_file}" >/dev/null
+    local rc=$?
+    rm -f "${merge_file}"
+    return "${rc}"
+}
+
 echo "run_exp01_memory_paths: campaign ${CAMPAIGN_ID} IN_PROGRESS at ${CAMPAIGN_DIR}" >&2
 
 # Step 3-4: existing GPU-free compilation and SASS gates; require artifacts.
@@ -428,6 +442,15 @@ while IFS=$'\t' read -r p_index p_method p_stages p_bif p_case_name; do
         write_manifest_status FAILED "validate_${p_case_name}" 1
         CAMPAIGN_OUTCOME=FAILED
         echo "run_exp01_memory_paths: ERROR: validation failed at index ${p_index} (${p_case_name}); see ${stderr_log}" >&2
+        exit 1
+    fi
+
+    configurations_completed=$((p_index + 1))
+    samples_completed=$((configurations_completed * REPETITIONS))
+    if ! write_manifest_progress "${configurations_completed}" "${samples_completed}"; then
+        write_manifest_status FAILED "progress_${p_case_name}" 1 || true
+        CAMPAIGN_OUTCOME=FAILED
+        echo "run_exp01_memory_paths: ERROR: could not record progress after ${p_case_name}" >&2
         exit 1
     fi
 done <<< "${PLAN_TSV}"

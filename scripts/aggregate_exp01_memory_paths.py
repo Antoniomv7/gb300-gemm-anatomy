@@ -96,6 +96,29 @@ ALLOWED_BINARIES = {
     "build/memory/tma": "tma_bin",
 }
 
+DEFAULT_CAPTURE_ARTIFACTS = {
+    "build/memory/ldgsts": MEMORY_LDGSTS_BIN,
+    "build/memory/tma": MEMORY_TMA_BIN,
+}
+
+DEFAULT_FINAL_ARTIFACTS = {
+    "ldgsts_bin": MEMORY_LDGSTS_BIN,
+    "ldgsts_sass": MEMORY_LDGSTS_SASS,
+    "tma_bin": MEMORY_TMA_BIN,
+    "tma_sass": MEMORY_TMA_SASS,
+}
+
+REQUIRED_VERSION_KEYS = (
+    "CUDA_VERSION",
+    "CUDA_IMAGE",
+    "CUDA_IMAGE_DIGEST",
+    "CUDA_IMAGE_PLATFORM",
+    "CUTLASS_VERSION",
+    "CUTLASS_COMMIT",
+    "CUDA_ARCH",
+    "MAX_BUILD_JOBS",
+)
+
 # Frozen contract constants shared by both binaries (see src/memory/README.md).
 FROZEN_THREADS_PER_CTA = 128
 FROZEN_TARGET_CTAS_PER_SM = 1
@@ -131,14 +154,18 @@ CAMPAIGN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 GPU_UUID_RE = re.compile(
     r"^GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+TIMESTAMP_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+MANIFEST_TIMESTAMP_RE = re.compile(r"^\d{8}T\d{6}Z$")
+CANONICAL_UINT_RE = re.compile(r"^(?:0|[1-9]\d*)$")
+CANONICAL_FIXED6_RE = re.compile(r"^(?:0|[1-9]\d*)\.\d{6}$")
 
 # Documented tolerances for values that pass through the binaries' fixed
 # six-decimal CSV formatting (std::fixed << std::setprecision(6)).
-RATIO_ABS_TOL = 1e-6
-GBPS_REL_TOL = 1e-3
+FIXED6_HALF_ULP = 0.5e-6
+RATIO_ABS_TOL = FIXED6_HALF_ULP + 1e-12
 
 INT64_MAX = 2**63 - 1
-INT64_MIN = -(2**63)
 
 TERMINAL_STATUSES = frozenset({"COMPLETE", "FAILED", "INTERRUPTED"})
 ALLOWED_TRANSITIONS: dict[str | None, frozenset[str]] = {
@@ -428,6 +455,12 @@ def resolve_campaign_dir(campaign_dir_rel: str) -> Path:
         if not os.path.lexists(current):
             raise UnsafePathError(f"{current}: does not exist")
     _confirm_contained(current, REPO_ROOT)
+    for subdir_name in ("cases", "logs"):
+        subdir = current / subdir_name
+        _reject_if_symlink_or_wrong_type(subdir, expect_dir=True)
+        if not os.path.lexists(subdir):
+            raise UnsafePathError(f"{subdir}: required campaign directory does not exist")
+        _confirm_contained(subdir, current)
     return current
 
 
@@ -463,15 +496,99 @@ def _publish_no_clobber(tmp_path: Path, final_path: Path) -> None:
     within the same campaign directory)."""
     if os.path.lexists(final_path):
         raise UnsafePathError(f"refusing to overwrite existing target: {final_path}")
+    source_identity = _file_identity(tmp_path)
     try:
         os.link(tmp_path, final_path)
     except FileExistsError as exc:
         raise UnsafePathError(f"refusing to overwrite existing target: {final_path}") from exc
-    finally:
+    except OSError as exc:
+        raise UnsafePathError(
+            f"could not publish {tmp_path} as {final_path} without clobbering: {exc}"
+        ) from exc
+    try:
+        tmp_path.unlink()
+    except OSError as exc:
         try:
-            tmp_path.unlink()
-        except FileNotFoundError:
+            _safe_unlink_owned(final_path, source_identity)
+        except UnsafePathError:
             pass
+        raise UnsafePathError(
+            f"published {final_path}, but could not remove owned temporary {tmp_path}: {exc}"
+        ) from exc
+
+
+def _open_regular_nofollow(path: Path, *, binary: bool):
+    """Open an existing non-empty regular file without following a symlink.
+
+    The pre-open lstat gives useful diagnostics; O_NOFOLLOW and the post-open
+    fstat close the symlink/type gap at the actual open operation.
+    """
+    artifact_error = _verify_artifact(path)
+    if artifact_error:
+        raise UnsafePathError(artifact_error)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise UnsafePathError(f"{path}: safe open failed: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        current = os.lstat(path)
+        if not stat.S_ISREG(opened.st_mode):
+            raise UnsafePathError(f"{path}: opened object is not a regular file")
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise UnsafePathError(f"{path}: changed while being opened")
+        if binary:
+            return os.fdopen(fd, "rb")
+        return os.fdopen(fd, "r", encoding="utf-8", newline="")
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _open_exclusive(path: Path, *, binary: bool, newline: str | None = None):
+    """Create a new regular file at path atomically, never following or
+    replacing an existing regular file, directory, symlink, or broken
+    symlink."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError as exc:
+        raise UnsafePathError(f"{path}: already exists, refusing to overwrite") from exc
+    except OSError as exc:
+        raise UnsafePathError(f"{path}: exclusive creation failed: {exc}") from exc
+    if binary:
+        return os.fdopen(fd, "wb")
+    return os.fdopen(fd, "w", encoding="utf-8", newline=newline)
+
+
+def _safe_unlink_owned(path: Path, identity: tuple[int, int] | None = None) -> None:
+    """Remove only a regular non-symlink file created by this process.
+
+    When identity is supplied, refuse to unlink a path whose inode changed.
+    This is used only for rollback/cleanup of this invocation's temporaries
+    and published aggregates.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise UnsafePathError(f"{path}: cleanup target is not the owned regular file")
+    if identity is not None and (st.st_dev, st.st_ino) != identity:
+        raise UnsafePathError(f"{path}: cleanup target changed; refusing to unlink")
+    path.unlink()
+
+
+def _file_identity(path: Path) -> tuple[int, int]:
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise UnsafePathError(f"{path}: expected a regular non-symlink file")
+    return st.st_dev, st.st_ino
 
 
 def _verify_artifact(path: Path) -> str | None:
@@ -491,7 +608,7 @@ def _verify_artifact(path: Path) -> str | None:
 
 def sha256_of(path: Path) -> str:
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with _open_regular_nofollow(path, binary=True) as handle:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -518,22 +635,25 @@ def _is_sha256_hex(value: object) -> bool:
 # contract by a future edit.
 # ---------------------------------------------------------------------------
 def _parse_strict_int(raw: str, errors: list[str], ctx: str, field: str) -> int | None:
-    if raw is None or raw.strip() == "" or raw != raw.strip():
-        errors.append(f"{ctx}: {field}={raw!r} is not a canonical integer (empty or has whitespace)")
-        return None
-    if not re.fullmatch(r"-?\d+", raw):
-        errors.append(f"{ctx}: {field}={raw!r} is not a canonical decimal integer")
+    if raw is None or not CANONICAL_UINT_RE.fullmatch(raw):
+        errors.append(
+            f"{ctx}: {field}={raw!r} is not a canonical unsigned decimal integer "
+            f"(expected 0 or a non-zero digit followed by digits)"
+        )
         return None
     value = int(raw)
-    if not (INT64_MIN <= value <= INT64_MAX):
+    if value > INT64_MAX:
         errors.append(f"{ctx}: {field}={value} is outside the signed 64-bit range")
         return None
     return value
 
 
 def _parse_strict_float(raw: str, errors: list[str], ctx: str, field: str) -> float | None:
-    if raw is None or raw.strip() == "":
-        errors.append(f"{ctx}: {field}={raw!r} is empty")
+    if raw is None or not CANONICAL_FIXED6_RE.fullmatch(raw):
+        errors.append(
+            f"{ctx}: {field}={raw!r} is not the binary's canonical non-negative "
+            f"fixed-point form with exactly six decimals"
+        )
         return None
     try:
         value = float(raw)
@@ -553,17 +673,20 @@ def _peek_int(row: dict[str, str], field: str) -> int | None:
     """Best-effort parse for cross-field checks; silently returns None on
     failure (the field's own dedicated validator reports that error)."""
     raw = row.get(field)
-    if raw is None or not re.fullmatch(r"-?\d+", raw.strip()) or raw != raw.strip():
+    if raw is None or not CANONICAL_UINT_RE.fullmatch(raw):
         return None
     value = int(raw)
-    if not (INT64_MIN <= value <= INT64_MAX):
+    if value > INT64_MAX:
         return None
     return value
 
 
 def _peek_float(row: dict[str, str], field: str) -> float | None:
+    raw = row.get(field)
+    if raw is None or not CANONICAL_FIXED6_RE.fullmatch(raw):
+        return None
     try:
-        value = float(row.get(field, ""))
+        value = float(raw)
     except (ValueError, TypeError):
         return None
     if math.isnan(value) or math.isinf(value):
@@ -580,6 +703,12 @@ def _v_schema_version(row, expect, errors, ctx):
 
 def _v_timestamp_utc(row, expect, errors, ctx):
     raw = row["timestamp_utc"]
+    if not TIMESTAMP_UTC_RE.fullmatch(raw):
+        errors.append(
+            f"{ctx}: timestamp_utc={raw!r} is not in exact "
+            f"YYYY-MM-DDTHH:MM:SSZ form"
+        )
+        return None
     try:
         _datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ")
     except (ValueError, TypeError):
@@ -769,7 +898,7 @@ def _v_useful_bytes(row, expect, errors, ctx):
     passes = _peek_int(row, "passes")
     if working_set_bytes is not None and passes is not None:
         product = working_set_bytes * passes
-        if not (INT64_MIN <= product <= INT64_MAX):
+        if product > INT64_MAX:
             errors.append(
                 f"{ctx}: working_set_bytes*passes={product} overflows the signed 64-bit range"
             )
@@ -809,12 +938,26 @@ def _v_effective_gbps(row, expect, errors, ctx):
     useful_bytes = _peek_int(row, "useful_bytes")
     if kernel_time_ms is not None and kernel_time_ms > 0 and useful_bytes is not None:
         recomputed = useful_bytes / (kernel_time_ms / 1000.0) / 1e9
-        if recomputed > 0:
-            rel_err = abs(recomputed - value) / recomputed
-            if rel_err > GBPS_REL_TOL:
+        # Both the reported time and bandwidth are rounded independently to
+        # six decimals.  Bound the possible true bandwidth using the entire
+        # half-ULP interval of the rounded time, then add the bandwidth's own
+        # half-ULP.  This is tighter and better justified than a blanket
+        # relative tolerance.
+        time_low = kernel_time_ms - FIXED6_HALF_ULP
+        time_high = kernel_time_ms + FIXED6_HALF_ULP
+        if time_low <= 0:
+            errors.append(
+                f"{ctx}: kernel_time_ms={kernel_time_ms} is too small to validate "
+                f"after six-decimal rounding"
+            )
+        else:
+            gbps_low = useful_bytes / (time_high * 1e6) - FIXED6_HALF_ULP
+            gbps_high = useful_bytes / (time_low * 1e6) + FIXED6_HALF_ULP
+            if not (gbps_low <= value <= gbps_high):
                 errors.append(
                     f"{ctx}: effective_gbps={value} inconsistent with useful_bytes/kernel_time="
-                    f"{recomputed} (rel_err={rel_err}, tol={GBPS_REL_TOL})"
+                    f"{recomputed}; six-decimal admissible interval is "
+                    f"[{gbps_low}, {gbps_high}]"
                 )
     return value
 
@@ -867,10 +1010,18 @@ def _v_compute_capability(row, expect, errors, ctx):
 
 
 def _v_git_commit(row, expect, errors, ctx):
-    if row["git_commit"] != expect["git_commit"]:
+    raw = row["git_commit"]
+    expected = expect["git_commit"]
+    if not GIT_COMMIT_RE.fullmatch(raw):
+        errors.append(f"{ctx}: git_commit={raw!r} is not 40 lowercase hexadecimal characters")
+        return None
+    if not isinstance(expected, str) or not GIT_COMMIT_RE.fullmatch(expected):
+        errors.append(f"{ctx}: expected git_commit={expected!r} is not a valid full commit SHA")
+        return None
+    if raw != expected:
         errors.append(f"{ctx}: git_commit={row['git_commit']!r} != expected {expect['git_commit']!r}")
         return None
-    return row["git_commit"]
+    return raw
 
 
 def _v_git_dirty(row, expect, errors, ctx):
@@ -947,9 +1098,9 @@ def read_case_rows(path: Path) -> tuple[list[list[str]], list[str]]:
     Returns (all_rows_including_header, errors). On a structural error the
     row list may be incomplete."""
     try:
-        with open(path, newline="", encoding="utf-8") as handle:
+        with _open_regular_nofollow(path, binary=False) as handle:
             rows = list(csv.reader(handle))
-    except OSError as exc:
+    except (OSError, UnsafePathError, UnicodeError) as exc:
         return [], [f"{path}: unable to read: {exc}"]
     if not rows:
         return [], [f"{path}: file is empty (no header)"]
@@ -1076,10 +1227,25 @@ def scan_case_directory(cases_dir: Path, plan: list[dict]) -> tuple[dict[int, Pa
     by_index = plan_by_index(plan)
     found: dict[int, Path] = {}
 
-    if not cases_dir.is_dir():
+    try:
+        _reject_if_symlink_or_wrong_type(cases_dir, expect_dir=True)
+    except UnsafePathError as exc:
+        return {}, [str(exc)]
+    if not os.path.lexists(cases_dir):
         return {}, [f"{cases_dir}: cases directory does not exist"]
 
     for path in sorted(cases_dir.iterdir()):
+        try:
+            st = os.lstat(path)
+        except OSError as exc:
+            errors.append(f"{path}: lstat failed: {exc}")
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            errors.append(f"{path}: is a symlink; refusing")
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            errors.append(f"{path}: is not a regular file; refusing")
+            continue
         if path.suffix != ".csv":
             continue  # .partial / .invalid / anything else is never aggregated
         match = CASE_NAME_RE.match(path.stem)
@@ -1140,12 +1306,22 @@ def write_execution_order(campaign_dir: Path, plan: list[dict]) -> Path:
     tmp_path = campaign_dir / "execution_order.csv.tmp"
     if os.path.lexists(tmp_path):
         raise UnsafePathError(f"{tmp_path}: stale temporary file already exists")
-    with open(tmp_path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(EXECUTION_ORDER_HEADER)
-        for entry in plan:
-            writer.writerow(_execution_order_row(entry))
-    _publish_no_clobber(tmp_path, out_path)
+    try:
+        with _open_exclusive(tmp_path, binary=False, newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(EXECUTION_ORDER_HEADER)
+            for entry in plan:
+                writer.writerow(_execution_order_row(entry))
+    except Exception:
+        if os.path.lexists(tmp_path):
+            _safe_unlink_owned(tmp_path)
+        raise
+    try:
+        _publish_no_clobber(tmp_path, out_path)
+    except UnsafePathError:
+        if os.path.lexists(tmp_path):
+            _safe_unlink_owned(tmp_path)
+        raise
     return out_path
 
 
@@ -1163,9 +1339,9 @@ def validate_execution_order_file(path: Path, plan: list[dict]) -> list[str]:
         return [f"{path}: does not exist"]
 
     try:
-        with open(path, newline="", encoding="utf-8") as handle:
+        with _open_regular_nofollow(path, binary=False) as handle:
             rows = list(csv.reader(handle))
-    except OSError as exc:
+    except (OSError, UnsafePathError, UnicodeError) as exc:
         return [f"{path}: unable to read: {exc}"]
     if not rows:
         return [f"{path}: empty file"]
@@ -1190,6 +1366,19 @@ def validate_execution_order_file(path: Path, plan: list[dict]) -> list[str]:
 # ---------------------------------------------------------------------------
 # Consolidation and aggregation (descriptive only; no-clobber publish).
 # ---------------------------------------------------------------------------
+def _aggregate_target_errors(paths: list[Path]) -> list[str]:
+    """Preflight the complete aggregate publication set before creating any
+    output.  A final target or its deterministic temporary name existing in
+    any form is fatal; nothing is removed or overwritten."""
+    errors: list[str] = []
+    for path in paths:
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        for candidate, label in ((path, "target"), (tmp_path, "temporary")):
+            if os.path.lexists(candidate):
+                errors.append(f"{candidate}: existing aggregate {label}; refusing to overwrite")
+    return errors
+
+
 def write_combined_samples(
     plan: list[dict], cases: list[tuple[dict, list[dict[str, str]]]], out_path: Path
 ) -> int:
@@ -1203,16 +1392,26 @@ def write_combined_samples(
     row_count = 0
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
     if os.path.lexists(tmp_path):
-        tmp_path.unlink()
-    with open(tmp_path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(CSV_HEADER)
-        for entry in plan:
-            rows = sorted(rows_by_index[entry["index"]], key=lambda r: int(r["sample_index"]))
-            for row in rows:
-                writer.writerow([row[field] for field in CSV_HEADER])
-                row_count += 1
-    _publish_no_clobber(tmp_path, out_path)
+        raise UnsafePathError(f"{tmp_path}: existing temporary; refusing to overwrite")
+    try:
+        with _open_exclusive(tmp_path, binary=False, newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(CSV_HEADER)
+            for entry in plan:
+                rows = sorted(rows_by_index[entry["index"]], key=lambda r: int(r["sample_index"]))
+                for row in rows:
+                    writer.writerow([row[field] for field in CSV_HEADER])
+                    row_count += 1
+    except Exception:
+        if os.path.lexists(tmp_path):
+            _safe_unlink_owned(tmp_path)
+        raise
+    try:
+        _publish_no_clobber(tmp_path, out_path)
+    except UnsafePathError:
+        if os.path.lexists(tmp_path):
+            _safe_unlink_owned(tmp_path)
+        raise
     return row_count
 
 
@@ -1284,13 +1483,23 @@ def write_summary(cases: list[tuple[dict, list[dict[str, str]]]], out_path: Path
     summaries.sort(key=lambda s: (s["stages"], s["bytes_in_flight_per_sm"], s["method"]))
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
     if os.path.lexists(tmp_path):
-        tmp_path.unlink()
-    with open(tmp_path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(SUMMARY_HEADER)
-        for summary in summaries:
-            writer.writerow([format_summary_value(field, summary[field]) for field in SUMMARY_HEADER])
-    _publish_no_clobber(tmp_path, out_path)
+        raise UnsafePathError(f"{tmp_path}: existing temporary; refusing to overwrite")
+    try:
+        with _open_exclusive(tmp_path, binary=False, newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(SUMMARY_HEADER)
+            for summary in summaries:
+                writer.writerow([format_summary_value(field, summary[field]) for field in SUMMARY_HEADER])
+    except Exception:
+        if os.path.lexists(tmp_path):
+            _safe_unlink_owned(tmp_path)
+        raise
+    try:
+        _publish_no_clobber(tmp_path, out_path)
+    except UnsafePathError:
+        if os.path.lexists(tmp_path):
+            _safe_unlink_owned(tmp_path)
+        raise
     return len(summaries)
 
 
@@ -1300,20 +1509,74 @@ def write_summary(cases: list[tuple[dict, list[dict[str, str]]]], out_path: Path
 # ---------------------------------------------------------------------------
 def load_manifest(campaign_dir: Path) -> dict:
     path = campaign_dir / "manifest.json"
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return {}
+    if not os.path.lexists(path):
+        return {}
+    try:
+        with _open_regular_nofollow(path, binary=False) as handle:
+            document = json.load(handle)
+    except (OSError, UnsafePathError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ManifestTransitionError(f"{path}: cannot load manifest safely: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ManifestTransitionError(
+            f"{path}: manifest root has type {type(document).__name__}, expected object"
+        )
+    return document
 
 
 def write_manifest_atomic(campaign_dir: Path, manifest: dict) -> None:
     path = campaign_dir / "manifest.json"
     tmp_path = campaign_dir / "manifest.json.tmp"
     text = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp_path, path)
+
+    prior_identity: tuple[int, int] | None = None
+    if os.path.lexists(path):
+        artifact_error = _verify_artifact(path)
+        if artifact_error:
+            raise ManifestTransitionError(artifact_error)
+        prior_identity = _file_identity(path)
+    if os.path.lexists(tmp_path):
+        raise ManifestTransitionError(
+            f"{tmp_path}: existing manifest temporary; refusing to overwrite"
+        )
+
+    created_tmp = False
+    try:
+        with _open_exclusive(tmp_path, binary=False) as handle:
+            created_tmp = True
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        if prior_identity is None:
+            if os.path.lexists(path):
+                raise ManifestTransitionError(
+                    f"{path}: appeared during initial manifest publication; refusing to overwrite"
+                )
+        elif not os.path.lexists(path) or _file_identity(path) != prior_identity:
+            raise ManifestTransitionError(
+                f"{path}: changed during manifest update; refusing to overwrite"
+            )
+        os.replace(tmp_path, path)
+        created_tmp = False
+    except UnsafePathError as exc:
+        raise ManifestTransitionError(str(exc)) from exc
+    finally:
+        if created_tmp and os.path.lexists(tmp_path):
+            try:
+                _safe_unlink_owned(tmp_path)
+            except UnsafePathError:
+                pass
+
+
+def _manifest_type_matches(value: object, expected: object) -> bool:
+    expected_types = expected if isinstance(expected, tuple) else (expected,)
+    for expected_type in expected_types:
+        if expected_type is int:
+            if type(value) is int:
+                return True
+        elif type(value) is expected_type:
+            return True
+    return False
 
 
 def _validate_manifest_updates(updates: dict) -> None:
@@ -1322,11 +1585,284 @@ def _validate_manifest_updates(updates: dict) -> None:
         raise ManifestTransitionError(f"unknown manifest field(s): {sorted(unknown)}")
     for key, value in updates.items():
         expected_type = ALLOWED_MANIFEST_KEYS[key]
-        if not isinstance(value, expected_type):
+        if not _manifest_type_matches(value, expected_type):
             raise ManifestTransitionError(
                 f"manifest field {key!r} has invalid type {type(value).__name__}, "
                 f"expected {expected_type}"
             )
+
+
+def _validate_compact_timestamp(value: object, field: str) -> None:
+    if not isinstance(value, str) or not MANIFEST_TIMESTAMP_RE.fullmatch(value):
+        raise ManifestTransitionError(
+            f"manifest field {field!r}={value!r} is not YYYYMMDDTHHMMSSZ"
+        )
+    try:
+        _datetime.strptime(value, "%Y%m%dT%H%M%SZ")
+    except ValueError as exc:
+        raise ManifestTransitionError(
+            f"manifest field {field!r}={value!r} is not a real UTC timestamp"
+        ) from exc
+
+
+def _validate_requested(requested: object) -> None:
+    expected_keys = {
+        "run_kind", "working_set_mib", "passes", "warmup_ms",
+        "repetitions", "campaign_id",
+    }
+    if not isinstance(requested, dict) or set(requested) != expected_keys:
+        raise ManifestTransitionError(
+            f"manifest requested keys={sorted(requested) if isinstance(requested, dict) else None} "
+            f"!= {sorted(expected_keys)}"
+        )
+    if requested["run_kind"] not in ("smoke", "benchmark"):
+        raise ManifestTransitionError("manifest requested.run_kind must be smoke or benchmark")
+    if not isinstance(requested["campaign_id"], str):
+        raise ManifestTransitionError("manifest requested.campaign_id must be a string")
+    try:
+        validate_campaign_id(requested["campaign_id"])
+    except UnsafePathError as exc:
+        raise ManifestTransitionError(
+            f"manifest requested.campaign_id is invalid: {exc}"
+        ) from exc
+    working_set_mib = requested["working_set_mib"]
+    if working_set_mib is not None and (type(working_set_mib) is not int or working_set_mib <= 0):
+        raise ManifestTransitionError(
+            "manifest requested.working_set_mib must be null or a positive integer"
+        )
+    for key, allow_zero in (("passes", False), ("warmup_ms", True), ("repetitions", False)):
+        value = requested[key]
+        if type(value) is not int or value < 0 or (not allow_zero and value == 0):
+            relation = "non-negative" if allow_zero else "positive"
+            raise ManifestTransitionError(
+                f"manifest requested.{key} must be a {relation} integer"
+            )
+
+
+def _validate_self_test_outcomes(value: object, *, require_pass: bool) -> None:
+    if not isinstance(value, dict) or set(value) != {"ldgsts", "tma"}:
+        raise ManifestTransitionError(
+            "manifest self_test_outcomes must contain exactly ldgsts and tma"
+        )
+    allowed = {"PASS"} if require_pass else {"PASS", "FAIL"}
+    for method in ("ldgsts", "tma"):
+        if value[method] not in allowed:
+            raise ManifestTransitionError(
+                f"manifest self_test_outcomes.{method}={value[method]!r} "
+                f"must be one of {sorted(allowed)}"
+            )
+
+
+def _validate_versions_dict(value: object) -> None:
+    if not isinstance(value, dict) or set(value) != set(REQUIRED_VERSION_KEYS):
+        raise ManifestTransitionError(
+            f"versions_env keys={sorted(value) if isinstance(value, dict) else None} "
+            f"!= required {sorted(REQUIRED_VERSION_KEYS)}"
+        )
+    for key in REQUIRED_VERSION_KEYS:
+        if not isinstance(value[key], str) or not value[key]:
+            raise ManifestTransitionError(f"versions_env.{key} must be a non-empty string")
+    if value["CUDA_ARCH"] != "sm_103a":
+        raise ManifestTransitionError("versions_env.CUDA_ARCH must remain sm_103a")
+    if value["MAX_BUILD_JOBS"] != "2":
+        raise ManifestTransitionError("versions_env.MAX_BUILD_JOBS must remain 2")
+
+
+def _validate_hash_map(value: object, expected_keys: set[str], field: str) -> None:
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ManifestTransitionError(
+            f"manifest {field} keys={sorted(value) if isinstance(value, dict) else None} "
+            f"!= {sorted(expected_keys)}"
+        )
+    for key, digest in value.items():
+        if not _is_sha256_hex(digest):
+            raise ManifestTransitionError(
+                f"manifest {field}.{key}={digest!r} is not a lowercase SHA-256"
+            )
+
+
+def _validate_manifest_document(
+    manifest: dict, *, require_initialized: bool = False
+) -> None:
+    """Validate the entire loaded manifest, not only the proposed update.
+
+    IN_PROGRESS documents may omit fields that are populated later, but any
+    field already present must be allowlisted, correctly typed, and have a
+    valid nested schema.  Finalization requests the initialized base schema;
+    COMPLETE additionally requires the full provenance/hash contract.
+    """
+    _validate_manifest_updates(manifest)
+    if not manifest:
+        if require_initialized:
+            raise ManifestTransitionError("manifest is empty")
+        return
+
+    status = manifest.get("status")
+    if status not in ALLOWED_TRANSITIONS:
+        raise ManifestTransitionError(f"manifest status={status!r} is invalid")
+    if "schema_version" in manifest and manifest["schema_version"] != MANIFEST_SCHEMA_VERSION:
+        raise ManifestTransitionError("manifest schema_version is invalid")
+    if "experiment_id" in manifest and manifest["experiment_id"] != EXPERIMENT_ID:
+        raise ManifestTransitionError("manifest experiment_id is invalid")
+    if "publishable" in manifest and manifest["publishable"] is not False:
+        raise ManifestTransitionError("manifest publishable must be false")
+
+    if "campaign_id" in manifest:
+        try:
+            validate_campaign_id(manifest["campaign_id"])
+        except UnsafePathError as exc:
+            raise ManifestTransitionError(f"manifest campaign_id is invalid: {exc}") from exc
+    if "run_kind" in manifest and manifest["run_kind"] not in ("smoke", "benchmark"):
+        raise ManifestTransitionError("manifest run_kind must be smoke or benchmark")
+    if "started_at_utc" in manifest:
+        _validate_compact_timestamp(manifest["started_at_utc"], "started_at_utc")
+    if manifest.get("completed_at_utc") is not None:
+        _validate_compact_timestamp(manifest["completed_at_utc"], "completed_at_utc")
+    if "git_commit" in manifest and not GIT_COMMIT_RE.fullmatch(manifest["git_commit"]):
+        raise ManifestTransitionError("manifest git_commit must be 40 lowercase hexadecimal characters")
+    if "git_dirty" in manifest and manifest["git_dirty"] is not False:
+        raise ManifestTransitionError("manifest git_dirty must be false")
+    if "selected_gpu_index" in manifest and manifest["selected_gpu_index"] < 0:
+        raise ManifestTransitionError("manifest selected_gpu_index must be non-negative")
+    if "gpu_name" in manifest:
+        if not manifest["gpu_name"].strip() or any(
+            ord(char) < 0x20 or ord(char) == 0x7F for char in manifest["gpu_name"]
+        ):
+            raise ManifestTransitionError("manifest gpu_name is empty or contains control characters")
+    if "gpu_uuid" in manifest and not GPU_UUID_RE.fullmatch(manifest["gpu_uuid"]):
+        raise ManifestTransitionError("manifest gpu_uuid has an invalid NVIDIA UUID form")
+    if (
+        "compute_capability" in manifest
+        and manifest["compute_capability"] != FROZEN_COMPUTE_CAPABILITY
+    ):
+        raise ManifestTransitionError("manifest compute_capability must remain 10.3")
+    for key in ("cuda_driver_version", "cuda_runtime_version"):
+        if key in manifest:
+            raw = str(manifest[key])
+            if not CANONICAL_UINT_RE.fullmatch(raw) or int(raw) <= 0:
+                raise ManifestTransitionError(f"manifest {key} must be a positive decimal version")
+
+    for key in (
+        "configuration_count_expected", "configuration_count_completed",
+        "sample_count_expected", "sample_count_completed",
+    ):
+        if key in manifest and manifest[key] < 0:
+            raise ManifestTransitionError(f"manifest {key} must be non-negative")
+
+    if "requested" in manifest:
+        _validate_requested(manifest["requested"])
+        requested = manifest["requested"]
+        if "campaign_id" in manifest and requested["campaign_id"] != manifest["campaign_id"]:
+            raise ManifestTransitionError("manifest requested.campaign_id disagrees with campaign_id")
+        if "run_kind" in manifest and requested["run_kind"] != manifest["run_kind"]:
+            raise ManifestTransitionError("manifest requested.run_kind disagrees with run_kind")
+        repetitions = requested["repetitions"]
+        if "configuration_count_expected" in manifest and "sample_count_expected" in manifest:
+            if manifest["sample_count_expected"] != manifest["configuration_count_expected"] * repetitions:
+                raise ManifestTransitionError(
+                    "manifest sample_count_expected disagrees with configurations*repetitions"
+                )
+        if "configuration_count_completed" in manifest and "sample_count_completed" in manifest:
+            if manifest["sample_count_completed"] != manifest["configuration_count_completed"] * repetitions:
+                raise ManifestTransitionError(
+                    "manifest sample_count_completed disagrees with configurations*repetitions"
+                )
+
+    if "self_test_outcomes" in manifest:
+        _validate_self_test_outcomes(
+            manifest["self_test_outcomes"], require_pass=status == "COMPLETE"
+        )
+    if "versions_env" in manifest:
+        _validate_versions_dict(manifest["versions_env"])
+    if "binary_and_sass_sha256" in manifest:
+        _validate_hash_map(
+            manifest["binary_and_sass_sha256"], set(DEFAULT_FINAL_ARTIFACTS),
+            "binary_and_sass_sha256",
+        )
+    if "case_file_sha256" in manifest:
+        _validate_hash_map(
+            manifest["case_file_sha256"],
+            {entry["case_name"] for entry in build_plan()},
+            "case_file_sha256",
+        )
+    if "aggregate_file_sha256" in manifest:
+        _validate_hash_map(
+            manifest["aggregate_file_sha256"],
+            {"combined_samples.csv", "summary.csv"},
+            "aggregate_file_sha256",
+        )
+    if "execution_order_sha256" in manifest and not _is_sha256_hex(
+        manifest["execution_order_sha256"]
+    ):
+        raise ManifestTransitionError("manifest execution_order_sha256 is not a lowercase SHA-256")
+    if "failure_detail" in manifest and manifest["failure_detail"] is not None:
+        if not all(isinstance(item, str) for item in manifest["failure_detail"]):
+            raise ManifestTransitionError("manifest failure_detail must be null or a list of strings")
+    if "failure_stage" in manifest and manifest["failure_stage"] is not None:
+        if not manifest["failure_stage"]:
+            raise ManifestTransitionError("manifest failure_stage must be null or non-empty")
+
+    if "observed_common" in manifest:
+        expected_observed = {
+            "requested_working_set_bytes", "working_set_bytes", "sm_count",
+            "l2_bytes", "passes", "warmup_ms", "repetitions",
+        }
+        observed = manifest["observed_common"]
+        if set(observed) != expected_observed:
+            raise ManifestTransitionError("manifest observed_common has an invalid nested schema")
+        if any(not isinstance(observed[key], str) for key in expected_observed - {"repetitions"}):
+            raise ManifestTransitionError("manifest observed_common values must match CSV strings")
+        if type(observed["repetitions"]) is not int or observed["repetitions"] <= 0:
+            raise ManifestTransitionError("manifest observed_common.repetitions must be positive")
+
+    if "invocation_order" in manifest:
+        expected_order = [
+            {
+                "index": entry["index"], "method": entry["method"],
+                "stages": entry["stages"], "bif_kib": entry["bif_kib"],
+                "case_name": entry["case_name"],
+            }
+            for entry in build_plan()
+        ]
+        if manifest["invocation_order"] != expected_order:
+            raise ManifestTransitionError("manifest invocation_order does not match the frozen plan")
+
+    initialized_required = {
+        "schema_version", "experiment_id", "campaign_id", "status", "run_kind",
+        "started_at_utc", "configuration_count_expected",
+        "configuration_count_completed", "sample_count_expected",
+        "sample_count_completed", "requested", "selected_gpu_index",
+        "git_commit", "git_dirty", "publishable",
+    }
+    if require_initialized:
+        missing = initialized_required - set(manifest)
+        if missing:
+            raise ManifestTransitionError(f"initialized manifest missing fields: {sorted(missing)}")
+        if manifest["configuration_count_expected"] != EXPECTED_CONFIGURATION_COUNT:
+            raise ManifestTransitionError("manifest configuration_count_expected must be 18")
+        if manifest["configuration_count_completed"] > EXPECTED_CONFIGURATION_COUNT:
+            raise ManifestTransitionError("manifest configuration_count_completed exceeds 18")
+
+    if status == "COMPLETE":
+        complete_required = initialized_required | {
+            "completed_at_utc", "observed_common", "invocation_order",
+            "gpu_name", "gpu_uuid", "compute_capability",
+            "cuda_driver_version", "cuda_runtime_version", "versions_env",
+            "binary_and_sass_sha256", "case_file_sha256",
+            "execution_order_sha256", "aggregate_file_sha256",
+            "self_test_outcomes", "failure_stage", "failure_detail",
+        }
+        missing = complete_required - set(manifest)
+        if missing:
+            raise ManifestTransitionError(f"COMPLETE manifest missing fields: {sorted(missing)}")
+        if manifest["configuration_count_completed"] != EXPECTED_CONFIGURATION_COUNT:
+            raise ManifestTransitionError("COMPLETE manifest must have 18 configurations")
+        if manifest["sample_count_completed"] != manifest["sample_count_expected"]:
+            raise ManifestTransitionError("COMPLETE manifest sample counts are incomplete")
+        if manifest["failure_stage"] is not None or manifest["failure_detail"] is not None:
+            raise ManifestTransitionError("COMPLETE manifest cannot retain failure metadata")
+        _validate_self_test_outcomes(manifest["self_test_outcomes"], require_pass=True)
+        _validate_versions_dict(manifest["versions_env"])
 
 
 def merge_manifest(
@@ -1341,32 +1877,69 @@ def merge_manifest(
         raise ManifestTransitionError("only the validated finalizer may set status=COMPLETE")
     _validate_manifest_updates(updates)
     manifest = load_manifest(campaign_dir)
+    _validate_manifest_document(manifest)
     current_status = manifest.get("status")
     allowed = ALLOWED_TRANSITIONS.get(current_status, frozenset())
     if status not in allowed:
         raise ManifestTransitionError(
             f"invalid manifest state transition: {current_status!r} -> {status!r}"
         )
+    immutable_after_init = {
+        "campaign_id", "run_kind", "started_at_utc",
+        "configuration_count_expected", "sample_count_expected", "requested",
+        "selected_gpu_index", "git_commit", "git_dirty",
+    }
+    for key in immutable_after_init & set(manifest) & set(updates):
+        if updates[key] != manifest[key]:
+            raise ManifestTransitionError(
+                f"manifest field {key!r} is immutable after initialization"
+            )
+    for key in ("configuration_count_completed", "sample_count_completed"):
+        if key in manifest and key in updates and updates[key] < manifest[key]:
+            raise ManifestTransitionError(f"manifest counter {key!r} cannot decrease")
+    if "self_test_outcomes" in manifest and "self_test_outcomes" in updates:
+        if updates["self_test_outcomes"] != manifest["self_test_outcomes"]:
+            raise ManifestTransitionError(
+                "manifest self_test_outcomes cannot change after being recorded"
+            )
     manifest.update(updates)
     manifest["schema_version"] = MANIFEST_SCHEMA_VERSION
     manifest["experiment_id"] = EXPERIMENT_ID
     manifest["status"] = status
     manifest["publishable"] = False
+    _validate_manifest_document(
+        manifest, require_initialized=(status == "COMPLETE")
+    )
     write_manifest_atomic(campaign_dir, manifest)
     return manifest
 
 
-def parse_versions_env() -> dict[str, str]:
+def parse_versions_env(versions_path: Path | None = None) -> dict[str, str]:
     values: dict[str, str] = {}
-    versions_path = REPO_ROOT / "VERSIONS.env"
-    if not versions_path.is_file():
-        return values
-    for line in versions_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    versions_path = REPO_ROOT / "VERSIONS.env" if versions_path is None else versions_path
+    try:
+        with _open_regular_nofollow(versions_path, binary=False) as handle:
+            lines = handle.read().splitlines()
+    except (OSError, UnsafePathError, UnicodeError) as exc:
+        raise ManifestTransitionError(f"invalid VERSIONS.env: {exc}") from exc
+    for line_no, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
             continue
+        if "=" not in line:
+            raise ManifestTransitionError(
+                f"VERSIONS.env line {line_no}: expected KEY=VALUE"
+            )
         key, _, value = line.partition("=")
-        values[key.strip()] = value.strip()
+        key, value = key.strip(), value.strip()
+        if key not in REQUIRED_VERSION_KEYS:
+            raise ManifestTransitionError(f"VERSIONS.env line {line_no}: unknown key {key!r}")
+        if key in values:
+            raise ManifestTransitionError(f"VERSIONS.env line {line_no}: duplicate key {key!r}")
+        if not value:
+            raise ManifestTransitionError(f"VERSIONS.env line {line_no}: empty value for {key!r}")
+        values[key] = value
+    _validate_versions_dict(values)
     return values
 
 
@@ -1427,7 +2000,13 @@ def cmd_init_campaign(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Subcommand: capture
 # ---------------------------------------------------------------------------
-def _do_capture(campaign_dir: Path, out_rel: str, binary_argv: list[str]) -> int:
+def _do_capture(
+    campaign_dir: Path,
+    out_rel: str,
+    binary_argv: list[str],
+    *,
+    artifact_paths: dict[str, Path] | None = None,
+) -> int:
     try:
         out_path = resolve_capture_out_path(campaign_dir, out_rel)
     except UnsafePathError as exc:
@@ -1446,7 +2025,16 @@ def _do_capture(campaign_dir: Path, out_rel: str, binary_argv: list[str]) -> int
             file=sys.stderr,
         )
         return 2
-    artifact_err = _verify_artifact(REPO_ROOT / binary_argv[0])
+    artifact_paths = DEFAULT_CAPTURE_ARTIFACTS if artifact_paths is None else artifact_paths
+    artifact_path = artifact_paths.get(binary_argv[0])
+    if artifact_path is None:
+        print(
+            f"aggregate_exp01_memory_paths: capture: ERROR: no verified artifact "
+            f"path supplied for {binary_argv[0]!r}",
+            file=sys.stderr,
+        )
+        return 2
+    artifact_err = _verify_artifact(artifact_path)
     if artifact_err:
         print(f"aggregate_exp01_memory_paths: capture: ERROR: {artifact_err}", file=sys.stderr)
         return 2
@@ -1460,21 +2048,46 @@ def _do_capture(campaign_dir: Path, out_rel: str, binary_argv: list[str]) -> int
         """Preserves non-empty tmp output as .invalid/.partial evidence via
         no-clobber publish, or removes it if empty. Always leaves no stale
         .tmp file."""
-        if tmp_path.exists() and tmp_path.stat().st_size > 0:
+        if os.path.lexists(tmp_path):
+            _file_identity(tmp_path)
+        if os.path.lexists(tmp_path) and os.lstat(tmp_path).st_size > 0:
             suffix = ".partial" if is_signal else ".invalid"
-            failed_path = out_path.with_name(out_path.name + suffix)
-            try:
-                _publish_no_clobber(tmp_path, failed_path)
-                print(f"aggregate_exp01_memory_paths: capture: preserved evidence as {failed_path.name}", file=sys.stderr)
-            except UnsafePathError as exc:
-                print(f"aggregate_exp01_memory_paths: capture: ERROR: could not preserve evidence: {exc}", file=sys.stderr)
-                tmp_path.unlink(missing_ok=True)
+            for sequence in range(10000):
+                numbered = "" if sequence == 0 else f".{sequence}"
+                failed_path = out_path.with_name(out_path.name + suffix + numbered)
+                try:
+                    _publish_no_clobber(tmp_path, failed_path)
+                    print(
+                        f"aggregate_exp01_memory_paths: capture: preserved evidence as "
+                        f"{failed_path.name}",
+                        file=sys.stderr,
+                    )
+                    return
+                except UnsafePathError:
+                    if os.path.lexists(tmp_path):
+                        continue
+                    return
+            print(
+                "aggregate_exp01_memory_paths: capture: ERROR: could not find a free "
+                "failure-evidence name",
+                file=sys.stderr,
+            )
         else:
-            tmp_path.unlink(missing_ok=True)
+            if os.path.lexists(tmp_path):
+                _safe_unlink_owned(tmp_path)
 
     print(f"aggregate_exp01_memory_paths: capture: running {binary_argv!r} -> {out_path.name}", file=sys.stderr)
     try:
-        with open(tmp_path, "wb") as csv_out:
+        csv_out = _open_exclusive(tmp_path, binary=True)
+    except UnsafePathError as exc:
+        print(
+            f"aggregate_exp01_memory_paths: capture: ERROR: cannot create owned "
+            f"temporary: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        with csv_out:
             result = subprocess.run(binary_argv, stdout=csv_out, stderr=None)
     except OSError as exc:
         print(f"aggregate_exp01_memory_paths: capture: ERROR: unable to launch binary: {exc}", file=sys.stderr)
@@ -1482,7 +2095,7 @@ def _do_capture(campaign_dir: Path, out_rel: str, binary_argv: list[str]) -> int
         return 1
 
     if result.returncode == 0:
-        if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+        if not os.path.lexists(tmp_path) or os.lstat(tmp_path).st_size == 0:
             print("aggregate_exp01_memory_paths: capture: ERROR: binary exited 0 but produced no stdout", file=sys.stderr)
             salvage(is_signal=False)
             return 1
@@ -1490,7 +2103,7 @@ def _do_capture(campaign_dir: Path, out_rel: str, binary_argv: list[str]) -> int
             _publish_no_clobber(tmp_path, out_path)
         except UnsafePathError as exc:
             print(f"aggregate_exp01_memory_paths: capture: ERROR: {exc}", file=sys.stderr)
-            tmp_path.unlink(missing_ok=True)
+            salvage(is_signal=False)
             return 1
         print(f"aggregate_exp01_memory_paths: capture: OK: wrote {out_path}", file=sys.stderr)
         return 0
@@ -1526,9 +2139,6 @@ def cmd_validate_case(args: argparse.Namespace) -> int:
         return 2
 
     case_path = campaign_dir / "cases" / f"{entry['case_name']}.csv"
-    if not case_path.is_file():
-        print(f"aggregate_exp01_memory_paths: validate-case: ERROR: missing case file {case_path}", file=sys.stderr)
-        return 1
 
     expect = {
         "method": entry["method"],
@@ -1561,7 +2171,11 @@ def _verify_manifest_preconditions(campaign_dir: Path, args) -> list[str]:
     started_at_utc/self-test outcomes all match the finalizer's own
     arguments."""
     errors: list[str] = []
-    manifest = load_manifest(campaign_dir)
+    try:
+        manifest = load_manifest(campaign_dir)
+        _validate_manifest_document(manifest, require_initialized=True)
+    except (ManifestTransitionError, UnsafePathError) as exc:
+        return [f"invalid existing manifest: {exc}"]
     if not manifest:
         return ["manifest.json does not exist; cannot finalize an uninitialized campaign"]
     if manifest.get("status") != "IN_PROGRESS":
@@ -1591,15 +2205,36 @@ def _verify_manifest_preconditions(campaign_dir: Path, args) -> list[str]:
         errors.append(f"manifest selected_gpu_index={manifest.get('selected_gpu_index')!r} != CLI gpu_index={args.gpu_index!r}")
     if manifest.get("started_at_utc") != args.started_at_utc:
         errors.append(f"manifest started_at_utc={manifest.get('started_at_utc')!r} != CLI started_at_utc={args.started_at_utc!r}")
+    if args.self_test_ldgsts != "PASS":
+        errors.append(f"CLI self_test_ldgsts={args.self_test_ldgsts!r} != 'PASS'")
+    if args.self_test_tma != "PASS":
+        errors.append(f"CLI self_test_tma={args.self_test_tma!r} != 'PASS'")
     self_test = manifest.get("self_test_outcomes", {})
     if self_test.get("ldgsts") != "PASS":
         errors.append(f"manifest self_test_outcomes.ldgsts={self_test.get('ldgsts')!r} != 'PASS'")
     if self_test.get("tma") != "PASS":
         errors.append(f"manifest self_test_outcomes.tma={self_test.get('tma')!r} != 'PASS'")
+    if manifest.get("configuration_count_completed") != EXPECTED_CONFIGURATION_COUNT:
+        errors.append(
+            f"manifest configuration_count_completed="
+            f"{manifest.get('configuration_count_completed')!r} != "
+            f"{EXPECTED_CONFIGURATION_COUNT}"
+        )
+    if manifest.get("sample_count_completed") != EXPECTED_CONFIGURATION_COUNT * args.repetitions:
+        errors.append(
+            f"manifest sample_count_completed={manifest.get('sample_count_completed')!r} != "
+            f"{EXPECTED_CONFIGURATION_COUNT * args.repetitions}"
+        )
     return errors
 
 
-def _do_finalize(campaign_dir: Path, args) -> tuple[bool, list[str]]:
+def _do_finalize(
+    campaign_dir: Path,
+    args,
+    *,
+    artifact_paths: dict[str, Path] | None = None,
+    versions_path: Path | None = None,
+) -> tuple[bool, list[str]]:
     """Core finalize logic (no argparse/print), reused directly by the
     self-test. Returns (success, errors). On success, manifest.json has
     already been written with status=COMPLETE and every mandatory hash;
@@ -1611,16 +2246,16 @@ def _do_finalize(campaign_dir: Path, args) -> tuple[bool, list[str]]:
         return False, [f"internal plan contract violation: {plan_errors}"]
 
     def fail(stage: str, errors: list[str]) -> tuple[bool, list[str]]:
-        manifest = load_manifest(campaign_dir)
-        if manifest.get("status") in (None, "IN_PROGRESS"):
-            try:
+        try:
+            manifest = load_manifest(campaign_dir)
+            if manifest.get("status") in (None, "IN_PROGRESS"):
                 merge_manifest(
                     campaign_dir,
                     {"failure_stage": stage, "failure_detail": errors[:50]},
                     status="FAILED",
                 )
-            except ManifestTransitionError:
-                pass
+        except (ManifestTransitionError, UnsafePathError):
+            pass
         return False, errors
 
     precondition_errors = _verify_manifest_preconditions(campaign_dir, args)
@@ -1664,36 +2299,90 @@ def _do_finalize(campaign_dir: Path, args) -> tuple[bool, list[str]]:
 
     cases.sort(key=lambda pair: pair[0]["index"])
 
+    artifact_paths = DEFAULT_FINAL_ARTIFACTS if artifact_paths is None else artifact_paths
     artifact_errors: list[str] = []
     binary_hashes: dict[str, str] = {}
-    for binary_rel, label in ALLOWED_BINARIES.items():
-        bin_path = REPO_ROOT / binary_rel
-        sass_path = bin_path.with_suffix(bin_path.suffix + ".sass")
-        for path, hash_label in ((bin_path, label), (sass_path, label.replace("_bin", "_sass"))):
+    if set(artifact_paths) != set(DEFAULT_FINAL_ARTIFACTS):
+        artifact_errors.append(
+            f"artifact labels={sorted(artifact_paths)} != "
+            f"{sorted(DEFAULT_FINAL_ARTIFACTS)}"
+        )
+    else:
+        for label, path in artifact_paths.items():
             err = _verify_artifact(path)
             if err:
                 artifact_errors.append(err)
             else:
-                binary_hashes[hash_label] = sha256_of(path)
+                try:
+                    binary_hashes[label] = sha256_of(path)
+                except UnsafePathError as exc:
+                    artifact_errors.append(str(exc))
     if artifact_errors:
         return fail("missing_artifact", artifact_errors)
 
+    try:
+        versions_env = parse_versions_env(versions_path)
+    except ManifestTransitionError as exc:
+        return fail("versions_env", [str(exc)])
+
+    reference_row = cases[0][1][0]
+    try:
+        case_hashes = {
+            plan_by_index(plan)[index]["case_name"]: sha256_of(found[index])
+            for index in sorted(found)
+        }
+        execution_order_hash = sha256_of(execution_order_path)
+    except UnsafePathError as exc:
+        return fail("input_hashing", [str(exc)])
+
     combined_path = campaign_dir / "combined_samples.csv"
     summary_path = campaign_dir / "summary.csv"
+    target_errors = _aggregate_target_errors([combined_path, summary_path])
+    if target_errors:
+        return fail("aggregate_preflight", target_errors)
+
+    published: list[tuple[Path, tuple[int, int]]] = []
+
+    def rollback_published() -> list[str]:
+        rollback_errors: list[str] = []
+        for path, identity in reversed(published):
+            try:
+                _safe_unlink_owned(path, identity)
+            except UnsafePathError as exc:
+                rollback_errors.append(str(exc))
+        return rollback_errors
+
     try:
         combined_rows = write_combined_samples(plan, cases, combined_path)
+        published.append((combined_path, _file_identity(combined_path)))
         summary_rows = write_summary(cases, summary_path)
-    except UnsafePathError as exc:
-        return fail("aggregate_publish", [str(exc)])
+        published.append((summary_path, _file_identity(summary_path)))
+    except (UnsafePathError, OSError) as exc:
+        errors = [str(exc), *rollback_published()]
+        return fail("aggregate_publish", errors)
 
     expected_rows = EXPECTED_CONFIGURATION_COUNT * args.repetitions
     if combined_rows != expected_rows:
-        return fail("consolidation", [f"combined_samples.csv has {combined_rows} rows, expected {expected_rows}"])
+        errors = [
+            f"combined_samples.csv has {combined_rows} rows, expected {expected_rows}",
+            *rollback_published(),
+        ]
+        return fail("consolidation", errors)
     if summary_rows != EXPECTED_CONFIGURATION_COUNT:
-        return fail("aggregation", [f"summary.csv has {summary_rows} rows, expected {EXPECTED_CONFIGURATION_COUNT}"])
+        errors = [
+            f"summary.csv has {summary_rows} rows, expected {EXPECTED_CONFIGURATION_COUNT}",
+            *rollback_published(),
+        ]
+        return fail("aggregation", errors)
 
-    reference_row = cases[0][1][0]
-    case_hashes = {plan_by_index(plan)[index]["case_name"]: sha256_of(found[index]) for index in sorted(found)}
+    try:
+        aggregate_hashes = {
+            "combined_samples.csv": sha256_of(combined_path),
+            "summary.csv": sha256_of(summary_path),
+        }
+    except UnsafePathError as exc:
+        errors = [str(exc), *rollback_published()]
+        return fail("aggregate_hashing", errors)
 
     updates = {
         "campaign_id": args.campaign_id,
@@ -1734,14 +2423,11 @@ def _do_finalize(campaign_dir: Path, args) -> tuple[bool, list[str]]:
         "cuda_runtime_version": reference_row["cuda_runtime_version"],
         "git_commit": args.git_commit,
         "git_dirty": False,
-        "versions_env": parse_versions_env(),
+        "versions_env": versions_env,
         "binary_and_sass_sha256": binary_hashes,
         "case_file_sha256": case_hashes,
-        "execution_order_sha256": sha256_of(execution_order_path),
-        "aggregate_file_sha256": {
-            "combined_samples.csv": sha256_of(combined_path),
-            "summary.csv": sha256_of(summary_path),
-        },
+        "execution_order_sha256": execution_order_hash,
+        "aggregate_file_sha256": aggregate_hashes,
         "self_test_outcomes": {"ldgsts": args.self_test_ldgsts, "tma": args.self_test_tma},
         "failure_stage": None,
         "failure_detail": None,
@@ -1749,7 +2435,8 @@ def _do_finalize(campaign_dir: Path, args) -> tuple[bool, list[str]]:
     try:
         merge_manifest(campaign_dir, updates, status="COMPLETE", allow_complete=True)
     except ManifestTransitionError as exc:
-        return False, [f"could not record COMPLETE: {exc}"]
+        errors = [f"could not record COMPLETE: {exc}", *rollback_published()]
+        return fail("complete_manifest", errors)
     return True, []
 
 
@@ -1958,6 +2645,66 @@ def _build_valid_campaign(
     return plan
 
 
+def _prepare_test_finalize_campaign(
+    parent: Path,
+    campaign_id: str,
+    *,
+    repetitions: int = 1,
+) -> tuple[Path, argparse.Namespace]:
+    """Create a complete synthetic pre-finalization fixture under parent.
+
+    It includes all 18 case files, execution_order.csv, an initialized
+    IN_PROGRESS manifest, PASS self-tests, and fully updated progress
+    counters.  It deliberately does not create build artifacts or a versions
+    contract; callers inject those controlled paths into _do_finalize.
+    """
+    campaign = parent / campaign_id
+    campaign.mkdir()
+    plan = _build_valid_campaign(campaign, repetitions=repetitions)
+    write_execution_order(campaign, plan)
+    started = "20260727T000000Z"
+    merge_manifest(
+        campaign,
+        {
+            "campaign_id": campaign_id,
+            "run_kind": "smoke",
+            "started_at_utc": started,
+            "configuration_count_expected": EXPECTED_CONFIGURATION_COUNT,
+            "configuration_count_completed": EXPECTED_CONFIGURATION_COUNT,
+            "sample_count_expected": EXPECTED_CONFIGURATION_COUNT * repetitions,
+            "sample_count_completed": EXPECTED_CONFIGURATION_COUNT * repetitions,
+            "requested": {
+                "run_kind": "smoke",
+                "working_set_mib": None,
+                "passes": 1,
+                "warmup_ms": 0,
+                "repetitions": repetitions,
+                "campaign_id": campaign_id,
+            },
+            "selected_gpu_index": 0,
+            "git_commit": "a" * 40,
+            "git_dirty": False,
+            "self_test_outcomes": {"ldgsts": "PASS", "tma": "PASS"},
+        },
+        status="IN_PROGRESS",
+    )
+    args = argparse.Namespace(
+        campaign_id=campaign_id,
+        run_kind="smoke",
+        repetitions=repetitions,
+        passes=1,
+        warmup_ms=0,
+        working_set_mib=None,
+        git_commit="a" * 40,
+        gpu_index=0,
+        started_at_utc=started,
+        completed_at_utc="20260727T000200Z",
+        self_test_ldgsts="PASS",
+        self_test_tma="PASS",
+    )
+    return campaign, args
+
+
 class _SelfTestRecorder:
     def __init__(self) -> None:
         self.failures: list[str] = []
@@ -2011,6 +2758,31 @@ def run_self_test() -> int:
     with tempfile.TemporaryDirectory(prefix="exp01_selftest_") as tmp:
         tmp_path = Path(tmp)
         entry0 = plan_by_index(plan)[0]
+        synthetic_artifact = tmp_path / "synthetic_build_artifact"
+        synthetic_artifact.write_bytes(b"synthetic non-empty artifact\n")
+        synthetic_capture_artifacts = {
+            binary_rel: synthetic_artifact for binary_rel in ALLOWED_BINARIES
+        }
+        synthetic_final_artifacts = {
+            label: synthetic_artifact for label in DEFAULT_FINAL_ARTIFACTS
+        }
+        synthetic_versions = tmp_path / "VERSIONS.env"
+        synthetic_versions.write_text(
+            "\n".join(
+                [
+                    "CUDA_VERSION=13.1.0",
+                    "CUDA_IMAGE=nvidia/cuda:13.1.0-devel-ubuntu24.04",
+                    "CUDA_IMAGE_DIGEST=sha256:synthetic",
+                    "CUDA_IMAGE_PLATFORM=linux/amd64",
+                    "CUTLASS_VERSION=v4.6.1",
+                    f"CUTLASS_COMMIT={'b' * 40}",
+                    "CUDA_ARCH=sm_103a",
+                    "MAX_BUILD_JOBS=2",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
 
         # --- 1. positive plan/aggregation/row-count/statistics ----------
         campaign = tmp_path / "campaign_valid"
@@ -2355,18 +3127,63 @@ def run_self_test() -> int:
                 result.returncode = 1
                 return result
             mock_run.side_effect = _write_and_fail
-            rc = _do_capture(campaign_capture, "cases/00_ldgsts_s2_bif16.csv", ["build/memory/ldgsts", "--self-test"])
+            rc = _do_capture(
+                campaign_capture,
+                "cases/00_ldgsts_s2_bif16.csv",
+                ["build/memory/ldgsts", "--self-test"],
+                artifact_paths=synthetic_capture_artifacts,
+            )
         rec.check(
             "existing .invalid evidence is never overwritten",
-            existing_invalid.read_text() == "earlier evidence\n" and rc == 1,
+            existing_invalid.read_text() == "earlier evidence\n"
+            and (campaign_capture / "cases" / "00_ldgsts_s2_bif16.csv.invalid.1").read_bytes()
+            == b"some partial csv output"
+            and not (campaign_capture / "cases" / "00_ldgsts_s2_bif16.csv.tmp").exists()
+            and rc == 1,
             detail=f"content={existing_invalid.read_text()!r} rc={rc}",
+        )
+
+        campaign_partial_evidence = tmp_path / "campaign_partial_evidence"
+        (campaign_partial_evidence / "cases").mkdir(parents=True)
+        existing_partial = (
+            campaign_partial_evidence / "cases" / "01_tma_s2_bif16.csv.partial"
+        )
+        existing_partial.write_text("earlier partial evidence\n")
+        with mock.patch("subprocess.run") as mock_signal:
+            def _write_and_signal(argv, stdout, stderr):
+                stdout.write(b"new partial csv output")
+                result = mock.Mock()
+                result.returncode = -2
+                return result
+            mock_signal.side_effect = _write_and_signal
+            rc_partial = _do_capture(
+                campaign_partial_evidence,
+                "cases/01_tma_s2_bif16.csv",
+                ["build/memory/tma", "--self-test"],
+                artifact_paths=synthetic_capture_artifacts,
+            )
+        new_partial = (
+            campaign_partial_evidence / "cases" / "01_tma_s2_bif16.csv.partial.1"
+        )
+        rec.check(
+            "existing .partial evidence is never overwritten",
+            existing_partial.read_text() == "earlier partial evidence\n"
+            and new_partial.read_bytes() == b"new partial csv output"
+            and not (campaign_partial_evidence / "cases" / "01_tma_s2_bif16.csv.tmp").exists()
+            and rc_partial == 1,
+            detail=f"content={existing_partial.read_text()!r} rc={rc_partial}",
         )
 
         # --- 33. OSError during binary launch leaves no .tmp ----------------
         campaign_oserror = tmp_path / "campaign_oserror"
         (campaign_oserror / "cases").mkdir(parents=True)
         with mock.patch("subprocess.run", side_effect=OSError("no such file")):
-            rc_os = _do_capture(campaign_oserror, "cases/01_tma_s2_bif16.csv", ["build/memory/tma", "--self-test"])
+            rc_os = _do_capture(
+                campaign_oserror,
+                "cases/01_tma_s2_bif16.csv",
+                ["build/memory/tma", "--self-test"],
+                artifact_paths=synthetic_capture_artifacts,
+            )
         leftover_tmp = list((campaign_oserror / "cases").glob("*.tmp"))
         rec.check(
             "OSError during binary launch leaves no stale .tmp file",
@@ -2386,7 +3203,12 @@ def run_self_test() -> int:
                 result.returncode = 0
                 return result
             mock_run2.side_effect = _write_and_succeed
-            rc2 = _do_capture(campaign_final, "cases/02_tma_s2_bif32.csv", ["build/memory/tma", "--self-test"])
+            rc2 = _do_capture(
+                campaign_final,
+                "cases/02_tma_s2_bif32.csv",
+                ["build/memory/tma", "--self-test"],
+                artifact_paths=synthetic_capture_artifacts,
+            )
         rec.check(
             "a successful capture cannot overwrite a final CSV",
             rc2 == 2 and final_csv.read_text() == "already published\n",
@@ -2547,6 +3369,10 @@ def run_self_test() -> int:
                 "campaign_id": "INCOMPLETE1", "run_kind": "smoke", "started_at_utc": started,
                 "requested": {"run_kind": "smoke", "working_set_mib": None, "passes": 1, "warmup_ms": 0,
                               "repetitions": 1, "campaign_id": "INCOMPLETE1"},
+                "configuration_count_expected": EXPECTED_CONFIGURATION_COUNT,
+                "configuration_count_completed": EXPECTED_CONFIGURATION_COUNT - 1,
+                "sample_count_expected": EXPECTED_CONFIGURATION_COUNT,
+                "sample_count_completed": EXPECTED_CONFIGURATION_COUNT - 1,
                 "selected_gpu_index": 0, "git_commit": "a" * 40, "git_dirty": False,
                 "self_test_outcomes": {"ldgsts": "PASS", "tma": "PASS"},
             },
@@ -2558,11 +3384,12 @@ def run_self_test() -> int:
             working_set_mib=None, git_commit="a" * 40, gpu_index=0, started_at_utc=started,
             completed_at_utc="20260727T000100Z", self_test_ldgsts="PASS", self_test_tma="PASS",
         )
-        with mock.patch(f"{__name__}.MEMORY_LDGSTS_BIN", REPO_ROOT / "VERSIONS.env"), \
-             mock.patch(f"{__name__}.MEMORY_LDGSTS_SASS", REPO_ROOT / "VERSIONS.env"), \
-             mock.patch(f"{__name__}.MEMORY_TMA_BIN", REPO_ROOT / "VERSIONS.env"), \
-             mock.patch(f"{__name__}.MEMORY_TMA_SASS", REPO_ROOT / "VERSIONS.env"):
-            success_incomplete, errors_incomplete = _do_finalize(campaign_incomplete, fin_args)
+        success_incomplete, errors_incomplete = _do_finalize(
+            campaign_incomplete,
+            fin_args,
+            artifact_paths=synthetic_final_artifacts,
+            versions_path=synthetic_versions,
+        )
         rec.check(
             "failure before all 18 cases cannot produce a valid summary",
             not success_incomplete and not (campaign_incomplete / "summary.csv").exists(),
@@ -2580,6 +3407,10 @@ def run_self_test() -> int:
                 "campaign_id": "FULLTEST1", "run_kind": "smoke", "started_at_utc": started,
                 "requested": {"run_kind": "smoke", "working_set_mib": None, "passes": 1, "warmup_ms": 0,
                               "repetitions": 2, "campaign_id": "FULLTEST1"},
+                "configuration_count_expected": EXPECTED_CONFIGURATION_COUNT,
+                "configuration_count_completed": EXPECTED_CONFIGURATION_COUNT,
+                "sample_count_expected": EXPECTED_CONFIGURATION_COUNT * 2,
+                "sample_count_completed": EXPECTED_CONFIGURATION_COUNT * 2,
                 "selected_gpu_index": 0, "git_commit": "a" * 40, "git_dirty": False,
                 "self_test_outcomes": {"ldgsts": "PASS", "tma": "PASS"},
             },
@@ -2590,12 +3421,12 @@ def run_self_test() -> int:
             working_set_mib=None, git_commit="a" * 40, gpu_index=0, started_at_utc=started,
             completed_at_utc="20260727T000200Z", self_test_ldgsts="PASS", self_test_tma="PASS",
         )
-        fake_bin_path = REPO_ROOT / "VERSIONS.env"  # a real, non-empty, non-symlink file to hash
-        with mock.patch(f"{__name__}.MEMORY_LDGSTS_BIN", fake_bin_path), \
-             mock.patch(f"{__name__}.MEMORY_LDGSTS_SASS", fake_bin_path), \
-             mock.patch(f"{__name__}.MEMORY_TMA_BIN", fake_bin_path), \
-             mock.patch(f"{__name__}.MEMORY_TMA_SASS", fake_bin_path):
-            success_full, errors_full = _do_finalize(campaign_full, fin_args_full)
+        success_full, errors_full = _do_finalize(
+            campaign_full,
+            fin_args_full,
+            artifact_paths=synthetic_final_artifacts,
+            versions_path=synthetic_versions,
+        )
         manifest_full = load_manifest(campaign_full) if success_full else {}
         binary_hashes = manifest_full.get("binary_and_sass_sha256", {})
         case_hashes = manifest_full.get("case_file_sha256", {})
@@ -2615,6 +3446,301 @@ def run_self_test() -> int:
             and all(_is_sha256_hex(v) for v in aggregate_hashes.values())
             and manifest_full.get("publishable") is False,
             detail=f"success={success_full} errors={errors_full[:3]} manifest_status={manifest_full.get('status')}",
+        )
+
+        # --- Additional regressions from the second independent audit ------
+        strict_timestamp_errors = validate_case_file(
+            _write_single_row_case(
+                tmp_path,
+                "non_padded_timestamp",
+                entry0,
+                overrides={"timestamp_utc": "2026-7-1T1:2:3Z"},
+            ),
+            _expect_for(entry0),
+        )[1]
+        rec.check(
+            "non-zero-padded timestamp is rejected",
+            bool(strict_timestamp_errors),
+            detail=f"errors={strict_timestamp_errors}",
+        )
+
+        for field in ("sample_index", "warmup_ms", "mismatches"):
+            negative_zero_errors = validate_case_file(
+                _write_single_row_case(
+                    tmp_path,
+                    f"negative_zero_{field}",
+                    entry0,
+                    overrides={field: "-0"},
+                ),
+                _expect_for(entry0),
+            )[1]
+            rec.check(
+                f"negative-zero {field} is rejected",
+                bool(negative_zero_errors),
+                detail=f"errors={negative_zero_errors}",
+            )
+
+        for whitespace_value, label in ((" 1.000000", "leading"), ("1.000000 ", "trailing")):
+            whitespace_errors = validate_case_file(
+                _write_single_row_case(
+                    tmp_path,
+                    f"{label}_float_whitespace",
+                    entry0,
+                    overrides={"kernel_time_ms": whitespace_value},
+                ),
+                _expect_for(entry0),
+            )[1]
+            rec.check(
+                f"{label} floating-point whitespace is rejected",
+                bool(whitespace_errors),
+                detail=f"errors={whitespace_errors}",
+            )
+
+        invalid_commit_expect = dict(DEFAULT_COMMON)
+        invalid_commit_expect["git_commit"] = "z" * 40
+        invalid_commit_errors = validate_case_file(
+            _write_single_row_case(
+                tmp_path,
+                "matching_nonhex_commit",
+                entry0,
+                overrides={"git_commit": "z" * 40},
+            ),
+            _expect_for(entry0, invalid_commit_expect),
+        )[1]
+        rec.check(
+            "matching but non-hex Git commit is rejected",
+            bool(invalid_commit_errors),
+            detail=f"errors={invalid_commit_errors}",
+        )
+
+        gbps_row = _default_row(entry0, 0, repetitions=1)
+        gbps_row["effective_gbps"] = f"{float(gbps_row['effective_gbps']) * 1.0005:.6f}"
+        gbps_path = tmp_path / "effective_gbps_005_percent.csv"
+        _write_case_csv(gbps_path, [gbps_row])
+        gbps_errors = validate_case_file(gbps_path, _expect_for(entry0))[1]
+        rec.check(
+            "effective_gbps changed by 0.05 percent is rejected",
+            bool(gbps_errors),
+            detail=f"errors={gbps_errors}",
+        )
+
+        campaign_cases_link, args_cases_link = _prepare_test_finalize_campaign(
+            tmp_path, "CASESLINK1"
+        )
+        real_cases_dir = tmp_path / "real_cases_dir"
+        (campaign_cases_link / "cases").rename(real_cases_dir)
+        try:
+            (campaign_cases_link / "cases").symlink_to(real_cases_dir, target_is_directory=True)
+            success_cases_link, errors_cases_link = _do_finalize(
+                campaign_cases_link,
+                args_cases_link,
+                artifact_paths=synthetic_final_artifacts,
+                versions_path=synthetic_versions,
+            )
+            rec.check(
+                "symlinked cases directory cannot reach COMPLETE",
+                not success_cases_link
+                and any("symlink" in error for error in errors_cases_link)
+                and not (campaign_cases_link / "summary.csv").exists(),
+                detail=f"success={success_cases_link} errors={errors_cases_link[:3]}",
+            )
+        except OSError as exc:
+            rec.check(
+                "symlinked cases directory cannot reach COMPLETE",
+                False,
+                detail=f"could not construct mandatory symlink fixture: {exc}",
+            )
+
+        campaign_case_link, args_case_link = _prepare_test_finalize_campaign(
+            tmp_path, "CASEFILELINK1"
+        )
+        linked_case = campaign_case_link / "cases" / f"{plan[0]['case_name']}.csv"
+        real_case = tmp_path / "real_case.csv"
+        linked_case.rename(real_case)
+        try:
+            linked_case.symlink_to(real_case)
+            success_case_link, errors_case_link = _do_finalize(
+                campaign_case_link,
+                args_case_link,
+                artifact_paths=synthetic_final_artifacts,
+                versions_path=synthetic_versions,
+            )
+            rec.check(
+                "symlinked case CSV cannot reach COMPLETE",
+                not success_case_link
+                and any("symlink" in error for error in errors_case_link)
+                and not (campaign_case_link / "summary.csv").exists(),
+                detail=f"success={success_case_link} errors={errors_case_link[:3]}",
+            )
+        except OSError as exc:
+            rec.check(
+                "symlinked case CSV cannot reach COMPLETE",
+                False,
+                detail=f"could not construct mandatory symlink fixture: {exc}",
+            )
+
+        campaign_manifest_tmp, args_manifest_tmp = _prepare_test_finalize_campaign(
+            tmp_path, "MANIFESTTMPLINK1"
+        )
+        external_manifest_target = tmp_path / "external_manifest_target.txt"
+        external_manifest_target.write_text("must remain unchanged\n", encoding="utf-8")
+        try:
+            (campaign_manifest_tmp / "manifest.json.tmp").symlink_to(external_manifest_target)
+            success_manifest_tmp, errors_manifest_tmp = _do_finalize(
+                campaign_manifest_tmp,
+                args_manifest_tmp,
+                artifact_paths=synthetic_final_artifacts,
+                versions_path=synthetic_versions,
+            )
+            rec.check(
+                "manifest temporary symlink cannot overwrite an external file",
+                not success_manifest_tmp
+                and external_manifest_target.read_text(encoding="utf-8") == "must remain unchanged\n"
+                and not (campaign_manifest_tmp / "summary.csv").exists()
+                and not (campaign_manifest_tmp / "combined_samples.csv").exists(),
+                detail=f"success={success_manifest_tmp} errors={errors_manifest_tmp[:3]}",
+            )
+        except OSError as exc:
+            rec.check(
+                "manifest temporary symlink cannot overwrite an external file",
+                False,
+                detail=f"could not construct mandatory symlink fixture: {exc}",
+            )
+
+        campaign_unknown, args_unknown = _prepare_test_finalize_campaign(
+            tmp_path, "UNKNOWNMANIFEST1"
+        )
+        unknown_document = json.loads(
+            (campaign_unknown / "manifest.json").read_text(encoding="utf-8")
+        )
+        unknown_document["unknown_preexisting"] = True
+        (campaign_unknown / "manifest.json").write_text(
+            json.dumps(unknown_document), encoding="utf-8"
+        )
+        success_unknown, errors_unknown = _do_finalize(
+            campaign_unknown,
+            args_unknown,
+            artifact_paths=synthetic_final_artifacts,
+            versions_path=synthetic_versions,
+        )
+        rec.check(
+            "pre-existing unknown manifest field prevents COMPLETE",
+            not success_unknown
+            and any("unknown manifest" in error for error in errors_unknown)
+            and not (campaign_unknown / "summary.csv").exists(),
+            detail=f"success={success_unknown} errors={errors_unknown[:3]}",
+        )
+
+        campaign_fail_args, args_fail_args = _prepare_test_finalize_campaign(
+            tmp_path, "FAILARGS1"
+        )
+        args_fail_args.self_test_ldgsts = "FAIL"
+        args_fail_args.self_test_tma = "FAIL"
+        success_fail_args, errors_fail_args = _do_finalize(
+            campaign_fail_args,
+            args_fail_args,
+            artifact_paths=synthetic_final_artifacts,
+            versions_path=synthetic_versions,
+        )
+        rec.check(
+            "FAIL self-test arguments prevent COMPLETE",
+            not success_fail_args
+            and any("CLI self_test_" in error for error in errors_fail_args)
+            and not (campaign_fail_args / "summary.csv").exists(),
+            detail=f"success={success_fail_args} errors={errors_fail_args[:3]}",
+        )
+
+        campaign_missing_versions, args_missing_versions = _prepare_test_finalize_campaign(
+            tmp_path, "MISSVERSIONS1"
+        )
+        success_missing_versions, errors_missing_versions = _do_finalize(
+            campaign_missing_versions,
+            args_missing_versions,
+            artifact_paths=synthetic_final_artifacts,
+            versions_path=tmp_path / "missing_versions.env",
+        )
+        rec.check(
+            "missing VERSIONS.env prevents COMPLETE",
+            not success_missing_versions
+            and any("VERSIONS.env" in error for error in errors_missing_versions)
+            and not (campaign_missing_versions / "summary.csv").exists(),
+            detail=f"success={success_missing_versions} errors={errors_missing_versions[:3]}",
+        )
+
+        empty_versions = tmp_path / "empty_versions.env"
+        empty_versions.write_text("", encoding="utf-8")
+        campaign_empty_versions, args_empty_versions = _prepare_test_finalize_campaign(
+            tmp_path, "EMPTYVERSIONS1"
+        )
+        success_empty_versions, errors_empty_versions = _do_finalize(
+            campaign_empty_versions,
+            args_empty_versions,
+            artifact_paths=synthetic_final_artifacts,
+            versions_path=empty_versions,
+        )
+        rec.check(
+            "empty VERSIONS.env prevents COMPLETE",
+            not success_empty_versions
+            and any("VERSIONS.env" in error or "versions_env" in error for error in errors_empty_versions)
+            and not (campaign_empty_versions / "summary.csv").exists(),
+            detail=f"success={success_empty_versions} errors={errors_empty_versions[:3]}",
+        )
+
+        campaign_combined_tmp, args_combined_tmp = _prepare_test_finalize_campaign(
+            tmp_path, "COMBINEDTMP1"
+        )
+        combined_tmp = campaign_combined_tmp / "combined_samples.csv.tmp"
+        combined_tmp.write_text("pre-existing temporary\n", encoding="utf-8")
+        success_combined_tmp, errors_combined_tmp = _do_finalize(
+            campaign_combined_tmp,
+            args_combined_tmp,
+            artifact_paths=synthetic_final_artifacts,
+            versions_path=synthetic_versions,
+        )
+        rec.check(
+            "pre-existing combined temporary is preserved",
+            not success_combined_tmp
+            and combined_tmp.read_text(encoding="utf-8") == "pre-existing temporary\n"
+            and not (campaign_combined_tmp / "summary.csv").exists(),
+            detail=f"success={success_combined_tmp} errors={errors_combined_tmp[:3]}",
+        )
+
+        campaign_summary_existing, args_summary_existing = _prepare_test_finalize_campaign(
+            tmp_path, "SUMMARYEXISTS1"
+        )
+        existing_summary = campaign_summary_existing / "summary.csv"
+        existing_summary.write_text("pre-existing summary\n", encoding="utf-8")
+        success_summary_existing, errors_summary_existing = _do_finalize(
+            campaign_summary_existing,
+            args_summary_existing,
+            artifact_paths=synthetic_final_artifacts,
+            versions_path=synthetic_versions,
+        )
+        rec.check(
+            "existing summary prevents any combined aggregate publication",
+            not success_summary_existing
+            and existing_summary.read_text(encoding="utf-8") == "pre-existing summary\n"
+            and not (campaign_summary_existing / "combined_samples.csv").exists(),
+            detail=f"success={success_summary_existing} errors={errors_summary_existing[:3]}",
+        )
+
+        campaign_missing_artifact, args_missing_artifact = _prepare_test_finalize_campaign(
+            tmp_path, "MISSARTIFACT1"
+        )
+        missing_artifact_paths = dict(synthetic_final_artifacts)
+        missing_artifact_paths["tma_sass"] = tmp_path / "missing_tma.sass"
+        success_missing_artifact, errors_missing_artifact = _do_finalize(
+            campaign_missing_artifact,
+            args_missing_artifact,
+            artifact_paths=missing_artifact_paths,
+            versions_path=synthetic_versions,
+        )
+        rec.check(
+            "real finalization path rejects a missing build artifact",
+            not success_missing_artifact
+            and any("missing_tma.sass" in error for error in errors_missing_artifact)
+            and not (campaign_missing_artifact / "summary.csv").exists(),
+            detail=f"success={success_missing_artifact} errors={errors_missing_artifact[:3]}",
         )
 
     if rec.failures:

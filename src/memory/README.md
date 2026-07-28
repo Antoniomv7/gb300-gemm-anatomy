@@ -392,15 +392,18 @@ is reproducible infrastructure for running P1.1 and P1.2 together, validating
 their raw CSV strictly, and computing descriptive statistics. It adds no CUDA
 code and does not modify `ldgsts.cu`, `tma.cu`, or either SASS checker.
 
-**Status: implemented, remediation completed, pending a new independent
-audit and GB300 functional verification (see `PLAN.md`).** A first
-independent audit of P1.3 found and confirmed fifteen defects spanning
-validation completeness, symlink safety, no-clobber I/O, manifest integrity,
-and CLI edge cases; this remediation fixes all fifteen (see "Remediated
-audit findings" below), but fixing them is not itself a new audit — P1.3
-remains Audited=NO / Verified on GB300=NO until an independent reviewer and
-a GB300 run both confirm the fix. P1.3 does not itself collect publishable
-measurements: it does not run Nsight Compute, compute LDGSTS/TMA speedups,
+**Status: implemented, second remediation completed, pending a new
+independent audit and GB300 functional verification (see `PLAN.md`).** A
+first independent audit found fifteen defects; a second audit found
+remaining blockers in synthetic-test isolation, symlink-safe finalization,
+loaded-manifest validation, no-clobber/rollback behavior, canonical CSV
+parsing, and per-case progress telemetry. The implementation and adversarial
+GPU-free tests now address both rounds (see "Remediated audit findings"
+below), but author-side remediation and self-tests are not an independent
+audit — P1.3 remains Audited=NO / Verified on GB300=NO until an independent
+reviewer and a GB300 run both confirm the fix. P1.3 does not itself collect
+publishable measurements: it does not run Nsight Compute, compute
+LDGSTS/TMA speedups,
 apply an outlier policy, or draw any performance conclusion. Whether the
 copied bytes actually came from DRAM/HBM (as opposed to L2) is still an open
 question that only Nsight Compute (P1.4) can answer; a `run_kind=smoke`
@@ -446,12 +449,20 @@ and comparative LDGSTS/TMA interpretation — is P1.4, which has not started.
   unlink no-clobber publish, never `os.replace()`. A binary-launch `OSError`
   or a nonzero exit leaves either genuine `.invalid`/`.partial` evidence or
   no temporary file at all — never both a stale `.tmp` and lost evidence.
+  Finalization preflights both aggregate targets and both deterministic
+  temporaries before publishing either aggregate, and rolls back its own new
+  aggregates if the final manifest transition fails.
 * **Manifest integrity.** Every manifest field is allowlisted by name and
-  type; only `finalize` may set `status=COMPLETE`; a terminal campaign
-  (`COMPLETE`/`FAILED`/`INTERRUPTED`) can never be reopened or rewritten; and
-  `COMPLETE` requires all four binary/SASS artifacts to exist as non-symlink,
-  non-empty regular files (never a `null` hash) plus all 18 case hashes, the
-  `execution_order.csv` hash, and both aggregate-file hashes.
+  type, including every already-loaded field and the exact schemas of nested
+  objects; `manifest.json.tmp` is created exclusively without following a
+  symlink; only `finalize` may set `status=COMPLETE`; a terminal campaign
+  (`COMPLETE`/`FAILED`/`INTERRUPTED`) can never be reopened or rewritten.
+  `COMPLETE` requires `PASS` from both full-binary self-tests, a complete
+  pinned `VERSIONS.env`, all four binary/SASS artifacts as non-symlink,
+  non-empty regular files (never a `null` hash), all 18 case hashes, the
+  `execution_order.csv` hash, and both aggregate-file hashes. Completed
+  configuration/sample counters are updated after every validated case and
+  cannot decrease.
 * **CLI duplicate/mutual-exclusion checks.** `--help`, `-h`, `--print-plan`,
   and `--self-test` may each be given at most once and are mutually
   exclusive with each other and with every campaign option; every rejection
@@ -530,11 +541,11 @@ Each binary's stdout is captured directly to a temporary per-case CSV inside
 the container (never through a shell-level redirect of the whole launcher
 invocation, which would otherwise mix in `scripts/run_container.sh`'s own
 allowlisted diagnostic lines and the base image's entrypoint banner); the
-temporary file is renamed to its final name only on a clean exit, and any
-non-empty output from a failed invocation is preserved with a `.partial` or
-`.invalid` suffix instead of being aggregated. See `results/README.md` for
-the campaign directory layout, manifest fields, strict CSV validation rules,
-and `summary.csv` formulas.
+temporary file is published by a hard-link-then-unlink no-clobber operation
+only on a clean exit, and any non-empty output from a failed invocation is
+preserved under a fresh `.partial` or `.invalid` name instead of being
+aggregated. See `results/README.md` for the campaign directory layout,
+manifest fields, strict CSV validation rules, and `summary.csv` formulas.
 
 ### GPU-free checks
 

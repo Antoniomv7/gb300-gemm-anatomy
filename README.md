@@ -50,14 +50,17 @@ lossless consolidation into `combined_samples.csv`, and purely descriptive
 per-configuration statistics in `summary.csv` (mean/median/sample
 stdev/coefficient of variation — no speedups, no outlier filtering, no
 significance testing). A first independent audit found fifteen confirmed
-defects (incomplete field validation, symlink-escape and overwrite risks,
-manifest integrity gaps, and CLI edge cases); this remediation fixes all
-fifteen (see `src/memory/README.md`), but fixing them does not itself
-constitute a new audit, so `PLAN.md` still records Implemented=YES,
-Audited=NO, and Verified on GB300=NO for P1.3. P1.4 (profiling, Nsight
-Compute, the pilot performance campaign, and comparative LDGSTS/TMA
-interpretation) has not started and remains blocked until P1.3 is
-independently (re-)audited and verified on GB300.
+defects; a second audit found remaining blockers in synthetic-test
+isolation, symlink-safe finalization, loaded-manifest validation,
+no-clobber/rollback behavior, canonical CSV parsing, and progress telemetry.
+The second remediation is completed in the implementation and adversarial
+GPU-free tests (see `src/memory/README.md`), but author-side remediation and
+self-tests do not themselves constitute a new independent audit. `PLAN.md`
+therefore still records Implemented=YES, Audited=NO, and Verified on
+GB300=NO for P1.3. P1.4 (profiling, Nsight Compute, the pilot performance
+campaign, and comparative LDGSTS/TMA interpretation) has not started and
+remains blocked until P1.3 is independently (re-)audited and verified on
+GB300.
 
 ## Research question
 
