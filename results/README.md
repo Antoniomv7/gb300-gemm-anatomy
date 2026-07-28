@@ -24,10 +24,10 @@ The raw campaign is stored locally at
 ignored by Git. This record closes P1.3's functional GB300 verification only;
 it must not be cited as a performance measurement or used to compare LDGSTS
 against TMA. P1.4 owns the pilot benchmark campaign, Nsight Compute/HBM
-validation, figures, and interpretation; it is implemented — and the five
-blockers an independent GPU-free audit found in that implementation have
-been remediated GPU-free (see `src/memory/P1_4_PROTOCOL.md`) — but its pilot
-has not been executed, so no P1.4 raw campaign exists yet either.
+validation, figures, and interpretation; it is implemented — and the nine
+blockers found by two independent GPU-free audits of that implementation
+have all been remediated GPU-free (see `src/memory/P1_4_PROTOCOL.md`) — but
+its pilot has not been executed, so no P1.4 raw campaign exists yet either.
 
 ### `results/raw/exp01_memory_paths_p14/<campaign_id>/` (raw, not committed)
 
@@ -50,10 +50,18 @@ machine
 (`PILOT_IN_PROGRESS`→`PILOT_COMPLETE`→`PROFILE_IN_PROGRESS`→`COMPLETE`→`ANALYZED`,
 or `FAILED`/`INTERRUPTED`); `COMPLETE` means the raw pilot-plus-profile
 collection succeeded, not that the result is publishable — `publishable` is
-always `false`. Before both `COMPLETE` and `ANALYZED`, every trusted
-artifact recorded in the manifest is re-hashed from disk and every CSV is
-reparsed, so a validated artifact modified after the fact is rejected rather
-than silently accepted. This raw tree is covered by the same blanket
+always `false`. Every manifest revision is validated both cryptographically
+(the hash chain) and semantically (an explicit classification of every
+field as immutable/set-once/append-only/state-derived/timestamp, so a
+correctly-hashed revision that changes an immutable field or edits an
+earlier profiled case's result is still rejected). Before both `COMPLETE`
+and `ANALYZED`, `profiles/` is confirmed to contain exactly the six
+canonical case directories the frozen plan expects, every trusted artifact
+recorded in the manifest is re-hashed from disk, and every profiled case's
+complete recorded result is compared, field for field, against what its
+raw evidence alone reconstructs — so a validated artifact, or any single
+recorded derived value, modified after the fact is rejected rather than
+silently accepted. This raw tree is covered by the same blanket
 `results/raw/` Git-ignore rule as P1.3's own raw tree.
 
 ## Storage layout

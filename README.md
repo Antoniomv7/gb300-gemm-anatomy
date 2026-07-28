@@ -9,9 +9,9 @@ baseline) — implemented, audited, functionally verified on GB300`. `P1.2
 verified on GB300`. `P1.3 (joint LDGSTS/TMA sweep infrastructure) —
 implemented, remediation completed, independently audited, and functionally
 verified on GB300`. `P1.4 (profiling, HBM validation, analysis, pilot) —
-implemented, remediated after an independent GPU-free audit; independent
-re-audit PENDING; verified on GB300: NO; pilot executed: NO; publishable
-results: NONE`.**
+implemented, remediated after two independent GPU-free audits; a further
+independent re-audit PENDING; verified on GB300: NO; pilot executed: NO;
+publishable results: NONE`.**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -86,16 +86,21 @@ over all 30 retained repetitions of all 18 pilot configurations, a paired
 LDGSTS/TMA ratio comparison, and a candidate-saturation search limited to
 the three tested bytes-in-flight values, then generates CSV/JSON/Markdown/
 SVG artifacts, all `publishable: false`. See `src/memory/P1_4_PROTOCOL.md`
-for the complete frozen protocol. An independent GPU-free audit of the first
-P1.4 implementation found five blockers (preflight/provenance comparison,
-post-validation tamper detection, NCU raw-CSV parsing, raw-tree/log write
-ordering and safety, and the manifest's overwrite-based publication); all
-five were remediated GPU-free, each with a new adversarial test that first
-demonstrably failed against the original behavior and then passed against
-the fix (see `src/memory/P1_4_PROTOCOL.md` for the closed design of each).
-P1.4 has not yet been independently re-audited, has not been verified on
-GB300, and its pilot has not been executed; no P1.4 performance result
-exists.
+for the complete frozen protocol. A first independent GPU-free audit found
+five blockers (preflight/provenance comparison, post-validation tamper
+detection, NCU raw-CSV parsing, raw-tree/log write ordering and safety, and
+the manifest's overwrite-based publication); a second independent GPU-free
+audit of the remediated implementation then found four further blockers
+(a residual raw-tree-write TOCTOU window, an uncompared/unplanned extra
+profile directory, cryptographically-chained-but-semantically-unvalidated
+manifest revisions, and an incomplete evidence-integrity comparison that
+missed some derived per-case fields). All nine blockers, across both
+rounds, were remediated GPU-free, each with a new adversarial test that
+first demonstrably failed against the original behavior and then passed
+against the fix (see `src/memory/P1_4_PROTOCOL.md` for the closed design of
+each). P1.4 has not yet been independently re-audited, has not been
+verified on GB300, and its pilot has not been executed; no P1.4 performance
+result exists.
 
 ## Research question
 
@@ -230,10 +235,10 @@ automatically and never exposes all GPUs to a container.
 Phase 0 provides environment and tooling validation only. Experiment 1 has
 completed P1.1, P1.2, and P1.3: all three units are implemented,
 independently audited, and functionally verified on GB300. P1.4 is
-implemented and its first-audit blockers have been remediated GPU-free (see
-above and `src/memory/P1_4_PROTOCOL.md`), but it has not yet been
-independently re-audited, not yet verified on GB300, and its pilot has not
-been executed; experiments 2-3 have not started. The repository contains no
+implemented and both rounds of audit blockers found so far have been
+remediated GPU-free (see above and `src/memory/P1_4_PROTOCOL.md`), but it
+has not yet passed independent re-audit, not yet verified on GB300, and its
+pilot has not been executed; experiments 2-3 have not started. The repository contains no
 publishable bandwidth, throughput, GEMM performance, or cuBLASLt comparison
 results; campaign `20260728T103315Z` and the earlier P1.1/P1.2 smoke runs
 are functional checks only. A fresh preflight is required before any P1.4

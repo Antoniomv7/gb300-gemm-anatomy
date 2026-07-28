@@ -67,10 +67,32 @@ NCU CSV parser is now fail-closed on schema/unit/kernel-identity; raw-tree
 log writes are symlink-safe and ordered after the safety check; and the P1.4
 manifest now publishes as an append-only, hash-chained revision history
 (`campaign_dir/manifest/000000.json`, `000001.json`, ...) that never calls
-`os.replace()`. Independent re-audit, GB300 verification, and pilot
-execution are all still pending; no performance result exists yet. A fresh
-preflight is required before any P1.4 GPU work because the host driver
-changed after the Phase 0 verification.
+`os.replace()`. A second independent GPU-free audit of that remediated
+implementation found four further blockers: (A) a precheck immediately
+before a shell redirection into the raw campaign still left a TOCTOU window
+between the check and the later `open()`; (B) an unplanned extra
+`profiles/<name>/` directory was never compared against anything and so was
+silently ignored; (C) a syntactically valid, correctly re-hashed manifest
+revision that changed the immutable `campaign_id` (or edited an earlier
+`case_result`, or jumped state illegally) previously passed unnoticed; (D)
+the evidence-integrity gate never compared its own `dram_read_bytes`
+reconstruction (or any `resolved_metric_values` entry) against what was
+recorded, so either could be silently tampered. All four were remediated
+GPU-free, each with a new adversarial test that first demonstrably failed
+and then passed: a descriptor-anchored safe-capture module
+(`scripts/p14_safe_capture.py`) replaces every raw-campaign shell redirection
+with `O_NOFOLLOW`/`O_EXCL` operations on already-open directory descriptors;
+`profiles/`'s actual contents are now compared exactly against the frozen
+plan before both `COMPLETE` and `ANALYZED`; every manifest revision is now
+semantically validated against an explicit per-field classification, not
+just cryptographically chained; and one canonical
+`reconstruct_case_result` function, shared by `validate-profile-case` and
+the gate, is now compared as a complete structure. See
+`src/memory/P1_4_PROTOCOL.md` for the full design of each. Independent
+re-audit, GB300 verification, and pilot execution are all still pending; no
+performance result exists yet. A fresh preflight is required before any
+P1.4 GPU work because the host driver changed after the Phase 0
+verification.
 
 ## Phase 2 — BF16 UMMA throughput (27 July–2 August 2026)
 

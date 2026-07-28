@@ -1,10 +1,10 @@
 # P1.4 frozen protocol — profiling, HBM validation, analysis, pilot
 
-**Status: implemented, remediated after an independent GPU-free audit;
-independent re-audit PENDING, GB300 verification NO, pilot NOT executed,
-NCU/HBM validation NO. No performance result exists yet.**
+**Status: implemented, remediated after two independent GPU-free audits;
+a further independent re-audit is PENDING, GB300 verification NO, pilot NOT
+executed, NCU/HBM validation NO. No performance result exists yet.**
 
-An independent GPU-free audit of the first implementation found five
+A first independent GPU-free audit of the initial implementation found five
 blockers, each closed with a GPU-free fix plus a new adversarial test that
 first demonstrably failed against the original behavior and then passed
 against the fix: (1) a profiling preflight from a different GPU/driver/commit
@@ -18,10 +18,40 @@ diagnostic logs before safely resolving the campaign tree — closed by
 reordering `--profile` and adding symlink-safe capture checks (Section 8);
 (5) P1.4 manifest updates delegated to P1.3's overwrite-based writer,
 contrary to the no-overwrite requirement — closed by the append-only,
-hash-chained manifest revision design (Section 8). None of these fixes
-changed the frozen pilot matrix, the six-case NCU plan, the statistical
-calculations, the bootstrap seed/resample count, the outlier-retention
-policy, the saturation rule, or the HBM thresholds below.
+hash-chained manifest revision design (Section 8).
+
+A second independent GPU-free audit of that remediated implementation found
+four further blockers, each closed the same way (a new adversarial test that
+first demonstrably failed, then passed): (A) a precheck (even a symlink-aware
+one) immediately before an ordinary shell redirection into the raw campaign
+still left a TOCTOU window between the check and the later `open()` —
+closed by `scripts/p14_safe_capture.py`, a P1.4-only descriptor-anchored
+capture module that opens every directory component exactly once with Linux
+no-follow semantics and never re-resolves a pathname afterward (Section 4);
+(B) an unplanned extra `profiles/<name>/` directory was never compared
+against anything and so was silently ignored regardless of state — closed by
+`verify_profiles_directory_inventory`, which requires `profiles/`'s actual
+contents to equal exactly the six canonical names in `profile_plan.csv`
+(Section 8); (C) a syntactically valid, correctly re-hashed manifest revision
+that changed the immutable `campaign_id` (or edited an earlier `case_result`,
+or jumped state illegally) previously passed unnoticed, since the hash chain
+alone only proves a revision was appended without altering an earlier byte,
+never that its *content* is a legitimate continuation — closed by
+`validate_manifest_revision_transition`, an explicit per-field classification
+and transition validator applied to every adjacent revision pair (Section 8);
+(D) the evidence-integrity gate recomputed several derived per-case values
+but never compared its own `dram_read_bytes` reconstruction (or any
+`resolved_metric_values` entry) against what was actually recorded, so either
+could be silently tampered without the classification/ratio checks (computed
+from the untouched CSV) ever disagreeing with anything — closed by
+`reconstruct_case_result`, one canonical function shared by
+`validate-profile-case` and the gate, compared as a complete structure, key
+for key, never a hand-picked subset (Section 8).
+
+None of these nine fixes, across both rounds, changed the frozen pilot
+matrix, the six-case NCU plan, the statistical calculations, the bootstrap
+seed/resample count, the outlier-retention policy, the saturation rule, or
+the HBM thresholds below.
 
 This document is the single frozen reference for P1.4
 (`scripts/run_exp01_memory_paths_p14.sh`,
@@ -235,11 +265,15 @@ still lands cleanly on the invocation's stdout, alongside
 `scripts/run_container.sh`'s own allowlisted banner lines. The application
 CSV is recovered by scanning the captured stdout for the exact 37-column
 `CSV_HEADER` line (reusing `aggregate_exp01_memory_paths.CSV_HEADER`) and
-taking that line plus the one row that follows — never by assuming the
-stream is otherwise clean. `-o` is never given `--force-overwrite`, so NCU
-itself refuses to clobber an existing report; `run_exp01_memory_paths_p14.sh`
-additionally pre-checks the target path with the same symlink/no-clobber
-primitives P1.3 uses (imported, not reimplemented).
+taking that line plus the one row that follows, then publishing it via
+`scripts/p14_safe_capture.py write` (below) — never by assuming the stream is
+otherwise clean, and never via a shell `>` redirect. `-o`/`--log-file` are
+NCU's own arguments; NCU resolves and writes those two paths itself (never
+given `--force-overwrite`, so NCU itself refuses to clobber an existing
+report), which this script cannot intercept — `run_exp01_memory_paths_p14.sh`
+re-verifies both landed strictly inside the anchored `profiles/<case>/`
+directory afterward via `scripts/p14_safe_capture.py verify` (Section 4a),
+instead of trusting a plain `test -f`.
 
 ### Metrics export (per case, GPU-free — pure `.ncu-rep` post-processing, plain `docker run`, no `--gpus`, no `BLACKWELL_GPU_INDEX`)
 
@@ -248,10 +282,11 @@ docker run --rm --network none --security-opt no-new-privileges --cap-drop ALL \
     -v "$PWD:/workspace" -w /workspace gb300-gemm-anatomy:phase0 \
     ncu --import <profiles>/<case>_report.ncu-rep \
         --csv --page raw --print-metric-name name --print-units base \
-        --print-kernel-base function \
-    > <profiles>/<case>.metrics_raw.csv
+        --print-kernel-base function
 ```
 
+(stdout/stderr captured via `scripts/p14_safe_capture.py run`, below — never
+a shell `>`/`2>` redirect into `<profiles>/<case>.metrics_raw.csv`.)
 `--print-metric-name name` selects the raw metric identifier (e.g.
 `dram__bytes_read.sum`) as the CSV column header instead of NCU's
 human-readable label; `--print-units base` keeps units unscaled;
@@ -260,6 +295,54 @@ function name (see the flag table above). This step never touches a GPU (it
 reads an already-collected `.ncu-rep`), so it does not need
 `BLACKWELL_GPU_INDEX` or the idle-device proof — only the GPU-touching
 collection step above does.
+
+### 4a. Descriptor-anchored safe capture (`scripts/p14_safe_capture.py`)
+
+Every raw-campaign write `run_exp01_memory_paths_p14.sh --profile` performs —
+the NCU-help-capability-probe log, both metric-discovery logs,
+`discover-metrics`' own stderr log, each case's container stdout/stderr, the
+extracted application CSV, and the exported metrics CSV/stderr — goes
+exclusively through this P1.4-only module, never a plain
+`>`/`>>`/`2>`/`2>>` shell redirection into `results/raw/exp01_memory_paths_p14/`
+(mechanically confirmed: `rg -n '(^|[[:space:]])[0-9]*>>?'
+scripts/run_exp01_memory_paths_p14.sh` and inspect every match). A precheck
+immediately before an ordinary redirection — even a symlink-aware one — still
+leaves a window between the check and the later `open()`; this module closes
+that window structurally instead of narrowing it:
+
+* every directory component from the repository root down to `logs/` or
+  `profiles/<case>/` is opened exactly once, with `O_DIRECTORY | O_NOFOLLOW`,
+  relative to the previously opened descriptor (`os.open(name, flags,
+  dir_fd=parent_fd)`) — never re-resolved by pathname afterward, so nothing
+  that later happens to the *name* (a symlink swap of an ancestor, or of the
+  final target) can redirect any subsequent operation;
+* the output file is created the same way, `O_EXCL | O_NOFOLLOW`, so it can
+  never already exist (as a directory, regular file, or symlink, dangling or
+  not) and can never be a symlink itself;
+* the child process (`subprocess.run(argv, stdout=<fd>, stderr=<fd>,
+  shell=False)`) writes directly to the already-open descriptor — it never
+  performs its own path lookup for the output name at all;
+* on a zero exit, the output is published via an in-directory hard link
+  (`os.link(partial, final, src_dir_fd=fd, dst_dir_fd=fd)`) then unlink of the
+  partial — `linkat()`'s own `EEXIST` is the sole, atomic no-clobber
+  guarantee; never `os.replace()`;
+* on a non-zero exit, a non-empty partial is preserved under its own unique
+  name (never renamed or clobbered); an empty owned partial is removed after
+  re-confirming its identity by descriptor, never by a second, racy path
+  lookup.
+
+`--rel-dir` is restricted to an explicit allowlist (`logs`, or one of the six
+frozen `profiles/<case>` names); `mkdir-case` (the safe replacement for the
+old `[ -L case_dir ] || [ -e case_dir ]; mkdir case_dir` precheck-then-create
+pair, which was itself racy against `profiles/` — the parent — being
+swapped) creates exactly one of those six directories via `mkdirat()`'s own
+`EEXIST`, never a separate check. `write` publishes already-extracted bytes
+(the application CSV) the same no-clobber way; `verify` confirms NCU's own
+`-o`/`--log-file` outputs are genuine non-symlink files strictly inside the
+anchored directory. See the module's own docstring and `--self-test` (two
+dedicated adversarial reproductions: a symlink swap of `logs/` itself, and a
+swap performed via an injectable hook after the directory descriptor is
+already open but before the child writes) for the complete design.
 
 ### Fail-closed raw-CSV parsing
 
@@ -524,23 +607,84 @@ strictly additive to P1.3's own manifest discipline: P1.4 never calls
 P1.3's `write_manifest_atomic`/`os.replace()`-based writer for its own
 manifest.
 
+### Semantic manifest transition validation
+
+The hash chain above proves a revision was appended without altering an
+earlier byte; it says nothing about whether the new revision's *content* is
+a legitimate continuation of the previous one. A syntactically valid,
+correctly re-hashed revision that simply changed `campaign_id` (or edited an
+earlier `case_result`, or jumped state illegally) previously passed
+unnoticed. `validate_manifest_revision_transition(previous, current,
+expected_campaign_id)` closes this: `load_p14_manifest_chain` applies it to
+every adjacent revision pair while walking the chain (never only to the
+latest revision), and `write_next_p14_manifest_revision` applies it once
+more, defensively, immediately before writing. `expected_campaign_id` always
+comes from the safely resolved campaign directory's own basename — a
+revision's own stored `campaign_id` is never trusted by itself.
+
+Every top-level P1.4 manifest field is classified into exactly one category
+(a module-level assertion in `analyze_exp01_memory_paths_p14.py` fails at
+import time if any field is ever left unclassified, so an unclassified field
+can never silently bypass transition validation):
+
+| Category | Fields | Rule |
+| --- | --- | --- |
+| immutable | `schema_version`, `experiment_id`, `campaign_id`, `publishable`, `frozen_protocol`, `profile_plan_sha256` | present from revision 0 onward; the exact same value forever |
+| allowed timestamp metadata | `started_at_utc`, `pilot_completed_at_utc`, `profile_started_at_utc`, `profile_completed_at_utc`, `analyzed_at_utc` | may be absent, then take a fixed value at its own specific transition; never changes once set |
+| set-once | `pilot_campaign_reference`, `preflight_reference_pilot`, `provenance`, `preflight_reference_profile`, `resolved_ncu_metrics`, `profile_order` | may be absent, then take a fixed value at its own specific transition; never changes once set (non-timestamp analogue of the row above) |
+| state-derived | `state`, `profile_count_completed` | governed by the state machine below (state) or monotonically non-decreasing (the count) |
+| append-only | `case_results`, `artifact_sha256` | may only gain new entries; an existing entry is never edited, deleted, or reordered; `case_results` must also grow strictly in the frozen six-case order (its key set is always exactly a prefix of the frozen order) |
+| (failure fields) | `failure_stage`, `failure_detail` | may be non-`None` only alongside `state in (FAILED, INTERRUPTED)` |
+
+`state` transitions (including a same-state "self-loop," such as appending
+the next validated profile case) are legal only when
+`ALLOWED_P14_TRANSITIONS` itself lists the target as reachable from the
+current state — there is no separate "same state is always fine" exception,
+since most states (`PILOT_COMPLETE`, `COMPLETE`, `ANALYZED`, `FAILED`,
+`INTERRUPTED`) have no self-loop at all and a repeat is exactly as illegal as
+any other disallowed jump; since the table only ever adds edges forward,
+this same check also rejects any state regression. `analyzed_at_utc` and any
+`artifact_sha256` key beginning `analysis/` may appear only once
+`state == "ANALYZED"`.
+
 ### Evidence-integrity gate (re-verified before `COMPLETE` and before `ANALYZED`)
 
 A validated artifact (any of: a case's `application.csv`, `metrics_raw.csv`,
 or `.ncu-rep`; `profile_plan.csv`; either preflight summary; the P1.3
 campaign's `manifest.json`, `combined_samples.csv`, or `summary.csv`) must
-never be modifiable after validation and still reach a completing state.
-`finalize-profile` (before `PROFILE_IN_PROGRESS -> COMPLETE`) and `analyze`
-(before `COMPLETE -> ANALYZED`) both call the same function,
-`verify_campaign_evidence_integrity`, unmodified: it re-derives every
-artifact's path from the frozen NCU plan and canonical case names alone
-(never from a stored path string), recomputes every SHA-256 fresh from disk
-and compares it against the hash recorded when that artifact was first
-validated, and reparses every application CSV and `metrics_raw.csv` to
-cross-check the reconstructed kernel name, resolved metrics, and HBM
-classification against what was originally recorded. Any mismatch — however
-it arose — fails the transition closed; nothing about an earlier validation
-is ever trusted without re-verification.
+never be modifiable after validation and still reach a completing state, and
+every profiled case's *complete* recorded result must still match what its
+authoritative evidence alone reconstructs. `finalize-profile` (before
+`PROFILE_IN_PROGRESS -> COMPLETE`) and `analyze` (before `COMPLETE ->
+ANALYZED`) both call the same function, `verify_campaign_evidence_integrity`,
+unmodified. It:
+
+1. re-derives every artifact's path from the frozen NCU plan and canonical
+   case names alone (never from a stored path string) and recomputes every
+   SHA-256 fresh from disk (pilot/profile preflights, the P1.3 terminal
+   manifest and its aggregate CSVs, this campaign's own `profile_plan.csv`);
+2. confirms `profiles/` contains *exactly* the six canonical case
+   directories in `profile_plan.csv` — no unplanned extra entry (directory,
+   regular file, or symlink, dangling or not), none missing, none the wrong
+   type (`verify_profiles_directory_inventory`; filesystem enumeration order
+   is irrelevant) — before ever trusting `case_results` at all;
+3. for each of the six cases, calls `reconstruct_case_result` — the exact
+   same canonical function `validate-profile-case` itself calls to build the
+   result it records — fresh from disk (the frozen plan row, the application
+   CSV, the raw metrics CSV, the `.ncu-rep` hash, campaign provenance, the
+   resolved-metric definition, and the fixed HBM-classification rule), and
+   compares the reconstruction against what is currently recorded as a
+   complete typed structure: every key (`case_name`, `method`, `stages`,
+   `bytes_in_flight_kib`, `useful_bytes`, `launch_id`, `launch_count`,
+   `dram_read_bytes`, `dram_read_ratio`, `hbm_classification`,
+   `diagnostic_flags`, `resolved_metric_values`, `resolved_metric_units`, and
+   the three artifact hashes), never a hand-picked subset — so a change to
+   any single derived field, including one nothing else happens to depend
+   on, can never go undetected merely because some other field still happens
+   to agree.
+
+Any mismatch — however it arose — fails the transition closed; nothing about
+an earlier validation is ever trusted without re-verification.
 
 ### State machine
 

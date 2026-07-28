@@ -33,6 +33,7 @@ SELF_PATH="${REPO_ROOT}/scripts/run_exp01_memory_paths_p14.sh"
 P13_RUNNER="${REPO_ROOT}/scripts/run_exp01_memory_paths.sh"
 P13_AGGREGATOR="${REPO_ROOT}/scripts/aggregate_exp01_memory_paths.py"
 P14_ANALYZER_HOST="${REPO_ROOT}/scripts/analyze_exp01_memory_paths_p14.py"
+P14_SAFE_CAPTURE="${REPO_ROOT}/scripts/p14_safe_capture.py"
 RUN_CONTAINER="${REPO_ROOT}/scripts/run_container.sh"
 IMAGE_TAG="${IMAGE_TAG:-gb300-gemm-anatomy:phase0}"
 
@@ -144,27 +145,20 @@ check_ncu_help_capability() {
 }
 
 # ---------------------------------------------------------------------------
-# Safe-capture precondition (Remediation D): a log/output target this script
-# is about to write via plain shell redirection must not already lexist --
-# as a regular file, directory, or symlink, dangling or not. `-e` alone
-# follows symlinks and reports false for a dangling one, so a target that is
-# a symlink to a not-yet-existing path would pass an `-e`-only check; `-L`
-# (lstat) catches a symlink regardless of whether its target exists. This
-# script's global `set -o noclobber` already refuses to redirect onto an
-# existing regular file, but that is a separate, implicit, shell/OS-specific
-# guarantee this script does not want to depend on for its own safety
-# argument; the explicit check here makes the property self-contained and
-# auditable, mirroring the analyzer's own lstat-based path-safety primitives.
-# Factored out as a pure function (like check_ncu_help_capability) so
-# --self-test can exercise it without any real campaign tree or Docker.
+# Safe capture (Remediation A, second audit): every raw-campaign write this
+# script performs -- every NCU-help/metric-discovery/collection/export log
+# and the extracted application CSV -- goes exclusively through
+# scripts/p14_safe_capture.py, never a plain `>`/`>>`/`2>`/`2>>` shell
+# redirection into results/raw/exp01_memory_paths_p14/. A precheck (even an
+# `-L`-aware one) immediately before an ordinary redirection still leaves a
+# TOCTOU window between the check and the later open(); p14_safe_capture.py
+# closes that window structurally by opening every directory component with
+# O_NOFOLLOW, relative to the previously opened descriptor, and never
+# re-resolving a pathname afterwards -- see its own module docstring and
+# self-test for the full design and the two adversarial race
+# reproductions. See "P1.4 GPU-free synthetic/adversarial tests" below for
+# where this module's own --self-test is exercised.
 # ---------------------------------------------------------------------------
-capture_target_is_safe() {
-    local target="$1"
-    if [ -L "${target}" ] || [ -e "${target}" ]; then
-        return 1
-    fi
-    return 0
-}
 
 # ---------------------------------------------------------------------------
 # CLI parsing: special modes only. --pilot/--profile take no flags of their
@@ -337,51 +331,13 @@ EOF
     rm -rf "${ncu_tmp}"
     trap - RETURN
 
-    # --- safe-capture precondition (Remediation D): a pure-function test
-    # against a real temp directory, never a real campaign tree or Docker.
-    # The dangling-symlink case is the one a bare `[ -e ]` check (used before
-    # this remediation) gets wrong: `-e` follows the symlink and reports
-    # false when its target does not exist, so it would treat a dangling
-    # symlink as "safe to write" -- exactly the case `-L` must catch.
-    local capture_tmp
-    capture_tmp="$(mktemp -d)"
-    trap 'rm -rf "${capture_tmp}"' RETURN
-    if capture_target_is_safe "${capture_tmp}/fresh.log"; then
-        echo "run_exp01_memory_paths_p14: self-test: PASS: capture_target_is_safe accepts a fresh, nonexistent target" >&2
+    echo "run_exp01_memory_paths_p14: self-test: delegating to the safe-capture module's own synthetic/adversarial test suite" >&2
+    if python3 "${P14_SAFE_CAPTURE}" --self-test; then
+        echo "run_exp01_memory_paths_p14: self-test: PASS: p14_safe_capture.py --self-test" >&2
     else
-        echo "run_exp01_memory_paths_p14: self-test: FAIL: capture_target_is_safe rejected a fresh, nonexistent target" >&2
+        echo "run_exp01_memory_paths_p14: self-test: FAIL: p14_safe_capture.py --self-test" >&2
         failures=$((failures + 1))
     fi
-    : > "${capture_tmp}/existing.log"
-    if capture_target_is_safe "${capture_tmp}/existing.log"; then
-        echo "run_exp01_memory_paths_p14: self-test: FAIL: capture_target_is_safe accepted an already-existing regular file" >&2
-        failures=$((failures + 1))
-    else
-        echo "run_exp01_memory_paths_p14: self-test: PASS: capture_target_is_safe rejects an already-existing regular file" >&2
-    fi
-    mkdir "${capture_tmp}/existing_dir"
-    if capture_target_is_safe "${capture_tmp}/existing_dir"; then
-        echo "run_exp01_memory_paths_p14: self-test: FAIL: capture_target_is_safe accepted an already-existing directory" >&2
-        failures=$((failures + 1))
-    else
-        echo "run_exp01_memory_paths_p14: self-test: PASS: capture_target_is_safe rejects an already-existing directory" >&2
-    fi
-    ln -s "${capture_tmp}/existing.log" "${capture_tmp}/symlink_to_existing.log"
-    if capture_target_is_safe "${capture_tmp}/symlink_to_existing.log"; then
-        echo "run_exp01_memory_paths_p14: self-test: FAIL: capture_target_is_safe accepted a symlink to an existing file" >&2
-        failures=$((failures + 1))
-    else
-        echo "run_exp01_memory_paths_p14: self-test: PASS: capture_target_is_safe rejects a symlink to an existing file" >&2
-    fi
-    ln -s "${capture_tmp}/does_not_exist_target.log" "${capture_tmp}/broken_symlink.log"
-    if capture_target_is_safe "${capture_tmp}/broken_symlink.log"; then
-        echo "run_exp01_memory_paths_p14: self-test: FAIL: capture_target_is_safe accepted a broken (dangling) symlink" >&2
-        failures=$((failures + 1))
-    else
-        echo "run_exp01_memory_paths_p14: self-test: PASS: capture_target_is_safe rejects a broken (dangling) symlink" >&2
-    fi
-    rm -rf "${capture_tmp}"
-    trap - RETURN
 
     _check_rejected_cli "'--help --help'" --help --help || failures=$((failures + 1))
     _check_rejected_cli "'-h --help'" -h --help || failures=$((failures + 1))
@@ -450,9 +406,12 @@ readonly CSV_HEADER_LITERAL="schema_version,timestamp_utc,run_kind,method,sample
 # `ncu --log-file` isolates NCU's own tool output elsewhere -- shares that
 # stream only with scripts/run_container.sh's own allowlisted banner lines.
 # Scans for the exact literal header rather than assuming the stream is
-# otherwise pure.
+# otherwise pure. The extracted bytes are piped into p14_safe_capture.py's
+# "write" subcommand -- never a shell "> out_path" -- so the actual
+# publication into the anchored profiles/<case>/ directory is descriptor-
+# anchored and no-clobber, exactly like every other P1.4 raw-tree write.
 extract_application_csv() {
-    local captured_stdout="$1" out_path="$2"
+    local captured_stdout="$1" campaign_rel="$2" rel_case_dir="$3" out_name="$4"
     local header_line_no total_lines data_line_no
     header_line_no="$(grep -nFx -- "${CSV_HEADER_LITERAL}" "${captured_stdout}" | head -n1 | cut -d: -f1)"
     if [ -z "${header_line_no}" ]; then
@@ -465,11 +424,9 @@ extract_application_csv() {
         echo "run_exp01_memory_paths_p14: CSV header found but no data row follows it in ${captured_stdout}" >&2
         return 1
     fi
-    if [ -e "${out_path}" ]; then
-        echo "run_exp01_memory_paths_p14: refusing to overwrite existing application CSV: ${out_path}" >&2
-        return 1
-    fi
-    sed -n "${header_line_no},${data_line_no}p" "${captured_stdout}" > "${out_path}"
+    sed -n "${header_line_no},${data_line_no}p" "${captured_stdout}" \
+        | python3 "${P14_SAFE_CAPTURE}" write \
+            --campaign-dir "${campaign_rel}" --rel-dir "${rel_case_dir}" --name "${out_name}"
 }
 
 CAMPAIGN_DIR="${REPO_ROOT}/${CAMPAIGN_REL}"
@@ -591,46 +548,51 @@ if [ "${PROFILE_COUNT}" -eq 1 ]; then
     echo "run_exp01_memory_paths_p14: --profile: campaign tree and profiling preconditions verified" >&2
 
     echo "run_exp01_memory_paths_p14: --profile: verifying NCU CLI capability (GPU-free)" >&2
-    NCU_HELP_LOG="${CAMPAIGN_DIR}/logs/ncu_help_capability_probe.log"
-    if ! capture_target_is_safe "${NCU_HELP_LOG}"; then
-        fail_run "stale or symlinked NCU capability probe log already exists: ${NCU_HELP_LOG}"
+    NCU_HELP_LOG_NAME="ncu_help_capability_probe.log"
+    if ! python3 "${P14_SAFE_CAPTURE}" run \
+            --campaign-dir "${CAMPAIGN_REL}" --rel-dir logs \
+            --stdout-name "${NCU_HELP_LOG_NAME}" --combine-stderr \
+            -- docker run --rm \
+                --network none \
+                --security-opt no-new-privileges \
+                --cap-drop ALL \
+                --user "$(id -u):$(id -g)" \
+                -e HOME=/tmp \
+                "${IMAGE_TAG}" \
+                ncu --help; then
+        fail_run "could not run 'ncu --help' inside the pinned image; see ${CAMPAIGN_DIR}/logs/${NCU_HELP_LOG_NAME}"
     fi
-    if ! docker run --rm \
-            --network none \
-            --security-opt no-new-privileges \
-            --cap-drop ALL \
-            --user "$(id -u):$(id -g)" \
-            -e HOME=/tmp \
-            "${IMAGE_TAG}" \
-            ncu --help > "${NCU_HELP_LOG}" 2>&1; then
-        fail_run "could not run 'ncu --help' inside the pinned image; see ${NCU_HELP_LOG}"
-    fi
+    NCU_HELP_LOG="${CAMPAIGN_DIR}/logs/${NCU_HELP_LOG_NAME}"
     if ! check_ncu_help_capability "${NCU_HELP_LOG}"; then
         fail_run "the installed NCU CLI does not support a control/flag/value the frozen protocol requires; see ${NCU_HELP_LOG}; never falling back to an NCU default that could control clocks"
     fi
     echo "run_exp01_memory_paths_p14: --profile: NCU CLI capability verified" >&2
 
     echo "run_exp01_memory_paths_p14: --profile: discovering supported NCU metrics on logical device 0" >&2
-    DISCOVERY_STDOUT="${CAMPAIGN_DIR}/logs/metric_discovery.stdout.log"
-    DISCOVERY_STDERR="${CAMPAIGN_DIR}/logs/metric_discovery.stderr.log"
-    if ! capture_target_is_safe "${DISCOVERY_STDOUT}" || ! capture_target_is_safe "${DISCOVERY_STDERR}"; then
-        fail_run "stale or symlinked metric discovery log(s) already exist under ${CAMPAIGN_DIR}/logs/"
-    fi
+    DISCOVERY_STDOUT_NAME="metric_discovery.stdout.log"
+    DISCOVERY_STDERR_NAME="metric_discovery.stderr.log"
     export BLACKWELL_GPU_INDEX
-    if ! "${RUN_CONTAINER}" ncu --query-metrics --query-metrics-mode all --devices 0 \
-            >"${DISCOVERY_STDOUT}" 2>"${DISCOVERY_STDERR}"; then
+    if ! python3 "${P14_SAFE_CAPTURE}" run \
+            --campaign-dir "${CAMPAIGN_REL}" --rel-dir logs \
+            --stdout-name "${DISCOVERY_STDOUT_NAME}" --stderr-name "${DISCOVERY_STDERR_NAME}" \
+            -- "${RUN_CONTAINER}" ncu --query-metrics --query-metrics-mode all --devices 0; then
         write_p14_manifest_status FAILED "metric_discovery" || true
         CAMPAIGN_OUTCOME=FAILED
-        fail_run "NCU metric discovery failed; see ${DISCOVERY_STDERR}"
+        fail_run "NCU metric discovery failed; see ${CAMPAIGN_DIR}/logs/${DISCOVERY_STDERR_NAME}"
     fi
+    DISCOVERY_STDOUT="${CAMPAIGN_DIR}/logs/${DISCOVERY_STDOUT_NAME}"
 
     PROFILE_STARTED_AT="$(date -u +%Y%m%dT%H%M%SZ)"
-    DISCOVER_METRICS_STDERR="${CAMPAIGN_DIR}/logs/discover_metrics.stderr.log"
-    if ! RESOLVED_METRICS="$(python3 "${P14_ANALYZER_HOST}" discover-metrics \
-            --campaign-dir "${CAMPAIGN_REL}" --discovery-log "${DISCOVERY_STDOUT}" \
-            --preflight "${P1_4_PREFLIGHT_SUMMARY}" --git-commit "${GIT_COMMIT}" \
-            --started-at-utc "${PROFILE_STARTED_AT}" 2>"${DISCOVER_METRICS_STDERR}")"; then
-        cat "${DISCOVER_METRICS_STDERR}" >&2
+    DISCOVER_METRICS_STDERR_NAME="discover_metrics.stderr.log"
+    DISCOVER_METRICS_STDERR="${CAMPAIGN_DIR}/logs/${DISCOVER_METRICS_STDERR_NAME}"
+    if ! RESOLVED_METRICS="$(python3 "${P14_SAFE_CAPTURE}" run \
+            --campaign-dir "${CAMPAIGN_REL}" --rel-dir logs \
+            --stderr-name "${DISCOVER_METRICS_STDERR_NAME}" \
+            -- python3 "${P14_ANALYZER_HOST}" discover-metrics \
+                --campaign-dir "${CAMPAIGN_REL}" --discovery-log "${DISCOVERY_STDOUT}" \
+                --preflight "${P1_4_PREFLIGHT_SUMMARY}" --git-commit "${GIT_COMMIT}" \
+                --started-at-utc "${PROFILE_STARTED_AT}")"; then
+        cat "${DISCOVER_METRICS_STDERR}" >&2 2>/dev/null || true
         CAMPAIGN_OUTCOME=FAILED
         fail_run "discover-metrics failed; P1.4 campaign marked FAILED; see ${DISCOVER_METRICS_STDERR}"
     fi
@@ -639,7 +601,6 @@ if [ "${PROFILE_COUNT}" -eq 1 ]; then
         || fail_run "discover-metrics resolved zero metrics; cannot proceed with NCU collection"
     echo "run_exp01_memory_paths_p14: --profile: resolved metrics: ${RESOLVED_METRICS}" >&2
 
-    PROFILES_DIR_REL="${CAMPAIGN_REL}/profiles"
     PLAN_TSV="$(python3 "${P14_ANALYZER_HOST}" plan --format lines)"
     while IFS=$'\t' read -r p_index p_method p_stages p_bif p_kernel p_case_name; do
         [ -n "${p_index}" ] || continue
@@ -650,86 +611,98 @@ if [ "${PROFILE_COUNT}" -eq 1 ]; then
             *) fail_run "internal error: unknown method '${p_method}'" ;;
         esac
 
-        case_rel="${PROFILES_DIR_REL}/${p_case_name}"
-        case_dir="${REPO_ROOT}/${case_rel}"
-        if [ -L "${case_dir}" ] || [ -e "${case_dir}" ]; then
-            fail_run "profile case directory already exists or is a symlink: ${case_dir}"
+        # Descriptor-anchored replacement for the old
+        # "[ -L case_dir ] || [ -e case_dir ]; mkdir case_dir" pair, which was
+        # itself racy against profiles/ (case_dir's *parent*) being swapped
+        # for a symlink between the check and the mkdir.
+        rel_case_dir="profiles/${p_case_name}"
+        case_dir="${CAMPAIGN_DIR}/${rel_case_dir}"
+        if ! python3 "${P14_SAFE_CAPTURE}" mkdir-case \
+                --campaign-dir "${CAMPAIGN_REL}" --case-name "${p_case_name}"; then
+            fail_run "profile case directory already exists or could not be safely created: ${case_dir}"
         fi
-        mkdir "${case_dir}"
 
-        report_base_rel="${case_rel}/${p_case_name}_report"
-        ncu_tool_log="${case_dir}/${p_case_name}.ncu_tool.log"
-        container_stdout="${case_dir}/${p_case_name}.container_stdout.log"
-        container_stderr="${case_dir}/${p_case_name}.container_stderr.log"
-        application_csv="${case_dir}/${p_case_name}.application.csv"
-        metrics_csv="${case_dir}/${p_case_name}.metrics_raw.csv"
-        metrics_export_stderr="${case_dir}/${p_case_name}.metrics_export_stderr.log"
+        report_base_rel="${rel_case_dir}/${p_case_name}_report"
+        ncu_tool_log_name="${p_case_name}.ncu_tool.log"
+        container_stdout_name="${p_case_name}.container_stdout.log"
+        container_stderr_name="${p_case_name}.container_stderr.log"
+        application_csv_name="${p_case_name}.application.csv"
+        metrics_csv_name="${p_case_name}.metrics_raw.csv"
+        metrics_export_stderr_name="${p_case_name}.metrics_export_stderr.log"
         ncu_rep_abs="${REPO_ROOT}/${report_base_rel}.ncu-rep"
 
         echo "run_exp01_memory_paths_p14: --profile: [${p_index}/5] collecting ${p_case_name} (${p_kernel})" >&2
-        if ! "${RUN_CONTAINER}" ncu \
-                --clock-control none \
-                --pipeline-boost-state dynamic \
-                --cache-control none \
-                --kernel-name-base function \
-                --kernel-name "${p_kernel}" \
-                --launch-count 1 \
-                --devices 0 \
-                --replay-mode kernel \
-                --metrics "${RESOLVED_METRICS}" \
-                --print-summary none \
-                --log-file "${report_base_rel}.ncu_tool.log" \
-                -o "${report_base_rel}" \
-                -- \
-                "${bin_rel}" --stages "${p_stages}" --bytes-in-flight-kib "${p_bif}" \
-                --run-kind benchmark --working-set-mib 512 --passes 32 --warmup-ms 0 --repetitions 1 \
-                >"${container_stdout}" 2>"${container_stderr}"; then
+        if ! python3 "${P14_SAFE_CAPTURE}" run \
+                --campaign-dir "${CAMPAIGN_REL}" --rel-dir "${rel_case_dir}" \
+                --stdout-name "${container_stdout_name}" --stderr-name "${container_stderr_name}" \
+                -- "${RUN_CONTAINER}" ncu \
+                    --clock-control none \
+                    --pipeline-boost-state dynamic \
+                    --cache-control none \
+                    --kernel-name-base function \
+                    --kernel-name "${p_kernel}" \
+                    --launch-count 1 \
+                    --devices 0 \
+                    --replay-mode kernel \
+                    --metrics "${RESOLVED_METRICS}" \
+                    --print-summary none \
+                    --log-file "${report_base_rel}.ncu_tool.log" \
+                    -o "${report_base_rel}" \
+                    -- \
+                    "${bin_rel}" --stages "${p_stages}" --bytes-in-flight-kib "${p_bif}" \
+                    --run-kind benchmark --working-set-mib 512 --passes 32 --warmup-ms 0 --repetitions 1; then
             write_p14_manifest_status FAILED "profile_collect_${p_case_name}" || true
             CAMPAIGN_OUTCOME=FAILED
-            fail_run "NCU collection failed for ${p_case_name}; see ${container_stderr}"
+            fail_run "NCU collection failed for ${p_case_name}; see ${case_dir}/${container_stderr_name}"
         fi
-        # -o and --log-file were both given paths rooted at case_rel (relative
-        # to /workspace, which scripts/run_container.sh binds to REPO_ROOT),
-        # so NCU writes both files directly to their final host location; a
-        # zero exit code alone does not prove either file was actually
-        # produced, so check for them explicitly before trusting them.
-        if [ ! -f "${ncu_rep_abs}" ]; then
+        container_stdout="${case_dir}/${container_stdout_name}"
+
+        # -o and --log-file were both given paths rooted at rel_case_dir
+        # (relative to /workspace, which scripts/run_container.sh binds to
+        # REPO_ROOT), so NCU writes .ncu-rep/.ncu_tool.log directly to their
+        # final host location itself -- this script cannot anchor those two
+        # writes via its own held descriptors the way it does its own
+        # stdout/stderr captures, since NCU resolves "-o"/"--log-file" itself.
+        # A zero exit code alone does not prove either file was actually
+        # produced inside the anchored directory (rather than, say, escaping
+        # through a symlink NCU itself would follow), so re-verify both via
+        # the same descriptor-anchored resolution p14_safe_capture.py uses
+        # for every other write, instead of trusting a plain "test -f".
+        if ! python3 "${P14_SAFE_CAPTURE}" verify \
+                --campaign-dir "${CAMPAIGN_REL}" --rel-dir "${rel_case_dir}" \
+                --name "${p_case_name}_report.ncu-rep" --name "${ncu_tool_log_name}"; then
             write_p14_manifest_status FAILED "profile_missing_report_${p_case_name}" || true
             CAMPAIGN_OUTCOME=FAILED
-            fail_run "expected .ncu-rep not found after collection: ${ncu_rep_abs}"
-        fi
-        if [ ! -f "${ncu_tool_log}" ]; then
-            write_p14_manifest_status FAILED "profile_missing_tool_log_${p_case_name}" || true
-            CAMPAIGN_OUTCOME=FAILED
-            fail_run "expected NCU tool log not found after collection: ${ncu_tool_log}"
+            fail_run "expected .ncu-rep/.ncu_tool.log not verified strictly inside ${case_dir} after collection for ${p_case_name}"
         fi
 
-        if ! extract_application_csv "${container_stdout}" "${application_csv}"; then
+        if ! extract_application_csv "${container_stdout}" "${CAMPAIGN_REL}" "${rel_case_dir}" "${application_csv_name}"; then
             write_p14_manifest_status FAILED "profile_extract_csv_${p_case_name}" || true
             CAMPAIGN_OUTCOME=FAILED
             fail_run "could not extract the application CSV for ${p_case_name} from ${container_stdout}"
         fi
+        application_csv="${case_dir}/${application_csv_name}"
 
-        if [ -e "${metrics_csv}" ]; then
-            fail_run "refusing to overwrite existing metrics CSV: ${metrics_csv}"
-        fi
-        if ! docker run --rm \
-                --network none \
-                --security-opt no-new-privileges \
-                --cap-drop ALL \
-                --user "$(id -u):$(id -g)" \
-                -e HOME=/tmp \
-                -v "${REPO_ROOT}:/workspace" \
-                -w /workspace \
-                "${IMAGE_TAG}" \
-                ncu --import "${report_base_rel}.ncu-rep" \
-                    --csv --page raw --print-metric-name name --print-units base \
-                    --print-kernel-base function \
-                >"${metrics_csv}" 2>"${metrics_export_stderr}"; then
+        if ! python3 "${P14_SAFE_CAPTURE}" run \
+                --campaign-dir "${CAMPAIGN_REL}" --rel-dir "${rel_case_dir}" \
+                --stdout-name "${metrics_csv_name}" --stderr-name "${metrics_export_stderr_name}" \
+                -- docker run --rm \
+                    --network none \
+                    --security-opt no-new-privileges \
+                    --cap-drop ALL \
+                    --user "$(id -u):$(id -g)" \
+                    -e HOME=/tmp \
+                    -v "${REPO_ROOT}:/workspace" \
+                    -w /workspace \
+                    "${IMAGE_TAG}" \
+                    ncu --import "${report_base_rel}.ncu-rep" \
+                        --csv --page raw --print-metric-name name --print-units base \
+                        --print-kernel-base function; then
             write_p14_manifest_status FAILED "profile_export_${p_case_name}" || true
             CAMPAIGN_OUTCOME=FAILED
-            fail_run "NCU metrics export failed for ${p_case_name}; see ${metrics_export_stderr}"
+            fail_run "NCU metrics export failed for ${p_case_name}; see ${case_dir}/${metrics_export_stderr_name}"
         fi
+        metrics_csv="${case_dir}/${metrics_csv_name}"
 
         if ! python3 "${P14_ANALYZER_HOST}" validate-profile-case \
                 --campaign-dir "${CAMPAIGN_REL}" --index "${p_index}" \

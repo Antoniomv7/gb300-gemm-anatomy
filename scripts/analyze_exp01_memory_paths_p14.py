@@ -59,12 +59,14 @@ or analysis failure; 2 on a usage/precondition error.
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import math
 import os
 import random
 import re
+import shutil
 import stat
 import statistics
 import sys
@@ -680,6 +682,194 @@ def _validate_p14_manifest_document(manifest: dict, *, require_initialized: bool
         raise p13.ManifestTransitionError(f"P1.4 manifest state={state!r} cannot retain failure_stage")
 
 
+# ---------------------------------------------------------------------------
+# Semantic manifest transition validation (Remediation C, second audit,
+# blocker C). The hash chain alone only proves a revision was appended
+# without altering an earlier byte -- it says nothing about whether the
+# *content* of the new revision is a legitimate continuation of the old one.
+# A syntactically valid, correctly re-hashed revision that simply changes
+# campaign_id (or edits an earlier case_result, or jumps state illegally)
+# previously passed unnoticed. Every top-level field is classified exactly
+# once below; validate_manifest_revision_transition enforces the invariant
+# each classification implies, and is applied to every adjacent revision
+# pair while walking the chain (never only to the latest revision).
+#
+# Classification (documented here and in src/memory/P1_4_PROTOCOL.md):
+#   immutable          -- present from revision 0 onward; the exact same
+#                          value forever.
+#   allowed timestamp   -- may be absent, then take a fixed value at its
+#                          own specific transition; never changes once set.
+#   set-once            -- (non-timestamp) may be absent, then take a fixed
+#                          value at its own specific transition; never
+#                          changes once set, and never reverts to absent.
+#   state-derived       -- governed by the state machine itself (state's own
+#                          allowlisted transitions; profile_count_completed's
+#                          monotonic, never-decreasing count).
+#   append-only         -- a collection that may only gain new entries; an
+#                          existing entry is never edited, deleted, or
+#                          reordered (case_results must also grow strictly
+#                          in the frozen six-case order).
+#   revision metadata    -- manifest_revision/previous_manifest_sha256 are
+#                          not P1.4 manifest *content* fields at all (they
+#                          are the chain wrapper); see MANIFEST_REVISION_KEYS.
+# ---------------------------------------------------------------------------
+P14_FIELD_IMMUTABLE = frozenset({
+    "schema_version", "experiment_id", "campaign_id", "publishable",
+    "frozen_protocol", "profile_plan_sha256",
+})
+P14_FIELD_ALLOWED_TIMESTAMP = frozenset({
+    "started_at_utc", "pilot_completed_at_utc", "profile_started_at_utc",
+    "profile_completed_at_utc", "analyzed_at_utc",
+})
+P14_FIELD_SET_ONCE = frozenset({
+    "pilot_campaign_reference", "preflight_reference_pilot", "provenance",
+    "preflight_reference_profile", "resolved_ncu_metrics", "profile_order",
+})
+P14_FIELD_STATE_DERIVED = frozenset({"state", "profile_count_completed"})
+P14_FIELD_APPEND_ONLY = frozenset({"case_results", "artifact_sha256"})
+# failure_stage/failure_detail: valid only alongside a FAILED/INTERRUPTED
+# state, and must be absent/None otherwise. Not immutable (they start
+# absent), not set-once in the usual sense (a FAILED/INTERRUPTED campaign is
+# always terminal in practice, so in effect they are set at most once, at
+# the terminal transition), not state-derived in the state/count sense --
+# validated by their own explicit rule in validate_manifest_revision_transition.
+P14_FIELD_FAILURE = frozenset({"failure_stage", "failure_detail"})
+
+_P14_FIELD_CLASSIFICATION_UNION = (
+    P14_FIELD_IMMUTABLE | P14_FIELD_ALLOWED_TIMESTAMP | P14_FIELD_SET_ONCE
+    | P14_FIELD_STATE_DERIVED | P14_FIELD_APPEND_ONLY | P14_FIELD_FAILURE
+)
+assert _P14_FIELD_CLASSIFICATION_UNION == frozenset(ALLOWED_P14_MANIFEST_KEYS), (
+    "every P1.4 manifest field must be classified into exactly one of the "
+    "P14_FIELD_* categories above -- an unclassified field must never be "
+    "able to bypass transition validation: "
+    f"missing={frozenset(ALLOWED_P14_MANIFEST_KEYS) - _P14_FIELD_CLASSIFICATION_UNION!r} "
+    f"extra={_P14_FIELD_CLASSIFICATION_UNION - frozenset(ALLOWED_P14_MANIFEST_KEYS)!r}"
+)
+
+
+def validate_manifest_revision_transition(
+    previous: dict | None, current: dict, expected_campaign_id: str,
+) -> list[str]:
+    """Validates one manifest revision (previous=None: revision 0 in
+    isolation) or one adjacent revision-to-revision transition. Never
+    trusts campaign_id recorded inside a revision by itself:
+    expected_campaign_id must come from the safely resolved campaign
+    directory's own basename, supplied by the caller. Returns a list of
+    violated-invariant messages, each identifying the specific field or
+    rule broken; empty iff fully compliant."""
+    errors: list[str] = []
+
+    if current.get("campaign_id") != expected_campaign_id:
+        errors.append(
+            f"campaign_id={current.get('campaign_id')!r} != campaign directory "
+            f"basename {expected_campaign_id!r}"
+        )
+    if current.get("publishable") is not False:
+        errors.append(f"publishable={current.get('publishable')!r} != False (must always be false)")
+
+    curr_state = current.get("state")
+    curr_failure_stage = current.get("failure_stage")
+    if curr_failure_stage is not None and curr_state not in ("FAILED", "INTERRUPTED"):
+        errors.append(
+            f"failure_stage={curr_failure_stage!r} is set but state={curr_state!r} "
+            f"is neither FAILED nor INTERRUPTED"
+        )
+    if current.get("analyzed_at_utc") is not None and curr_state != "ANALYZED":
+        errors.append(f"analyzed_at_utc is set but state={curr_state!r} != 'ANALYZED'")
+    curr_artifact_sha256 = current.get("artifact_sha256")
+    if isinstance(curr_artifact_sha256, dict):
+        for name in curr_artifact_sha256:
+            if name.startswith("analysis/") and curr_state != "ANALYZED":
+                errors.append(
+                    f"artifact_sha256 contains analysis artifact {name!r} but "
+                    f"state={curr_state!r} != 'ANALYZED'"
+                )
+
+    if previous is None:
+        prev_state = None
+    else:
+        for field in P14_FIELD_IMMUTABLE:
+            if field in previous and previous.get(field) != current.get(field):
+                errors.append(
+                    f"{field} is immutable but changed: {previous.get(field)!r} -> {current.get(field)!r}"
+                )
+        for field in P14_FIELD_ALLOWED_TIMESTAMP | P14_FIELD_SET_ONCE:
+            prev_value = previous.get(field)
+            curr_value = current.get(field)
+            if prev_value is not None and curr_value != prev_value:
+                errors.append(f"{field} is set-once but changed: {prev_value!r} -> {curr_value!r}")
+            if field in previous and prev_value is not None and field not in current:
+                errors.append(f"{field} was present in the previous revision but is now absent")
+
+        prev_artifacts = previous.get("artifact_sha256")
+        prev_artifacts = prev_artifacts if isinstance(prev_artifacts, dict) else {}
+        curr_artifacts = curr_artifact_sha256 if isinstance(curr_artifact_sha256, dict) else {}
+        for name, prev_hash in prev_artifacts.items():
+            if name not in curr_artifacts:
+                errors.append(f"artifact_sha256.{name} was deleted")
+            elif curr_artifacts[name] != prev_hash:
+                errors.append(
+                    f"artifact_sha256.{name} changed after being recorded: "
+                    f"{prev_hash!r} -> {curr_artifacts[name]!r}"
+                )
+
+        prev_cases = previous.get("case_results")
+        prev_cases = prev_cases if isinstance(prev_cases, dict) else {}
+        curr_cases = current.get("case_results")
+        curr_cases = curr_cases if isinstance(curr_cases, dict) else {}
+        for case_name, prev_value in prev_cases.items():
+            if case_name not in curr_cases:
+                errors.append(f"case_results.{case_name} was deleted")
+            elif curr_cases[case_name] != prev_value:
+                errors.append(
+                    f"case_results.{case_name} was modified after being recorded "
+                    f"(existing case_results entries are append-only and immutable)"
+                )
+        frozen_order = [entry["case_name"] for entry in build_ncu_plan()]
+
+        def _frozen_prefix_len(names: set) -> int | None:
+            for k in range(len(frozen_order) + 1):
+                if names == set(frozen_order[:k]):
+                    return k
+            return None
+
+        prev_k = _frozen_prefix_len(set(prev_cases))
+        curr_k = _frozen_prefix_len(set(curr_cases))
+        if prev_k is None:
+            errors.append(f"case_results in the previous revision is not a frozen-order prefix: {sorted(prev_cases)}")
+        elif curr_k is None:
+            errors.append(
+                f"case_results gained an entry out of frozen order: now contains "
+                f"{sorted(curr_cases)}, which is not a prefix of {frozen_order!r}"
+            )
+        elif curr_k < prev_k:
+            errors.append(f"case_results shrank from {prev_k} to {curr_k} entrie(s)")
+
+        prev_count = previous.get("profile_count_completed")
+        curr_count = current.get("profile_count_completed")
+        if isinstance(prev_count, int) and isinstance(curr_count, int) and curr_count < prev_count:
+            errors.append(f"profile_count_completed regressed: {prev_count} -> {curr_count}")
+
+        # Same-state ("self-loop") revisions are only legitimate where
+        # ALLOWED_P14_TRANSITIONS itself lists the state as its own valid
+        # next state (PILOT_IN_PROGRESS, PROFILE_IN_PROGRESS -- e.g.
+        # appending the next validated profile case); every other state
+        # (PILOT_COMPLETE, COMPLETE, ANALYZED, FAILED, INTERRUPTED) has no
+        # self-loop entry and so cannot legally repeat, exactly like any
+        # other disallowed transition -- there is deliberately no special
+        # case for curr_state == prev_state here.
+        prev_state = previous.get("state")
+        allowed_next_states = ALLOWED_P14_TRANSITIONS.get(prev_state, frozenset())
+        if curr_state not in allowed_next_states:
+            errors.append(
+                f"illegal state transition: {prev_state!r} -> {curr_state!r} "
+                f"(allowed next state(s) from {prev_state!r}: {sorted(allowed_next_states)!r})"
+            )
+
+    return errors
+
+
 MANIFEST_REVISION_RE = re.compile(r"^(\d{6})\.json$")
 MANIFEST_REVISION_TMP_NAME = ".manifest_revision.tmp"
 MANIFEST_REVISION_KEYS = ("manifest_revision", "previous_manifest_sha256")
@@ -731,7 +921,13 @@ def load_p14_manifest_chain(campaign_dir: Path) -> tuple[dict, int]:
             f"000000..{len(revision_names) - 1:06d}.json: found {revision_names!r}"
         )
 
+    # Never trusts campaign_id recorded inside any revision by itself: the
+    # expected value comes from the safely resolved campaign directory's own
+    # basename, established once here, before any revision content is read.
+    expected_campaign_id = campaign_dir.name
+
     previous_hash: str | None = None
+    previous_content: dict | None = None
     current_content: dict = {}
     for i, name in enumerate(expected_names):
         path = manifest_dir / name
@@ -762,6 +958,19 @@ def load_p14_manifest_chain(campaign_dir: Path) -> tuple[dict, int]:
             _validate_p14_manifest_document(content)
         except p13.ManifestTransitionError as exc:
             raise p13.ManifestTransitionError(f"{path}: {exc}") from exc
+        # Semantic transition validation (Remediation C): the hash chain
+        # above only proves this revision was appended without altering an
+        # earlier byte; it says nothing about whether *this* revision's
+        # content is a legitimate continuation of the previous one (or, for
+        # revision 0, of the campaign directory itself).
+        transition_errors = validate_manifest_revision_transition(
+            previous_content, content, expected_campaign_id,
+        )
+        if transition_errors:
+            raise p13.ManifestTransitionError(
+                f"{path}: semantic transition validation failed: {transition_errors}"
+            )
+        previous_content = content
         current_content = content
         try:
             previous_hash = p13.sha256_of(path)
@@ -787,7 +996,7 @@ def write_next_p14_manifest_revision(campaign_dir: Path, manifest_content: dict)
     replaced revision."""
     manifest_dir = _p14_manifest_dir(campaign_dir)
     p13._mkdir_component(manifest_dir, must_not_exist=False)
-    _current, current_revision = load_p14_manifest_chain(campaign_dir)
+    current, current_revision = load_p14_manifest_chain(campaign_dir)
     new_revision = current_revision + 1
     previous_hash = None
     if current_revision >= 0:
@@ -801,6 +1010,25 @@ def write_next_p14_manifest_revision(campaign_dir: Path, manifest_content: dict)
     tmp_path = manifest_dir / MANIFEST_REVISION_TMP_NAME
     if os.path.lexists(tmp_path):
         raise p13.UnsafePathError(f"{tmp_path}: stale manifest-revision temporary already exists")
+
+    # Defense in depth (Remediation C): re-validate the candidate revision's
+    # transition here too, before ever writing it, using the exact same
+    # function load_p14_manifest_chain re-applies on every future read. This
+    # never replaces the read-side check (an attacker could always bypass
+    # this function and write a revision file directly), but it does catch
+    # a bug in this codebase's own callers before it is ever persisted. Runs
+    # after the stale-tmp check above: a leftover temporary from an
+    # interrupted write is a filesystem-hygiene defect independent of the
+    # new content's own semantic validity, and should fail with that more
+    # specific diagnosis first.
+    transition_errors = validate_manifest_revision_transition(
+        current if current_revision >= 0 else None, manifest_content, campaign_dir.name,
+    )
+    if transition_errors:
+        raise p13.ManifestTransitionError(
+            f"refusing to write a non-compliant manifest revision: {transition_errors}"
+        )
+
     final_path = _manifest_revision_path(campaign_dir, new_revision)
     try:
         with p13._open_exclusive(tmp_path, binary=False) as handle:
@@ -2045,6 +2273,115 @@ def cmd_validate_profile_preconditions(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Canonical case-result reconstruction (Remediation D, second audit,
+# blocker D). The single function that reconstructs one profile case's
+# complete, evidence-derived result from its authoritative sources alone --
+# the frozen profile-plan row, the application CSV, the NCU raw metrics
+# CSV, the .ncu-rep's own hash, campaign provenance, the resolved-metric
+# definition, and the fixed HBM-classification rule -- never from a stored
+# value. validate-profile-case calls this once to build the result it
+# records; the central evidence-integrity gate calls it again, fresh from
+# disk, immediately before both COMPLETE and ANALYZED, and compares the
+# result to what is currently recorded as a complete typed structure (every
+# key, not a hand-picked subset) so a change to any single derived field --
+# including one nothing else happens to depend on, such as
+# dram_read_bytes or a resolved_metric_values entry -- can never go
+# undetected merely because some other field still happens to agree.
+# ---------------------------------------------------------------------------
+def reconstruct_case_result(
+    *, entry: dict, application_csv: Path, metrics_csv: Path, ncu_rep: Path,
+    provenance: dict, resolved_ncu_metrics: dict, git_commit: str,
+) -> tuple[dict | None, list[str]]:
+    errors: list[str] = []
+
+    ncu_rep_err = p13._verify_artifact(ncu_rep)
+    if ncu_rep_err:
+        errors.append(ncu_rep_err)
+
+    expect = {
+        "method": entry["method"], "stages": entry["stages"], "bif_kib": entry["bif_kib"],
+        "run_kind": FROZEN_PROFILE_PARAMS["run_kind"], "repetitions": FROZEN_PROFILE_PARAMS["repetitions"],
+        "passes": FROZEN_PROFILE_PARAMS["passes"], "warmup_ms": FROZEN_PROFILE_PARAMS["warmup_ms"],
+        "working_set_mib": FROZEN_PROFILE_PARAMS["working_set_mib"], "git_commit": git_commit,
+    }
+    app_rows, app_errors = p13.validate_case_file(application_csv, expect)
+    errors.extend(app_errors)
+    app_row = app_rows[0] if (app_rows and not app_errors) else None
+
+    if app_row is not None:
+        for field in (
+            "gpu_uuid", "gpu_name", "compute_capability", "cuda_driver_version",
+            "cuda_runtime_version", "working_set_bytes", "passes",
+        ):
+            if str(app_row.get(field)) != str(provenance.get(field)):
+                errors.append(
+                    f"application CSV {field}={app_row.get(field)!r} != pilot provenance "
+                    f"{field}={provenance.get(field)!r}"
+                )
+
+    parsed_metrics = None
+    try:
+        parsed_metrics = parse_ncu_raw_csv(metrics_csv)
+    except NcuCsvParseError as exc:
+        errors.append(str(exc))
+
+    resolved_names = resolved_ncu_metrics.get("resolved", [])
+    if parsed_metrics is not None:
+        # Exact function-name match only -- never substring/regex matching.
+        # The only accepted values are the two frozen benchmark kernel names.
+        if parsed_metrics["kernel_name"] != entry["kernel_name"]:
+            errors.append(
+                f"metrics CSV kernel name {parsed_metrics['kernel_name']!r} != expected exact "
+                f"function name {entry['kernel_name']!r} (no substring/regex matching is permitted)"
+            )
+        # A metric recorded as *resolved* during discovery but absent, duplicated,
+        # malformed, or wrong-unit in this case's own CSV is an integrity failure --
+        # never silently reclassified as INCONCLUSIVE.
+        for resolved_metric in resolved_names:
+            if resolved_metric not in parsed_metrics["metrics"]:
+                errors.append(
+                    f"metrics CSV is missing resolved metric {resolved_metric!r} "
+                    f"(recorded as resolved during metric discovery; this is an evidence "
+                    f"integrity failure, not an INCONCLUSIVE HBM classification)"
+                )
+
+    if errors:
+        return None, errors
+
+    dram_available = bool(resolved_ncu_metrics.get("dram_read_metric_available"))
+    dram_read_bytes = parsed_metrics["metrics"].get(MANDATORY_DRAM_METRIC) if dram_available else None
+    useful_bytes = float(app_row["useful_bytes"])
+    classification, flags, ratio = classify_hbm(dram_read_bytes, useful_bytes)
+
+    try:
+        app_hash = p13.sha256_of(application_csv)
+        metrics_hash = p13.sha256_of(metrics_csv)
+        ncu_rep_hash = p13.sha256_of(ncu_rep)
+    except p13.UnsafePathError as exc:
+        return None, [str(exc)]
+
+    case_result = {
+        "case_name": entry["case_name"],
+        "method": entry["method"],
+        "stages": entry["stages"],
+        "bytes_in_flight_kib": entry["bif_kib"],
+        "useful_bytes": app_row["useful_bytes"],
+        "launch_id": parsed_metrics["launch_id"],
+        "launch_count": parsed_metrics["launch_count"],
+        "dram_read_bytes": dram_read_bytes,
+        "dram_read_ratio": ratio,
+        "hbm_classification": classification,
+        "diagnostic_flags": list(flags),
+        "resolved_metric_values": {m: parsed_metrics["metrics"].get(m) for m in resolved_names},
+        "resolved_metric_units": {m: parsed_metrics["units"].get(m) for m in resolved_names},
+        "application_csv_sha256": app_hash,
+        "metrics_csv_sha256": metrics_hash,
+        "ncu_rep_sha256": ncu_rep_hash,
+    }
+    return case_result, []
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: validate-profile-case
 #
 # Mirrors p13's cmd_validate_case: a single-case validator that never
@@ -2075,92 +2412,15 @@ def _do_validate_profile_case(
     if entry["case_name"] in existing_results:
         return False, [f"case {entry['case_name']} was already validated and recorded; refusing to redo it"]
 
-    errors: list[str] = []
-
-    ncu_rep_err = p13._verify_artifact(ncu_rep)
-    if ncu_rep_err:
-        errors.append(ncu_rep_err)
-
-    expect = {
-        "method": entry["method"], "stages": entry["stages"], "bif_kib": entry["bif_kib"],
-        "run_kind": FROZEN_PROFILE_PARAMS["run_kind"], "repetitions": FROZEN_PROFILE_PARAMS["repetitions"],
-        "passes": FROZEN_PROFILE_PARAMS["passes"], "warmup_ms": FROZEN_PROFILE_PARAMS["warmup_ms"],
-        "working_set_mib": FROZEN_PROFILE_PARAMS["working_set_mib"], "git_commit": git_commit,
-    }
-    app_rows, app_errors = p13.validate_case_file(application_csv, expect)
-    errors.extend(app_errors)
-    app_row = app_rows[0] if (app_rows and not app_errors) else None
-
     provenance = manifest.get("provenance", {}) if isinstance(manifest.get("provenance"), dict) else {}
-    if app_row is not None:
-        for field in (
-            "gpu_uuid", "gpu_name", "compute_capability", "cuda_driver_version",
-            "cuda_runtime_version", "working_set_bytes", "passes",
-        ):
-            if str(app_row.get(field)) != str(provenance.get(field)):
-                errors.append(
-                    f"application CSV {field}={app_row.get(field)!r} != pilot provenance "
-                    f"{field}={provenance.get(field)!r}"
-                )
-
-    parsed_metrics = None
-    try:
-        parsed_metrics = parse_ncu_raw_csv(metrics_csv)
-    except NcuCsvParseError as exc:
-        errors.append(str(exc))
-
     resolved_ncu_metrics = manifest.get("resolved_ncu_metrics", {})
-    if parsed_metrics is not None:
-        # Exact function-name match only -- never substring/regex matching.
-        # The only accepted values are the two frozen benchmark kernel names.
-        if parsed_metrics["kernel_name"] != entry["kernel_name"]:
-            errors.append(
-                f"metrics CSV kernel name {parsed_metrics['kernel_name']!r} != expected exact "
-                f"function name {entry['kernel_name']!r} (no substring/regex matching is permitted)"
-            )
-        # A metric recorded as *resolved* during discovery but absent, duplicated,
-        # malformed, or wrong-unit in this case's own CSV is an integrity failure --
-        # never silently reclassified as INCONCLUSIVE.
-        for resolved_metric in resolved_ncu_metrics.get("resolved", []):
-            if resolved_metric not in parsed_metrics["metrics"]:
-                errors.append(
-                    f"metrics CSV is missing resolved metric {resolved_metric!r} "
-                    f"(recorded as resolved during metric discovery; this is an evidence "
-                    f"integrity failure, not an INCONCLUSIVE HBM classification)"
-                )
-
-    if errors:
+    case_result, errors = reconstruct_case_result(
+        entry=entry, application_csv=application_csv, metrics_csv=metrics_csv, ncu_rep=ncu_rep,
+        provenance=provenance, resolved_ncu_metrics=resolved_ncu_metrics, git_commit=git_commit,
+    )
+    if case_result is None:
         return False, errors
 
-    dram_available = bool(resolved_ncu_metrics.get("dram_read_metric_available"))
-    dram_read_bytes = parsed_metrics["metrics"].get(MANDATORY_DRAM_METRIC) if dram_available else None
-    useful_bytes = float(app_row["useful_bytes"])
-    classification, flags, ratio = classify_hbm(dram_read_bytes, useful_bytes)
-
-    try:
-        app_hash = p13.sha256_of(application_csv)
-        metrics_hash = p13.sha256_of(metrics_csv)
-        ncu_rep_hash = p13.sha256_of(ncu_rep)
-    except p13.UnsafePathError as exc:
-        return False, [str(exc)]
-
-    case_result = {
-        "case_name": entry["case_name"],
-        "method": entry["method"],
-        "stages": entry["stages"],
-        "bytes_in_flight_kib": entry["bif_kib"],
-        "useful_bytes": app_row["useful_bytes"],
-        "dram_read_bytes": dram_read_bytes,
-        "dram_read_ratio": ratio,
-        "hbm_classification": classification,
-        "diagnostic_flags": flags,
-        "resolved_metric_values": {
-            m: parsed_metrics["metrics"].get(m) for m in resolved_ncu_metrics.get("resolved", [])
-        } if parsed_metrics else {},
-        "application_csv_sha256": app_hash,
-        "metrics_csv_sha256": metrics_hash,
-        "ncu_rep_sha256": ncu_rep_hash,
-    }
     new_results = dict(existing_results)
     new_results[entry["case_name"]] = case_result
     updates = {
@@ -2260,6 +2520,73 @@ def _resolve_case_evidence_paths(campaign_dir: Path, case_name: str, errors: lis
     return paths
 
 
+def _read_profile_plan_case_names(profile_plan_path: Path) -> tuple[list[str], list[str]]:
+    """Reads campaign_dir/profile_plan.csv (already hash-verified by the time
+    this runs) and returns (case_names_in_file_order, errors). Never trusts
+    build_ncu_plan() for the expected-name set here -- the whole point of
+    Remediation B is to derive the expected set from the frozen,
+    already-on-disk plan file, not from an in-memory constant."""
+    try:
+        with p13._open_regular_nofollow(profile_plan_path, binary=False) as handle:
+            rows = list(csv.reader(handle))
+    except (OSError, p13.UnsafePathError, UnicodeError) as exc:
+        return [], [f"{profile_plan_path}: unable to read: {exc}"]
+    if not rows:
+        return [], [f"{profile_plan_path}: empty file"]
+    header, data_rows = rows[0], rows[1:]
+    if header != PROFILE_PLAN_HEADER:
+        return [], [f"{profile_plan_path}: header mismatch: {header!r}"]
+    case_names = [row[-1] for row in data_rows if row]
+    return case_names, []
+
+
+def verify_profiles_directory_inventory(campaign_dir: Path) -> list[str]:
+    """Confirms profiles/ contains *exactly* the canonical case directory
+    names in campaign_dir/profile_plan.csv -- no more, no less -- rejecting
+    any extra entry (directory, regular file, or symlink, dangling or not),
+    any missing canonical directory, and any non-directory or symlinked
+    canonical case entry. Filesystem enumeration order is irrelevant.
+    Reused unmodified before both COMPLETE and ANALYZED (Remediation B,
+    second audit, blocker B: an unplanned extra profiles/<name>/ directory
+    was previously never compared against anything and so was silently
+    ignored, regardless of state)."""
+    profile_plan_path = campaign_dir / "profile_plan.csv"
+    case_names, plan_errors = _read_profile_plan_case_names(profile_plan_path)
+    if plan_errors:
+        return plan_errors
+    if len(set(case_names)) != len(case_names):
+        return [f"{profile_plan_path}: contains a duplicate case name: {case_names!r}"]
+    expected_names = set(case_names)
+
+    profiles_dir = campaign_dir / "profiles"
+    try:
+        p13._reject_if_symlink_or_wrong_type(profiles_dir, expect_dir=True)
+    except p13.UnsafePathError as exc:
+        return [f"profiles/: {exc}"]
+    if not os.path.lexists(profiles_dir):
+        return ["profiles/: does not exist"]
+    try:
+        actual_names = set(os.listdir(profiles_dir))
+    except OSError as exc:
+        return [f"profiles/: cannot list directory: {exc}"]
+
+    errors: list[str] = []
+    for extra in sorted(actual_names - expected_names):
+        errors.append(
+            f"profiles/{extra}: unplanned entry not present in profile_plan.csv "
+            f"(exactly {sorted(expected_names)} are permitted)"
+        )
+    for missing in sorted(expected_names - actual_names):
+        errors.append(f"profiles/{missing}: missing canonical case directory")
+    for name in sorted(actual_names & expected_names):
+        case_path = profiles_dir / name
+        try:
+            p13._reject_if_symlink_or_wrong_type(case_path, expect_dir=True)
+        except p13.UnsafePathError as exc:
+            errors.append(f"profiles/{name}: {exc}")
+    return errors
+
+
 def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> list[str]:
     """Returns a list of errors (empty iff every trusted artifact still
     matches its recorded evidence and every reparsed value still agrees
@@ -2303,6 +2630,14 @@ def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> li
     if plan_errors:
         return errors + [f"internal NCU plan contract violation: {plan_errors}"]
 
+    # Remediation B (blocker B): confirm profiles/ contains *exactly* the six
+    # canonical case directories in profile_plan.csv -- no unplanned extra
+    # entry, none missing, none the wrong type -- before ever trusting
+    # case_results at all. The previous gate never enumerated profiles/'s
+    # actual contents, so an unplanned profiles/99_unplanned_profile/ (or
+    # any other stray entry) was silently ignored regardless of state.
+    errors.extend(verify_profiles_directory_inventory(campaign_dir))
+
     case_results = manifest.get("case_results")
     if not isinstance(case_results, dict):
         return errors + ["case_results is missing or not an object"]
@@ -2317,83 +2652,55 @@ def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> li
     if not isinstance(provenance, dict):
         provenance = {}
         errors.append("provenance is missing or not an object")
-    resolved_ncu_metrics = manifest.get("resolved_ncu_metrics", {})
-    dram_available = bool(resolved_ncu_metrics.get("dram_read_metric_available"))
-    resolved_metrics = resolved_ncu_metrics.get("resolved", [])
+    resolved_ncu_metrics = manifest.get("resolved_ncu_metrics")
+    if not isinstance(resolved_ncu_metrics, dict):
+        resolved_ncu_metrics = {}
 
+    # Remediation D (blocker D): reconstruct each case's complete result from
+    # its authoritative evidence alone -- the same canonical function
+    # validate-profile-case itself used to build it -- and compare the
+    # reconstruction against what is currently recorded as a complete typed
+    # structure (every key), never a hand-picked subset. The previous gate
+    # recomputed several derived values but never compared its own
+    # dram_read_bytes reconstruction (or any resolved_metric_values entry)
+    # against the recorded case_results at all, so either could be silently
+    # tampered without the classification/ratio checks (computed from the
+    # untouched CSV) ever disagreeing with anything.
     for entry in plan:
         case_name = entry["case_name"]
         recorded = case_results.get(case_name)
         if recorded is None:
             continue  # already reported as missing above
+        if not isinstance(recorded, dict):
+            errors.append(f"{case_name}: recorded case_results entry is not an object")
+            continue
 
         paths = _resolve_case_evidence_paths(campaign_dir, case_name, errors)
         if paths is None:
             continue
 
-        _verify_hash(f"{case_name} application CSV", paths["application_csv"],
-                     recorded.get("application_csv_sha256"), errors)
-        _verify_hash(f"{case_name} metrics CSV", paths["metrics_csv"],
-                     recorded.get("metrics_csv_sha256"), errors)
-        _verify_hash(f"{case_name} .ncu-rep", paths["ncu_rep"],
-                     recorded.get("ncu_rep_sha256"), errors)
-
-        expect = {
-            "method": entry["method"], "stages": entry["stages"], "bif_kib": entry["bif_kib"],
-            "run_kind": FROZEN_PROFILE_PARAMS["run_kind"], "repetitions": FROZEN_PROFILE_PARAMS["repetitions"],
-            "passes": FROZEN_PROFILE_PARAMS["passes"], "warmup_ms": FROZEN_PROFILE_PARAMS["warmup_ms"],
-            "working_set_mib": FROZEN_PROFILE_PARAMS["working_set_mib"],
-            "git_commit": provenance.get("git_commit"),
-        }
-        app_rows, app_errors = p13.validate_case_file(paths["application_csv"], expect)
-        if app_errors:
-            errors.extend(f"{case_name} application CSV: {e}" for e in app_errors)
-            continue
-        app_row = app_rows[0]
-        for field in (
-            "gpu_uuid", "gpu_name", "compute_capability", "cuda_driver_version",
-            "cuda_runtime_version", "working_set_bytes", "passes",
-        ):
-            if str(app_row.get(field)) != str(provenance.get(field)):
-                errors.append(
-                    f"{case_name} application CSV {field}={app_row.get(field)!r} != pilot "
-                    f"provenance {field}={provenance.get(field)!r}"
-                )
-        if str(app_row.get("useful_bytes")) != str(recorded.get("useful_bytes")):
-            errors.append(
-                f"{case_name}: reparsed useful_bytes={app_row.get('useful_bytes')!r} != "
-                f"recorded case_results useful_bytes={recorded.get('useful_bytes')!r}"
-            )
-
-        try:
-            parsed_metrics = parse_ncu_raw_csv(paths["metrics_csv"])
-        except NcuCsvParseError as exc:
-            errors.append(f"{case_name} metrics CSV: {exc}")
-            continue
-        if parsed_metrics["kernel_name"] != entry["kernel_name"]:
-            errors.append(
-                f"{case_name}: reparsed kernel name {parsed_metrics['kernel_name']!r} != "
-                f"expected exact {entry['kernel_name']!r}"
-            )
-        for resolved_metric in resolved_metrics:
-            if resolved_metric not in parsed_metrics["metrics"]:
-                errors.append(f"{case_name}: reparsed metrics CSV is missing resolved metric {resolved_metric!r}")
-
-        reparsed_dram_bytes = parsed_metrics["metrics"].get(MANDATORY_DRAM_METRIC) if dram_available else None
-        reparsed_useful_bytes = float(app_row["useful_bytes"])
-        reparsed_classification, _reparsed_flags, reparsed_ratio = classify_hbm(
-            reparsed_dram_bytes, reparsed_useful_bytes,
+        reconstructed, case_errors = reconstruct_case_result(
+            entry=entry, application_csv=paths["application_csv"], metrics_csv=paths["metrics_csv"],
+            ncu_rep=paths["ncu_rep"], provenance=provenance, resolved_ncu_metrics=resolved_ncu_metrics,
+            git_commit=provenance.get("git_commit"),
         )
-        if reparsed_classification != recorded.get("hbm_classification"):
-            errors.append(
-                f"{case_name}: reparsed hbm_classification={reparsed_classification!r} != "
-                f"recorded {recorded.get('hbm_classification')!r}"
-            )
-        if reparsed_ratio != recorded.get("dram_read_ratio"):
-            errors.append(
-                f"{case_name}: reparsed dram_read_ratio={reparsed_ratio!r} != "
-                f"recorded {recorded.get('dram_read_ratio')!r}"
-            )
+        if reconstructed is None:
+            errors.extend(f"{case_name}: {e}" for e in case_errors)
+            continue
+
+        for key in sorted(set(reconstructed) | set(recorded)):
+            if reconstructed.get(key) == recorded.get(key):
+                continue
+            if key.endswith("_sha256"):
+                errors.append(
+                    f"{case_name}.{key}: SHA-256 {reconstructed.get(key)!r} != recorded "
+                    f"{recorded.get(key)!r} (tampered or corrupted since it was first validated)"
+                )
+            else:
+                errors.append(
+                    f"{case_name}.{key}: recorded {recorded.get(key)!r} != reconstructed "
+                    f"{reconstructed.get(key)!r} (recomputed fresh from disk)"
+                )
 
     return errors
 
@@ -4336,10 +4643,19 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             )
             audit_metrics_path.write_bytes(audit_metrics_path.read_bytes() + b"\ntampered\n")
             ok, errors = _do_finalize_profile(campaign_dir=p14_audit_seq, completed_at_utc="20260728T210100Z")
+            # The central gate now reconstructs each case via the exact same
+            # canonical function validate-profile-case itself uses
+            # (reconstruct_case_result), which reparses metrics_raw.csv
+            # *before* it would ever re-hash it -- so an appended malformed
+            # row is caught here as a structural parse failure, not a hash
+            # mismatch; a tamper that preserved CSV structure would instead
+            # be caught by the SHA-256 comparison a few lines later in the
+            # same reconstruction. Both are the same evidence-integrity gate
+            # rejecting the same tampered file; only the diagnostic differs.
             rec.check(
                 "audited sequence: finalize-profile rejects a metrics_raw.csv modified "
                 "after validate-profile-case recorded it",
-                not ok and any("SHA-256" in e and "tampered" in e for e in errors),
+                not ok and any("metrics_raw.csv" in e for e in errors),
                 detail=f"ok={ok} errors={errors}",
             )
             rec.check(
@@ -4352,6 +4668,437 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 "finalize-profile was rejected",
                 not ok,
                 detail=f"ok={ok} errors={errors}",
+            )
+
+            # --- Remediation B: exact profile-directory inventory (second
+            # audit, blocker B) ---------------------------------------------------
+            # The exact audit regression: an unplanned seventh profile
+            # directory, never compared against anything by the previous gate.
+            p14_inv, _ = _run_profile_pipeline(tmp_path, "20260728T220000Z")
+            unplanned_dir = p14_inv / "profiles" / "99_unplanned_profile"
+            unplanned_dir.mkdir()
+            (unplanned_dir / "unplanned.ncu-rep").write_bytes(b"unplanned bytes\n")
+            ok, errors = _do_finalize_profile(campaign_dir=p14_inv, completed_at_utc="20260728T220001Z")
+            rec.check(
+                "finalize-profile rejects an unplanned seventh profile directory "
+                "(Remediation B, audit blocker B, exact regression)",
+                not ok and any("99_unplanned_profile" in e for e in errors),
+                detail=f"ok={ok} errors={errors}",
+            )
+            rec.check(
+                "the campaign with an unplanned profile directory never reaches COMPLETE",
+                load_p14_manifest_chain(p14_inv)[0].get("state") != "COMPLETE",
+            )
+
+            p14_inv_emptydir, _ = _run_profile_pipeline(tmp_path, "20260728T220200Z")
+            (p14_inv_emptydir / "profiles" / "extra_empty_dir").mkdir()
+            ok, errors = _do_finalize_profile(campaign_dir=p14_inv_emptydir, completed_at_utc="20260728T220201Z")
+            rec.expect_error_containing(
+                "finalize-profile rejects an extra empty profiles/ directory (Remediation B)",
+                errors, "extra_empty_dir",
+            )
+
+            p14_inv_file, _ = _run_profile_pipeline(tmp_path, "20260728T220300Z")
+            (p14_inv_file / "profiles" / "extra_file.txt").write_text("not a case\n", encoding="utf-8")
+            ok, errors = _do_finalize_profile(campaign_dir=p14_inv_file, completed_at_utc="20260728T220301Z")
+            rec.expect_error_containing(
+                "finalize-profile rejects an extra regular file at profiles/ root (Remediation B)",
+                errors, "extra_file.txt",
+            )
+
+            p14_inv_symlink, _ = _run_profile_pipeline(tmp_path, "20260728T220400Z")
+            symlink_escape_dir = tmp_path / "profiles_symlink_escape_target"
+            symlink_escape_dir.mkdir()
+            (p14_inv_symlink / "profiles" / "extra_symlink").symlink_to(symlink_escape_dir)
+            ok, errors = _do_finalize_profile(campaign_dir=p14_inv_symlink, completed_at_utc="20260728T220401Z")
+            rec.expect_error_containing(
+                "finalize-profile rejects an extra symlink at profiles/ root (Remediation B)",
+                errors, "extra_symlink",
+            )
+
+            p14_inv_missing, _ = _run_profile_pipeline(tmp_path, "20260728T220500Z")
+            missing_case_name = build_ncu_plan()[0]["case_name"]
+            shutil.rmtree(p14_inv_missing / "profiles" / missing_case_name)
+            ok, errors = _do_finalize_profile(campaign_dir=p14_inv_missing, completed_at_utc="20260728T220501Z")
+            rec.expect_error_containing(
+                "finalize-profile rejects a missing canonical profile directory (Remediation B)",
+                errors, "missing canonical",
+            )
+
+            p14_inv_post, _ = _run_profile_pipeline(tmp_path, "20260728T220600Z")
+            ok, errors = _do_finalize_profile(campaign_dir=p14_inv_post, completed_at_utc="20260728T220601Z")
+            assert ok, errors
+            (p14_inv_post / "profiles" / "post_complete_extra").mkdir()
+            ok, errors = _do_analyze(campaign_dir=p14_inv_post, analyzed_at_utc="20260728T220700Z")
+            analysis_dir_inv = p14_inv_post / "analysis"
+            published_inv = list(analysis_dir_inv.rglob("*")) if analysis_dir_inv.exists() else []
+            rec.check(
+                "analyze() rejects a profiles/ entry that appeared after COMPLETE and "
+                "publishes no analysis artifact (Remediation B)",
+                not ok and not published_inv and any("post_complete_extra" in e for e in errors),
+                detail=f"ok={ok} errors={errors} published={published_inv}",
+            )
+
+            # --- Remediation D: canonical case-result reconstruction (second
+            # audit, blocker D) ---------------------------------------------------
+            def _mutate_case_field(case_name: str, field: str, value):
+                def _mutate(manifest: dict) -> None:
+                    manifest["case_results"][case_name][field] = value
+                return _mutate
+
+            def _append_tampered_manifest_revision(campaign_dir: Path, mutate_fn) -> None:
+                """Simulates an attacker with direct filesystem write access
+                to manifest/ -- bypassing write_next_p14_manifest_revision
+                and its own semantic-transition check entirely, exactly as
+                the audited reproduction did ("a correctly hashed new
+                revision... was accepted") -- by writing a syntactically
+                valid, correctly hash-chained next revision file directly,
+                whose content has been tampered. Never goes through this
+                module's own writer, which would now (correctly) refuse it."""
+                current, current_revision = load_p14_manifest_chain(campaign_dir)
+                mutated = copy.deepcopy(current)
+                mutate_fn(mutated)
+                new_revision = current_revision + 1
+                previous_hash = p13.sha256_of(_manifest_revision_path(campaign_dir, current_revision))
+                doc = dict(mutated)
+                doc["manifest_revision"] = new_revision
+                doc["previous_manifest_sha256"] = previous_hash
+                text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
+                _manifest_revision_path(campaign_dir, new_revision).write_text(text, encoding="utf-8")
+
+            d_case_name = build_ncu_plan()[0]["case_name"]
+
+            def _mentions_case_tamper(errors: list[str]) -> bool:
+                # Once Remediation C exists, tampering *any* field inside an
+                # already-recorded case_results entry is *also* an "existing
+                # case_result was modified" append-only violation, which
+                # load_p14_manifest_chain now catches even before
+                # verify_campaign_evidence_integrity's own field-by-field
+                # dram_read_bytes comparison would run. Both are correct,
+                # independent confirmations that the exact same tamper is
+                # rejected; accept either diagnosis.
+                return any(
+                    f"{d_case_name}.dram_read_bytes" in e
+                    or (f"case_results.{d_case_name}" in e and "modified" in e)
+                    for e in errors
+                )
+
+            # The exact audit regression: dram_read_bytes tampered to 0 while
+            # metrics_raw.csv itself is left completely untouched.
+            p14_d_pre, _ = _run_profile_pipeline(tmp_path, "20260728T221000Z")
+            _append_tampered_manifest_revision(p14_d_pre, _mutate_case_field(d_case_name, "dram_read_bytes", 0.0))
+            ok, errors = _do_finalize_profile(campaign_dir=p14_d_pre, completed_at_utc="20260728T221001Z")
+            rec.check(
+                "finalize-profile rejects a tampered dram_read_bytes even though "
+                "metrics_raw.csv is untouched (Remediation D, audit blocker D, exact regression)",
+                not ok and _mentions_case_tamper(errors),
+                detail=f"ok={ok} errors={errors}",
+            )
+            try:
+                pre_state = load_p14_manifest_chain(p14_d_pre)[0].get("state")
+            except p13.ManifestTransitionError:
+                pre_state = None  # the chain itself is now invalid -- certainly not COMPLETE
+            rec.check(
+                "the campaign with a tampered dram_read_bytes never reaches COMPLETE",
+                pre_state != "COMPLETE",
+            )
+
+            p14_d_post, _ = _run_profile_pipeline(tmp_path, "20260728T221100Z")
+            ok, errors = _do_finalize_profile(campaign_dir=p14_d_post, completed_at_utc="20260728T221101Z")
+            assert ok, errors
+            _append_tampered_manifest_revision(p14_d_post, _mutate_case_field(d_case_name, "dram_read_bytes", 0.0))
+            ok, errors = _do_analyze(campaign_dir=p14_d_post, analyzed_at_utc="20260728T221200Z")
+            analysis_dir_d = p14_d_post / "analysis"
+            published_d = list(analysis_dir_d.rglob("*")) if analysis_dir_d.exists() else []
+            rec.check(
+                "analyze() rejects a post-COMPLETE tampered dram_read_bytes and "
+                "publishes no analysis artifact (Remediation D)",
+                not ok and not published_d and _mentions_case_tamper(errors),
+                detail=f"ok={ok} errors={errors} published={published_d}",
+            )
+
+            # Table-driven: every remaining evidence-derived field, tested
+            # directly against the pure verify_campaign_evidence_integrity
+            # function (never mutates the manifest/campaign) for speed --
+            # building a fresh six-case campaign per mutation would be
+            # correct but needlessly slow; this exercises the exact same
+            # comparison logic finalize-profile/analyze both call unmodified.
+            p14_d_table, _ = _run_profile_pipeline(tmp_path, "20260728T221300Z")
+            ok, errors = _do_finalize_profile(campaign_dir=p14_d_table, completed_at_utc="20260728T221301Z")
+            assert ok, errors
+            base_manifest_d, _rev = load_p14_manifest_chain(p14_d_table)
+            baseline_errors = verify_campaign_evidence_integrity(p14_d_table, base_manifest_d)
+            rec.check(
+                "verify_campaign_evidence_integrity finds no errors on an untampered COMPLETE campaign",
+                baseline_errors == [],
+                detail=f"errors={baseline_errors}",
+            )
+            some_resolved_metric = next(iter(base_manifest_d["case_results"][d_case_name]["resolved_metric_values"]))
+
+            def _check_d_mutation(label: str, field: str, mutate) -> None:
+                mutated_manifest = copy.deepcopy(base_manifest_d)
+                mutate(mutated_manifest["case_results"][d_case_name])
+                mutation_errors = verify_campaign_evidence_integrity(p14_d_table, mutated_manifest)
+                rec.check(
+                    f"canonical reconstruction detects a mutated {label} (Remediation D)",
+                    any(f"{d_case_name}.{field}" in e for e in mutation_errors),
+                    detail=f"errors={mutation_errors}",
+                )
+
+            _check_d_mutation(
+                "resolved metric numeric value", "resolved_metric_values",
+                lambda c: c["resolved_metric_values"].__setitem__(some_resolved_metric, -999.0),
+            )
+            _check_d_mutation(
+                "resolved metric unit", "resolved_metric_units",
+                lambda c: c["resolved_metric_units"].__setitem__(some_resolved_metric, "furlongs"),
+            )
+            _check_d_mutation(
+                "missing resolved metric value", "resolved_metric_values",
+                lambda c: c["resolved_metric_values"].pop(some_resolved_metric),
+            )
+            _check_d_mutation(
+                "extra resolved metric value", "resolved_metric_values",
+                lambda c: c["resolved_metric_values"].__setitem__("bogus_extra_metric", 1.0),
+            )
+            _check_d_mutation(
+                "dram_read_ratio", "dram_read_ratio", lambda c: c.__setitem__("dram_read_ratio", 0.0),
+            )
+            _check_d_mutation(
+                "HBM classification", "hbm_classification",
+                lambda c: c.__setitem__("hbm_classification", "INCONCLUSIVE"),
+            )
+            _check_d_mutation(
+                "diagnostic_flags (READ_AMPLIFICATION)", "diagnostic_flags",
+                lambda c: c.__setitem__("diagnostic_flags", ["READ_AMPLIFICATION"]),
+            )
+            _check_d_mutation(
+                "useful_bytes (expected DRAM-read bytes)", "useful_bytes",
+                lambda c: c.__setitem__("useful_bytes", "1"),
+            )
+            _check_d_mutation("stages (stage count)", "stages", lambda c: c.__setitem__("stages", 999))
+            _check_d_mutation(
+                "bytes_in_flight_kib (bytes in flight)", "bytes_in_flight_kib",
+                lambda c: c.__setitem__("bytes_in_flight_kib", 999),
+            )
+            _check_d_mutation("launch_id", "launch_id", lambda c: c.__setitem__("launch_id", "999"))
+            _check_d_mutation("launch_count", "launch_count", lambda c: c.__setitem__("launch_count", 999))
+            _check_d_mutation(
+                "application_csv_sha256 (artifact hash)", "application_csv_sha256",
+                lambda c: c.__setitem__("application_csv_sha256", "0" * 64),
+            )
+            _check_d_mutation(
+                "metrics_csv_sha256 (artifact hash)", "metrics_csv_sha256",
+                lambda c: c.__setitem__("metrics_csv_sha256", "0" * 64),
+            )
+            _check_d_mutation(
+                "ncu_rep_sha256 (artifact hash)", "ncu_rep_sha256",
+                lambda c: c.__setitem__("ncu_rep_sha256", "0" * 64),
+            )
+
+            # Paths and the frozen kernel name are re-derived, never trusted
+            # from storage, so their integrity is tested directly against
+            # reconstruct_case_result -- the exact function the gate and
+            # validate-profile-case both call -- rather than as a case_results
+            # mutation.
+            d_entry = build_ncu_plan()[0]
+            d_provenance = base_manifest_d["provenance"]
+            d_resolved = base_manifest_d["resolved_ncu_metrics"]
+            good_app_csv, good_metrics_csv, good_ncu_rep, _ = _build_ncu_case_fixture(tmp_path, d_entry)
+            _, wrong_kernel_metrics_csv, _, _ = _build_ncu_case_fixture(
+                tmp_path, d_entry, kernel_name_in_csv=f"{d_entry['kernel_name']}_v2",
+            )
+            reconstructed, recon_errors = reconstruct_case_result(
+                entry=d_entry, application_csv=good_app_csv, metrics_csv=wrong_kernel_metrics_csv,
+                ncu_rep=good_ncu_rep, provenance=d_provenance, resolved_ncu_metrics=d_resolved,
+                git_commit=_FIXED_GIT_COMMIT,
+            )
+            rec.check(
+                "reconstruct_case_result rejects a metrics CSV whose kernel name does not "
+                "match the frozen plan entry (Remediation D, case order/identity)",
+                reconstructed is None and any("kernel name" in e for e in recon_errors),
+                detail=f"errors={recon_errors}",
+            )
+
+            missing_ncu_rep = tmp_path / "does_not_exist_report.ncu-rep"
+            reconstructed, recon_errors = reconstruct_case_result(
+                entry=d_entry, application_csv=good_app_csv, metrics_csv=good_metrics_csv,
+                ncu_rep=missing_ncu_rep, provenance=d_provenance, resolved_ncu_metrics=d_resolved,
+                git_commit=_FIXED_GIT_COMMIT,
+            )
+            rec.check(
+                "reconstruct_case_result rejects a missing .ncu-rep artifact (Remediation D, "
+                "artifact path)",
+                reconstructed is None and bool(recon_errors),
+                detail=f"errors={recon_errors}",
+            )
+
+            # --- Remediation C: semantic manifest transition validation
+            # (second audit, blocker C) --------------------------------------
+            def _mutate_top_level_field(field: str, value):
+                def _mutate(manifest: dict) -> None:
+                    manifest[field] = value
+                return _mutate
+
+            # The exact audit regression: a syntactically valid, correctly
+            # hash-chained new revision that changes the immutable
+            # campaign_id must still be rejected by semantic loading.
+            p14_c_campaign_id, _ = _run_profile_pipeline(tmp_path, "20260728T222000Z")
+            _append_tampered_manifest_revision(
+                p14_c_campaign_id, _mutate_top_level_field("campaign_id", "20260728T235959Z"),
+            )
+            raised, error_text = False, ""
+            try:
+                load_p14_manifest_chain(p14_c_campaign_id)
+            except p13.ManifestTransitionError as exc:
+                raised, error_text = True, str(exc)
+            rec.check(
+                "load_p14_manifest_chain rejects a syntactically valid, correctly "
+                "hash-chained revision that changes campaign_id (Remediation C, audit "
+                "blocker C, exact regression)",
+                raised and "campaign_id" in error_text,
+                detail=f"raised={raised} error={error_text}",
+            )
+
+            # revision-zero campaign_id not matching the campaign directory.
+            p14_c_rev0_id = "20260728T222100Z"
+            p14_c_rev0 = _do_init_campaign(campaign_id=p14_c_rev0_id, started_at_utc=p14_c_rev0_id)
+            rev0_path = p14_c_rev0 / "manifest" / "000000.json"
+            rev0_doc = json.loads(rev0_path.read_text(encoding="utf-8"))
+            rev0_doc["campaign_id"] = "20260728T235959Z"
+            rev0_path.write_text(json.dumps(rev0_doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            raised = False
+            try:
+                load_p14_manifest_chain(p14_c_rev0)
+            except p13.ManifestTransitionError as exc:
+                raised = "campaign_id" in str(exc)
+            rec.check(
+                "load_p14_manifest_chain rejects a revision 0 whose campaign_id does "
+                "not match the campaign directory basename (Remediation C)",
+                raised,
+            )
+
+            # Every other invariant: exercised directly against
+            # validate_manifest_revision_transition, isolating each one from the
+            # other, unrelated schema checks load_p14_manifest_chain also applies
+            # (several of these values would also independently trip
+            # _validate_p14_manifest_document's required-field/schema checks;
+            # testing the pure transition function directly proves *this*
+            # invariant specifically catches it too).
+            # A same-document "unchanged pair" is not itself a meaningful check
+            # for every state (e.g. COMPLETE has no self-loop, since
+            # finalize-profile runs exactly once) -- so validate against a
+            # real adjacent pair from p14_d_table's own untampered chain
+            # instead (revision N-1 -> N, its last two real revisions).
+            table_revision_files = sorted((p14_d_table / "manifest").glob("*.json"))
+            assert len(table_revision_files) >= 2, table_revision_files
+            real_prev_doc = json.loads(table_revision_files[-2].read_text(encoding="utf-8"))
+            real_curr_doc = json.loads(table_revision_files[-1].read_text(encoding="utf-8"))
+            real_prev_content = {k: v for k, v in real_prev_doc.items() if k not in MANIFEST_REVISION_KEYS}
+            real_curr_content = {k: v for k, v in real_curr_doc.items() if k not in MANIFEST_REVISION_KEYS}
+            base_transition_ok = validate_manifest_revision_transition(
+                real_prev_content, real_curr_content, real_curr_content["campaign_id"],
+            )
+            rec.check(
+                "validate_manifest_revision_transition finds no errors for a real, "
+                "untampered adjacent revision pair",
+                base_transition_ok == [],
+                detail=f"errors={base_transition_ok}",
+            )
+
+            def _check_c_invariant(label: str, mutate_prev, mutate_curr, expect_substr: str) -> None:
+                prev = copy.deepcopy(base_manifest_d)
+                curr = copy.deepcopy(base_manifest_d)
+                if mutate_prev is not None:
+                    mutate_prev(prev)
+                if mutate_curr is not None:
+                    mutate_curr(curr)
+                transition_errors = validate_manifest_revision_transition(prev, curr, prev["campaign_id"])
+                rec.check(
+                    f"validate_manifest_revision_transition detects {label} (Remediation C)",
+                    any(expect_substr in e for e in transition_errors),
+                    detail=f"errors={transition_errors}",
+                )
+
+            _check_c_invariant(
+                "a changed schema_version", None,
+                lambda m: m.__setitem__("schema_version", "999"), "schema_version",
+            )
+            _check_c_invariant(
+                "a changed frozen_protocol", None,
+                lambda m: m.__setitem__("frozen_protocol", {"tampered": True}), "frozen_protocol",
+            )
+            _check_c_invariant(
+                "a changed pilot_campaign_reference", None,
+                lambda m: m.__setitem__("pilot_campaign_reference", {"path": "tampered"}),
+                "pilot_campaign_reference",
+            )
+            _check_c_invariant(
+                "a changed resolved-metric definition (resolved_ncu_metrics)", None,
+                lambda m: m.__setitem__(
+                    "resolved_ncu_metrics", {"resolved": [], "dram_read_metric_available": False},
+                ),
+                "resolved_ncu_metrics",
+            )
+            _check_c_invariant(
+                "an illegal state jump (COMPLETE -> PILOT_IN_PROGRESS)",
+                lambda m: m.__setitem__("state", "COMPLETE"),
+                lambda m: m.__setitem__("state", "PILOT_IN_PROGRESS"),
+                "illegal state transition",
+            )
+            _check_c_invariant(
+                "a state regression (ANALYZED -> COMPLETE)",
+                lambda m: m.__setitem__("state", "ANALYZED"),
+                lambda m: m.__setitem__("state", "COMPLETE"),
+                "illegal state transition",
+            )
+            _check_c_invariant(
+                "a modified earlier case_result", None,
+                lambda m: m["case_results"][d_case_name].__setitem__("dram_read_bytes", -1.0),
+                f"case_results.{d_case_name}",
+            )
+            _check_c_invariant(
+                "a deleted case_result", None,
+                lambda m: m["case_results"].pop(d_case_name),
+                f"case_results.{d_case_name}",
+            )
+
+            frozen_order_names = [entry["case_name"] for entry in build_ncu_plan()]
+            all_case_results = base_manifest_d["case_results"]
+            prev_prefix_one = copy.deepcopy(base_manifest_d)
+            prev_prefix_one["case_results"] = {frozen_order_names[0]: all_case_results[frozen_order_names[0]]}
+            curr_skips_ahead = copy.deepcopy(base_manifest_d)
+            curr_skips_ahead["case_results"] = {
+                frozen_order_names[0]: all_case_results[frozen_order_names[0]],
+                frozen_order_names[2]: all_case_results[frozen_order_names[2]],
+            }
+            reorder_errors = validate_manifest_revision_transition(
+                prev_prefix_one, curr_skips_ahead, prev_prefix_one["campaign_id"],
+            )
+            rec.check(
+                "validate_manifest_revision_transition detects case_results gaining an "
+                "entry out of the frozen six-case order (Remediation C)",
+                any("case_results" in e and "frozen" in e for e in reorder_errors),
+                detail=f"errors={reorder_errors}",
+            )
+
+            # unknown top-level fields must not bypass transition validation --
+            # confirmed at the full load_p14_manifest_chain level, since this is
+            # (still, correctly) enforced by the pre-existing schema validator
+            # this refactor must not weaken.
+            p14_c_unknown, _ = _run_profile_pipeline(tmp_path, "20260728T222900Z")
+            _append_tampered_manifest_revision(
+                p14_c_unknown, _mutate_top_level_field("some_unclassified_field", "value"),
+            )
+            raised = False
+            try:
+                load_p14_manifest_chain(p14_c_unknown)
+            except p13.ManifestTransitionError as exc:
+                raised = "unknown" in str(exc).lower() or "some_unclassified_field" in str(exc)
+            rec.check(
+                "load_p14_manifest_chain still rejects an unknown top-level field -- "
+                "it can never bypass transition validation (Remediation C)",
+                raised,
             )
 
     if rec.failures:

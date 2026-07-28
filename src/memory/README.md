@@ -22,11 +22,13 @@ functionally, not experimentally. P1.4 (profiling, Nsight Compute HBM
 validation, the pilot benchmark campaign, and LDGSTS/TMA comparative
 interpretation, `scripts/run_exp01_memory_paths_p14.sh` and
 `scripts/analyze_exp01_memory_paths_p14.py`, see
-`src/memory/P1_4_PROTOCOL.md`) is implemented, and the five blockers an
-independent GPU-free audit found in that implementation have been
-remediated GPU-free (see `src/memory/P1_4_PROTOCOL.md`'s status note for the
-list); it is not yet independently re-audited, not yet verified on GB300,
-and its pilot has not been executed; no P1.4 performance result exists.
+`src/memory/P1_4_PROTOCOL.md`) is implemented, and the nine blockers found by
+two independent GPU-free audits of that implementation (five in the first,
+four more in the second, against the remediated result of the first) have
+all been remediated GPU-free (see `src/memory/P1_4_PROTOCOL.md`'s status
+note for the full list); it is not yet independently re-audited, not yet
+verified on GB300, and its pilot has not been executed; no P1.4 performance
+result exists.
 
 ## P1.1 — standalone LDGSTS baseline
 
@@ -698,10 +700,16 @@ CI and an explicit ratio-direction interpretation, never a p-value or a
 "winner"; a candidate-saturation search is limited to the three tested
 bytes-in-flight values per `(method, stages)` group and is never called a
 universal architectural threshold. Before both `COMPLETE` and `ANALYZED`, a
-central evidence-integrity gate re-hashes every trusted artifact (each
-case's application/metrics/`.ncu-rep`, both preflights, `profile_plan.csv`,
-and the P1.3 pilot's own manifest/CSVs) from disk and reparses every CSV,
-rejecting any modification made after it was first validated.
+central evidence-integrity gate re-derives `profiles/`'s expected contents
+from `profile_plan.csv` and confirms the directory contains exactly those
+six canonical case directories (no unplanned extra entry, none missing, none
+the wrong type), re-hashes every other trusted artifact (each case's
+application/metrics/`.ncu-rep`, both preflights, `profile_plan.csv`, and the
+P1.3 pilot's own manifest/CSVs) from disk, and for each case calls
+`reconstruct_case_result` — the same canonical function `validate-profile-case`
+itself calls — fresh from disk and compares it against what is recorded as a
+complete structure, key for key, rejecting any modification made after it
+was first validated (not just a hand-picked subset of derived fields).
 `scripts/analyze_exp01_memory_paths_p14.py` reuses
 `scripts/aggregate_exp01_memory_paths.py`'s path-safety primitives,
 37-column CSV schema/validators, and geometry formulas directly (imported,
@@ -709,19 +717,36 @@ never reimplemented), but publishes its own manifest as an append-only,
 hash-chained revision history (`campaign_dir/manifest/000000.json`,
 `000001.json`, ...) rather than reusing P1.3's atomic-replace manifest
 writer, since a single mutable `manifest.json` cannot make the same
-no-overwrite guarantee. See `src/memory/P1_4_PROTOCOL.md` for the complete
-frozen protocol, the exact NCU command structure, the raw-directory/
-state-machine/manifest-chain design, and the statistical policy.
+no-overwrite guarantee; every revision is additionally validated
+*semantically* against an explicit classification of every manifest field
+(immutable/set-once/append-only/state-derived/timestamp), so a
+cryptographically valid revision that changes an immutable field, edits an
+earlier `case_result`, or jumps state illegally is rejected even though its
+hash chain is intact. Every raw-campaign write during `--profile` (NCU-help
+probe, discovery logs, per-case container/metrics captures, the extracted
+application CSV) goes through `scripts/p14_safe_capture.py`, a P1.4-only
+module that opens every directory component exactly once with `O_NOFOLLOW`,
+relative to the previously opened descriptor, and never re-resolves a
+pathname afterward — closing the TOCTOU window a plain shell redirect (even
+one preceded by a symlink-aware precheck) still leaves open. See
+`src/memory/P1_4_PROTOCOL.md` for the complete frozen protocol, the exact
+NCU command structure, the raw-directory/state-machine/manifest-chain
+design, and the statistical policy.
 
-**Status: implemented, remediated after an independent GPU-free audit;
-independent re-audit PENDING; verified on GB300: NO; pilot executed: NO;
-NCU/HBM validation: NO; publishable results: NONE.** An independent
-GPU-free audit of the first implementation found five blockers (preflight
-provenance, post-validation tamper detection, NCU CSV parsing, raw-tree/log
-write ordering and safety, and the manifest's overwrite-based publication);
-all five were remediated GPU-free as described above, each with a new
-adversarial test that first demonstrably failed against the original
-behavior and then passed against the fix. `make memory-paths-p14-plan` and
+**Status: implemented, remediated after two independent GPU-free audits; a
+further independent re-audit is PENDING; verified on GB300: NO; pilot
+executed: NO; NCU/HBM validation: NO; publishable results: NONE.** A first
+independent GPU-free audit found five blockers (preflight provenance,
+post-validation tamper detection, NCU CSV parsing, raw-tree/log write
+ordering and safety, and the manifest's overwrite-based publication); a
+second independent GPU-free audit of the remediated implementation then
+found four further blockers (a residual raw-tree-write TOCTOU window, an
+uncompared/unplanned extra profile directory, cryptographically-chained-but-
+semantically-unvalidated manifest revisions, and an incomplete
+evidence-integrity comparison that missed some derived per-case fields). All
+nine, across both rounds, were remediated GPU-free as described above, each
+with a new adversarial test that first demonstrably failed against the
+original behavior and then passed against the fix. `make memory-paths-p14-plan` and
 `make memory-paths-p14-check` are GPU-free (no Docker, no GPU, no network);
 `make memory-paths-p14-pilot` and `make memory-paths-p14-profile` require an
 explicit, operator-provided `BLACKWELL_GPU_INDEX`, `P1_4_CAMPAIGN_ID`, and

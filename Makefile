@@ -30,6 +30,7 @@ EXP01_AGGREGATOR := scripts/aggregate_exp01_memory_paths.py
 
 EXP01_P14_RUNNER := scripts/run_exp01_memory_paths_p14.sh
 EXP01_P14_ANALYZER := scripts/analyze_exp01_memory_paths_p14.py
+EXP01_P14_SAFE_CAPTURE := scripts/p14_safe_capture.py
 EXP01_P14_PROTOCOL := src/memory/P1_4_PROTOCOL.md
 EXP01_P14_RAW_ROOT := results/raw/exp01_memory_paths_p14
 
@@ -42,7 +43,7 @@ REQUIRED_FILES := \
 	src/memory/ldgsts.cu src/memory/tma.cu src/memory/README.md \
 	results/README.md \
 	$(EXP01_RUNNER) $(EXP01_AGGREGATOR) \
-	$(EXP01_P14_RUNNER) $(EXP01_P14_ANALYZER) $(EXP01_P14_PROTOCOL)
+	$(EXP01_P14_RUNNER) $(EXP01_P14_ANALYZER) $(EXP01_P14_SAFE_CAPTURE) $(EXP01_P14_PROTOCOL)
 
 .DEFAULT_GOAL := help
 .PHONY: help check-static build-image check-env preflight \
@@ -243,11 +244,14 @@ check-static:
 	@echo "== P1.4 required files present, executable, and syntactically valid =="
 	@test -x $(EXP01_P14_RUNNER)
 	@test -x $(EXP01_P14_ANALYZER)
+	@test -x $(EXP01_P14_SAFE_CAPTURE)
 	bash -n $(EXP01_P14_RUNNER)
 	python3 -m py_compile $(EXP01_P14_ANALYZER)
+	python3 -m py_compile $(EXP01_P14_SAFE_CAPTURE)
 	@rm -rf scripts/__pycache__
 	@echo "== P1.4 GPU-free synthetic/adversarial tests (self-test) =="
 	python3 $(EXP01_P14_ANALYZER) --self-test
+	python3 $(EXP01_P14_SAFE_CAPTURE) --self-test
 	$(EXP01_P14_RUNNER) --self-test
 	@echo "== P1.4 exact plan validation (18-way P1.3 pilot, six-way P1.4 NCU) =="
 	@test "$$(python3 $(EXP01_AGGREGATOR) plan --format lines | wc -l | tr -d ' ')" -eq 18
@@ -257,7 +261,7 @@ check-static:
 	pat="$$pat|\bs""udo\b|\$$\(np""roc\)|--force-overwrite|--set[ =]+full"; \
 	pat="$$pat|clock-control[ =]+base|clock-control[ =]+boost|clock-control[ =]+force-boost"; \
 	pat="$$pat|nvidia-smi[^|]*(-pm|--persistence-mode|-lgc|--lock-gpu-clocks|-pl|--power-limit)"; \
-	! grep -nE -- "$$pat" $(EXP01_P14_RUNNER) $(EXP01_P14_ANALYZER)
+	! grep -nE -- "$$pat" $(EXP01_P14_RUNNER) $(EXP01_P14_ANALYZER) $(EXP01_P14_SAFE_CAPTURE)
 	@echo "== P1.4 runner uses the audited launcher/P1.3 runner and never selects a GPU automatically =="
 	@grep -Fq 'run_container.sh' $(EXP01_P14_RUNNER)
 	@grep -Fq 'BLACKWELL_GPU_INDEX' $(EXP01_P14_RUNNER)
@@ -512,9 +516,12 @@ memory-paths-p14-check:
 	bash -n $(EXP01_P14_RUNNER)
 	@test -x $(EXP01_P14_RUNNER)
 	@test -x $(EXP01_P14_ANALYZER)
+	@test -x $(EXP01_P14_SAFE_CAPTURE)
 	python3 -m py_compile $(EXP01_P14_ANALYZER)
+	python3 -m py_compile $(EXP01_P14_SAFE_CAPTURE)
 	@rm -rf scripts/__pycache__
 	python3 $(EXP01_P14_ANALYZER) --self-test
+	python3 $(EXP01_P14_SAFE_CAPTURE) --self-test
 	@test "$$(python3 $(EXP01_AGGREGATOR) plan --format lines | wc -l | tr -d ' ')" -eq 18
 	@test "$$(python3 $(EXP01_P14_ANALYZER) plan --format lines | wc -l | tr -d ' ')" -eq 6
 	$(EXP01_P14_RUNNER) --self-test
