@@ -8,7 +8,9 @@ baseline) — implemented, audited, functionally verified on GB300`. `P1.2
 (standalone 2D unicast TMA path) — implemented, audited, functionally
 verified on GB300`. `P1.3 (joint LDGSTS/TMA sweep infrastructure) —
 implemented, remediation completed, independently audited, and functionally
-verified on GB300`. `P1.4 — not started`.**
+verified on GB300`. `P1.4 (profiling, HBM validation, analysis, pilot) —
+implemented; independent audit PENDING; verified on GB300: NO; pilot
+executed: NO; publishable results: NONE`.**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -64,9 +66,28 @@ subsequently passed a new independent GPU-free audit. Campaign
 full self-tests and all 18 smoke configurations passed. `PLAN.md` therefore
 records Implemented=YES, Audited=YES, and Verified on GB300=YES for P1.3.
 This closes the P1.3 infrastructure gate but does not create a publishable
-performance result. P1.4 (profiling, Nsight Compute, the pilot performance
-campaign, and comparative LDGSTS/TMA interpretation) has not started; it is
-now unblocked.
+performance result.
+
+P1.4 (profiling, Nsight Compute HBM validation, the pilot benchmark
+campaign, statistics, and comparative LDGSTS/TMA interpretation) is
+implemented as a GPU-free layer around the audited P1.3 infrastructure:
+`scripts/run_exp01_memory_paths_p14.sh` reuses the unmodified P1.3 runner,
+under frozen parameters, for the one 18-configuration `run_kind=benchmark`
+pilot, and profiles exactly six predefined `(method, stages,
+bytes_in_flight_kib)` cases with Nsight Compute 2025.4.0.0 under
+clock-control-disabled, non-defaulting profiler controls that were verified
+against the pinned image's real `ncu --help` output during implementation.
+`scripts/analyze_exp01_memory_paths_p14.py` validates the frozen
+preflight/provenance contract, classifies each profiled case's DRAM-read
+ratio as `HBM_VALIDATED` or `INCONCLUSIVE`, computes deterministic
+bootstrap statistics (fixed seed, 10,000 resamples, standard library only)
+over all 30 retained repetitions of all 18 pilot configurations, a paired
+LDGSTS/TMA ratio comparison, and a candidate-saturation search limited to
+the three tested bytes-in-flight values, then generates CSV/JSON/Markdown/
+SVG artifacts, all `publishable: false`. See `src/memory/P1_4_PROTOCOL.md`
+for the complete frozen protocol. P1.4 is implemented but has not been
+independently audited, has not been verified on GB300, and its pilot has
+not been executed; no P1.4 performance result exists.
 
 ## Research question
 
@@ -200,12 +221,14 @@ automatically and never exposes all GPUs to a container.
 
 Phase 0 provides environment and tooling validation only. Experiment 1 has
 completed P1.1, P1.2, and P1.3: all three units are implemented,
-independently audited, and functionally verified on GB300. P1.4 is unblocked
-but has not started, and experiments 2–3 have not started. The repository
-contains no publishable bandwidth, throughput, GEMM performance, or cuBLASLt
-comparison results; campaign `20260728T103315Z` and the earlier P1.1/P1.2
-smoke runs are functional checks only. A fresh preflight is still required
-before P1.4 because the host driver changed after the Phase 0 verification;
+independently audited, and functionally verified on GB300. P1.4 is
+implemented (see above and `src/memory/P1_4_PROTOCOL.md`) but not yet
+independently audited, not yet verified on GB300, and its pilot has not been
+executed; experiments 2-3 have not started. The repository contains no
+publishable bandwidth, throughput, GEMM performance, or cuBLASLt comparison
+results; campaign `20260728T103315Z` and the earlier P1.1/P1.2 smoke runs
+are functional checks only. A fresh preflight is required before any P1.4
+GPU work because the host driver changed after the Phase 0 verification;
 the pinned CUDA 13.1 container contract remains unchanged. See `PLAN.md` for
 the remaining schedule and `AGENTS.md` for the mandatory shared-cluster
 rules.

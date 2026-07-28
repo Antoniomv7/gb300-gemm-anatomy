@@ -18,9 +18,13 @@ or anywhere else in the repository: the P1.1/P1.2 GB300 verification runs
 were functional checks (all nine `--self-test` specializations plus one short
 `run_kind=smoke` measurement each), not publishable results. P1.3 smoke
 campaign `20260728T103315Z` likewise verified the joint infrastructure
-functionally, not experimentally. P1.4 (profiling, Nsight Compute, the pilot
-performance campaign, and LDGSTS/TMA comparative interpretation) has not
-started and is now unblocked.
+functionally, not experimentally. P1.4 (profiling, Nsight Compute HBM
+validation, the pilot benchmark campaign, and LDGSTS/TMA comparative
+interpretation, `scripts/run_exp01_memory_paths_p14.sh` and
+`scripts/analyze_exp01_memory_paths_p14.py`, see
+`src/memory/P1_4_PROTOCOL.md`) is implemented but not yet independently
+audited, not yet verified on GB300, and its pilot has not been executed;
+no P1.4 performance result exists.
 
 ## P1.1 — standalone LDGSTS baseline
 
@@ -411,8 +415,10 @@ an outlier policy, or draw a performance conclusion. Whether copied bytes
 actually came from DRAM/HBM rather than L2 remains an open question that only
 Nsight Compute can answer. The pilot benchmark campaign, HBM traffic
 validation, variability/outlier judgment, figures, tables, and comparative
-LDGSTS/TMA interpretation all remain P1.4 work. P1.4 has not started but is
-now unblocked.
+LDGSTS/TMA interpretation are P1.4 work; P1.4 is implemented (see
+`src/memory/P1_4_PROTOCOL.md` and "P1.4 -- profiling, HBM validation,
+analysis, pilot" below) but not yet independently audited, not yet verified
+on GB300, and its pilot has not been executed.
 
 ### GB300 functional verification record
 
@@ -649,3 +655,52 @@ stdout; everything else goes to stderr.
 | `cuda_runtime_version` | integer | Raw `cudaRuntimeGetVersion` value, same encoding. |
 | `git_commit` | hex string \| `UNKNOWN` | `git rev-parse HEAD` at run time. |
 | `git_dirty` | `true` \| `false` \| `unknown` | Whether `git status --porcelain` reported any changes. |
+
+## P1.4 — profiling, HBM validation, analysis, pilot
+
+`scripts/run_exp01_memory_paths_p14.sh` and
+`scripts/analyze_exp01_memory_paths_p14.py` add a reproducible layer around
+the audited P1.3 infrastructure. `--pilot` reuses P1.3's unmodified runner,
+under frozen parameters (`run_kind=benchmark`, `working_set_mib=512`,
+`passes=32`, `warmup_ms=2000`, `repetitions=30`), for the one 18-configuration
+pilot P1.3 itself never runs. `--profile` profiles exactly six predefined
+`(method, stages, bytes_in_flight_kib)` cases with Nsight Compute 2025.4.0.0,
+using profiler controls (`--clock-control none`, `--pipeline-boost-state
+dynamic`, `--cache-control none`, `--kernel-name-base function`,
+`--launch-count 1`, `--replay-mode kernel`) verified against the pinned
+image's own `ncu --help` output — never NCU defaults that could lock or
+boost clocks, never `--force-overwrite`, never `--set full`. The analyzer
+validates the frozen preflight/provenance contract (Git commit, GPU UUID,
+compute capability, driver/runtime versions, working-set parameters, and
+`passes` must agree across the preflight, the P1.3 pilot, and all six
+profiled cases), discovers the exact supported NCU metric names on the
+profiled device rather than assuming them, and classifies each of the six
+cases' `dram_read_bytes / useful_bytes` ratio as `HBM_VALIDATED` (`>= 0.90`,
+flagged `READ_AMPLIFICATION` above `1.10`) or `INCONCLUSIVE` — a
+classification that applies only to those six cases, never extrapolated to
+the other twelve pilot configurations. Statistics (mean/median/sample
+stdev/CV/min/max, a 95% bootstrap CI for the median with a fixed seed and
+10,000 resamples, IQR diagnostics that flag but never remove a sample) cover
+all 30 retained repetitions of all 18 pilot configurations; a paired
+LDGSTS/TMA `tma_to_ldgsts_ratio` per identical `(stages,
+bytes_in_flight_kib)` pair is reported with its own independently-resampled
+CI and an explicit ratio-direction interpretation, never a p-value or a
+"winner"; a candidate-saturation search is limited to the three tested
+bytes-in-flight values per `(method, stages)` group and is never called a
+universal architectural threshold. `scripts/analyze_exp01_memory_paths_p14.py`
+reuses `scripts/aggregate_exp01_memory_paths.py`'s path-safety primitives,
+37-column CSV schema/validators, geometry formulas, and manifest atomic-write
+helper directly (imported, never reimplemented). See
+`src/memory/P1_4_PROTOCOL.md` for the complete frozen protocol, the exact
+future NCU command structure, the raw-directory/state-machine design, and
+the statistical policy.
+
+**Status: implemented; independent audit PENDING; verified on GB300: NO;
+pilot executed: NO; NCU/HBM validation: NO; publishable results: NONE.**
+`make memory-paths-p14-plan` and `make memory-paths-p14-check` are GPU-free
+(no Docker, no GPU, no network); `make memory-paths-p14-pilot` and
+`make memory-paths-p14-profile` require an explicit, operator-provided
+`BLACKWELL_GPU_INDEX`, `P1_4_CAMPAIGN_ID`, and `P1_4_PREFLIGHT_SUMMARY`, and
+have not been executed as part of this implementation. `make
+memory-paths-p14-analyze` is GPU-free and validates/analyzes an already-
+`COMPLETE` P1.4 campaign.

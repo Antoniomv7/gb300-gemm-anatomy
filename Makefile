@@ -3,7 +3,9 @@
 # memory-ldgsts-build, memory-ldgsts-sass, memory-ldgsts-self-test,
 # memory-ldgsts-smoke, memory-tma-build, memory-tma-sass,
 # memory-tma-self-test, memory-tma-smoke, memory-paths-plan,
-# memory-paths-check, memory-paths-smoke.
+# memory-paths-check, memory-paths-smoke, memory-paths-p14-plan,
+# memory-paths-p14-check, memory-paths-p14-pilot, memory-paths-p14-profile,
+# memory-paths-p14-analyze.
 # No target selects a GPU automatically, elevates privileges, or exceeds two
 # build jobs.
 
@@ -26,6 +28,11 @@ MEMORY_TMA_SASS := build/memory/tma.sass
 EXP01_RUNNER := scripts/run_exp01_memory_paths.sh
 EXP01_AGGREGATOR := scripts/aggregate_exp01_memory_paths.py
 
+EXP01_P14_RUNNER := scripts/run_exp01_memory_paths_p14.sh
+EXP01_P14_ANALYZER := scripts/analyze_exp01_memory_paths_p14.py
+EXP01_P14_PROTOCOL := src/memory/P1_4_PROTOCOL.md
+EXP01_P14_RAW_ROOT := results/raw/exp01_memory_paths_p14
+
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
 	Dockerfile Makefile \
@@ -34,13 +41,16 @@ REQUIRED_FILES := \
 	smoke/cuda_smoke.cu smoke/cutedsl_smoke.py \
 	src/memory/ldgsts.cu src/memory/tma.cu src/memory/README.md \
 	results/README.md \
-	$(EXP01_RUNNER) $(EXP01_AGGREGATOR)
+	$(EXP01_RUNNER) $(EXP01_AGGREGATOR) \
+	$(EXP01_P14_RUNNER) $(EXP01_P14_ANALYZER) $(EXP01_P14_PROTOCOL)
 
 .DEFAULT_GOAL := help
 .PHONY: help check-static build-image check-env preflight \
 	memory-ldgsts-build memory-ldgsts-sass memory-ldgsts-self-test memory-ldgsts-smoke \
 	memory-tma-build memory-tma-sass memory-tma-self-test memory-tma-smoke \
-	memory-paths-plan memory-paths-check memory-paths-smoke
+	memory-paths-plan memory-paths-check memory-paths-smoke \
+	memory-paths-p14-plan memory-paths-p14-check memory-paths-p14-pilot \
+	memory-paths-p14-profile memory-paths-p14-analyze
 
 help:
 	@echo "gb300-gemm-anatomy — Phase 0 + P1.1 (LDGSTS) + P1.2 (TMA) + P1.3 (sweep) targets"
@@ -89,8 +99,26 @@ help:
 	@echo "  make memory-paths-smoke      run_kind=smoke only; functional verification,"
 	@echo "                               NOT a publishable performance result."
 	@echo "  P1.3 never runs Nsight Compute and never collects run_kind=benchmark data;"
-	@echo "  a future, explicit benchmark-campaign target is P1.4 work and is not"
-	@echo "  performed by this Makefile today."
+	@echo "  P1.4 (below) owns the pilot, profiling, and interpretation."
+	@echo ""
+	@echo "  -- P1.4 profiling, HBM validation, analysis, pilot (see"
+	@echo "     src/memory/P1_4_PROTOCOL.md; implemented, audit PENDING, not verified,"
+	@echo "     pilot NOT executed) --"
+	@echo "  GPU-free P1.4 planning/checking (no GPU, no Docker, no network):"
+	@echo "  make memory-paths-p14-plan     Print the frozen P1.3 18-invocation pilot plan"
+	@echo "                                 and the frozen P1.4 six-case NCU plan."
+	@echo "  make memory-paths-p14-check    Shell/Python syntax, executable bits, GPU-free"
+	@echo "                                 synthetic/adversarial tests, and exact-plan"
+	@echo "                                 validation (18-way P1.3, six-way P1.4)."
+	@echo "  GPU-executing (requires BLACKWELL_GPU_INDEX, P1_4_CAMPAIGN_ID, and"
+	@echo "  P1_4_PREFLIGHT_SUMMARY; never selects a GPU automatically; not run by this task):"
+	@echo "  make memory-paths-p14-pilot    The frozen 18-configuration run_kind=benchmark"
+	@echo "                                 pilot, through the unmodified P1.3 runner."
+	@echo "  make memory-paths-p14-profile  Nsight Compute on exactly the six frozen cases"
+	@echo "                                 against an already-PILOT_COMPLETE campaign."
+	@echo "  GPU-free P1.4 analysis (requires P1_4_CAMPAIGN_ID; a completed pilot+profile):"
+	@echo "  make memory-paths-p14-analyze  Validate and analyze a COMPLETE P1.4 campaign;"
+	@echo "                                 all outputs remain publishable=false."
 	@echo ""
 	@echo "Pinned contract (VERSIONS.env): CUDA $(CUDA_VERSION), CUTLASS $(CUTLASS_VERSION),"
 	@echo "arch $(CUDA_ARCH), max build jobs $(MAX_BUILD_JOBS)."
@@ -203,7 +231,7 @@ check-static:
 	@grep -Fq 'P1.1 | Standalone LDGSTS baseline | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P1.2 | Equivalent TMA path | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P1.3 | Joint sweep (≤18 configurations) | YES | YES | YES |' PLAN.md
-	@grep -Fq 'P1.4 | Profiling, validation, analysis, pilot | NO | NO | NO |' PLAN.md
+	@grep -Fq 'P1.4 | Profiling, validation, analysis, pilot | YES | NO | NO |' PLAN.md
 	@! grep -F 'P1.3, P1.4, and experiments 2' README.md
 	@! grep -F 'P1.3 (the joint LDGSTS/TMA sweep) has not started' README.md
 	@! grep -F 'P1.3 (the joint sweep) and P1.4' src/memory/README.md
@@ -212,6 +240,32 @@ check-static:
 	@! grep -nF 'not a comparison against LDGSTS (P1.3 is the' src/memory/README.md
 	@grep -Fq 'remediation completed' README.md
 	@grep -Fq 'remediation completed' src/memory/README.md
+	@echo "== P1.4 required files present, executable, and syntactically valid =="
+	@test -x $(EXP01_P14_RUNNER)
+	@test -x $(EXP01_P14_ANALYZER)
+	bash -n $(EXP01_P14_RUNNER)
+	python3 -m py_compile $(EXP01_P14_ANALYZER)
+	@rm -rf scripts/__pycache__
+	@echo "== P1.4 GPU-free synthetic/adversarial tests (self-test) =="
+	python3 $(EXP01_P14_ANALYZER) --self-test
+	$(EXP01_P14_RUNNER) --self-test
+	@echo "== P1.4 exact plan validation (18-way P1.3 pilot, six-way P1.4 NCU) =="
+	@test "$$(python3 $(EXP01_AGGREGATOR) plan --format lines | wc -l | tr -d ' ')" -eq 18
+	@test "$$(python3 $(EXP01_P14_ANALYZER) plan --format lines | wc -l | tr -d ' ')" -eq 6
+	@echo "== P1.4 forbidden patterns absent (ncu itself is expected/required in P1.4) =="
+	@pat='--gpus[ =]+all|NVIDIA_VISIBLE_DEVICES=all|--privileged|--pid[ =]+host|docker\.sock|--cap-add|SYS_ADMIN|set -x'; \
+	pat="$$pat|\bs""udo\b|\$$\(np""roc\)|--force-overwrite|--set[ =]+full"; \
+	pat="$$pat|clock-control[ =]+base|clock-control[ =]+boost|clock-control[ =]+force-boost"; \
+	pat="$$pat|nvidia-smi[^|]*(-pm|--persistence-mode|-lgc|--lock-gpu-clocks|-pl|--power-limit)"; \
+	! grep -nE -- "$$pat" $(EXP01_P14_RUNNER) $(EXP01_P14_ANALYZER)
+	@echo "== P1.4 runner uses the audited launcher/P1.3 runner and never selects a GPU automatically =="
+	@grep -Fq 'run_container.sh' $(EXP01_P14_RUNNER)
+	@grep -Fq 'BLACKWELL_GPU_INDEX' $(EXP01_P14_RUNNER)
+	@grep -Fq '$(EXP01_RUNNER)' $(EXP01_P14_RUNNER)
+	@grep -Fq -- '--working-set-mib 512' $(EXP01_P14_RUNNER)
+	@grep -Fq -- '--passes 32' $(EXP01_P14_RUNNER)
+	@grep -Fq -- '--warmup-ms 2000' $(EXP01_P14_RUNNER)
+	@grep -Fq -- '--repetitions 30' $(EXP01_P14_RUNNER)
 	@echo "check-static: OK"
 
 build-image:
@@ -439,3 +493,76 @@ memory-paths-smoke: memory-ldgsts-sass memory-tma-sass
 	@echo "infrastructure only. It is NOT a final experimental result, computes no"
 	@echo "speedup, and must not be cited as a performance number."
 	@echo "=============================================================================="
+
+# --- P1.4: profiling, HBM validation, analysis, pilot (exp01_memory_paths_p14) -
+# memory-paths-p14-plan and memory-paths-p14-check never touch a GPU, Docker,
+# or the network: they only exercise scripts/run_exp01_memory_paths_p14.sh's
+# and scripts/analyze_exp01_memory_paths_p14.py's own GPU-free CLI paths and
+# synthetic/adversarial self-tests. memory-paths-p14-pilot and
+# memory-paths-p14-profile are the only P1.4 targets that execute on GPU;
+# each requires an explicit BLACKWELL_GPU_INDEX, P1_4_CAMPAIGN_ID (a canonical
+# UTC timestamp), and P1_4_PREFLIGHT_SUMMARY, and never selects a GPU
+# automatically. memory-paths-p14-analyze is GPU-free and validates/analyzes
+# an already-COMPLETE P1.4 campaign; it requires only P1_4_CAMPAIGN_ID.
+
+memory-paths-p14-plan:
+	$(EXP01_P14_RUNNER) --print-plan
+
+memory-paths-p14-check:
+	bash -n $(EXP01_P14_RUNNER)
+	@test -x $(EXP01_P14_RUNNER)
+	@test -x $(EXP01_P14_ANALYZER)
+	python3 -m py_compile $(EXP01_P14_ANALYZER)
+	@rm -rf scripts/__pycache__
+	python3 $(EXP01_P14_ANALYZER) --self-test
+	@test "$$(python3 $(EXP01_AGGREGATOR) plan --format lines | wc -l | tr -d ' ')" -eq 18
+	@test "$$(python3 $(EXP01_P14_ANALYZER) plan --format lines | wc -l | tr -d ' ')" -eq 6
+	$(EXP01_P14_RUNNER) --self-test
+	@echo "memory-paths-p14-check: OK"
+
+memory-paths-p14-pilot:
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make memory-paths-p14-pilot"; \
+		echo "       This project never selects a GPU automatically."; \
+		exit 2; \
+	fi
+	@if [ -z "$${P1_4_CAMPAIGN_ID:-}" ]; then \
+		echo "ERROR: P1_4_CAMPAIGN_ID must be set explicitly to a canonical UTC timestamp"; \
+		echo "       YYYYMMDDTHHMMSSZ. Example: P1_4_CAMPAIGN_ID=$$(date -u +%Y%m%dT%H%M%SZ)"; \
+		exit 2; \
+	fi
+	@if [ -z "$${P1_4_PREFLIGHT_SUMMARY:-}" ]; then \
+		echo "ERROR: P1_4_PREFLIGHT_SUMMARY must be set explicitly to a fresh preflight"; \
+		echo "       summary.json path (see 'make preflight')."; \
+		exit 2; \
+	fi
+	$(EXP01_P14_RUNNER) --pilot
+
+memory-paths-p14-profile:
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make memory-paths-p14-profile"; \
+		echo "       This project never selects a GPU automatically."; \
+		exit 2; \
+	fi
+	@if [ -z "$${P1_4_CAMPAIGN_ID:-}" ]; then \
+		echo "ERROR: P1_4_CAMPAIGN_ID must be set explicitly to the same canonical UTC"; \
+		echo "       timestamp used for 'make memory-paths-p14-pilot'."; \
+		exit 2; \
+	fi
+	@if [ -z "$${P1_4_PREFLIGHT_SUMMARY:-}" ]; then \
+		echo "ERROR: P1_4_PREFLIGHT_SUMMARY must be set explicitly to a fresh preflight"; \
+		echo "       summary.json path (see 'make preflight')."; \
+		exit 2; \
+	fi
+	$(EXP01_P14_RUNNER) --profile
+
+memory-paths-p14-analyze:
+	@if [ -z "$${P1_4_CAMPAIGN_ID:-}" ]; then \
+		echo "ERROR: P1_4_CAMPAIGN_ID must be set explicitly to the campaign to analyze."; \
+		exit 2; \
+	fi
+	python3 $(EXP01_P14_ANALYZER) analyze \
+		--campaign-dir $(EXP01_P14_RAW_ROOT)/$${P1_4_CAMPAIGN_ID} \
+		--analyzed-at-utc "$$(date -u +%Y%m%dT%H%M%SZ)"

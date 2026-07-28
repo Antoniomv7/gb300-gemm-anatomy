@@ -36,18 +36,25 @@ Gate: Phase 0 gate passed; correctness validated before any timing/profiling.
 | P1.1 | Standalone LDGSTS baseline | YES | YES | YES |
 | P1.2 | Equivalent TMA path | YES | YES | YES |
 | P1.3 | Joint sweep (≤18 configurations) | YES | YES | YES |
-| P1.4 | Profiling, validation, analysis, pilot | NO | NO | NO |
+| P1.4 | Profiling, validation, analysis, pilot | YES | NO | NO |
 
 P1.3's remediated implementation passed a new independent GPU-free audit and
 was functionally verified on GB300 on 28 July 2026. At Git commit
 `59777406b9454f00799c48bff8fa85cb03625cb6`, smoke campaign
 `20260728T103315Z` completed both full-binary self-tests and all 18 planned
 invocations with `status=COMPLETE` and `publishable=false`. This closes P1.3
-without creating an experimental performance result. P1.4 is unblocked but
-has not started; it still owns Nsight Compute validation, the pilot benchmark
-campaign, performance analysis, figures, and comparative interpretation. A
-fresh preflight is required before P1.4 because the host driver changed after
-the Phase 0 verification.
+without creating an experimental performance result. P1.4 (profiling,
+Nsight Compute validation, the pilot benchmark campaign, statistics, and
+comparative interpretation) is now implemented: a GPU-free layer
+(`scripts/run_exp01_memory_paths_p14.sh`,
+`scripts/analyze_exp01_memory_paths_p14.py`, see
+`src/memory/P1_4_PROTOCOL.md`) that reuses the audited P1.3 runner unmodified
+for the frozen 18-configuration pilot and adds Nsight Compute validation of
+six frozen cases, deterministic statistics/bootstrap/saturation analysis,
+and report/figure generation. Independent audit, GB300 verification, and
+pilot execution are all still pending; no performance result exists yet. A
+fresh preflight is required before any P1.4 GPU work because the host driver
+changed after the Phase 0 verification.
 
 ## Phase 2 — BF16 UMMA throughput (27 July–2 August 2026)
 
