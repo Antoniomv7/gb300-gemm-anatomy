@@ -1,8 +1,30 @@
 # P1.4 frozen protocol — profiling, HBM validation, analysis, pilot
 
-**Status: implemented, remediated after THREE independent GPU-free audits;
-a further independent re-audit is PENDING, GB300 verification NO, pilot NOT
-executed, NCU/HBM validation NO. No performance result exists yet.**
+**Status: implemented, remediated after FOUR independent GPU-free audits.
+P1.4 Implemented: YES — remediated. Independent audit: PENDING RE-AUDIT.
+Verified on GB300: NO. Fresh preflight: PENDING. Pilot executed: NO.
+NCU/HBM validation: NO. Publishable results: NONE. Phase 1: OPEN. No
+performance result exists yet. GPU-free self-tests passing in this
+repository are not, and are never described here as, an independent audit —
+only a human reviewer working outside this codebase can close the
+"Independent audit" line above.**
+
+## 0. Trust model (binding on every remediation in this document)
+
+The campaign filesystem is trusted and single-writer. P1.4 protects against
+accidental corruption, malformed or stale evidence, interrupted execution,
+pre-existing unsafe paths, accidental overwrites, and ordinary recovery
+failures. It does not claim to defend against a malicious concurrent process
+running with the same filesystem permissions, or against deliberate path or
+inode replacement after validation within one operation. Every
+descriptor-anchored check, no-clobber publish, and ownership-checked cleanup
+described below exists to make single-writer mistakes and interruptions
+safe and auditable — not to withstand a hostile co-resident process
+deliberately racing filesystem operations, holding every campaign descriptor
+for an entire campaign, or replacing an inode between validation and use
+within one operation. A future auditor should evaluate every claim in this
+document against this scope, not against a general adversarial-filesystem
+threat model.
 
 A first independent GPU-free audit of the initial implementation found five
 blockers, each closed with a GPU-free fix plus a new adversarial test that
@@ -81,7 +103,46 @@ corrected failure-cleanup control flow, and extending the descriptor-
 anchored discipline to profile inventory, evidence reads, and the manifest
 revision directory itself (Sections 4a, 8).
 
-None of these fourteen fixes, across all three rounds, changed the frozen
+A **fourth** independent GPU-free audit of that thrice-remediated
+implementation found six further blockers (Groups A-F), each closed the
+same way (a new adversarial test that first demonstrably failed against
+`a66d0fa8b37147eb4f237911c42b02e3c8cbed59`, then passed): (A) the manifest
+state-shape check tested `key in current and current[key] is not None`, so
+a premature key holding an explicit `null` compared as absent, letting
+revision 0 carry later-phase fields such as `profile_completed_at_utc:
+null` unnoticed — closed by testing presence alone (`key in current`) and
+by removing `type(None)` from every manifest field's declared type that had
+allowed a premature null in the first place (Section 9); (B) lifecycle
+timestamps were syntax- and immutability-checked but never compared against
+each other, so e.g. a `profile_started_at_utc` earlier than
+`pilot_completed_at_utc` passed unnoticed — closed by
+`validate_manifest_timestamp_chronology`, one reusable validator enforcing
+`started_at_utc <= pilot_completed_at_utc <= profile_started_at_utc <=
+profile_completed_at_utc <= analyzed_at_utc` on every revision (Section 9);
+(C) `profile_count_completed` and `case_results` could each appear without
+the other, since their relationship was only checked once both already
+existed — closed by an explicit co-occurrence check inside
+`validate_manifest_state_shape` (Section 9); (D) `finalize-profile` and
+`analyze` each performed the central evidence-integrity gate correctly but
+then built `artifact_sha256` from values already sitting in memory before
+the gate ran, and `analyze` never re-ran the gate a second time immediately
+before publishing `ANALYZED` — closed by having
+`verify_campaign_evidence_integrity` return the exact hashes/reconstructions
+it just recomputed for direct use by the terminal manifest revision, and by
+adding a second gate call in `analyze`, immediately before publication,
+whose failure removes only the analysis artifacts just published and never
+publishes `ANALYZED` (Section 8); (E) `publish_ncu_bundle()`'s rollback and
+final bundle unlink removed any current regular file at a recorded name,
+without checking it was still the same file this call itself had published
+or opened — closed by `unlink_if_same_owned_inode`, a small dir_fd-anchored
+helper that unlinks a name only while its `(st_dev, st_ino)` still matches
+what was recorded at publish/open time (`scripts/p14_safe_capture.py`); (F)
+`PLAN.md` stated "Gate: Phase 1 gate passed" as if already true — closed by
+rephrasing it as an entry condition with an explicit current-status line,
+and by adding this trust-model section (Section 0) to this document and to
+`results/README.md`.
+
+None of these twenty fixes, across all four rounds, changed the frozen
 pilot matrix, the six-case NCU plan, the statistical calculations, the
 bootstrap seed/resample count, the outlier-retention policy, the saturation
 rule, or the HBM thresholds below.

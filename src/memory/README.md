@@ -733,9 +733,10 @@ one preceded by a symlink-aware precheck) still leaves open. See
 NCU command structure, the raw-directory/state-machine/manifest-chain
 design, and the statistical policy.
 
-**Status: implemented, remediated after THREE independent GPU-free audits; a
-further independent re-audit is PENDING; verified on GB300: NO; pilot
-executed: NO; NCU/HBM validation: NO; publishable results: NONE.** A first
+**Status: implemented, remediated after FOUR independent GPU-free audits; a
+further independent re-audit is PENDING; verified on GB300: NO; fresh
+preflight: PENDING; pilot executed: NO; NCU/HBM validation: NO; publishable
+results: NONE; Phase 1: OPEN.** A first
 independent GPU-free audit found five blockers (preflight provenance,
 post-validation tamper detection, NCU CSV parsing, raw-tree/log write
 ordering and safety, and the manifest's overwrite-based publication); a
@@ -757,21 +758,38 @@ specific transition legally allowed to introduce them; (E) an unvalidated
 capture filename could escape the anchored directory, a launch failure
 orphaned an empty partial file, and `profiles/`'s own inventory/evidence
 reads were still lstat-then-listdir/open-by-path rather than
-descriptor-anchored. All fourteen, across all three rounds, were remediated
-GPU-free as described above, each with a new adversarial test that first
-demonstrably failed against the original behavior and then passed against
-the fix. The third round's fix for (A/B) is a new container-side bridge
-(`scripts/p14_ncu_bridge.py`) that runs NCU collection and metrics export
-entirely inside the container's own private, non-host-mounted `/tmp` and
-hands the host only a versioned, length-delimited bundle over its own
-stdout, so NCU never receives a campaign-relative pathname at all; (C) is
-closed by a strict recursive structural comparison (exact key sets, exact
-types, no tolerance); (D) by a new `validate_manifest_state_shape` function
-run alongside the existing transition validator; (E) by strict
-single-component basename validation, corrected failure-cleanup control
-flow, and extending descriptor-anchored, no-follow discipline to profile
-inventory, per-case evidence reads, and the manifest revision directory
-itself. `make memory-paths-p14-plan` and
+descriptor-anchored. A **fourth** independent GPU-free audit of that
+thrice-remediated implementation then found six further blockers: (A) the
+manifest state-shape check tested `key in current and current[key] is not
+None`, so a premature key holding an explicit `null` compared as absent;
+(B) lifecycle timestamps were never compared against each other for
+chronological order; (C) `profile_count_completed`/`case_results` could
+each appear without the other; (D) `finalize-profile`/`analyze` built
+`artifact_sha256` from values already in memory before the
+evidence-integrity gate ran, and `analyze` never re-ran that gate a second
+time immediately before publishing `ANALYZED`; (E) `publish_ncu_bundle()`'s
+cleanup could unlink a file it no longer owned; (F) `PLAN.md` stated a
+phase gate had passed when it had not, and the trusted, single-writer
+filesystem model was not documented. All twenty blockers, across all four
+rounds, were remediated GPU-free as described above, each with a new
+adversarial test that first demonstrably failed against the original
+behavior and then passed against the fix. The third round's fix for (A/B)
+is a new container-side bridge (`scripts/p14_ncu_bridge.py`) that runs NCU
+collection and metrics export entirely inside the container's own private,
+non-host-mounted `/tmp` and hands the host only a versioned,
+length-delimited bundle over its own stdout, so NCU never receives a
+campaign-relative pathname at all; (C) is closed by a strict recursive
+structural comparison (exact key sets, exact types, no tolerance); (D) by a
+new `validate_manifest_state_shape` function run alongside the existing
+transition validator; (E) by strict single-component basename validation,
+corrected failure-cleanup control flow, and extending descriptor-anchored,
+no-follow discipline to profile inventory, per-case evidence reads, and the
+manifest revision directory itself. The fourth round's fixes (Groups A-F,
+see `src/memory/P1_4_PROTOCOL.md`) close six blockers found against Git
+commit `a66d0fa8b37147eb4f237911c42b02e3c8cbed59` under an explicitly
+documented trusted, single-writer filesystem model (Section 0 of that
+document) rather than expanding P1.4 into a hostile-concurrency-resistant
+design. `make memory-paths-p14-plan` and
 `make memory-paths-p14-check` are GPU-free (no Docker, no GPU, no network);
 `make memory-paths-p14-pilot` and `make memory-paths-p14-profile` require an
 explicit, operator-provided `BLACKWELL_GPU_INDEX`, `P1_4_CAMPAIGN_ID`, and

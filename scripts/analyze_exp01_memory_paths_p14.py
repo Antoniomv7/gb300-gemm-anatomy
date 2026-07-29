@@ -75,8 +75,10 @@ import tempfile
 import xml.dom.minidom as minidom
 from unittest import mock
 from datetime import datetime as _datetime
+from datetime import timedelta as _timedelta
 from datetime import timezone as _timezone
 from pathlib import Path
+from typing import Callable
 from xml.sax.saxutils import escape as _xml_escape
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -188,10 +190,14 @@ ALLOWED_P14_MANIFEST_KEYS: dict[str, object] = {
     "state": str,
     "publishable": bool,
     "started_at_utc": str,
-    "pilot_completed_at_utc": (str, type(None)),
-    "profile_started_at_utc": (str, type(None)),
-    "profile_completed_at_utc": (str, type(None)),
-    "analyzed_at_utc": (str, type(None)),
+    # Task 4 re-audit remediation (Group A): these four fields must never be
+    # nullable. A premature key with value null is otherwise indistinguishable
+    # from "not yet reached" by any check that tests truthiness/non-None
+    # instead of presence -- absence is the only legal "not yet" placeholder.
+    "pilot_completed_at_utc": str,
+    "profile_started_at_utc": str,
+    "profile_completed_at_utc": str,
+    "analyzed_at_utc": str,
     "frozen_protocol": dict,
     "profile_plan_sha256": str,
     "pilot_campaign_reference": dict,
@@ -203,8 +209,11 @@ ALLOWED_P14_MANIFEST_KEYS: dict[str, object] = {
     "profile_count_completed": int,
     "case_results": dict,
     "artifact_sha256": dict,
-    "failure_stage": (str, type(None)),
-    "failure_detail": (list, type(None)),
+    # Task 4 re-audit remediation (Group A): failure_stage/failure_detail must
+    # be absent (not merely null) outside FAILED/INTERRUPTED -- see the
+    # comment above.
+    "failure_stage": str,
+    "failure_detail": list,
 }
 
 
@@ -647,17 +656,17 @@ def _validate_p14_manifest_document(manifest: dict, *, require_initialized: bool
     if "started_at_utc" in manifest:
         p13._validate_compact_timestamp(manifest["started_at_utc"], "started_at_utc")
     for key in ("pilot_completed_at_utc", "profile_started_at_utc", "profile_completed_at_utc", "analyzed_at_utc"):
-        if manifest.get(key) is not None:
+        if key in manifest:
             p13._validate_compact_timestamp(manifest[key], key)
     if "profile_count_completed" in manifest and not (0 <= manifest["profile_count_completed"] <= EXPECTED_NCU_CASE_COUNT):
         raise p13.ManifestTransitionError(
             f"P1.4 manifest profile_count_completed must be in [0, {EXPECTED_NCU_CASE_COUNT}]"
         )
-    if "failure_stage" in manifest and manifest["failure_stage"] is not None and not manifest["failure_stage"]:
-        raise p13.ManifestTransitionError("P1.4 manifest failure_stage must be null or non-empty")
-    if "failure_detail" in manifest and manifest["failure_detail"] is not None:
+    if "failure_stage" in manifest and not manifest["failure_stage"]:
+        raise p13.ManifestTransitionError("P1.4 manifest failure_stage must be non-empty when present")
+    if "failure_detail" in manifest:
         if not all(isinstance(item, str) for item in manifest["failure_detail"]):
-            raise p13.ManifestTransitionError("P1.4 manifest failure_detail must be null or a list of strings")
+            raise p13.ManifestTransitionError("P1.4 manifest failure_detail must be a list of strings")
 
     required_by_state = {
         "PILOT_IN_PROGRESS": {
@@ -882,14 +891,40 @@ def validate_manifest_state_shape(current: dict, expected_campaign_id: str) -> l
             f"{expected_campaign_id!r}"
         )
 
+    # Re-audit remediation (Group A): legality depends on key *presence*,
+    # never on truthiness or non-null value. Before this fix, a premature key
+    # holding an explicit `null` compared equal to "absent" here, so e.g. a
+    # revision-0 manifest (state=PILOT_IN_PROGRESS) could carry
+    # "profile_completed_at_utc": null / "analyzed_at_utc": null unnoticed.
+    # ALLOWED_P14_MANIFEST_KEYS no longer declares any of the fields this
+    # loop guards as nullable (see the type table above), so a present value
+    # is always the field's real declared type by the time this runs; the
+    # only question this loop asks is "is the key present at all".
     allowed = _p14_cumulative_allowed_fields(state)
     for key in ALLOWED_P14_MANIFEST_KEYS:
-        present = key in current and current[key] is not None
+        present = key in current
         if present and key not in allowed:
             errors.append(
                 f"{key} is present but state={state!r} has not yet reached the state that may "
                 f"introduce it (Task 4 Section 9 mutation matrix)"
             )
+
+    # Re-audit remediation (Group C): profile_count_completed and
+    # case_results must always appear together -- neither may be present
+    # without the other. Before this fix, only the *value* relationship
+    # (count == len(case_results)) was checked, and only when case_results
+    # happened to already be a dict; a manifest with profile_count_completed
+    # present and case_results entirely absent (or vice versa) passed
+    # unnoticed because the whole comparison lived inside
+    # `if isinstance(case_results, dict):`.
+    case_results_present = "case_results" in current
+    count_present = "profile_count_completed" in current
+    if case_results_present != count_present:
+        errors.append(
+            f"profile_count_completed present={count_present} but case_results "
+            f"present={case_results_present} (the two fields must always appear together, "
+            f"never one without the other)"
+        )
 
     case_results = current.get("case_results")
     if isinstance(case_results, dict):
@@ -907,7 +942,7 @@ def validate_manifest_state_shape(current: dict, expected_campaign_id: str) -> l
                 f"case_results key order {actual_order!r} is not an exact ordered prefix of the "
                 f"frozen six-case order {frozen_order!r} (checked as an ordered list, never a set)"
             )
-        if "profile_count_completed" in current and current["profile_count_completed"] != len(case_results):
+        if count_present and current["profile_count_completed"] != len(case_results):
             errors.append(
                 f"profile_count_completed={current.get('profile_count_completed')!r} != "
                 f"len(case_results)={len(case_results)}"
@@ -1058,6 +1093,62 @@ def validate_manifest_revision_transition(
     return errors
 
 
+# ---------------------------------------------------------------------------
+# Chronological timestamp validation (re-audit remediation, Group B). Neither
+# validate_manifest_state_shape() nor validate_manifest_revision_transition()
+# reject a lifecycle timestamp that moves backwards: the former only checks
+# *which* fields may appear in a given state, and the latter only checks that
+# an *already-set* timestamp never changes -- neither compares two different
+# timestamp fields' parsed values against each other. One reusable validator,
+# run alongside the other two semantic layers for revision 0 and every later
+# revision alike.
+# ---------------------------------------------------------------------------
+P14_LIFECYCLE_TIMESTAMP_ORDER: tuple[str, ...] = (
+    "started_at_utc", "pilot_completed_at_utc", "profile_started_at_utc",
+    "profile_completed_at_utc", "analyzed_at_utc",
+)
+
+
+def validate_manifest_timestamp_chronology(current: dict) -> list[str]:
+    """Pure function of one revision's own content: requires the fixed,
+    nondecreasing causal order started_at_utc <= pilot_completed_at_utc <=
+    profile_started_at_utc <= profile_completed_at_utc <= analyzed_at_utc for
+    every one of those fields actually present in `current` (a field's own
+    requiredness -- whether it must be present at all in a given state -- is
+    already enforced by _validate_p14_manifest_document/
+    validate_manifest_state_shape; this only orders whichever subset is
+    present). Parses each value with the existing canonical compact-UTC
+    validator and compares the parsed datetimes, never the raw strings, so
+    e.g. lexical ordering quirks can never matter. Because every P1.4
+    manifest revision is a complete snapshot (never a diff), a newly
+    introduced timestamp always appears in the very same revision as every
+    earlier lifecycle timestamp already set, so a single per-revision
+    ordered-pairwise scan is sufficient to catch a newly introduced
+    timestamp that precedes an earlier one -- no history/previous-revision
+    argument is needed. A malformed value is not re-reported here (the base
+    schema validator already rejects it); this function silently skips a
+    field it cannot parse rather than raising a second, redundant error."""
+    errors: list[str] = []
+    parsed: list[tuple[str, _datetime]] = []
+    for field in P14_LIFECYCLE_TIMESTAMP_ORDER:
+        value = current.get(field)
+        if not isinstance(value, str):
+            continue
+        try:
+            p13._validate_compact_timestamp(value, field)
+            parsed.append((field, _datetime.strptime(value, "%Y%m%dT%H%M%SZ")))
+        except p13.ManifestTransitionError:
+            continue
+    for (earlier_field, earlier_dt), (later_field, later_dt) in zip(parsed, parsed[1:]):
+        if later_dt < earlier_dt:
+            errors.append(
+                f"{later_field}={current[later_field]!r} precedes {earlier_field}="
+                f"{current[earlier_field]!r} (lifecycle timestamps must be nondecreasing: "
+                f"{' <= '.join(P14_LIFECYCLE_TIMESTAMP_ORDER)})"
+            )
+    return errors
+
+
 MANIFEST_REVISION_RE = re.compile(r"^(\d{6})\.json$")
 MANIFEST_REVISION_TMP_NAME = ".manifest_revision.tmp"
 MANIFEST_REVISION_KEYS = ("manifest_revision", "previous_manifest_sha256")
@@ -1175,16 +1266,19 @@ def load_p14_manifest_chain(campaign_dir: Path) -> tuple[dict, int]:
                 _validate_p14_manifest_document(content)
             except p13.ManifestTransitionError as exc:
                 raise p13.ManifestTransitionError(f"{path}: {exc}") from exc
-            # Two explicit semantic validation layers (Task 4, Section 9), run
-            # for revision 0 and every later revision alike: shape validation
-            # (is this revision well-formed for its own declared state, taken
-            # in isolation -- e.g. no field introduced before the one state
-            # that may legally introduce it) and transition validation (is
-            # this revision a legitimate continuation of the previous one).
-            # The hash chain alone only proves a revision was appended
-            # without altering an earlier byte; neither says anything the
-            # other already checks, and together they are what "semantically
-            # valid" means here.
+            # Three explicit semantic validation layers (Task 4, Section 9;
+            # chronology added by the re-audit remediation, Group B), run for
+            # revision 0 and every later revision alike: shape validation (is
+            # this revision well-formed for its own declared state, taken in
+            # isolation -- e.g. no field introduced before the one state that
+            # may legally introduce it), transition validation (is this
+            # revision a legitimate continuation of the previous one), and
+            # chronology validation (do this revision's own lifecycle
+            # timestamps agree with each other on a single nondecreasing
+            # causal order). The hash chain alone only proves a revision was
+            # appended without altering an earlier byte; none of the three
+            # says anything the others already check, and together they are
+            # what "semantically valid" means here.
             shape_errors = validate_manifest_state_shape(content, expected_campaign_id)
             if shape_errors:
                 raise p13.ManifestTransitionError(
@@ -1196,6 +1290,11 @@ def load_p14_manifest_chain(campaign_dir: Path) -> tuple[dict, int]:
             if transition_errors:
                 raise p13.ManifestTransitionError(
                     f"{path}: semantic transition validation failed: {transition_errors}"
+                )
+            chronology_errors = validate_manifest_timestamp_chronology(content)
+            if chronology_errors:
+                raise p13.ManifestTransitionError(
+                    f"{path}: manifest timestamp chronology validation failed: {chronology_errors}"
                 )
             previous_content = content
             current_content = content
@@ -1240,16 +1339,16 @@ def write_next_p14_manifest_revision(campaign_dir: Path, manifest_content: dict)
         raise p13.UnsafePathError(f"{tmp_path}: stale manifest-revision temporary already exists")
 
     # Defense in depth (Remediation C, extended by Task 4/Section 9 to both
-    # semantic layers): re-validate the candidate revision's shape and
-    # transition here too, before ever writing it, using the exact same two
-    # functions load_p14_manifest_chain re-applies on every future read.
-    # This never replaces the read-side check (an attacker could always
-    # bypass this function and write a revision file directly), but it does
-    # catch a bug in this codebase's own callers before it is ever
-    # persisted. Runs after the stale-tmp check above: a leftover temporary
-    # from an interrupted write is a filesystem-hygiene defect independent
-    # of the new content's own semantic validity, and should fail with that
-    # more specific diagnosis first.
+    # semantic layers): re-validate the candidate revision's shape,
+    # transition, and timestamp chronology here too, before ever writing it,
+    # using the exact same functions load_p14_manifest_chain re-applies on
+    # every future read. This never replaces the read-side check (an
+    # attacker could always bypass this function and write a revision file
+    # directly), but it does catch a bug in this codebase's own callers
+    # before it is ever persisted. Runs after the stale-tmp check above: a
+    # leftover temporary from an interrupted write is a filesystem-hygiene
+    # defect independent of the new content's own semantic validity, and
+    # should fail with that more specific diagnosis first.
     shape_errors = validate_manifest_state_shape(manifest_content, campaign_dir.name)
     if shape_errors:
         raise p13.ManifestTransitionError(
@@ -1261,6 +1360,11 @@ def write_next_p14_manifest_revision(campaign_dir: Path, manifest_content: dict)
     if transition_errors:
         raise p13.ManifestTransitionError(
             f"refusing to write a non-compliant manifest revision: {transition_errors}"
+        )
+    chronology_errors = validate_manifest_timestamp_chronology(manifest_content)
+    if chronology_errors:
+        raise p13.ManifestTransitionError(
+            f"refusing to write a manifest revision with invalid timestamp chronology: {chronology_errors}"
         )
 
     final_path = _manifest_revision_path(campaign_dir, new_revision)
@@ -2973,20 +3077,28 @@ def cmd_validate_profile_case(args: argparse.Namespace) -> int:
 # call. Per-case paths are derived only from the frozen NCU plan and
 # canonical case names, never from any stored path string.
 # ---------------------------------------------------------------------------
-def _verify_hash(label: str, path: Path, expected_sha256: object, errors: list[str]) -> None:
+def _verify_hash(label: str, path: Path, expected_sha256: object, errors: list[str]) -> str | None:
+    """Returns the freshly recomputed SHA-256 of `path` (re-audit
+    remediation, Group D), or None if it could not be computed or compared.
+    Appending to `errors` is unchanged; the return value lets a caller build
+    a terminal manifest revision directly from what this function just
+    recomputed, rather than from a value that was already sitting in memory
+    before this check ran."""
     if not isinstance(expected_sha256, str) or not p13._is_sha256_hex(expected_sha256):
         errors.append(f"{label}: no valid recorded SHA-256 to verify against (got {expected_sha256!r})")
-        return
+        return None
     try:
         actual = p13.sha256_of(path)
     except p13.UnsafePathError as exc:
         errors.append(f"{label}: {exc}")
-        return
+        return None
     if actual != expected_sha256:
         errors.append(
             f"{label}: {path} SHA-256 {actual} != recorded {expected_sha256} "
             f"(tampered or corrupted since it was first validated)"
         )
+        return None
+    return actual
 
 
 def _resolve_case_evidence_paths(campaign_dir: Path, case_name: str, errors: list[str]) -> dict[str, Path] | None:
@@ -3244,10 +3356,19 @@ def _recheck_inode_identity(campaign_fd: int, profiles_fd: int, case_fds: dict[s
     return errors
 
 
-def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> list[str]:
-    """Returns a list of errors (empty iff every trusted artifact still
-    matches its recorded evidence and every reparsed value still agrees
-    with what was recorded). Never mutates the manifest or the campaign.
+def verify_campaign_evidence_integrity(
+    campaign_dir: Path, manifest: dict,
+) -> tuple[list[str], dict | None]:
+    """Returns (errors, verified_snapshot). errors is empty iff every trusted
+    artifact still matches its recorded evidence and every reparsed value
+    still agrees with what was recorded; verified_snapshot is None whenever
+    errors is non-empty, and otherwise a dict of exactly the hashes and
+    per-case reconstructions this call just recomputed fresh from disk
+    (re-audit remediation, Group D) -- callers building a terminal manifest
+    revision's artifact_sha256 use *this* returned snapshot, never a value
+    that was already sitting in the caller's in-memory `manifest` before
+    this check ran, so the gate's own freshly-verified data is what
+    actually gets published. Never mutates the manifest or the campaign.
 
     The profiles/ inventory and every case's evidence read (Task 4, Section
     7) are descriptor-anchored: the campaign directory, profiles/, and each
@@ -3257,47 +3378,60 @@ def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> li
     inventory+evidence check below -- including the final inode-identity
     re-check immediately before this function returns its verdict."""
     errors: list[str] = []
+    snapshot: dict = {}
 
     pilot_ref = manifest.get("pilot_campaign_reference")
     if not isinstance(pilot_ref, dict) or "path" not in pilot_ref:
-        return ["pilot_campaign_reference is missing or incomplete; cannot verify pilot evidence"]
+        return ["pilot_campaign_reference is missing or incomplete; cannot verify pilot evidence"], None
     try:
         p13_campaign_dir = resolve_p13_campaign_dir_arg(pilot_ref["path"])
     except p13.UnsafePathError as exc:
-        return [f"pilot_campaign_reference.path: {exc}"]
+        return [f"pilot_campaign_reference.path: {exc}"], None
 
-    _verify_hash("P1.3 manifest.json", p13_campaign_dir / "manifest.json",
-                 pilot_ref.get("manifest_sha256"), errors)
-    _verify_hash("P1.3 combined_samples.csv", p13_campaign_dir / "combined_samples.csv",
-                 pilot_ref.get("combined_samples_sha256"), errors)
-    _verify_hash("P1.3 summary.csv", p13_campaign_dir / "summary.csv",
-                 pilot_ref.get("summary_sha256"), errors)
+    snapshot["pilot_manifest_sha256"] = _verify_hash(
+        "P1.3 manifest.json", p13_campaign_dir / "manifest.json",
+        pilot_ref.get("manifest_sha256"), errors,
+    )
+    snapshot["pilot_combined_samples_sha256"] = _verify_hash(
+        "P1.3 combined_samples.csv", p13_campaign_dir / "combined_samples.csv",
+        pilot_ref.get("combined_samples_sha256"), errors,
+    )
+    snapshot["pilot_summary_sha256"] = _verify_hash(
+        "P1.3 summary.csv", p13_campaign_dir / "summary.csv",
+        pilot_ref.get("summary_sha256"), errors,
+    )
 
     preflight_pilot = manifest.get("preflight_reference_pilot", {})
     if isinstance(preflight_pilot, dict) and preflight_pilot.get("path"):
-        _verify_hash("pilot preflight summary", Path(preflight_pilot["path"]),
-                     preflight_pilot.get("sha256"), errors)
+        snapshot["preflight_reference_pilot_sha256"] = _verify_hash(
+            "pilot preflight summary", Path(preflight_pilot["path"]),
+            preflight_pilot.get("sha256"), errors,
+        )
     else:
         errors.append("preflight_reference_pilot is missing or incomplete")
 
     preflight_profile = manifest.get("preflight_reference_profile", {})
     if isinstance(preflight_profile, dict) and preflight_profile.get("path"):
-        _verify_hash("profile preflight summary", Path(preflight_profile["path"]),
-                     preflight_profile.get("sha256"), errors)
+        snapshot["preflight_reference_profile_sha256"] = _verify_hash(
+            "profile preflight summary", Path(preflight_profile["path"]),
+            preflight_profile.get("sha256"), errors,
+        )
     else:
         errors.append("preflight_reference_profile is missing or incomplete")
 
-    _verify_hash("P1.4 profile_plan.csv", campaign_dir / "profile_plan.csv",
-                 manifest.get("profile_plan_sha256"), errors)
+    snapshot["profile_plan_sha256"] = _verify_hash(
+        "P1.4 profile_plan.csv", campaign_dir / "profile_plan.csv",
+        manifest.get("profile_plan_sha256"), errors,
+    )
 
     plan = build_ncu_plan()
     plan_errors = check_ncu_plan_contract(plan)
     if plan_errors:
-        return errors + [f"internal NCU plan contract violation: {plan_errors}"]
+        return errors + [f"internal NCU plan contract violation: {plan_errors}"], None
 
     case_results = manifest.get("case_results")
     if not isinstance(case_results, dict):
-        return errors + ["case_results is missing or not an object"]
+        return errors + ["case_results is missing or not an object"], None
 
     provenance = manifest.get("provenance")
     if not isinstance(provenance, dict):
@@ -3308,6 +3442,7 @@ def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> li
         resolved_ncu_metrics = {}
 
     expected_names = {entry["case_name"] for entry in plan}
+    snapshot_case_results: dict[str, dict] = {}
 
     # Descriptor-anchored inventory + evidence (Task 4, Section 7): open the
     # campaign directory and profiles/ exactly once, hold both descriptors
@@ -3317,16 +3452,16 @@ def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> li
         campaign_parts = campaign_dir.relative_to(REPO_ROOT).parts
         campaign_fd = _open_dir_component_chain(*campaign_parts)
     except p13.UnsafePathError as exc:
-        return errors + [f"campaign directory: {exc}"]
+        return errors + [f"campaign directory: {exc}"], None
     try:
         try:
             profiles_fd = _open_dir_nofollow_p14("profiles", dir_fd=campaign_fd)
         except p13.UnsafePathError as exc:
-            return errors + [f"profiles/: {exc}"]
+            return errors + [f"profiles/: {exc}"], None
         try:
             inventory_errors = _list_and_check_profiles_inventory(profiles_fd, expected_names)
             if inventory_errors:
-                return errors + inventory_errors
+                return errors + inventory_errors, None
 
             found_case_names = set(case_results)
             for missing in sorted(expected_names - found_case_names):
@@ -3363,6 +3498,7 @@ def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> li
                         continue
 
                     _strict_compare_values(case_name, recorded, reconstructed, errors)
+                    snapshot_case_results[case_name] = reconstructed
 
                 if not errors:
                     errors.extend(_recheck_inode_identity(campaign_fd, profiles_fd, case_fds))
@@ -3374,7 +3510,10 @@ def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> li
     finally:
         os.close(campaign_fd)
 
-    return errors
+    if errors:
+        return errors, None
+    snapshot["case_results"] = snapshot_case_results
+    return errors, snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -3423,27 +3562,42 @@ def _do_finalize_profile(
     if errors:
         return _fail_p14(campaign_dir, "profile_finalize", errors)
 
-    # Central evidence-integrity gate: re-reads and recomputes every trusted
-    # hash and reparses every application/metrics CSV from disk, rejecting
-    # any tampering that happened after validate-profile-case recorded it.
-    integrity_errors = verify_campaign_evidence_integrity(campaign_dir, manifest)
+    # Central evidence-integrity gate, run as the final filesystem evidence
+    # read before COMPLETE (re-audit remediation, Group D): re-reads and
+    # recomputes every trusted hash and reparses every application/metrics
+    # CSV from disk, rejecting any tampering that happened after
+    # validate-profile-case recorded it. Between this call and the manifest
+    # publication below, only deterministic in-memory construction from its
+    # returned `verified` snapshot happens -- no further evidence read, no
+    # artifact write, no external process.
+    integrity_errors, verified = verify_campaign_evidence_integrity(campaign_dir, manifest)
     if integrity_errors:
         return _fail_p14(campaign_dir, "profile_finalize_integrity", integrity_errors)
 
-    artifact_sha256 = dict(manifest.get("artifact_sha256", {}))
-    artifact_sha256["profile_plan.csv"] = manifest["profile_plan_sha256"]
-    pilot_ref = manifest.get("pilot_campaign_reference", {})
-    for key in ("manifest_sha256", "combined_samples_sha256", "summary_sha256"):
-        if key in pilot_ref:
-            artifact_sha256[f"pilot_{key}"] = pilot_ref[key]
-    for ref_name in ("preflight_reference_pilot", "preflight_reference_profile"):
-        ref = manifest.get(ref_name, {})
-        if isinstance(ref, dict) and "sha256" in ref:
-            artifact_sha256[ref_name] = ref["sha256"]
-    for case_name, result in case_results.items():
+    # artifact_sha256 is built exclusively from `verified` -- the hashes and
+    # per-case reconstructions the gate above just recomputed fresh from
+    # disk -- never copied from `manifest`/`case_results`, which were loaded
+    # before the gate ran and could otherwise carry a stale value forward
+    # into COMPLETE even though the gate itself compared correctly.
+    artifact_sha256: dict[str, str] = {}
+    if verified["profile_plan_sha256"] is not None:
+        artifact_sha256["profile_plan.csv"] = verified["profile_plan_sha256"]
+    for pilot_key, snapshot_key in (
+        ("manifest_sha256", "pilot_manifest_sha256"),
+        ("combined_samples_sha256", "pilot_combined_samples_sha256"),
+        ("summary_sha256", "pilot_summary_sha256"),
+    ):
+        if verified[snapshot_key] is not None:
+            artifact_sha256[f"pilot_{pilot_key}"] = verified[snapshot_key]
+    for ref_name, snapshot_key in (
+        ("preflight_reference_pilot", "preflight_reference_pilot_sha256"),
+        ("preflight_reference_profile", "preflight_reference_profile_sha256"),
+    ):
+        if verified[snapshot_key] is not None:
+            artifact_sha256[ref_name] = verified[snapshot_key]
+    for case_name, result in verified["case_results"].items():
         for key in ("application_csv_sha256", "metrics_csv_sha256", "ncu_rep_sha256"):
-            if key in result:
-                artifact_sha256[f"{case_name}.{key}"] = result[key]
+            artifact_sha256[f"{case_name}.{key}"] = result[key]
 
     updates = {
         "profile_completed_at_utc": completed_at_utc,
@@ -3583,7 +3737,18 @@ def _write_text_no_clobber(path: Path, text: str) -> None:
         raise
 
 
-def _do_analyze(*, campaign_dir: Path, analyzed_at_utc: str) -> tuple[bool, list[str]]:
+def _do_analyze(
+    *, campaign_dir: Path, analyzed_at_utc: str,
+    _test_hook_before_final_gate: Callable[[], None] | None = None,
+) -> tuple[bool, list[str]]:
+    """_test_hook_before_final_gate, if given, is called with no arguments
+    immediately after the newly published analysis artifacts are hashed and
+    immediately before the second (pre-ANALYZED) evidence-integrity gate --
+    self-test only, never exposed as a production CLI option (mirrors
+    scripts/p14_safe_capture.py's own `_test_hook_after_open` convention) --
+    so an adversarial test can mutate original pilot/profile evidence at
+    exactly that boundary and prove the second gate, not merely the first,
+    is what catches it."""
     try:
         manifest, _revision = load_p14_manifest_chain(campaign_dir)
         _validate_p14_manifest_document(manifest, require_initialized=True)
@@ -3592,11 +3757,16 @@ def _do_analyze(*, campaign_dir: Path, analyzed_at_utc: str) -> tuple[bool, list
     if manifest.get("state") != "COMPLETE":
         return False, [f"P1.4 manifest state={manifest.get('state')!r} != 'COMPLETE'; cannot analyze"]
 
-    # Central evidence-integrity gate: the exact same function finalize-profile
-    # calls before COMPLETE, re-run here before ANALYZED. Re-reads and
-    # recomputes every trusted hash and reparses every application/metrics
-    # CSV from disk; rejects any tampering that happened after finalize-profile.
-    integrity_errors = verify_campaign_evidence_integrity(campaign_dir, manifest)
+    # First evidence-integrity gate (re-audit remediation, Group D): run
+    # before consuming any evidence. The exact same function finalize-profile
+    # calls before COMPLETE, re-run here before analysis starts consuming
+    # pilot/profile evidence. Re-reads and recomputes every trusted hash and
+    # reparses every application/metrics CSV from disk; rejects any
+    # tampering that happened after finalize-profile. Analysis legitimately
+    # reads evidence *after* this point (it must, to compute statistics), so
+    # a second gate immediately before publishing ANALYZED closes that
+    # interval below.
+    integrity_errors, _verified_before = verify_campaign_evidence_integrity(campaign_dir, manifest)
     if integrity_errors:
         return False, integrity_errors
 
@@ -3721,20 +3891,33 @@ def _do_analyze(*, campaign_dir: Path, analyzed_at_utc: str) -> tuple[bool, list
             if os.path.lexists(candidate):
                 return False, [f"{candidate}: existing analysis artifact; refusing to overwrite"]
 
+    # published_identity records each artifact's (dev, inode) immediately
+    # after this call publishes it, so any later cleanup can unlink it only
+    # while its identity is still exactly what was just published --
+    # ownership-safe cleanup (re-audit remediation, Group E), reusing the
+    # existing, audited p13._safe_unlink_owned(path, identity) rather than a
+    # bare unconditional unlink.
     published: list[Path] = []
+    published_identity: dict[Path, tuple[int, int]] = {}
+
+    def _cleanup_published() -> None:
+        for cleanup_path in published:
+            try:
+                p13._safe_unlink_owned(cleanup_path, published_identity.get(cleanup_path))
+            except p13.UnsafePathError:
+                pass
+
     try:
         for path, header, rows in outputs:
             _write_csv_no_clobber(path, header, rows)
             published.append(path)
+            published_identity[path] = p13._file_identity(path)
         for path, text in file_writes:
             _write_text_no_clobber(path, text)
             published.append(path)
+            published_identity[path] = p13._file_identity(path)
     except (p13.UnsafePathError, OSError) as exc:
-        for path in published:
-            try:
-                p13._safe_unlink_owned(path)
-            except p13.UnsafePathError:
-                pass
+        _cleanup_published()
         return False, [f"analysis artifact publication failed: {exc}"]
 
     try:
@@ -3745,7 +3928,29 @@ def _do_analyze(*, campaign_dir: Path, analyzed_at_utc: str) -> tuple[bool, list
             {path.relative_to(campaign_dir).as_posix(): p13.sha256_of(path) for path, _ in file_writes}
         )
     except p13.UnsafePathError as exc:
+        _cleanup_published()
         return False, [str(exc)]
+
+    if _test_hook_before_final_gate is not None:
+        _test_hook_before_final_gate()
+
+    # Second evidence-integrity gate, run as the final filesystem evidence
+    # read before ANALYZED (re-audit remediation, Group D): confirms none of
+    # the original pilot/profile evidence changed while this analysis was
+    # being computed and published above. If it fails, ANALYZED is never
+    # published; the analysis artifacts this call itself just published are
+    # removed (ownership/identity-checked, never an unfamiliar replacement);
+    # and the changed-artifact diagnostics from the gate are reported.
+    # Between this gate and the manifest publication below, only
+    # deterministic in-memory construction of `updates` happens.
+    integrity_errors2, _verified_after = verify_campaign_evidence_integrity(campaign_dir, manifest)
+    if integrity_errors2:
+        _cleanup_published()
+        return False, [
+            "evidence changed while analysis was being computed/published, detected by the "
+            "second (pre-ANALYZED) integrity gate; ANALYZED was not published and the "
+            "analysis artifacts just written were removed:",
+        ] + integrity_errors2
 
     updates = {
         "analyzed_at_utc": analyzed_at_utc,
@@ -4068,7 +4273,12 @@ def _run_profile_pipeline(
     ok, errors, _resolved = _do_discover_metrics(
         campaign_dir=p14_campaign_dir, discovery_log=discovery_log,
         preflight_path=preflight_path, git_commit=_FIXED_GIT_COMMIT,
-        started_at_utc="20260728T003100Z", now_utc=now,
+        # One minute after this fixture's own pilot_completed_at_utc
+        # ("20260728T103000Z" above) -- was previously "20260728T003100Z"
+        # (00:31, i.e. *before* pilot completion), a latent fixture typo that
+        # validate_manifest_timestamp_chronology (re-audit remediation,
+        # Group B) now correctly catches.
+        started_at_utc="20260728T103100Z", now_utc=now,
     )
     if not ok:
         raise AssertionError(f"self-test fixture: discover-metrics failed: {errors}")
@@ -5506,21 +5716,28 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             ok, errors = _do_finalize_profile(campaign_dir=p14_d_table, completed_at_utc="20260728T221301Z")
             assert ok, errors
             base_manifest_d, _rev = load_p14_manifest_chain(p14_d_table)
-            baseline_errors = verify_campaign_evidence_integrity(p14_d_table, base_manifest_d)
+            baseline_errors, baseline_snapshot = verify_campaign_evidence_integrity(p14_d_table, base_manifest_d)
             rec.check(
                 "verify_campaign_evidence_integrity finds no errors on an untampered COMPLETE campaign",
                 baseline_errors == [],
                 detail=f"errors={baseline_errors}",
+            )
+            rec.check(
+                "verify_campaign_evidence_integrity returns a non-None verified snapshot with all six "
+                "freshly reconstructed case results when it finds no errors (re-audit remediation, Group D)",
+                baseline_snapshot is not None
+                and set(baseline_snapshot.get("case_results", {})) == {e["case_name"] for e in build_ncu_plan()},
+                detail=f"snapshot={baseline_snapshot}",
             )
             some_resolved_metric = next(iter(base_manifest_d["case_results"][d_case_name]["resolved_metric_values"]))
 
             def _check_d_mutation(label: str, field: str, mutate) -> None:
                 mutated_manifest = copy.deepcopy(base_manifest_d)
                 mutate(mutated_manifest["case_results"][d_case_name])
-                mutation_errors = verify_campaign_evidence_integrity(p14_d_table, mutated_manifest)
+                mutation_errors, mutation_snapshot = verify_campaign_evidence_integrity(p14_d_table, mutated_manifest)
                 rec.check(
                     f"canonical reconstruction detects a mutated {label} (Remediation D)",
-                    any(f"{d_case_name}.{field}" in e for e in mutation_errors),
+                    any(f"{d_case_name}.{field}" in e for e in mutation_errors) and mutation_snapshot is None,
                     detail=f"errors={mutation_errors}",
                 )
 
@@ -6030,6 +6247,310 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 raised and "exactly one" in errmsg,
                 detail=f"raised={raised} errmsg={errmsg}",
             )
+
+            # =================================================================
+            # Independent re-audit remediation (pragmatic, final scope): Groups
+            # A-D. Each group closes exactly one blocker found against Git
+            # commit a66d0fa8b37147eb4f237911c42b02e3c8cbed59.
+            # =================================================================
+            _reaudit_ts_state = {"n": 0}
+            _reaudit_ts_base = _datetime(2026, 7, 29, 12, 0, 0, tzinfo=_timezone.utc)
+
+            def _next_reaudit_ts() -> str:
+                # A monotonically increasing real UTC instant, one second per
+                # call -- avoids ever hand-typing an invalid HHMMSS literal
+                # (e.g. minute/second fields >= 60) among the many distinct
+                # campaign IDs and timestamp values Groups A-D need below.
+                _reaudit_ts_state["n"] += 1
+                return (
+                    _reaudit_ts_base + _timedelta(seconds=_reaudit_ts_state["n"])
+                ).strftime("%Y%m%dT%H%M%SZ")
+
+            # --- Group A: premature null-valued manifest fields. Legality
+            # must depend on key *presence*, not truthiness/non-null value --
+            # `key in current and current[key] is not None` treated a
+            # premature key holding an explicit `null` as absent. Every
+            # revision constructed below is revision 0 of its own fresh
+            # campaign, produced by the real, audited init-campaign path and
+            # then mutated *in place* (same revision number, same
+            # previous_manifest_sha256=null) -- so the hash chain itself
+            # remains valid and any rejection proves semantic validation,
+            # never merely a broken chain. ------------------------------
+            _group_a_null_fields = [
+                "pilot_completed_at_utc", "profile_started_at_utc",
+                "profile_completed_at_utc", "analyzed_at_utc",
+                "resolved_ncu_metrics", "case_results", "artifact_sha256",
+                "failure_stage", "failure_detail", "unknown_field",
+            ]
+            for _field in _group_a_null_fields:
+                _campaign_id = _next_reaudit_ts()
+                _p14_null = _do_init_campaign(campaign_id=_campaign_id, started_at_utc=_campaign_id)
+                _rewrite_revision_in_place(_p14_null, 0, lambda d, f=_field: d.__setitem__(f, None))
+                _raised = False
+                _errmsg = ""
+                try:
+                    load_p14_manifest_chain(_p14_null)
+                except p13.ManifestTransitionError as _exc:
+                    _raised, _errmsg = True, str(_exc)
+                rec.check(
+                    f"revision zero with {_field}=null is rejected, not treated as absent (Group A)",
+                    _raised,
+                    detail=f"errmsg={_errmsg}",
+                )
+
+            # A required timestamp (started_at_utc) set to null in its own
+            # (revision-zero) state must also be rejected -- not merely a
+            # premature field appearing too early, but a required field
+            # whose declared type no longer tolerates null at all.
+            _null_started_id = _next_reaudit_ts()
+            _p14_null_started = _do_init_campaign(
+                campaign_id=_null_started_id, started_at_utc=_null_started_id,
+            )
+            _rewrite_revision_in_place(_p14_null_started, 0, lambda d: d.__setitem__("started_at_utc", None))
+            _raised = False
+            try:
+                load_p14_manifest_chain(_p14_null_started)
+            except p13.ManifestTransitionError:
+                _raised = True
+            rec.check(
+                "a required timestamp (started_at_utc) set to null in its own state is rejected "
+                "(Group A)",
+                _raised,
+            )
+
+            # Revision zero must contain *exactly* the None -> PILOT_IN_PROGRESS
+            # initialization fields -- confirmed positively (the untampered
+            # fixture above has no shape errors) and negatively (a premature,
+            # non-null, otherwise well-typed later-phase field is already
+            # covered by the existing "manifest state-shape validation
+            # rejects ... while state=PILOT_IN_PROGRESS" checks above; this
+            # positive check guards against a future over-broad fix that
+            # rejected *everything*).
+            _p14_a_baseline, _ = _run_profile_pipeline(tmp_path, _next_reaudit_ts())
+            _baseline_rev0, _ = load_p14_manifest_chain(_p14_a_baseline)
+            rec.check(
+                "an untampered, fully-progressed manifest still passes state-shape validation "
+                "(Group A fix is not over-broad)",
+                validate_manifest_state_shape(_baseline_rev0, _baseline_rev0["campaign_id"]) == [],
+                detail=f"errors={validate_manifest_state_shape(_baseline_rev0, _baseline_rev0['campaign_id'])}",
+            )
+
+            # --- Group B: chronological timestamp validation. Reuses
+            # last_manifest (loaded above from the fully ANALYZED p14_det
+            # campaign), which carries a real value for all five lifecycle
+            # timestamps. -------------------------------------------------
+            rec.check(
+                "validate_manifest_timestamp_chronology finds no errors on an untampered, "
+                "fully-progressed ANALYZED manifest",
+                validate_manifest_timestamp_chronology(last_manifest) == [],
+                detail=f"errors={validate_manifest_timestamp_chronology(last_manifest)}",
+            )
+
+            def _one_second_before(value: str) -> str:
+                dt = _datetime.strptime(value, "%Y%m%dT%H%M%SZ") - _timedelta(seconds=1)
+                return dt.strftime("%Y%m%dT%H%M%SZ")
+
+            def _check_b_invariant(label: str, field: str) -> None:
+                mutated = dict(last_manifest)
+                mutated[field] = _one_second_before(last_manifest[field])
+                chrono_errors = validate_manifest_timestamp_chronology(mutated)
+                rec.check(
+                    f"validate_manifest_timestamp_chronology rejects {label} (Group B)",
+                    any(field in e for e in chrono_errors),
+                    detail=f"errors={chrono_errors}",
+                )
+
+            _check_b_invariant("pilot_completed_at_utc < started_at_utc", "pilot_completed_at_utc")
+            _check_b_invariant("profile_started_at_utc < pilot_completed_at_utc", "profile_started_at_utc")
+            _check_b_invariant("profile_completed_at_utc < profile_started_at_utc", "profile_completed_at_utc")
+            _check_b_invariant("analyzed_at_utc < profile_completed_at_utc", "analyzed_at_utc")
+
+            # End-to-end: an earlier timestamp introduced in a later revision,
+            # even with otherwise-valid syntax, must be rejected by
+            # load_p14_manifest_chain itself, not merely by the pure
+            # function in isolation -- and the mutated revision remains
+            # cryptographically valid (same revision number, same
+            # previous_manifest_sha256), so this proves semantic rejection.
+            _p14_det_rev0, _p14_det_last_rev = load_p14_manifest_chain(p14_det)
+            _rewrite_revision_in_place(
+                p14_det, _p14_det_last_rev,
+                lambda d: d.__setitem__(
+                    "analyzed_at_utc", _one_second_before(d["profile_completed_at_utc"]),
+                ),
+            )
+            _raised, _errmsg = False, ""
+            try:
+                load_p14_manifest_chain(p14_det)
+            except p13.ManifestTransitionError as _exc:
+                _raised, _errmsg = True, str(_exc)
+            rec.check(
+                "load_p14_manifest_chain rejects an earlier timestamp (analyzed_at_utc) "
+                "introduced in the final revision, chained correctly but preceding an earlier "
+                "lifecycle timestamp (Group B)",
+                _raised and "chronology" in _errmsg,
+                detail=f"raised={_raised} errmsg={_errmsg}",
+            )
+
+            # --- Group C: profile_count_completed / case_results must always
+            # appear together, and their value relationship holds exactly.
+            # Uses reorder_manifest (a real PROFILE_IN_PROGRESS-state
+            # manifest with all six cases validated) as a base for pure-
+            # function isolation tests, mirroring the existing reordering
+            # test's own style. ---------------------------------------------
+            _some_case_results = {
+                k: v for i, (k, v) in enumerate(reorder_manifest["case_results"].items()) if i == 0
+            }
+
+            _count_absent = dict(reorder_manifest)
+            _count_absent["case_results"] = _some_case_results
+            del _count_absent["profile_count_completed"]
+            _errs = validate_manifest_state_shape(_count_absent, reorder_manifest["campaign_id"])
+            rec.check(
+                "case_results present but profile_count_completed absent is rejected (Group C)",
+                any("must always appear together" in e for e in _errs),
+                detail=f"errors={_errs}",
+            )
+
+            _case_results_absent = dict(reorder_manifest)
+            del _case_results_absent["case_results"]
+            _case_results_absent["profile_count_completed"] = 1
+            _errs = validate_manifest_state_shape(_case_results_absent, reorder_manifest["campaign_id"])
+            rec.check(
+                "profile_count_completed present but case_results absent is rejected (Group C)",
+                any("must always appear together" in e for e in _errs),
+                detail=f"errors={_errs}",
+            )
+
+            _count_one_empty = dict(reorder_manifest)
+            _count_one_empty["case_results"] = {}
+            _count_one_empty["profile_count_completed"] = 1
+            _errs = validate_manifest_state_shape(_count_one_empty, reorder_manifest["campaign_id"])
+            rec.check(
+                "profile_count_completed=1 with empty case_results is rejected (Group C)",
+                any("!= len(case_results)" in e for e in _errs),
+                detail=f"errors={_errs}",
+            )
+
+            _count_zero_one_case = dict(reorder_manifest)
+            _count_zero_one_case["case_results"] = _some_case_results
+            _count_zero_one_case["profile_count_completed"] = 0
+            _errs = validate_manifest_state_shape(_count_zero_one_case, reorder_manifest["campaign_id"])
+            rec.check(
+                "profile_count_completed=0 with one case_results entry is rejected (Group C)",
+                any("!= len(case_results)" in e for e in _errs),
+                detail=f"errors={_errs}",
+            )
+
+            # count=true/-1/7: end-to-end through load_p14_manifest_chain, on
+            # a fresh six-case-validated campaign each, since these are base
+            # schema/type/range violations (bool is never accepted in place
+            # of a canonical int; the range is [0, 6]), not shape-in-
+            # isolation violations.
+            def _check_count_rejected(label: str, campaign_id: str, bad_count) -> None:
+                p14_ct, _ = _run_profile_pipeline(tmp_path, campaign_id)
+                ct_rev = load_p14_manifest_chain(p14_ct)[1]
+                _rewrite_revision_in_place(
+                    p14_ct, ct_rev, lambda d: d.__setitem__("profile_count_completed", bad_count),
+                )
+                raised_ct = False
+                try:
+                    load_p14_manifest_chain(p14_ct)
+                except p13.ManifestTransitionError:
+                    raised_ct = True
+                rec.check(f"profile_count_completed={bad_count!r} is rejected ({label}) (Group C)", raised_ct)
+
+            _check_count_rejected("count=true, a bool masquerading as int", _next_reaudit_ts(), True)
+            _check_count_rejected("count=-1", _next_reaudit_ts(), -1)
+            _check_count_rejected("count=7", _next_reaudit_ts(), 7)
+
+            # COMPLETE/ANALYZED both require exactly six cases in frozen
+            # order and count 6 -- COMPLETE via _validate_p14_manifest_document's
+            # own explicit check; ANALYZED (which can never legally *shrink*
+            # case_results below what COMPLETE already required six of, since
+            # case_results is append-only) verified end-to-end by shrinking
+            # the already-ANALYZED p14_det campaign's final revision in
+            # place and confirming the chain-level append-only invariant
+            # still catches it.
+            _complete_five_cases = copy.deepcopy(base_manifest_d)
+            _removed_case_name = next(iter(_complete_five_cases["case_results"]))
+            _complete_five_cases["case_results"].pop(_removed_case_name)
+            _complete_five_cases["profile_count_completed"] = 5
+            _raised = False
+            try:
+                _validate_p14_manifest_document(_complete_five_cases, require_initialized=True)
+            except p13.ManifestTransitionError:
+                _raised = True
+            rec.check("COMPLETE with only five (of six) cases is rejected (Group C)", _raised)
+
+            p14_analyzed_shrink, _ = _run_profile_pipeline(tmp_path, _next_reaudit_ts())
+            ok, errors = _do_finalize_profile(
+                campaign_dir=p14_analyzed_shrink, completed_at_utc=_next_reaudit_ts(),
+            )
+            assert ok, errors
+            ok, errors = _do_analyze(campaign_dir=p14_analyzed_shrink, analyzed_at_utc=_next_reaudit_ts())
+            assert ok, errors
+            _shrink_manifest, _shrink_rev = load_p14_manifest_chain(p14_analyzed_shrink)
+
+            def _shrink_case_results(d: dict) -> None:
+                removed_name = next(iter(d["case_results"]))
+                d["case_results"].pop(removed_name)
+                d["profile_count_completed"] = len(d["case_results"])
+
+            _rewrite_revision_in_place(p14_analyzed_shrink, _shrink_rev, _shrink_case_results)
+            _raised, _errmsg = False, ""
+            try:
+                load_p14_manifest_chain(p14_analyzed_shrink)
+            except p13.ManifestTransitionError as _exc:
+                _raised, _errmsg = True, str(_exc)
+            rec.check(
+                "ANALYZED with fewer than six cases (case_results shrunk on the final revision) "
+                "is rejected end-to-end (Group C)",
+                _raised,
+                detail=f"raised={_raised} errmsg={_errmsg}",
+            )
+
+            # --- Group D: the second, pre-ANALYZED evidence-integrity gate
+            # must catch evidence mutated *between* the first gate and
+            # analysis publication -- not merely evidence already tampered
+            # before analyze() starts (already covered by the Remediation B
+            # _check_tamper_rejected table above). Uses the test-only
+            # _test_hook_before_final_gate, fired after the analysis
+            # artifacts are published and hashed but immediately before the
+            # second integrity gate -- never exposed as a production CLI
+            # option. ---------------------------------------------------
+            p14_gate2, _ = _run_profile_pipeline(tmp_path, _next_reaudit_ts())
+            ok, errors = _do_finalize_profile(campaign_dir=p14_gate2, completed_at_utc=_next_reaudit_ts())
+            assert ok, errors
+            gate2_manifest, _ = load_p14_manifest_chain(p14_gate2)
+            gate2_p13_dir = REPO_ROOT / gate2_manifest["pilot_campaign_reference"]["path"]
+            gate2_combined_path = gate2_p13_dir / "combined_samples.csv"
+            gate2_original_combined = gate2_combined_path.read_bytes()
+            gate2_hook_called = {"n": 0}
+
+            def _tamper_between_gates() -> None:
+                gate2_hook_called["n"] += 1
+                gate2_combined_path.write_bytes(gate2_original_combined + b"\ntampered_between_gates\n")
+
+            ok, errors = _do_analyze(
+                campaign_dir=p14_gate2, analyzed_at_utc=_next_reaudit_ts(),
+                _test_hook_before_final_gate=_tamper_between_gates,
+            )
+            gate2_analysis_dir = p14_gate2 / "analysis"
+            gate2_published = (
+                [p for p in gate2_analysis_dir.rglob("*") if p.is_file()] if gate2_analysis_dir.exists() else []
+            )
+            gate2_state_after = load_p14_manifest_chain(p14_gate2)[0].get("state")
+            rec.check(
+                "the second (pre-ANALYZED) integrity gate rejects evidence mutated after the "
+                "first gate passed but before ANALYZED is published, detected via a deterministic "
+                "test-only hook fired between analysis publication and the final gate; no "
+                "analysis artifact survives and the campaign remains COMPLETE, not ANALYZED "
+                "(Group D)",
+                gate2_hook_called["n"] == 1 and not ok and not gate2_published
+                and gate2_state_after == "COMPLETE",
+                detail=f"ok={ok} errors={errors} published={gate2_published} state={gate2_state_after}",
+            )
+            gate2_combined_path.write_bytes(gate2_original_combined)
 
     if rec.failures:
         print(

@@ -7,6 +7,17 @@ P1.3 joint smoke campaign `20260728T103315Z` also completed both full-binary
 self-tests and all 18 planned invocations on GB300. None of those smoke
 bandwidth values are experimental results.
 
+## Trust model
+
+The campaign filesystem under `results/raw/` is trusted and single-writer.
+P1.4's manifest chain, no-clobber publication, and evidence-integrity gates
+(see `src/memory/P1_4_PROTOCOL.md`) protect against accidental corruption,
+malformed or stale evidence, interrupted execution, pre-existing unsafe
+paths, accidental overwrites, and ordinary recovery failures. They do not
+claim to defend against a malicious concurrent process running with the
+same filesystem permissions, or against deliberate path or inode
+replacement after validation within one operation.
+
 ## Recorded P1.3 functional verification
 
 ```text
@@ -25,10 +36,11 @@ ignored by Git. This record closes P1.3's functional GB300 verification only;
 it must not be cited as a performance measurement or used to compare LDGSTS
 against TMA. P1.4 owns the pilot benchmark campaign, Nsight Compute/HBM
 validation, figures, and interpretation; it is implemented — and the
-fourteen blockers found by three independent GPU-free audits of that
+twenty blockers found by four independent GPU-free audits of that
 implementation have all been remediated GPU-free (see
-`src/memory/P1_4_PROTOCOL.md`) — but its pilot has not been executed, so no
-P1.4 raw campaign exists yet either.
+`src/memory/P1_4_PROTOCOL.md`) — but a further independent re-audit is
+pending, its pilot has not been executed, and no P1.4 raw campaign exists
+yet either.
 
 ### `results/raw/exp01_memory_paths_p14/<campaign_id>/` (raw, not committed)
 

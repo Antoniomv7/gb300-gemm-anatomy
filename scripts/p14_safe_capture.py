@@ -314,6 +314,50 @@ def discard_if_empty_owned(dir_fd: int, partial_name: str, partial_stat: os.stat
     return True
 
 
+def unlink_if_same_owned_inode(dir_fd: int, name: str, expected_stat: os.stat_result) -> bool:
+    """Re-audit remediation (Group E): the one small helper every "this
+    module may later need to remove a file it published or created earlier
+    in the same operation" cleanup path is built on -- publish_ncu_bundle()'s
+    rollback-on-partial-publication loop and its final bundle unlink below.
+    `expected_stat` is the identity (st_dev, st_ino) and type the caller
+    captured (via os.fstat() on an already-open fd, or an earlier
+    os.stat(..., dir_fd=..., follow_symlinks=False)) at the moment it first
+    created or trusted `name`, strictly within the same dir_fd.
+
+    Unlinks `name`, strictly within dir_fd and without ever following a
+    symlink, only if a fresh, non-following stat still shows the exact same
+    (device, inode) and regular-file type as expected_stat -- i.e. only if
+    the name still refers to the very entry this call site itself is
+    responsible for. A missing name is treated as already absent (returns
+    False, not an error: cleanup is idempotent). A name that currently
+    identifies a different inode, or is no longer a regular file, is left
+    completely untouched and reported via a raised UnsafeCaptureError --
+    this is the ordinary single-writer case of "something else already
+    replaced this entry since we last trusted it," not a hostile-race
+    scenario, and the correct response is to leave the replacement alone
+    and say so, never to delete whatever now occupies the name."""
+    try:
+        current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(expected_stat.st_mode):
+        raise UnsafeCaptureError(f"{name}: expected_stat is not a regular file; refusing to unlink anything")
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
+        raise UnsafeCaptureError(
+            f"{name}: no longer a regular file (now mode {oct(current.st_mode)}); the entry at "
+            f"this name was replaced since it was last trusted -- leaving it untouched"
+        )
+    if (current.st_dev, current.st_ino) != (expected_stat.st_dev, expected_stat.st_ino):
+        raise UnsafeCaptureError(
+            f"{name}: identity changed since it was last trusted (expected inode "
+            f"{expected_stat.st_dev}:{expected_stat.st_ino}, found "
+            f"{current.st_dev}:{current.st_ino}); a different file now occupies this name -- "
+            f"leaving it untouched"
+        )
+    os.unlink(name, dir_fd=dir_fd)
+    return True
+
+
 def verify_regular_file_in_dir(dir_fd: int, name: str) -> str | None:
     """Returns an error string, or None if name exists strictly within
     dir_fd as a non-symlink, non-empty regular file. Never follows a
@@ -435,6 +479,14 @@ def publish_ncu_bundle(
             raise UnsafeCaptureError(f"{bundle_name}: {verify_err}")
         bundle_fd = os.open(bundle_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
         try:
+            # Captured once, from the already-open fd, at the moment this
+            # call first trusted bundle_name -- the identity
+            # unlink_if_same_owned_inode() below re-checks immediately
+            # before the final unlink (re-audit remediation, Group E), so a
+            # name that no longer identifies this exact inode is left
+            # untouched rather than unlinked merely because *some* regular
+            # file currently sits at that name.
+            bundle_identity = os.fstat(bundle_fd)
             chunks = []
             while True:
                 chunk = os.read(bundle_fd, 1 << 20)
@@ -450,7 +502,14 @@ def publish_ncu_bundle(
         except NcuBundleParseError as exc:
             raise UnsafeCaptureError(f"{bundle_name}: {exc}") from exc
 
-        published: list[str] = []
+        # published maps each already-published output name to the identity
+        # (captured via os.fstat() on its own partial fd, before the
+        # hard-link-then-unlink publish -- linkat() never changes the
+        # underlying inode, so the partial's identity *is* the published
+        # name's identity) it had at the moment this call published it.
+        # Re-audit remediation, Group E: a rollback below unlinks a name
+        # only while it still has this exact recorded identity.
+        published: dict[str, os.stat_result] = {}
         try:
             for segment_name, output_name in zip(NCU_BUNDLE_SEGMENT_NAMES, output_names):
                 partial_fd, partial = create_partial(dir_fd, output_name)
@@ -470,18 +529,16 @@ def publish_ncu_bundle(
                         pass
                     raise UnsafeCaptureError(f"{output_name}: failed to write bundle segment {segment_name!r}")
                 publish_no_clobber(dir_fd, partial, output_name)
-                published.append(output_name)
+                published[output_name] = partial_stat
         except Exception:
-            for name in published:
+            for name, identity in published.items():
                 try:
-                    st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-                    if stat.S_ISREG(st.st_mode):
-                        os.unlink(name, dir_fd=dir_fd)
-                except OSError:
+                    unlink_if_same_owned_inode(dir_fd, name, identity)
+                except UnsafeCaptureError:
                     pass
             raise
 
-        os.unlink(bundle_name, dir_fd=dir_fd)
+        unlink_if_same_owned_inode(dir_fd, bundle_name, bundle_identity)
     finally:
         os.close(dir_fd)
 
@@ -1467,6 +1524,246 @@ def run_self_test() -> int:
             except UnsafeCaptureError:
                 raised = True
             rec.check("publish-bundle rejects a traversal entry inside --names", raised)
+
+            # -----------------------------------------------------------
+            # Re-audit remediation (Group E): unlink_if_same_owned_inode,
+            # the ownership-safe cleanup primitive publish_ncu_bundle() now
+            # uses for both its partial-publication rollback loop and its
+            # final bundle unlink, in place of an unconditional
+            # "stat + unlink if regular file" that would remove whatever
+            # currently occupies a name regardless of whether it is the
+            # same file this call itself published or trusted earlier.
+            # -----------------------------------------------------------
+            owned_dir = tmp_path / "owned_inode_tests"
+            owned_dir.mkdir()
+            owned_fd = os.open(owned_dir, os.O_DIRECTORY)
+            try:
+                (owned_dir / "owned.bin").write_bytes(b"owned content\n")
+                owned_identity = os.stat("owned.bin", dir_fd=owned_fd, follow_symlinks=False)
+                removed = unlink_if_same_owned_inode(owned_fd, "owned.bin", owned_identity)
+                rec.check(
+                    "unlink_if_same_owned_inode removes an owned file with unchanged inode (Group E)",
+                    removed is True and not (owned_dir / "owned.bin").exists(),
+                )
+
+                removed_again = unlink_if_same_owned_inode(owned_fd, "owned.bin", owned_identity)
+                rec.check(
+                    "unlink_if_same_owned_inode treats an already-absent owned name as harmless, "
+                    "returning False rather than raising (Group E)",
+                    removed_again is False,
+                )
+
+                (owned_dir / "replaced_by_file.bin").write_bytes(b"original\n")
+                replaced_identity = os.stat("replaced_by_file.bin", dir_fd=owned_fd, follow_symlinks=False)
+                # os.replace() (not unlink()-then-recreate) so the
+                # replacement is guaranteed a genuinely different inode:
+                # tmpfs (a common /tmp backing) can immediately reuse an
+                # inode number freed by unlink() within the same directory,
+                # which would make this scenario indistinguishable from
+                # "unchanged" by (st_dev, st_ino) alone. Writing the
+                # replacement under its own name first, then atomically
+                # renaming it over the original, guarantees two distinct
+                # inodes existed simultaneously before the swap.
+                (owned_dir / "replaced_by_file_new.bin").write_bytes(b"a completely different file now\n")
+                os.replace(owned_dir / "replaced_by_file_new.bin", owned_dir / "replaced_by_file.bin")
+                raised = False
+                try:
+                    unlink_if_same_owned_inode(owned_fd, "replaced_by_file.bin", replaced_identity)
+                except UnsafeCaptureError:
+                    raised = True
+                rec.check(
+                    "unlink_if_same_owned_inode refuses to unlink a name replaced by another "
+                    "regular file; the replacement survives untouched (Group E)",
+                    raised
+                    and (owned_dir / "replaced_by_file.bin").read_bytes() == b"a completely different file now\n",
+                )
+
+                (owned_dir / "replaced_by_symlink.bin").write_bytes(b"original\n")
+                symlinked_identity = os.stat("replaced_by_symlink.bin", dir_fd=owned_fd, follow_symlinks=False)
+                (owned_dir / "replaced_by_symlink.bin").unlink()
+                symlink_target = tmp_path / "symlink_target_outside.bin"
+                symlink_target.write_bytes(b"outside content\n")
+                (owned_dir / "replaced_by_symlink.bin").symlink_to(symlink_target)
+                raised = False
+                try:
+                    unlink_if_same_owned_inode(owned_fd, "replaced_by_symlink.bin", symlinked_identity)
+                except UnsafeCaptureError:
+                    raised = True
+                rec.check(
+                    "unlink_if_same_owned_inode refuses to unlink a name replaced by a symlink; "
+                    "the symlink and its target survive untouched (Group E)",
+                    raised and (owned_dir / "replaced_by_symlink.bin").is_symlink()
+                    and symlink_target.read_bytes() == b"outside content\n",
+                )
+
+                (owned_dir / "replaced_by_dangling.bin").write_bytes(b"original\n")
+                dangling_identity = os.stat("replaced_by_dangling.bin", dir_fd=owned_fd, follow_symlinks=False)
+                (owned_dir / "replaced_by_dangling.bin").unlink()
+                (owned_dir / "replaced_by_dangling.bin").symlink_to(tmp_path / "does_not_exist_at_all.bin")
+                raised = False
+                try:
+                    unlink_if_same_owned_inode(owned_fd, "replaced_by_dangling.bin", dangling_identity)
+                except UnsafeCaptureError:
+                    raised = True
+                rec.check(
+                    "unlink_if_same_owned_inode refuses to unlink a name replaced by a dangling "
+                    "symlink, which survives untouched (Group E)",
+                    raised and (owned_dir / "replaced_by_dangling.bin").is_symlink(),
+                )
+            finally:
+                os.close(owned_fd)
+
+            # --- publish_ncu_bundle rollback: an already-published segment
+            # replaced by another regular file during the rollback window
+            # itself must be preserved, not deleted (Group E). Mirrors the
+            # existing "_flaky_create_partial" injection pattern above
+            # (used for run_capturing_outputs) applied to
+            # publish_ncu_bundle's own segment-publish loop. ---
+            rollback_case_name = p14.build_ncu_plan()[2]["case_name"]
+            rollback_case_dir = tmp_path / campaign_rel / "profiles" / rollback_case_name
+            rollback_case_rel = f"profiles/{rollback_case_name}"
+            fd = resolve_profiles_root_fd(campaign_rel)
+            try:
+                mkdir_case_dir(fd, rollback_case_name)
+            finally:
+                os.close(fd)
+            rollback_bundle_script = tmp_path / "fake_bundle_emitter_rollback.py"
+            rollback_bundle_script.write_text(
+                "import sys\nsys.stdout.buffer.write(" + repr(encoded) + ")\n", encoding="utf-8",
+            )
+            run_capturing_outputs(
+                campaign_dir_rel=campaign_rel, rel_dir=rollback_case_rel, stdout_name="raw_bundle_rb.bin",
+                stderr_name=None, combine_stderr=False, argv=[sys.executable, str(rollback_bundle_script)],
+            )
+            rollback_output_names = [
+                f"{rollback_case_name}.container_stdout.log", f"{rollback_case_name}.container_stderr.log",
+                f"{rollback_case_name}.ncu_tool.log", f"{rollback_case_name}_report.ncu-rep",
+                f"{rollback_case_name}.metrics_raw.csv", f"{rollback_case_name}.metrics_export_stderr.log",
+            ]
+            first_rollback_output_name = rollback_output_names[0]
+            rollback_replacement_marker = b"REPLACED DURING ROLLBACK\n"
+            real_create_partial_for_rollback = create_partial
+            rollback_call_state = {"n": 0}
+
+            def _flaky_create_partial_for_rollback(dir_fd_arg: int, final_name_arg: str):
+                rollback_call_state["n"] += 1
+                if rollback_call_state["n"] == 2:
+                    # The first segment (first_rollback_output_name) already
+                    # published successfully via the real create_partial on
+                    # call 1; replace it with a different regular file
+                    # *before* this call fails, so the exception this raises
+                    # drives publish_ncu_bundle's own except-Exception
+                    # rollback loop into finding a name whose identity no
+                    # longer matches what it itself published moments ago.
+                    # os.replace(), not unlink()-then-recreate: guarantees a
+                    # genuinely different inode (see the identical comment
+                    # on the direct unlink_if_same_owned_inode test above).
+                    (rollback_case_dir / "replacement_new.bin").write_bytes(rollback_replacement_marker)
+                    os.replace(
+                        rollback_case_dir / "replacement_new.bin",
+                        rollback_case_dir / first_rollback_output_name,
+                    )
+                    raise UnsafeCaptureError("synthetic second-segment creation failure (self-test)")
+                return real_create_partial_for_rollback(dir_fd_arg, final_name_arg)
+
+            raised = False
+            with mock.patch.object(
+                sys.modules[__name__], "create_partial", side_effect=_flaky_create_partial_for_rollback,
+            ):
+                try:
+                    publish_ncu_bundle(
+                        campaign_dir_rel=campaign_rel, rel_dir=rollback_case_rel,
+                        bundle_name="raw_bundle_rb.bin", output_names=rollback_output_names,
+                    )
+                except UnsafeCaptureError:
+                    raised = True
+            rec.check(
+                "publish_ncu_bundle's rollback preserves an already-published segment that was "
+                "replaced by another regular file before rollback ran, rather than deleting the "
+                "replacement (Group E)",
+                raised
+                and (rollback_case_dir / first_rollback_output_name).read_bytes() == rollback_replacement_marker,
+                detail=(
+                    f"raised={raised} "
+                    f"content={(rollback_case_dir / first_rollback_output_name).read_bytes()!r}"
+                ),
+            )
+
+            # --- publish_ncu_bundle final cleanup: the bundle name itself
+            # replaced by another regular file between the initial
+            # verify/open and the final cleanup unlink must be preserved,
+            # even though all six segments were already published
+            # successfully (Group E). ---
+            bundle_replace_case_name = p14.build_ncu_plan()[3]["case_name"]
+            bundle_replace_case_dir = tmp_path / campaign_rel / "profiles" / bundle_replace_case_name
+            bundle_replace_case_rel = f"profiles/{bundle_replace_case_name}"
+            fd = resolve_profiles_root_fd(campaign_rel)
+            try:
+                mkdir_case_dir(fd, bundle_replace_case_name)
+            finally:
+                os.close(fd)
+            bundle_replace_script = tmp_path / "fake_bundle_emitter_replace.py"
+            bundle_replace_script.write_text(
+                "import sys\nsys.stdout.buffer.write(" + repr(encoded) + ")\n", encoding="utf-8",
+            )
+            run_capturing_outputs(
+                campaign_dir_rel=campaign_rel, rel_dir=bundle_replace_case_rel,
+                stdout_name="raw_bundle_replace.bin", stderr_name=None, combine_stderr=False,
+                argv=[sys.executable, str(bundle_replace_script)],
+            )
+            bundle_replace_output_names = [
+                f"{bundle_replace_case_name}.container_stdout.log",
+                f"{bundle_replace_case_name}.container_stderr.log",
+                f"{bundle_replace_case_name}.ncu_tool.log", f"{bundle_replace_case_name}_report.ncu-rep",
+                f"{bundle_replace_case_name}.metrics_raw.csv",
+                f"{bundle_replace_case_name}.metrics_export_stderr.log",
+            ]
+            bundle_replacement_marker = b"BUNDLE REPLACED BEFORE FINAL CLEANUP\n"
+            real_decode_ncu_bundle_for_replace = decode_ncu_bundle
+
+            def _decode_then_replace_bundle(raw_bytes: bytes) -> dict[str, bytes]:
+                # Decodes the real bundle first (so the six segments below
+                # still publish correctly), then simulates something else
+                # replacing the bundle *name* with an unrelated regular file
+                # in the window between this module's own read of the
+                # bundle and its final ownership-checked cleanup unlink.
+                result = real_decode_ncu_bundle_for_replace(raw_bytes)
+                # os.replace(), not unlink()-then-recreate: guarantees a
+                # genuinely different inode (see the identical comment on
+                # the direct unlink_if_same_owned_inode test above).
+                (bundle_replace_case_dir / "raw_bundle_replace_new.bin").write_bytes(bundle_replacement_marker)
+                os.replace(
+                    bundle_replace_case_dir / "raw_bundle_replace_new.bin",
+                    bundle_replace_case_dir / "raw_bundle_replace.bin",
+                )
+                return result
+
+            raised = False
+            with mock.patch.object(
+                sys.modules[__name__], "decode_ncu_bundle", side_effect=_decode_then_replace_bundle,
+            ):
+                try:
+                    publish_ncu_bundle(
+                        campaign_dir_rel=campaign_rel, rel_dir=bundle_replace_case_rel,
+                        bundle_name="raw_bundle_replace.bin", output_names=bundle_replace_output_names,
+                    )
+                except UnsafeCaptureError:
+                    raised = True
+            all_six_published = all(
+                (bundle_replace_case_dir / name).exists() for name in bundle_replace_output_names
+            )
+            rec.check(
+                "publish_ncu_bundle preserves a bundle name replaced by another regular file "
+                "before the final cleanup unlink, even though all six segments were already "
+                "successfully published (Group E)",
+                raised and all_six_published
+                and (bundle_replace_case_dir / "raw_bundle_replace.bin").read_bytes()
+                == bundle_replacement_marker,
+                detail=(
+                    f"raised={raised} all_six_published={all_six_published} "
+                    f"content={(bundle_replace_case_dir / 'raw_bundle_replace.bin').read_bytes()!r}"
+                ),
+            )
 
     if rec.failures:
         print(

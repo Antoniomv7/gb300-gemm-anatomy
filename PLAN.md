@@ -128,7 +128,9 @@ verification.
 
 ## Phase 2 — BF16 UMMA throughput (27 July–2 August 2026)
 
-Gate: Phase 1 gate passed.
+Entry condition for Phase 2: the Phase 1 gate must pass. Current status:
+Phase 1 remains open pending independent P1.4 re-audit and GB300
+verification.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
