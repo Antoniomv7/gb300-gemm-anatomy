@@ -1906,30 +1906,30 @@ def classify_hbm(dram_read_bytes: float | None, useful_bytes: float) -> tuple[st
 # ---------------------------------------------------------------------------
 # NCU raw-CSV metrics parsing.
 #
-# ASSUMPTION (documented, not directly testable without a live GPU — see
-# src/memory/P1_4_PROTOCOL.md and the remediation handoff): NCU 2025.4.0.0's
-# `--page raw --csv --print-metric-name name --print-units base
-# --print-kernel-base function` export is a long-form table with one row per
-# (kernel launch, metric), including literal columns "ID", "Kernel Name",
-# "Metric Name", "Metric Unit", and "Metric Value" (well-established, stable
-# NCU CSV conventions; --print-kernel-base's allowed values mirror
-# --kernel-name-base, confirmed against the pinned image's real `ncu --help`).
-# The parser below is fail-closed: it requires these five columns to be
-# present, unique, and non-empty per row; a single distinct launch ID; a
-# single distinct kernel name; exactly one row per metric name (never two,
-# even with equal values); finite, non-negative metric values; and an exact
-# (case/whitespace-normalized, never scaled) unit match against
-# EXPECTED_METRIC_UNITS for each of the five candidate metrics. It never
-# invents a default, never falls back to a structural heuristic, and never
-# accepts substring/partial evidence. The very first real profiling run
-# should sanity-check metrics_raw.csv against this parser before trusting
-# its HBM_VALIDATED/INCONCLUSIVE output.
+# NCU 2025.4's `--page raw --csv --print-units base
+# --print-kernel-base function` output is a *wide* table. The first row
+# contains launch metadata columns (including literal "ID" and "Kernel
+# Name") followed by one column per collected metric; the second row
+# contains the unit for each metric column; every later row is one profiled
+# launch. This is distinct from the Details-page long form whose rows carry
+# "Metric Name", "Metric Unit", and "Metric Value" fields.
+#
+# The parser below is fail-closed: it requires unique columns, the two
+# launch-identity columns, one unit row, exactly one launch row, non-empty
+# launch/kernel identities, and one unambiguous column for every candidate
+# metric present. Candidate values must be finite and non-negative and
+# candidate units must match EXPECTED_METRIC_UNITS exactly after only
+# case/whitespace normalization. Canonical and namespace-qualified GB300
+# metric spellings are associated only through
+# canonical_candidate_metric_name(); two columns mapping to the same
+# canonical candidate are rejected as ambiguous. No unit scaling,
+# aggregation, substring match, or structural fallback is permitted.
 # ---------------------------------------------------------------------------
 class NcuCsvParseError(ValueError):
     pass
 
 
-REQUIRED_NCU_CSV_COLUMNS = ("ID", "Kernel Name", "Metric Name", "Metric Unit", "Metric Value")
+REQUIRED_NCU_CSV_COLUMNS = ("ID", "Kernel Name")
 
 # Documented, NCU-2025.4-specific assumption for the one percentage-valued
 # candidate metric: base-unit CSV export reports it as "%". This has not
@@ -1952,16 +1952,17 @@ def _parse_ncu_raw_csv_rows(rows_raw: list[list[str]], *, label: str) -> dict:
     caller read from a path, or a descriptor-anchored "profiles/<case>/..."
     description when the caller read from an already-open fd -- see
     parse_ncu_raw_csv() and _reconstruct_case_result_from_fds()). Returns a
-    dict with keys 'metrics' (metric name -> float value), 'units' (metric
-    name -> the exact unit string recorded for it), 'kernel_name' (the
-    single distinct kernel name found), and 'launch_id' (the single
-    distinct launch ID found). Raises NcuCsvParseError on any defect -- see
-    the module docstring above for the complete list of rejected
-    conditions."""
+    dict with keys 'metrics' (actual metric-column name -> float value),
+    'units' (actual metric-column name -> the exact unit string recorded for
+    it), 'candidate_metric_names' (canonical candidate -> actual column
+    name), 'kernel_name', and 'launch_id'. Raises NcuCsvParseError on any
+    defect -- see the module comment above for the complete contract."""
     if not rows_raw:
         raise NcuCsvParseError(f"{label}: empty file (no header)")
 
     header = rows_raw[0]
+    if not header:
+        raise NcuCsvParseError(f"{label}: empty header row")
     if len(header) != len(set(header)):
         duplicates = sorted({h for h in header if header.count(h) > 1})
         raise NcuCsvParseError(f"{label}: duplicate header column name(s): {duplicates}")
@@ -1972,87 +1973,97 @@ def _parse_ncu_raw_csv_rows(rows_raw: list[list[str]], *, label: str) -> dict:
         )
     col_index = {name: header.index(name) for name in REQUIRED_NCU_CSV_COLUMNS}
 
-    data_rows = rows_raw[1:]
-    if not data_rows:
-        raise NcuCsvParseError(f"{label}: no data rows")
+    if len(rows_raw) < 2:
+        raise NcuCsvParseError(f"{label}: missing metric-unit row")
+    unit_row = rows_raw[1]
+    if len(unit_row) != len(header):
+        raise NcuCsvParseError(
+            f"{label}: line 2 (metric units): expected {len(header)} field(s), "
+            f"got {len(unit_row)}"
+        )
 
-    launch_ids: set[str] = set()
-    kernel_names: set[str] = set()
+    data_rows = rows_raw[2:]
+    if len(data_rows) != 1:
+        raise NcuCsvParseError(
+            f"{label}: found {len(data_rows)} profiled launch row(s), expected exactly 1 "
+            f"(--launch-count 1 should guarantee this)"
+        )
+    data_row = data_rows[0]
+    if len(data_row) != len(header):
+        raise NcuCsvParseError(
+            f"{label}: line 3 (profiled launch): expected {len(header)} field(s), "
+            f"got {len(data_row)}"
+        )
+
+    launch_id = data_row[col_index["ID"]].strip()
+    kernel_name = data_row[col_index["Kernel Name"]].strip()
+    if not launch_id:
+        raise NcuCsvParseError(f"{label}: line 3: empty launch ID")
+    if not kernel_name:
+        raise NcuCsvParseError(f"{label}: line 3: empty kernel name")
+
     metrics: dict[str, float] = {}
     units: dict[str, str] = {}
-    for line_no, row in enumerate(data_rows, start=2):
-        if len(row) != len(header):
+    candidate_metric_names: dict[str, str] = {}
+    for column_index, metric_name_raw in enumerate(header):
+        metric_name = metric_name_raw.strip()
+        canonical_metric_name = canonical_candidate_metric_name(metric_name)
+        if canonical_metric_name is None:
+            continue
+        if canonical_metric_name in candidate_metric_names:
+            previous = candidate_metric_names[canonical_metric_name]
             raise NcuCsvParseError(
-                f"{label}: line {line_no}: expected {len(header)} field(s), got {len(row)}"
+                f"{label}: candidate metric {canonical_metric_name!r} is represented by "
+                f"more than one column ({previous!r}, {metric_name!r}); refusing an "
+                f"ambiguous canonical/qualified mapping"
             )
-        launch_id = row[col_index["ID"]].strip()
-        kernel_name = row[col_index["Kernel Name"]].strip()
-        metric_name = row[col_index["Metric Name"]].strip()
-        metric_unit = row[col_index["Metric Unit"]].strip()
-        raw_value = row[col_index["Metric Value"]].strip()
 
-        if not launch_id:
-            raise NcuCsvParseError(f"{label}: line {line_no}: empty launch ID")
-        if not kernel_name:
-            raise NcuCsvParseError(f"{label}: line {line_no}: empty kernel name")
-        if not metric_name:
-            raise NcuCsvParseError(f"{label}: line {line_no}: empty metric name")
+        metric_unit = unit_row[column_index].strip()
+        raw_value = data_row[column_index].strip()
         if not metric_unit:
-            raise NcuCsvParseError(f"{label}: line {line_no}: empty metric unit for {metric_name!r}")
+            raise NcuCsvParseError(
+                f"{label}: line 2: empty metric unit for candidate column {metric_name!r}"
+            )
         if not raw_value:
-            raise NcuCsvParseError(f"{label}: line {line_no}: empty metric value for {metric_name!r}")
+            raise NcuCsvParseError(
+                f"{label}: line 3: empty metric value for candidate column {metric_name!r}"
+            )
 
         try:
             value = float(raw_value)
         except ValueError as exc:
             raise NcuCsvParseError(
-                f"{label}: line {line_no}: metric {metric_name!r} value {raw_value!r} is not a number"
+                f"{label}: line 3: metric {metric_name!r} value {raw_value!r} is not a number"
             ) from exc
         if not math.isfinite(value):
             raise NcuCsvParseError(
-                f"{label}: line {line_no}: metric {metric_name!r} value {raw_value!r} is not finite"
+                f"{label}: line 3: metric {metric_name!r} value {raw_value!r} is not finite"
             )
         if value < 0:
             raise NcuCsvParseError(
-                f"{label}: line {line_no}: metric {metric_name!r} value {value!r} is negative"
+                f"{label}: line 3: metric {metric_name!r} value {value!r} is negative"
             )
 
-        canonical_metric_name = canonical_candidate_metric_name(metric_name)
         expected_unit = EXPECTED_METRIC_UNITS.get(canonical_metric_name)
-        if expected_unit is not None and metric_unit.strip().lower() != expected_unit.strip().lower():
+        assert expected_unit is not None
+        if metric_unit.strip().lower() != expected_unit.strip().lower():
             raise NcuCsvParseError(
-                f"{label}: line {line_no}: metric {metric_name!r} has unit {metric_unit!r}, "
+                f"{label}: line 2: metric {metric_name!r} has unit {metric_unit!r}, "
                 f"expected exactly {expected_unit!r} (base units are matched case/whitespace-"
                 f"insensitively but never scaled or converted)"
             )
 
-        launch_ids.add(launch_id)
-        kernel_names.add(kernel_name)
-        if metric_name in metrics:
-            raise NcuCsvParseError(
-                f"{label}: metric {metric_name!r} appears more than once "
-                f"(duplicate rows for a resolved metric are rejected even when values agree)"
-            )
         metrics[metric_name] = value
         units[metric_name] = metric_unit
-
-    if len(launch_ids) > 1:
-        raise NcuCsvParseError(
-            f"{label}: {len(launch_ids)} distinct launch IDs found ({sorted(launch_ids)!r}), "
-            f"expected exactly 1 (--launch-count 1 should guarantee this)"
-        )
-    if len(kernel_names) > 1:
-        raise NcuCsvParseError(
-            f"{label}: {len(kernel_names)} distinct kernel names found ({sorted(kernel_names)!r}), "
-            f"expected exactly 1"
-        )
+        candidate_metric_names[canonical_metric_name] = metric_name
 
     return {
         "metrics": metrics,
         "units": units,
-        "kernel_name": next(iter(kernel_names)),
-        "launch_id": next(iter(launch_ids)),
-        "launch_count": len(launch_ids),
+        "candidate_metric_names": candidate_metric_names,
+        "kernel_name": kernel_name,
+        "launch_id": launch_id,
+        "launch_count": 1,
     }
 
 
@@ -3179,6 +3190,7 @@ def _reconstruct_case_result_core(
         errors.append(str(exc))
 
     resolved_names = resolved_ncu_metrics.get("resolved", [])
+    resolved_to_actual: dict[str, str] = {}
     if parsed_metrics is not None:
         # Exact function-name match only -- never substring/regex matching.
         # The only accepted values are the two frozen benchmark kernel names.
@@ -3187,23 +3199,36 @@ def _reconstruct_case_result_core(
                 f"metrics CSV kernel name {parsed_metrics['kernel_name']!r} != expected exact "
                 f"function name {entry['kernel_name']!r} (no substring/regex matching is permitted)"
             )
-        # A metric recorded as *resolved* during discovery but absent, duplicated,
-        # malformed, or wrong-unit in this case's own CSV is an integrity failure --
+        # Discovery and raw-page export may spell the same GB300 counter as
+        # either its canonical identifier or a namespace-qualified identifier.
+        # Associate them only through the exact suffix mapping shared with
+        # discovery; the parser has already rejected two raw columns mapping
+        # to the same candidate. A resolved semantic metric that is absent,
+        # duplicated, malformed, or wrong-unit remains an integrity failure --
         # never silently reclassified as INCONCLUSIVE.
         for resolved_metric in resolved_names:
-            if resolved_metric not in parsed_metrics["metrics"]:
+            canonical_name = canonical_candidate_metric_name(resolved_metric)
+            actual_name = (
+                parsed_metrics["candidate_metric_names"].get(canonical_name)
+                if canonical_name is not None
+                else None
+            )
+            if actual_name is None:
                 errors.append(
                     f"metrics CSV is missing resolved metric {resolved_metric!r} "
                     f"(recorded as resolved during metric discovery; this is an evidence "
                     f"integrity failure, not an INCONCLUSIVE HBM classification)"
                 )
+            else:
+                resolved_to_actual[resolved_metric] = actual_name
 
     if errors:
         return None, errors
 
     dram_available = bool(resolved_ncu_metrics.get("dram_read_metric_available"))
     dram_metric_name = resolved_ncu_metrics.get("dram_read_metric")
-    dram_read_bytes = parsed_metrics["metrics"].get(dram_metric_name) if dram_available else None
+    dram_actual_name = resolved_to_actual.get(dram_metric_name) if dram_available else None
+    dram_read_bytes = parsed_metrics["metrics"].get(dram_actual_name) if dram_actual_name else None
     useful_bytes = float(app_row["useful_bytes"])
     classification, flags, ratio = classify_hbm(dram_read_bytes, useful_bytes)
 
@@ -3219,8 +3244,14 @@ def _reconstruct_case_result_core(
         "dram_read_ratio": ratio,
         "hbm_classification": classification,
         "diagnostic_flags": list(flags),
-        "resolved_metric_values": {m: parsed_metrics["metrics"].get(m) for m in resolved_names},
-        "resolved_metric_units": {m: parsed_metrics["units"].get(m) for m in resolved_names},
+        "resolved_metric_values": {
+            m: parsed_metrics["metrics"].get(resolved_to_actual[m])
+            for m in resolved_names
+        },
+        "resolved_metric_units": {
+            m: parsed_metrics["units"].get(resolved_to_actual[m])
+            for m in resolved_names
+        },
         "application_csv_sha256": application_hash,
         "metrics_csv_sha256": metrics_hash,
         "ncu_rep_sha256": ncu_rep_hash,
@@ -4503,18 +4534,21 @@ def _build_p13_pilot_campaign_fixture(
 def _build_ncu_case_fixture(
     tmp_path: Path, entry: dict, *, git_commit: str = _FIXED_GIT_COMMIT,
     gpu_uuid: str = _FIXED_GPU_UUID, gpu_name: str = _FIXED_GPU_NAME,
-    dram_read_bytes: float | None = None, extra_metric_rows: list[list[str]] | None = None,
+    dram_read_bytes: float | None = None, extra_launch_rows: list[list[str]] | None = None,
     kernel_name_in_csv: str | None = None, extra_kernel_row: bool = False,
+    extra_same_id_kernel_row: bool = False,
     omit_metrics: tuple[str, ...] = (), unit_overrides: dict[str, str] | None = None,
-    value_overrides: dict[str, str] | None = None, header_override: list[str] | None = None,
-    duplicate_header: bool = False, resolved_metrics: tuple[str, ...] = CANDIDATE_METRICS,
+    value_overrides: dict[str, str] | None = None,
+    resolved_metrics: tuple[str, ...] = CANDIDATE_METRICS,
     case_dir: Path | None = None,
 ) -> tuple[Path, Path, Path, dict]:
     """Builds one application CSV + metrics_raw.csv + .ncu-rep for a given
-    NCU_PLAN entry. By default writes exactly one row per metric in
-    `resolved_metrics` (all five candidates, matching a campaign where every
-    candidate metric resolved) with correct exact base units, and the exact
-    un-templated kernel name --print-kernel-base function would produce.
+    NCU_PLAN entry. By default writes NCU's raw-page wide CSV shape: one
+    header row containing launch metadata and one column per metric in
+    `resolved_metrics`, one units row, and one launch row containing the
+    values. The default covers all five candidates with exact base units
+    and the exact un-templated kernel name --print-kernel-base function
+    would produce.
     `case_dir`, when given, is the directory the three artifacts are written
     into -- pass campaign_dir/"profiles"/case_name so the fixture matches the
     real layout _resolve_case_evidence_paths re-derives paths from (required
@@ -4545,45 +4579,60 @@ def _build_ncu_case_fixture(
     value_overrides = value_overrides or {}
     metrics_csv = out_dir / f"{entry['case_name']}.metrics_raw.csv"
     kernel_name_field = kernel_name_in_csv or entry["kernel_name"]
-    header = header_override if header_override is not None else [
-        "ID", "Kernel Name", "Metric Unit", "Metric Name", "Metric Value",
+    metadata_header = [
+        "ID", "Process ID", "Process Name", "Host Name", "Kernel Name",
+        "Kernel Time", "Context", "Stream",
     ]
+    metadata_units = [""] * len(metadata_header)
+    metadata_values = [
+        "0", "1234", "fixture", "fixture-host", kernel_name_field,
+        "2026-Jul-28 00:00:00", "1", "7",
+    ]
+    metric_names: list[str] = []
+    metric_units: list[str] = []
+    metric_values: list[str] = []
+    for metric_name in resolved_metrics:
+        canonical_metric_name = canonical_candidate_metric_name(metric_name)
+        if canonical_metric_name is None:
+            raise AssertionError(
+                f"self-test fixture received a non-candidate resolved metric: {metric_name!r}"
+            )
+        if metric_name in omit_metrics or canonical_metric_name in omit_metrics:
+            continue
+        metric_names.append(metric_name)
+        metric_units.append(unit_overrides.get(
+            metric_name,
+            unit_overrides.get(
+                canonical_metric_name,
+                EXPECTED_METRIC_UNITS[canonical_metric_name],
+            ),
+        ))
+        metric_values.append(value_overrides.get(
+            metric_name,
+            value_overrides.get(
+                canonical_metric_name,
+                default_values[canonical_metric_name],
+            ),
+        ))
+
+    header = metadata_header + metric_names
+    units = metadata_units + metric_units
+    launch_values = metadata_values + metric_values
     with open(metrics_csv, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        if duplicate_header:
-            writer.writerow(header + [header[0]])
-        else:
-            writer.writerow(header)
-        for metric_name in resolved_metrics:
-            canonical_metric_name = canonical_candidate_metric_name(metric_name)
-            if canonical_metric_name is None:
-                raise AssertionError(
-                    f"self-test fixture received a non-candidate resolved metric: {metric_name!r}"
-                )
-            if metric_name in omit_metrics or canonical_metric_name in omit_metrics:
-                continue
-            unit = unit_overrides.get(
-                metric_name,
-                unit_overrides.get(
-                    canonical_metric_name,
-                    EXPECTED_METRIC_UNITS[canonical_metric_name],
-                ),
-            )
-            value = value_overrides.get(
-                metric_name,
-                value_overrides.get(
-                    canonical_metric_name,
-                    default_values[canonical_metric_name],
-                ),
-            )
-            writer.writerow(["0", kernel_name_field, unit, metric_name, value])
+        writer.writerow(header)
+        writer.writerow(units)
+        writer.writerow(launch_values)
         if extra_kernel_row:
-            # A distinct kernel name/ID with its own, otherwise-unused metric
-            # name (never one of the five candidates), so this row triggers
-            # only the "more than one distinct kernel/launch" check -- never
-            # also the separate "duplicate metric name" check.
-            writer.writerow(["1", "some_other_kernel", "nsecond", "some_other_kernel__metric.sum", "1"])
-        for extra in extra_metric_rows or []:
+            second_launch = launch_values.copy()
+            second_launch[header.index("ID")] = "1"
+            second_launch[header.index("Kernel Name")] = "some_other_kernel"
+            writer.writerow(second_launch)
+        if extra_same_id_kernel_row:
+            second_kernel = launch_values.copy()
+            second_kernel[header.index("Kernel Name")] = "some_other_kernel"
+            writer.writerow(second_kernel)
+        for extra in extra_launch_rows or []:
             writer.writerow(extra)
     ncu_rep = out_dir / f"{entry['case_name']}_report.ncu-rep"
     ncu_rep.write_bytes(b"synthetic ncu report bytes, never a real profile\n")
@@ -4745,26 +4794,42 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
 
             # --- fail-closed NCU CSV parser (Remediation C / spec Section 7) -------
             plan0 = ncu_plan[0]
-            _NCU_HEADER = ["ID", "Kernel Name", "Metric Unit", "Metric Name", "Metric Value"]
+            _NCU_METADATA_HEADER = [
+                "ID", "Process ID", "Process Name", "Host Name", "Kernel Name",
+                "Kernel Time", "Context", "Stream",
+            ]
+            _NCU_METADATA_UNITS = [""] * len(_NCU_METADATA_HEADER)
+            _NCU_METADATA_VALUES = [
+                "0", "1234", "fixture", "fixture-host", plan0["kernel_name"],
+                "2026-Jul-28 00:00:00", "1", "7",
+            ]
 
-            def _write_ncu_csv(path: Path, header: list[str], rows: list[list[str]]) -> Path:
+            def _write_ncu_csv(
+                path: Path, header: list[str], units: list[str], rows: list[list[str]],
+            ) -> Path:
                 with open(path, "w", newline="", encoding="utf-8") as fh:
                     w = csv.writer(fh)
                     w.writerow(header)
+                    w.writerow(units)
                     for row in rows:
                         w.writerow(row)
                 return path
 
+            one_metric_header = _NCU_METADATA_HEADER + [MANDATORY_DRAM_METRIC]
+            one_metric_units = _NCU_METADATA_UNITS + ["byte"]
+            one_metric_values = _NCU_METADATA_VALUES + ["1000000"]
             good_csv = _write_ncu_csv(
-                tmp_path / "metrics_good.csv", _NCU_HEADER,
-                [["0", plan0["kernel_name"], "byte", "dram__bytes_read.sum", "1000000"]],
+                tmp_path / "metrics_good.csv",
+                one_metric_header, one_metric_units, [one_metric_values],
             )
             parsed = parse_ncu_raw_csv(good_csv)
             rec.check(
-                "well-formed metrics CSV parses to a float value with the exact kernel name and unit",
-                parsed["metrics"].get("dram__bytes_read.sum") == 1000000.0
+                "well-formed NCU wide raw CSV parses its metric column, units row, launch, and kernel",
+                parsed["metrics"].get(MANDATORY_DRAM_METRIC) == 1000000.0
                 and parsed["kernel_name"] == plan0["kernel_name"]
-                and parsed["units"]["dram__bytes_read.sum"] == "byte",
+                and parsed["units"][MANDATORY_DRAM_METRIC] == "byte"
+                and parsed["launch_id"] == "0"
+                and parsed["launch_count"] == 1,
                 detail=f"parsed={parsed}",
             )
 
@@ -4772,9 +4837,11 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 ("empty", ""), ("NaN", "nan"), ("infinite", "inf"), ("negative-infinite", "-inf"),
                 ("non-numeric", "not-a-number"), ("negative", "-5"),
             ):
+                malformed_values = one_metric_values.copy()
+                malformed_values[-1] = value
                 bad_csv = _write_ncu_csv(
-                    tmp_path / f"metrics_bad_{label}.csv", _NCU_HEADER,
-                    [["0", plan0["kernel_name"], "byte", "dram__bytes_read.sum", value]],
+                    tmp_path / f"metrics_bad_{label}.csv",
+                    one_metric_header, one_metric_units, [malformed_values],
                 )
                 raised = False
                 try:
@@ -4783,13 +4850,15 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                     raised = True
                 rec.check(f"metrics CSV with {label} value is rejected", raised)
 
-            # missing ID / Kernel Name / Metric Unit column (item: "missing X column")
-            for missing_col in ("ID", "Kernel Name", "Metric Unit"):
-                header_without = [c for c in _NCU_HEADER if c != missing_col]
-                row_without = [v for c, v in zip(_NCU_HEADER, ["0", plan0["kernel_name"], "byte", "dram__bytes_read.sum", "1000000"]) if c != missing_col]
+            # Launch identity columns are structural requirements.
+            for missing_col in ("ID", "Kernel Name"):
+                remove_at = one_metric_header.index(missing_col)
+                header_without = one_metric_header[:remove_at] + one_metric_header[remove_at + 1:]
+                units_without = one_metric_units[:remove_at] + one_metric_units[remove_at + 1:]
+                row_without = one_metric_values[:remove_at] + one_metric_values[remove_at + 1:]
                 missing_csv = _write_ncu_csv(
                     tmp_path / f"metrics_missing_{missing_col.replace(' ', '_')}.csv",
-                    header_without, [row_without],
+                    header_without, units_without, [row_without],
                 )
                 raised = False
                 try:
@@ -4798,10 +4867,25 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                     raised = True
                 rec.check(f"metrics CSV missing the {missing_col!r} column is rejected", raised)
 
+            missing_unit_row = one_metric_units.copy()
+            missing_unit_row[-1] = ""
+            missing_unit_csv = _write_ncu_csv(
+                tmp_path / "metrics_missing_candidate_unit.csv",
+                one_metric_header, missing_unit_row, [one_metric_values],
+            )
+            raised = False
+            try:
+                parse_ncu_raw_csv(missing_unit_csv)
+            except NcuCsvParseError:
+                raised = True
+            rec.check("metrics CSV with an empty candidate unit in the units row is rejected", raised)
+
             # duplicate required header
             dup_header_csv = _write_ncu_csv(
-                tmp_path / "metrics_dup_header.csv", _NCU_HEADER + ["ID"],
-                [["0", plan0["kernel_name"], "byte", "dram__bytes_read.sum", "1000000", "0"]],
+                tmp_path / "metrics_dup_header.csv",
+                one_metric_header + ["ID"],
+                one_metric_units + [""],
+                [one_metric_values + ["0"]],
             )
             raised = False
             try:
@@ -4811,9 +4895,11 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             rec.check("metrics CSV with a duplicate header column name is rejected", raised)
 
             # empty launch ID
+            empty_id_values = one_metric_values.copy()
+            empty_id_values[one_metric_header.index("ID")] = ""
             empty_id_csv = _write_ncu_csv(
-                tmp_path / "metrics_empty_id.csv", _NCU_HEADER,
-                [["", plan0["kernel_name"], "byte", "dram__bytes_read.sum", "1000000"]],
+                tmp_path / "metrics_empty_id.csv",
+                one_metric_header, one_metric_units, [empty_id_values],
             )
             raised = False
             try:
@@ -4823,12 +4909,12 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             rec.check("metrics CSV with an empty launch ID is rejected", raised)
 
             # two launch IDs (unit-level, complementing the validate-profile-case test below)
+            second_launch_values = one_metric_values.copy()
+            second_launch_values[one_metric_header.index("ID")] = "1"
             two_launch_csv = _write_ncu_csv(
-                tmp_path / "metrics_two_launch.csv", _NCU_HEADER,
-                [
-                    ["0", plan0["kernel_name"], "byte", "dram__bytes_read.sum", "1000000"],
-                    ["1", plan0["kernel_name"], "nsecond", "gpu__time_duration.sum", "1"],
-                ],
+                tmp_path / "metrics_two_launch.csv",
+                one_metric_header, one_metric_units,
+                [one_metric_values, second_launch_values],
             )
             raised = False
             try:
@@ -4837,13 +4923,15 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 raised = True
             rec.check("metrics CSV with two distinct launch IDs is rejected (unit-level)", raised)
 
-            # duplicate resolved metric, equal values -- still rejected
+            # Canonical and qualified columns for the same candidate are
+            # semantically duplicate and therefore ambiguous, even if values
+            # agree and the literal header strings differ.
+            qualified_dram = f"FBSP.TriageCompute.{MANDATORY_DRAM_METRIC}"
             dup_metric_csv = _write_ncu_csv(
-                tmp_path / "metrics_dup_metric.csv", _NCU_HEADER,
-                [
-                    ["0", plan0["kernel_name"], "byte", "dram__bytes_read.sum", "1000000"],
-                    ["0", plan0["kernel_name"], "byte", "dram__bytes_read.sum", "1000000"],
-                ],
+                tmp_path / "metrics_dup_metric.csv",
+                one_metric_header + [qualified_dram],
+                one_metric_units + ["byte"],
+                [one_metric_values + ["1000000"]],
             )
             raised = False
             try:
@@ -4851,15 +4939,17 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             except NcuCsvParseError:
                 raised = True
             rec.check(
-                "metrics CSV with a duplicate row for a resolved metric is rejected, even with equal values",
+                "metrics CSV with canonical and qualified columns for one candidate is rejected as ambiguous",
                 raised,
             )
 
             # dram unit = kilobyte / Kbyte -- rejected (never scaled/converted)
             for bad_unit in ("kilobyte", "Kbyte", "KB"):
+                bad_units = one_metric_units.copy()
+                bad_units[-1] = bad_unit
                 bad_unit_csv = _write_ncu_csv(
-                    tmp_path / f"metrics_unit_{bad_unit}.csv", _NCU_HEADER,
-                    [["0", plan0["kernel_name"], bad_unit, "dram__bytes_read.sum", "1000"]],
+                    tmp_path / f"metrics_unit_{bad_unit}.csv",
+                    one_metric_header, bad_units, [one_metric_values],
                 )
                 raised = False
                 try:
@@ -4868,9 +4958,11 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                     raised = True
                 rec.check(f"metrics CSV with dram unit={bad_unit!r} is rejected", raised)
             # dram unit = byte (any case) -- accepted
+            byte_case_units = one_metric_units.copy()
+            byte_case_units[-1] = "Byte"
             byte_case_csv = _write_ncu_csv(
-                tmp_path / "metrics_unit_Byte.csv", _NCU_HEADER,
-                [["0", plan0["kernel_name"], "Byte", "dram__bytes_read.sum", "1000"]],
+                tmp_path / "metrics_unit_Byte.csv",
+                one_metric_header, byte_case_units, [one_metric_values],
             )
             byte_case_parsed = None
             try:
@@ -4879,7 +4971,8 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 pass
             rec.check(
                 "metrics CSV with dram unit='Byte' (case-normalized) is accepted",
-                byte_case_parsed is not None and byte_case_parsed["metrics"]["dram__bytes_read.sum"] == 1000.0,
+                byte_case_parsed is not None
+                and byte_case_parsed["metrics"][MANDATORY_DRAM_METRIC] == 1000000.0,
             )
 
             # --- HBM classification thresholds (items 14, 15, 16) -------------------
@@ -5214,7 +5307,12 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             _build_ncu_case_fixture(
                 tmp_path,
                 qualified_case,
-                resolved_metrics=qualified_candidates,
+                # Exact cross-spelling regression: discovery preserved the
+                # GB300-qualified identifiers above, while the raw page uses
+                # canonical metric column names. Both spellings must resolve
+                # to one semantic candidate without weakening ambiguity
+                # checks or changing the manifest's discovery identifiers.
+                resolved_metrics=CANDIDATE_METRICS,
                 case_dir=p14_dm / "profiles" / qualified_case["case_name"],
             )
             qualified_case_ok, qualified_case_errors = _do_validate_profile_case(
@@ -5226,8 +5324,8 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 "case_results", {}
             ).get(qualified_case["case_name"], {})
             rec.check(
-                "a profile CSV using the qualified GB300 metric identifiers validates and "
-                "classifies the mandatory DRAM metric",
+                "qualified GB300 discovery identifiers validate against canonical raw-page "
+                "metric columns and classify the mandatory DRAM metric",
                 qualified_case_ok
                 and qualified_case_result.get("hbm_classification") == "HBM_VALIDATED"
                 and qualified_candidates[0]
@@ -5456,22 +5554,21 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 campaign_dir=p14_vc2, index=1, git_commit=_FIXED_GIT_COMMIT,
             )
             rec.expect_error_containing(
-                "validate-profile-case rejects more than one distinct profiled launch (item 11)", errors,
-                "distinct launch IDs found",
+                "validate-profile-case rejects more than one profiled launch row (item 11)", errors,
+                "profiled launch row(s)",
             )
 
             case_dup_kernel = build_ncu_plan()[2]
             _build_ncu_case_fixture(
-                tmp_path, case_dup_kernel,
-                extra_metric_rows=[["0", "some_other_kernel", "nsecond", "some_other_kernel__metric.sum", "1"]],
+                tmp_path, case_dup_kernel, extra_same_id_kernel_row=True,
                 case_dir=p14_vc2 / "profiles" / case_dup_kernel["case_name"],
             )
             ok, errors = _do_validate_profile_case(
                 campaign_dir=p14_vc2, index=2, git_commit=_FIXED_GIT_COMMIT,
             )
             rec.expect_error_containing(
-                "validate-profile-case rejects more than one distinct kernel name, same launch ID (item 11)",
-                errors, "distinct kernel names found",
+                "validate-profile-case rejects a second kernel row even when its launch ID is reused (item 11)",
+                errors, "profiled launch row(s)",
             )
 
             # Kernel name containing the expected name plus extra text: exact

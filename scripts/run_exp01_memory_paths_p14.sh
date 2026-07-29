@@ -131,7 +131,7 @@ check_ncu_help_capability() {
         -- '--clock-control' '--pipeline-boost-state' '--cache-control' \
         '--kernel-name-base' '--kernel-name' '--launch-count' \
         '--devices' '--replay-mode' '--query-metrics' '--metrics' \
-        '--csv' '--page' '--print-metric-name' '--print-units' \
+        '--csv' '--page' '--print-units' \
         '--print-kernel-base' '--log-file' '--import' '--export'
     do
         [ "${pat}" = "--" ] && continue
@@ -342,7 +342,6 @@ raise SystemExit(
   -i [ --import ] arg                   Set the input file for reading profile results.
   --csv                                 Use comma-separated values in the output.
   --page arg (=details)                 Select report page to output.
-  --print-metric-name arg (=label)      Select one of the option to show it in the Metric Name column.
   --print-units arg (=auto)             Set scaling of metric units.
   --print-kernel-base arg (=demangled)  Set the basis for kernel name output. See
                                           --kernel-name-base for available options.
@@ -351,6 +350,14 @@ EOF
         echo "run_exp01_memory_paths_p14: self-test: PASS: NCU capability gate accepts a complete synthetic --help" >&2
     else
         echo "run_exp01_memory_paths_p14: self-test: FAIL: NCU capability gate rejected a complete synthetic --help" >&2
+        failures=$((failures + 1))
+    fi
+    sed '/--print-units arg/i\\  --print-metric-name arg (=label)      Details-page-only metric label selector.' \
+        "${ncu_tmp}/good_help.txt" > "${ncu_tmp}/help_with_details_only_metric_name.txt"
+    if check_ncu_help_capability "${ncu_tmp}/help_with_details_only_metric_name.txt"; then
+        echo "run_exp01_memory_paths_p14: self-test: PASS: NCU capability gate does not require the details-only --print-metric-name option" >&2
+    else
+        echo "run_exp01_memory_paths_p14: self-test: FAIL: NCU capability gate incorrectly depends on the details-only --print-metric-name option" >&2
         failures=$((failures + 1))
     fi
     grep -v -- '--kernel-name-base' "${ncu_tmp}/good_help.txt" > "${ncu_tmp}/missing_flag.txt"

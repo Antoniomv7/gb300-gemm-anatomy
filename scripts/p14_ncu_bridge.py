@@ -81,8 +81,8 @@ import p14_safe_capture as capture_lib  # noqa: E402
 
 # Verified against the pinned image's own NCU 2025.4.0.0 --help output
 # during the original P1.4 implementation (see src/memory/P1_4_PROTOCOL.md
-# Section 4); unchanged by this remediation. Never a forced-overwrite flag,
-# never the full metric set, never a clock-controlling default.
+# Section 4). Never a forced-overwrite flag, never the full metric set,
+# never a clock-controlling default.
 NCU_COLLECTION_FLAGS = (
     "--clock-control", "none",
     "--pipeline-boost-state", "dynamic",
@@ -93,9 +93,14 @@ NCU_COLLECTION_FLAGS = (
     "--replay-mode", "kernel",
     "--print-summary", "none",
 )
+# `--print-metric-name` is intentionally absent. NCU 2025.4 accepts that
+# option only for the details page and exits 1 when it is combined with
+# `--page raw`; the raw page already emits actual metric identifiers as
+# wide-table column names. `--csv` implies base units, but keep
+# `--print-units base` explicit because the parser's unit contract is
+# intentionally frozen.
 NCU_EXPORT_FLAGS = (
     "--csv", "--page", "raw",
-    "--print-metric-name", "name",
     "--print-units", "base",
     "--print-kernel-base", "function",
 )
@@ -103,6 +108,28 @@ NCU_EXPORT_FLAGS = (
 
 class BridgeError(RuntimeError):
     pass
+
+
+def _bounded_diagnostic(path: Path, *, limit: int = 4096) -> str:
+    """Returns a bounded, escaped rendering of an NCU diagnostic stream.
+
+    NCU can report CLI errors on stdout even when stderr is empty. The
+    private directory is always deleted, so include both streams in the
+    bridge's own stderr before cleanup. `repr` keeps control characters from
+    altering the surrounding log, while the byte limit prevents an
+    unexpectedly large profiler response from flooding it.
+    """
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        return f"<unreadable: {exc}>"
+    if not data:
+        return "<empty>"
+    truncated = len(data) > limit
+    data = data[:limit]
+    text = data.decode("utf-8", errors="backslashreplace")
+    suffix = f" <truncated after {limit} bytes>" if truncated else ""
+    return f"{text!r}{suffix}"
 
 
 def _require_nonempty_file(path: Path, label: str) -> None:
@@ -186,8 +213,10 @@ def run_bridge(
                 raise BridgeError(f"could not launch NCU metrics export ({ncu_binary!r}): {exc}") from exc
         if export_result.returncode != 0:
             raise BridgeError(
-                f"NCU metrics export exited {export_result.returncode}; not bundling any output "
-                f"for this case"
+                f"NCU metrics export exited {export_result.returncode}; "
+                f"stdout={_bounded_diagnostic(metrics_csv_path)}; "
+                f"stderr={_bounded_diagnostic(metrics_export_stderr_path)}; "
+                f"not bundling any output for this case"
             )
         _require_nonempty_file(metrics_csv_path, "export: metrics_raw.csv")
 
@@ -279,6 +308,17 @@ def run_self_test() -> int:
             "the bundled metrics_csv segment is the fake NCU's own exported CSV",
             b"dram__bytes_read.sum" in segments["metrics_csv"],
         )
+        check(
+            "the raw-page export omits details-only --print-metric-name while retaining "
+            "the frozen CSV/page/unit/kernel-name controls",
+            "--print-metric-name" not in NCU_EXPORT_FLAGS
+            and NCU_EXPORT_FLAGS == (
+                "--csv", "--page", "raw",
+                "--print-units", "base",
+                "--print-kernel-base", "function",
+            ),
+            detail=f"flags={NCU_EXPORT_FLAGS!r}",
+        )
         private_dirs_left = list(tmp_root.iterdir())
         check(
             "the private directory is removed before run_bridge() returns",
@@ -331,8 +371,13 @@ def run_self_test() -> int:
         except BridgeError as exc:
             raised = str(exc)
         check(
-            "a metrics-export failure raises BridgeError and produces no bundle",
-            raised is not None and "export" in raised, detail=f"raised={raised!r}",
+            "a metrics-export failure raises BridgeError and preserves bounded stdout/stderr "
+            "diagnostics in the bridge error",
+            raised is not None
+            and "export" in raised
+            and "fake export stdout diagnostic" in raised
+            and "fake export stderr diagnostic" in raised,
+            detail=f"raised={raised!r}",
         )
 
         # --- no benchmark command at all ---
@@ -405,8 +450,18 @@ if "--import" in args:
     with open(rep_path, "rb") as f:
         if not f.read():
             sys.exit(9)
-    sys.stdout.write("ID,Kernel Name,Metric Name,Metric Unit,Metric Value\\n")
-    sys.stdout.write("0,fake_kernel,dram__bytes_read.sum,byte,12345\\n")
+    # Exact regression for NCU 2025.4: this option is details-page-only and
+    # must never be passed with the raw page.
+    if "--print-metric-name" in args:
+        sys.stdout.write("==ERROR== Option '--print-metric-name' is only supported for the details page.\\n")
+        sys.exit(1)
+    required = ["--csv", "--page", "raw", "--print-units", "base", "--print-kernel-base", "function"]
+    if any(item not in args for item in required):
+        sys.stderr.write("fake export is missing a required raw-page flag\\n")
+        sys.exit(8)
+    sys.stdout.write("ID,Process ID,Process Name,Host Name,Kernel Name,Kernel Time,Context,Stream,dram__bytes_read.sum\\n")
+    sys.stdout.write(",,,,,,,,byte\\n")
+    sys.stdout.write("0,1234,fake,fake-host,fake_kernel,2026-Jul-28 00:00:00,1,7,12345\\n")
     sys.exit(0)
 o_idx = args.index("-o")
 report_base = args[o_idx + 1]
@@ -440,7 +495,8 @@ import subprocess
 import sys
 args = sys.argv[1:]
 if "--import" in args:
-    sys.stderr.write("fake export failure\\n")
+    sys.stdout.write("fake export stdout diagnostic\\n")
+    sys.stderr.write("fake export stderr diagnostic\\n")
     sys.exit(7)
 o_idx = args.index("-o")
 report_base = args[o_idx + 1]

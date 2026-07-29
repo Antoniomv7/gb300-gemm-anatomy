@@ -310,7 +310,7 @@ docker run --rm --network none --security-opt no-new-privileges --cap-drop ALL \
 
 and greps the captured text for every flag name and every required value
 listed above, plus `--query-metrics`, `--query-metrics-mode`, `--metrics`,
-`--csv`, `--page`, `--print-metric-name`, `--print-units`, `--log-file`,
+`--csv`, `--page`, `--print-units`, `--log-file`,
 `--import`, `-o`/`--export`, `--launch-count`, `--kernel-name`. If any is
 missing, `--profile` stops immediately (exit 1) and reports exactly which
 flag/value is unavailable; it never falls back to an NCU default that could
@@ -390,9 +390,12 @@ Inside the container, the bridge:
    profiled binary's own inherited stdout/stderr captured to two more files
    in the same private directory;
 3. runs the metrics-export invocation (`--import`, `--csv --page raw
-   --print-metric-name name --print-units base --print-kernel-base
-   function`) against the private `.ncu-rep`, likewise entirely inside the
-   private directory;
+   --print-units base --print-kernel-base function`) against the private
+   `.ncu-rep`, likewise entirely inside the private directory.
+   `--print-metric-name` is deliberately absent: NCU 2025.4 supports it only
+   on the details page and exits 1 when it is combined with `--page raw`;
+   the raw page already writes the actual metric identifiers as wide-table
+   column names;
 4. verifies every output that must be non-empty (`.ncu-rep`, the NCU tool
    log, the application stdout, the exported metrics CSV) is a genuine
    non-symlink regular file;
@@ -401,9 +404,11 @@ Inside the container, the bridge:
    the exported `metrics_raw.csv`, and the metric-export step's stderr, in
    that fixed order — to its own stdout, and deletes the private directory
    before exiting;
-6. on any collection or export failure, emits nothing to stdout at all (only
-   diagnostics on stderr), so no bundle is ever produced from a partial or
-   failed run.
+6. on any collection or export failure, emits nothing to stdout at all and
+   copies a bounded, escaped rendering of both export streams into its own
+   stderr before deleting the private directory, so no bundle is ever
+   produced from a partial or failed run and the root cause remains in the
+   host-side bridge stderr log.
 
 The host side never talks to the bridge directly: `run_exp01_memory_paths_p14.sh`
 captures the bridge's stdout through `scripts/p14_safe_capture.py run`
@@ -496,24 +501,29 @@ bundle-format regressions above) for the complete design.
 duplicate header column name is itself detected) and rejected outright,
 before any value is trusted, unless all of the following hold:
 
-* the header contains exactly the five required columns `ID`, `Kernel Name`,
-  `Metric Name`, `Metric Unit`, `Metric Value`, with no duplicate column name;
-* every row has that same column count;
-* the file contains exactly one distinct `ID` (launch) and exactly one
-  distinct `Kernel Name` — never invented as `launch_count=1`, and never
-  averaged/summed across multiple launches or kernels;
-* the one `Kernel Name` present equals the frozen case's kernel name exactly
-  (see above) — never a substring, prefix, or regex match;
-* every metric's `Metric Unit` equals its expected unit exactly, after only
-  case/whitespace normalization — `byte`, `Byte`, and `BYTE` are the same
-  unit; `kilobyte`/`Kbyte`/`KB` are a **different**, rejected unit, never
-  silently rescaled to bytes;
-* every metric value is present, numeric, and finite (no empty/NaN/±infinity
-  value is ever treated as zero or missing-but-ignorable);
-* no metric name appears more than once, even with an identical value.
+* it has NCU's raw-page **wide** shape: a header row containing `ID`,
+  `Kernel Name`, and one column per collected metric; one equal-width units
+  row; and exactly one equal-width profiled-launch row;
+* no header name is duplicated, and no canonical/namespace-qualified pair
+  maps to the same frozen candidate metric;
+* the launch row's `ID` and `Kernel Name` are both non-empty; the latter
+  equals the frozen case's kernel name exactly (see above), never a
+  substring, prefix, or regex match;
+* every candidate metric column's entry in the units row equals its expected
+  unit exactly, after only case/whitespace normalization — `byte`, `Byte`,
+  and `BYTE` are the same unit; `kilobyte`/`Kbyte`/`KB` are a **different**,
+  rejected unit, never silently rescaled to bytes;
+* every candidate metric value in the launch row is present, numeric,
+  finite, and non-negative (no empty/NaN/±infinity value is ever treated as
+  zero or missing-but-ignorable);
+* canonical and GB300 namespace-qualified spellings are associated only
+  when the complete column name is either the canonical candidate or ends
+  with `.` plus that complete candidate. Arbitrary substring matches are
+  never accepted.
 
 A metric NCU discovery recorded as *resolved* (`resolved_ncu_metrics.resolved`
-in the manifest) but absent from this case's own `metrics_raw.csv` is a hard
+in the manifest) but lacking one unambiguous canonical-or-qualified column
+for the same frozen candidate in this case's own `metrics_raw.csv` is a hard
 validation failure, never a silent downgrade to `INCONCLUSIVE` — that
 downgrade path is reserved exclusively for `dram__bytes_read.sum` never
 having resolved for the whole campaign in the first place (Section 5).
