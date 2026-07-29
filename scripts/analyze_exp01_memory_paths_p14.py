@@ -2017,7 +2017,8 @@ def _parse_ncu_raw_csv_rows(rows_raw: list[list[str]], *, label: str) -> dict:
                 f"{label}: line {line_no}: metric {metric_name!r} value {value!r} is negative"
             )
 
-        expected_unit = EXPECTED_METRIC_UNITS.get(metric_name)
+        canonical_metric_name = canonical_candidate_metric_name(metric_name)
+        expected_unit = EXPECTED_METRIC_UNITS.get(canonical_metric_name)
         if expected_unit is not None and metric_unit.strip().lower() != expected_unit.strip().lower():
             raise NcuCsvParseError(
                 f"{label}: line {line_no}: metric {metric_name!r} has unit {metric_unit!r}, "
@@ -2796,11 +2797,33 @@ def cmd_record_pilot(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Subcommand: discover-metrics
 # ---------------------------------------------------------------------------
+def canonical_candidate_metric_name(metric_name: str) -> str | None:
+    """Maps an exact or namespace-qualified NCU name to one frozen candidate.
+
+    NCU 2025.4 on GB300 prints profiling metric identifiers such as
+    ``FBSP.TriageCompute.dram__bytes_read.sum``. Older/synthetic output uses
+    the canonical ``dram__bytes_read.sum`` form. A qualified identifier is a
+    match only when it ends with a dot followed by the complete canonical
+    candidate; arbitrary substring matches are never accepted.
+    """
+    if metric_name in CANDIDATE_METRICS:
+        return metric_name
+    matches = [
+        candidate
+        for candidate in CANDIDATE_METRICS
+        if metric_name.endswith(f".{candidate}")
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def parse_metric_discovery_log(path: Path) -> set[str]:
-    """Parses `ncu --query-metrics --query-metrics-mode all --devices 0`
-    output: one metric identifier per meaningful line, no surrounding
-    whitespace, containing the "__" structural signature every NCU metric
-    name has (e.g. dram__bytes_read.sum)."""
+    """Parses `ncu --query-metrics --query-metrics-mode all --devices 0`.
+
+    NCU may emit either one bare identifier per line or a table whose first
+    whitespace-delimited column is the full identifier, followed by type,
+    unit, and description columns. Preserve the exact identifier NCU reports
+    so the same name can later be passed back to ``--metrics``.
+    """
     try:
         with p13._open_regular_nofollow(path, binary=False) as handle:
             text = handle.read()
@@ -2808,23 +2831,60 @@ def parse_metric_discovery_log(path: Path) -> set[str]:
         raise ValueError(f"{path}: unable to read: {exc}") from exc
     names: set[str] = set()
     for line in text.splitlines():
-        token = line.strip()
-        if not token or " " in token or "\t" in token:
+        fields = line.split(maxsplit=1)
+        if not fields:
             continue
+        token = fields[0]
         if "__" in token:
             names.add(token)
     return names
 
 
 def resolve_ncu_metrics(discovered: set[str]) -> dict:
-    resolved = [m for m in CANDIDATE_METRICS if m in discovered]
-    missing = [m for m in CANDIDATE_METRICS if m not in discovered]
+    selected: dict[str, str] = {}
+    ambiguous: dict[str, list[str]] = {}
+    for candidate in CANDIDATE_METRICS:
+        matches = sorted(
+            name
+            for name in discovered
+            if canonical_candidate_metric_name(name) == candidate
+        )
+        if candidate in matches:
+            # Prefer the canonical identifier if NCU reports both canonical
+            # and qualified spellings for the same semantic metric.
+            selected[candidate] = candidate
+        elif len(matches) == 1:
+            selected[candidate] = matches[0]
+        elif len(matches) > 1:
+            ambiguous[candidate] = matches
+
+    if ambiguous:
+        detail = "; ".join(
+            f"{candidate}: {matches!r}"
+            for candidate, matches in sorted(ambiguous.items())
+        )
+        raise ValueError(
+            "metric discovery returned multiple qualified identifiers for "
+            f"the same frozen candidate; refusing to guess ({detail})"
+        )
+
+    resolved = [
+        selected[candidate]
+        for candidate in CANDIDATE_METRICS
+        if candidate in selected
+    ]
+    missing = [
+        candidate
+        for candidate in CANDIDATE_METRICS
+        if candidate not in selected
+    ]
+    dram_read_metric = selected.get(MANDATORY_DRAM_METRIC)
     return {
         "requested": list(CANDIDATE_METRICS),
         "resolved": resolved,
         "missing": missing,
-        "dram_read_metric": MANDATORY_DRAM_METRIC if MANDATORY_DRAM_METRIC in discovered else None,
-        "dram_read_metric_available": MANDATORY_DRAM_METRIC in discovered,
+        "dram_read_metric": dram_read_metric,
+        "dram_read_metric_available": dram_read_metric is not None,
     }
 
 
@@ -2861,17 +2921,18 @@ def _do_discover_metrics(
         else:
             errors.extend(compare_preflight_provenance(pilot_preflight_snapshot, preflight_snapshot))
 
+    resolved = None
     try:
         discovered = parse_metric_discovery_log(discovery_log)
+        resolved = resolve_ncu_metrics(discovered)
     except ValueError as exc:
         errors.append(str(exc))
-        discovered = set()
 
     if errors:
         success, fail_errors = _fail_p14(campaign_dir, "profile_start", errors)
         return success, fail_errors, None
 
-    resolved = resolve_ncu_metrics(discovered)
+    assert resolved is not None
     updates = {
         "profile_started_at_utc": started_at_utc,
         "resolved_ncu_metrics": resolved,
@@ -3141,7 +3202,8 @@ def _reconstruct_case_result_core(
         return None, errors
 
     dram_available = bool(resolved_ncu_metrics.get("dram_read_metric_available"))
-    dram_read_bytes = parsed_metrics["metrics"].get(MANDATORY_DRAM_METRIC) if dram_available else None
+    dram_metric_name = resolved_ncu_metrics.get("dram_read_metric")
+    dram_read_bytes = parsed_metrics["metrics"].get(dram_metric_name) if dram_available else None
     useful_bytes = float(app_row["useful_bytes"])
     classification, flags, ratio = classify_hbm(dram_read_bytes, useful_bytes)
 
@@ -4493,10 +4555,27 @@ def _build_ncu_case_fixture(
         else:
             writer.writerow(header)
         for metric_name in resolved_metrics:
-            if metric_name in omit_metrics:
+            canonical_metric_name = canonical_candidate_metric_name(metric_name)
+            if canonical_metric_name is None:
+                raise AssertionError(
+                    f"self-test fixture received a non-candidate resolved metric: {metric_name!r}"
+                )
+            if metric_name in omit_metrics or canonical_metric_name in omit_metrics:
                 continue
-            unit = unit_overrides.get(metric_name, EXPECTED_METRIC_UNITS[metric_name])
-            value = value_overrides.get(metric_name, default_values[metric_name])
+            unit = unit_overrides.get(
+                metric_name,
+                unit_overrides.get(
+                    canonical_metric_name,
+                    EXPECTED_METRIC_UNITS[canonical_metric_name],
+                ),
+            )
+            value = value_overrides.get(
+                metric_name,
+                value_overrides.get(
+                    canonical_metric_name,
+                    default_values[canonical_metric_name],
+                ),
+            )
             writer.writerow(["0", kernel_name_field, unit, metric_name, value])
         if extra_kernel_row:
             # A distinct kernel name/ID with its own, otherwise-unused metric
@@ -5098,17 +5177,83 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 git_commit=_FIXED_GIT_COMMIT, completed_at_utc="20260728T161100Z", now_utc=now_rp,
             )
             assert ok, errors
+            # NCU 2025.4 on the real GB300 emits a table and namespace-
+            # qualified metric identifiers, not one bare canonical metric
+            # per line. Reproduce that observed format exactly enough to
+            # exercise both first-column extraction and qualified-name
+            # resolution while retaining the full name for --metrics.
+            qualified_prefix = "FBSP.TriageCompute."
+            qualified_candidates = tuple(
+                f"{qualified_prefix}{metric}"
+                for metric in CANDIDATE_METRICS
+            )
             full_discovery_log = tmp_path / "discovery_full.log"
-            full_discovery_log.write_text("\n".join(CANDIDATE_METRICS) + "\nunrelated__noise.metric\n", encoding="utf-8")
+            full_discovery_log.write_text(
+                "Device NVIDIA B300 SXM6 AC (GB110)\n"
+                + "\n".join(
+                    f"{metric:<96} Counter         byte            # synthetic description"
+                    for metric in qualified_candidates
+                )
+                + "\nunrelated__noise.metric                                      Counter\n",
+                encoding="utf-8",
+            )
             ok, errors, resolved = _do_discover_metrics(
                 campaign_dir=p14_dm, discovery_log=full_discovery_log, preflight_path=good_preflight_rp,
                 git_commit=_FIXED_GIT_COMMIT, started_at_utc="20260728T161200Z", now_utc=now_rp,
             )
             rec.check(
-                "discover-metrics resolves all five candidate metrics and transitions to PROFILE_IN_PROGRESS",
+                "discover-metrics parses the real GB300 table format, preserves all five qualified "
+                "NCU identifiers, and transitions to PROFILE_IN_PROGRESS",
                 ok and resolved["dram_read_metric_available"]
+                and resolved["resolved"] == list(qualified_candidates)
+                and resolved["dram_read_metric"] == qualified_candidates[0]
                 and load_p14_manifest_chain(p14_dm)[0].get("state") == "PROFILE_IN_PROGRESS",
                 detail=f"ok={ok} resolved={resolved}",
+            )
+            qualified_case = build_ncu_plan()[0]
+            _build_ncu_case_fixture(
+                tmp_path,
+                qualified_case,
+                resolved_metrics=qualified_candidates,
+                case_dir=p14_dm / "profiles" / qualified_case["case_name"],
+            )
+            qualified_case_ok, qualified_case_errors = _do_validate_profile_case(
+                campaign_dir=p14_dm,
+                index=qualified_case["index"],
+                git_commit=_FIXED_GIT_COMMIT,
+            )
+            qualified_case_result = load_p14_manifest_chain(p14_dm)[0].get(
+                "case_results", {}
+            ).get(qualified_case["case_name"], {})
+            rec.check(
+                "a profile CSV using the qualified GB300 metric identifiers validates and "
+                "classifies the mandatory DRAM metric",
+                qualified_case_ok
+                and qualified_case_result.get("hbm_classification") == "HBM_VALIDATED"
+                and qualified_candidates[0]
+                in qualified_case_result.get("resolved_metric_values", {}),
+                detail=(
+                    f"ok={qualified_case_ok} errors={qualified_case_errors} "
+                    f"result={qualified_case_result}"
+                ),
+            )
+
+            ambiguous_metric_rejected = False
+            ambiguous_metric_error = ""
+            try:
+                resolve_ncu_metrics({
+                    f"DomainA.{MANDATORY_DRAM_METRIC}",
+                    f"DomainB.{MANDATORY_DRAM_METRIC}",
+                })
+            except ValueError as exc:
+                ambiguous_metric_rejected = True
+                ambiguous_metric_error = str(exc)
+            rec.check(
+                "metric discovery rejects multiple qualified identifiers for one canonical "
+                "candidate instead of guessing",
+                ambiguous_metric_rejected
+                and MANDATORY_DRAM_METRIC in ambiguous_metric_error,
+                detail=f"error={ambiguous_metric_error!r}",
             )
 
             # --- pilot vs profile preflight provenance mismatch is rejected

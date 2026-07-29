@@ -334,10 +334,17 @@ gpu__time_duration.sum
 ```
 
 `dram__bytes_read.sum` is the semantic measurement "DRAM bytes read by the
-profiled benchmark kernel." A metric is "resolved" only if its exact string
-appears verbatim in the `--query-metrics-mode all` output for logical device
-0 — never inferred, never substituted from a different architecture. If
-`dram__bytes_read.sum` does not resolve, the whole six-case HBM
+profiled benchmark kernel." NCU may print either that canonical identifier
+or a namespace-qualified full identifier whose final component is exactly
+that candidate (for example,
+`FBSP.TriageCompute.dram__bytes_read.sum` on GB300). The discovery parser
+reads the first whitespace-delimited table column and resolves a candidate
+only on an exact whole-name match or an exact `.<candidate>` suffix. It
+preserves the full identifier NCU reported and passes that same identifier
+back to `--metrics`; if more than one qualified identifier matches a
+candidate, discovery fails closed rather than guessing. No substring match,
+architecture substitution, or inferred metric is accepted. If
+`dram__bytes_read.sum` does not resolve under those rules, the whole six-case HBM
 classification becomes `INCONCLUSIVE` (recorded explicitly in the manifest as
 `resolved_ncu_metrics.dram_read_metric_available: false`); the other
 resolved metrics (if any) are still collected and recorded, since they may
