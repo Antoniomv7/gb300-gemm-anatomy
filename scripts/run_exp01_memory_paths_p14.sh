@@ -143,14 +143,12 @@ check_ncu_help_capability() {
 
     # Required values: ncu --help wraps each flag's allowed-value list across
     # several lines below the flag's own line, so look within a fixed window
-    # of lines following the flag (verified against the pinned NCU
-    # 2025.4.0.0 --help output during implementation) rather than assuming a
-    # single-line match or relying on grep-implementation-specific
-    # multi-line dot-matches-newline behavior.
+    # of lines following the flag rather than assuming a single-line match or
+    # relying on grep-implementation-specific multi-line
+    # dot-matches-newline behavior.
     for pat in \
         "clock-control:none" "pipeline-boost-state:dynamic" \
-        "cache-control:none" "kernel-name-base:function" \
-        "print-kernel-base:function"
+        "cache-control:none" "kernel-name-base:function"
     do
         flag="${pat%%:*}"
         val="${pat##*:}"
@@ -159,6 +157,15 @@ check_ncu_help_capability() {
             missing=1
         fi
     done
+
+    # NCU 2025.4 does not repeat the allowed values below
+    # --print-kernel-base; it refers to --kernel-name-base instead. Require
+    # that explicit reference, then use the validated value list above.
+    if ! grep -A 10 -F -- "--print-kernel-base arg" "${help_file}" \
+            | grep -qF -- "--kernel-name-base"; then
+        echo "run_exp01_memory_paths_p14: NCU capability gate: --print-kernel-base does not reference --kernel-name-base" >&2
+        missing=1
+    fi
 
     [ "${missing}" -eq 0 ]
 }
@@ -337,10 +344,8 @@ raise SystemExit(
   --page arg (=details)                 Select report page to output.
   --print-metric-name arg (=label)      Select one of the option to show it in the Metric Name column.
   --print-units arg (=auto)             Set scaling of metric units.
-  --print-kernel-base arg (=demangled)  Set the basis for kernel name output. See --kernel-name-base:
-                                          function
-                                          demangled
-                                          mangled
+  --print-kernel-base arg (=demangled)  Set the basis for kernel name output. See
+                                          --kernel-name-base for available options.
 EOF
     if check_ncu_help_capability "${ncu_tmp}/good_help.txt"; then
         echo "run_exp01_memory_paths_p14: self-test: PASS: NCU capability gate accepts a complete synthetic --help" >&2
@@ -368,6 +373,14 @@ EOF
         failures=$((failures + 1))
     else
         echo "run_exp01_memory_paths_p14: self-test: PASS: NCU capability gate rejects a --help missing --print-kernel-base" >&2
+    fi
+    sed 's/--kernel-name-base for available options/kernel-name output options/' \
+        "${ncu_tmp}/good_help.txt" > "${ncu_tmp}/missing_print_kernel_base_reference.txt"
+    if check_ncu_help_capability "${ncu_tmp}/missing_print_kernel_base_reference.txt"; then
+        echo "run_exp01_memory_paths_p14: self-test: FAIL: NCU capability gate accepted --print-kernel-base without its --kernel-name-base reference" >&2
+        failures=$((failures + 1))
+    else
+        echo "run_exp01_memory_paths_p14: self-test: PASS: NCU capability gate rejects --print-kernel-base without its --kernel-name-base reference" >&2
     fi
     rm -rf "${ncu_tmp}"
     trap - RETURN
