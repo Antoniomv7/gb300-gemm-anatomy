@@ -97,6 +97,24 @@ fail_run() {
     exit 1
 }
 
+# Failure metadata is rendered in one place and exercised by --self-test.
+# Every production call site supplies an internal, single-component stage
+# label; validating that small alphabet here keeps the printf below valid
+# JSON without introducing a second ad-hoc escaping implementation. The
+# analyzer's manifest schema requires failure_detail to be list[str], so an
+# empty list is the truthful representation when the runner has no more
+# specific diagnostic than failure_stage.
+render_p14_failure_merge_json() {
+    local failure_stage="${1:-}"
+    if [ -z "${failure_stage}" ]; then
+        printf '{}\n'
+        return 0
+    fi
+    [[ "${failure_stage}" =~ ^[A-Za-z0-9_.-]+$ ]] \
+        || return 2
+    printf '{"failure_stage": "%s", "failure_detail": []}\n' "${failure_stage}"
+}
+
 # ---------------------------------------------------------------------------
 # NCU CLI capability gate: a pure function over already-captured `ncu --help`
 # text (a file path), so --self-test can exercise it against synthetic
@@ -236,6 +254,28 @@ run_self_test() {
     else
         echo "run_exp01_memory_paths_p14: self-test: FAIL: VERSIONS.env not found at resolved repo root" >&2
         failures=$((failures + 1))
+    fi
+
+    local failure_payload
+    failure_payload="$(render_p14_failure_merge_json "signal_TERM")"
+    if python3 -c '
+import json
+import sys
+doc = json.load(sys.stdin)
+raise SystemExit(
+    0 if doc == {"failure_stage": "signal_TERM", "failure_detail": []} else 1
+)
+' <<< "${failure_payload}"; then
+        echo "run_exp01_memory_paths_p14: self-test: PASS: failure telemetry renders failure_detail as list[str]" >&2
+    else
+        echo "run_exp01_memory_paths_p14: self-test: FAIL: failure telemetry JSON is malformed or uses a non-list failure_detail" >&2
+        failures=$((failures + 1))
+    fi
+    if render_p14_failure_merge_json '../unsafe' >/dev/null 2>&1; then
+        echo "run_exp01_memory_paths_p14: self-test: FAIL: failure telemetry accepted an unsafe stage label" >&2
+        failures=$((failures + 1))
+    else
+        echo "run_exp01_memory_paths_p14: self-test: PASS: failure telemetry rejects an unsafe stage label" >&2
     fi
 
     local p13_plan_lines p14_plan_lines
@@ -451,11 +491,7 @@ write_p14_manifest_status() {
     # no directory argument) takes it out of the raw tree entirely, so no
     # raw-campaign path is ever mktemp'd or shell-redirected into.
     merge_file="$(mktemp)"
-    if [ -n "${failure_stage}" ]; then
-        printf '{"failure_stage": "%s", "failure_detail": null}\n' "${failure_stage}" >| "${merge_file}"
-    else
-        printf '{}' >| "${merge_file}"
-    fi
+    render_p14_failure_merge_json "${failure_stage}" >| "${merge_file}"
     python3 "${P14_ANALYZER_HOST}" manifest-write --campaign-dir "${CAMPAIGN_REL}" \
         --status "${status}" --merge-json "${merge_file}" >/dev/null
     rc=$?

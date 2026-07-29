@@ -719,10 +719,14 @@ hash-chained revision history (`campaign_dir/manifest/000000.json`,
 writer, since a single mutable `manifest.json` cannot make the same
 no-overwrite guarantee; every revision is additionally validated
 *semantically* against an explicit classification of every manifest field
-(immutable/set-once/append-only/state-derived/timestamp), so a
+(immutable/set-once/append-only/state-derived/timestamp) and an exact
+per-transition mutation matrix, so a
 cryptographically valid revision that changes an immutable field, edits an
-earlier `case_result`, or jumps state illegally is rejected even though its
-hash chain is intact. Every raw-campaign write during `--profile` (NCU-help
+earlier `case_result`, introduces progress on the wrong transition, or jumps
+state illegally is rejected even though its hash chain is intact.
+`COMPLETE` and `ANALYZED` additionally require the frozen profile order and
+their exact canonical artifact-hash inventories. Every raw-campaign write
+during `--profile` (NCU-help
 probe, discovery logs, per-case container/metrics captures, the extracted
 application CSV) goes through `scripts/p14_safe_capture.py`, a P1.4-only
 module that opens every directory component exactly once with `O_NOFOLLOW`,
@@ -733,8 +737,9 @@ one preceded by a symlink-aware precheck) still leaves open. See
 NCU command structure, the raw-directory/state-machine/manifest-chain
 design, and the statistical policy.
 
-**Status: implemented, remediated after FOUR independent GPU-free audits; a
-further independent re-audit is PENDING; verified on GB300: NO; fresh
+**Status: implemented, remediated after FIVE independent GPU-free audits;
+final GPU-free acceptance suite: PASS; independent post-remediation sign-off
+is PENDING; verified on GB300: NO; fresh
 preflight: PENDING; pilot executed: NO; NCU/HBM validation: NO; publishable
 results: NONE; Phase 1: OPEN.** A first
 independent GPU-free audit found five blockers (preflight provenance,
@@ -770,8 +775,13 @@ evidence-integrity gate ran, and `analyze` never re-ran that gate a second
 time immediately before publishing `ANALYZED`; (E) `publish_ncu_bundle()`'s
 cleanup could unlink a file it no longer owned; (F) `PLAN.md` stated a
 phase gate had passed when it had not, and the trusted, single-writer
-filesystem model was not documented. All twenty blockers, across all four
-rounds, were remediated GPU-free as described above, each with a new
+filesystem model was not documented. A **fifth** independent audit of
+`3d92a6b375ce3d0e803afd3e62723b08e471f3c8` found three final functional
+blockers: runner failure telemetry used `failure_detail: null` and could not
+record a signal while still `PILOT_COMPLETE`; the semantic loader lacked an
+exact mutation matrix per transition; and terminal `profile_order`/
+`artifact_sha256` content was not canonical. All twenty-three blockers,
+across all five rounds, were remediated GPU-free as described above, each with a new
 adversarial test that first demonstrably failed against the original
 behavior and then passed against the fix. The third round's fix for (A/B)
 is a new container-side bridge (`scripts/p14_ncu_bridge.py`) that runs NCU
@@ -789,7 +799,10 @@ see `src/memory/P1_4_PROTOCOL.md`) close six blockers found against Git
 commit `a66d0fa8b37147eb4f237911c42b02e3c8cbed59` under an explicitly
 documented trusted, single-writer filesystem model (Section 0 of that
 document) rather than expanding P1.4 into a hostile-concurrency-resistant
-design. `make memory-paths-p14-plan` and
+design. The fifth round adds typed failure telemetry, the real
+`PILOT_COMPLETE -> INTERRUPTED` edge, exact transition mutations, and
+canonical terminal-content checks, backed by eight full-chain regressions.
+`make memory-paths-p14-plan` and
 `make memory-paths-p14-check` are GPU-free (no Docker, no GPU, no network);
 `make memory-paths-p14-pilot` and `make memory-paths-p14-profile` require an
 explicit, operator-provided `BLACKWELL_GPU_INDEX`, `P1_4_CAMPAIGN_ID`, and

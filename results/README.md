@@ -36,11 +36,11 @@ ignored by Git. This record closes P1.3's functional GB300 verification only;
 it must not be cited as a performance measurement or used to compare LDGSTS
 against TMA. P1.4 owns the pilot benchmark campaign, Nsight Compute/HBM
 validation, figures, and interpretation; it is implemented — and the
-twenty blockers found by four independent GPU-free audits of that
+twenty-three blockers found by five independent GPU-free audits of that
 implementation have all been remediated GPU-free (see
-`src/memory/P1_4_PROTOCOL.md`) — but a further independent re-audit is
-pending, its pilot has not been executed, and no P1.4 raw campaign exists
-yet either.
+`src/memory/P1_4_PROTOCOL.md`). The final GPU-free acceptance suite passes,
+but independent post-remediation sign-off is pending; its pilot has not
+been executed, and no P1.4 raw campaign exists yet either.
 
 ### `results/raw/exp01_memory_paths_p14/<campaign_id>/` (raw, not committed)
 
@@ -76,7 +76,12 @@ immutable/set-once/append-only/state-derived/timestamp classification, and
 `case_results`'s key order is checked as an exact list, never reduced to a
 set comparison) and a transition check (a correctly-hashed revision that
 changes an immutable field, edits an earlier profiled case's result, or
-appends more than one case at once is still rejected). Before both
+appends more than one case at once is still rejected). The transition check
+also enforces an exact per-edge mutation set: profile cases appear only one
+at a time on `PROFILE_IN_PROGRESS` self-loops, failure/interruption preserves
+the exact recorded prefix, and finalization cannot introduce its sixth case.
+`COMPLETE`/`ANALYZED` require the frozen profile order and exact canonical
+artifact-hash inventories. Before both
 `COMPLETE` and `ANALYZED`, the campaign directory, `profiles/`, and each
 case directory are opened once with descriptor-anchored, no-follow
 resolution and held open for the whole check; `profiles/` is confirmed to

@@ -16,11 +16,13 @@ deterministic, standard-library-only statistics/comparison/saturation/HBM
 analysis artifacts (CSV, JSON, Markdown, SVG).
 
 It imports ``scripts/aggregate_exp01_memory_paths.py`` (P1.3, frozen and
-unmodified) as a library and reuses its path-safety primitives (symlink
-rejection, no-clobber publish, exclusive creation, SHA-256 hashing), its
-37-column CSV schema and per-field validators, its geometry formulas, and its
-manifest atomic-write helper, rather than reimplementing any of them. P1.4
-does not modify, and does not need to modify, that file.
+unmodified) as a library and reuses its generic path-safety primitives
+(symlink rejection, no-clobber publish, exclusive creation, SHA-256
+hashing), its 37-column CSV schema and per-field validators, and its geometry
+formulas rather than reimplementing them. P1.4 deliberately does not reuse
+P1.3's mutable manifest writer: its own state is an append-only immutable
+revision chain. P1.4 does not modify, and does not need to modify, the P1.3
+file.
 
 Subcommands:
   plan                 Print the frozen six-case NCU plan.
@@ -45,9 +47,10 @@ Subcommands:
                         FAILED).
   analyze               Generate analysis/* from a COMPLETE campaign;
                         transitions COMPLETE -> ANALYZED.
-  manifest-write        Mark FAILED/INTERRUPTED with an optional failure
-                        stage/detail (mirrors P1.3's own manifest-write, but
-                        never accepts a completing status).
+  manifest-write        Mark FAILED/INTERRUPTED with required failure
+                        stage/detail metadata (mirrors P1.3's own
+                        manifest-write, but never accepts a completing
+                        status).
   --self-test           GPU-free synthetic/adversarial tests. Prints
                         "analyze_exp01_memory_paths_p14: SELF_TEST_RESULT=PASS"
                         only if every case passes.
@@ -175,7 +178,11 @@ P14_TERMINAL_STATES = frozenset({"ANALYZED", "FAILED", "INTERRUPTED"})
 ALLOWED_P14_TRANSITIONS: dict[str | None, frozenset[str]] = {
     None: frozenset({"PILOT_IN_PROGRESS"}),
     "PILOT_IN_PROGRESS": frozenset({"PILOT_COMPLETE", "FAILED", "INTERRUPTED"}),
-    "PILOT_COMPLETE": frozenset({"PROFILE_IN_PROGRESS", "FAILED"}),
+    # --profile installs its signal/exit traps while the campaign is still
+    # PILOT_COMPLETE, before metric discovery publishes PROFILE_IN_PROGRESS.
+    # An interruption in that real runner interval must therefore be
+    # recordable rather than silently discarded by `|| true`.
+    "PILOT_COMPLETE": frozenset({"PROFILE_IN_PROGRESS", "FAILED", "INTERRUPTED"}),
     "PROFILE_IN_PROGRESS": frozenset({"PROFILE_IN_PROGRESS", "COMPLETE", "FAILED", "INTERRUPTED"}),
     "COMPLETE": frozenset({"ANALYZED"}),
     "ANALYZED": frozenset(),
@@ -215,6 +222,24 @@ ALLOWED_P14_MANIFEST_KEYS: dict[str, object] = {
     "failure_stage": str,
     "failure_detail": list,
 }
+
+CASE_ARTIFACT_HASH_FIELDS: tuple[str, ...] = (
+    "application_csv_sha256",
+    "metrics_csv_sha256",
+    "ncu_rep_sha256",
+)
+
+ANALYSIS_ARTIFACT_RELATIVE_PATHS: tuple[str, ...] = (
+    "analysis/pilot_statistics.csv",
+    "analysis/pairwise_comparison.csv",
+    "analysis/saturation_candidates.csv",
+    "analysis/ncu_validation.csv",
+    "analysis/analysis.json",
+    "analysis/report.md",
+    "analysis/figures/effective_gbps.svg",
+    "analysis/figures/tma_to_ldgsts_ratio.svg",
+    "analysis/figures/dram_read_ratio.svg",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -619,6 +644,137 @@ def validate_profile_plan_file(path: Path, plan: list[dict]) -> list[str]:
 # _publish_no_clobber, _reject_if_symlink_or_wrong_type, _mkdir_component,
 # _open_regular_nofollow, sha256_of) for the revision files themselves.
 # ---------------------------------------------------------------------------
+def _expected_complete_artifact_sha256(manifest: dict) -> tuple[dict[str, str], list[str]]:
+    """Derives COMPLETE's exact base-evidence hash map from the manifest's
+    already-recorded canonical references and six case results.
+
+    This is deliberately independent of artifact_sha256 itself: a terminal
+    revision cannot make an incomplete or fabricated map self-consistent by
+    merely asserting the same bad value twice. The evidence-integrity gate
+    separately reopens and verifies these recorded source hashes against
+    disk before production COMPLETE/ANALYZED transitions.
+    """
+    expected: dict[str, str] = {}
+    errors: list[str] = []
+
+    def _record(output_key: str, value: object, source: str) -> None:
+        if not isinstance(value, str) or not p13._is_sha256_hex(value):
+            errors.append(
+                f"{source} must be a canonical 64-hex SHA-256 before "
+                f"artifact_sha256[{output_key!r}] can be derived; got {value!r}"
+            )
+            return
+        expected[output_key] = value
+
+    _record(
+        "profile_plan.csv",
+        manifest.get("profile_plan_sha256"),
+        "profile_plan_sha256",
+    )
+
+    pilot_ref = manifest.get("pilot_campaign_reference")
+    if not isinstance(pilot_ref, dict):
+        errors.append("pilot_campaign_reference must be an object for terminal artifact validation")
+    else:
+        for source_key, output_key in (
+            ("manifest_sha256", "pilot_manifest_sha256"),
+            ("combined_samples_sha256", "pilot_combined_samples_sha256"),
+            ("summary_sha256", "pilot_summary_sha256"),
+        ):
+            _record(
+                output_key,
+                pilot_ref.get(source_key),
+                f"pilot_campaign_reference.{source_key}",
+            )
+
+    for ref_name in ("preflight_reference_pilot", "preflight_reference_profile"):
+        ref = manifest.get(ref_name)
+        if not isinstance(ref, dict):
+            errors.append(f"{ref_name} must be an object for terminal artifact validation")
+            continue
+        _record(ref_name, ref.get("sha256"), f"{ref_name}.sha256")
+
+    case_results = manifest.get("case_results")
+    if not isinstance(case_results, dict):
+        errors.append("case_results must be an object for terminal artifact validation")
+    else:
+        for entry in build_ncu_plan():
+            case_name = entry["case_name"]
+            result = case_results.get(case_name)
+            if not isinstance(result, dict):
+                errors.append(
+                    f"case_results.{case_name} must be an object for terminal artifact validation"
+                )
+                continue
+            for field in CASE_ARTIFACT_HASH_FIELDS:
+                _record(
+                    f"{case_name}.{field}",
+                    result.get(field),
+                    f"case_results.{case_name}.{field}",
+                )
+
+    return expected, errors
+
+
+def validate_terminal_manifest_content(manifest: dict) -> list[str]:
+    """Requires canonical, complete terminal metadata.
+
+    COMPLETE records exactly the frozen six-case plan plus every base
+    evidence hash derived above. ANALYZED preserves that exact base map and
+    adds exactly the nine deterministic analysis artifacts, each with a
+    canonical SHA-256. No missing, extra, reordered, or internally
+    inconsistent terminal field is tolerated.
+    """
+    state = manifest.get("state")
+    if state not in ("COMPLETE", "ANALYZED"):
+        return []
+
+    errors: list[str] = []
+    expected_plan = build_ncu_plan()
+    if manifest.get("profile_order") != expected_plan:
+        errors.append(
+            "profile_order is not exactly the frozen six-case plan in its canonical order"
+        )
+
+    expected_base, source_errors = _expected_complete_artifact_sha256(manifest)
+    errors.extend(source_errors)
+
+    actual = manifest.get("artifact_sha256")
+    if not isinstance(actual, dict):
+        return errors + ["artifact_sha256 must be an object in COMPLETE/ANALYZED"]
+
+    expected_keys = set(expected_base)
+    if state == "ANALYZED":
+        expected_keys.update(ANALYSIS_ARTIFACT_RELATIVE_PATHS)
+    actual_keys = set(actual)
+    missing = sorted(expected_keys - actual_keys)
+    unexpected = sorted(actual_keys - expected_keys)
+    if missing:
+        errors.append(f"artifact_sha256 is missing canonical key(s): {missing}")
+    if unexpected:
+        errors.append(f"artifact_sha256 contains unexpected key(s): {unexpected}")
+
+    for key, expected_hash in expected_base.items():
+        if key in actual and actual[key] != expected_hash:
+            errors.append(
+                f"artifact_sha256[{key!r}]={actual[key]!r} does not equal its "
+                f"canonical recorded evidence hash {expected_hash!r}"
+            )
+
+    if state == "ANALYZED":
+        for key in ANALYSIS_ARTIFACT_RELATIVE_PATHS:
+            value = actual.get(key)
+            if key in actual and (
+                not isinstance(value, str) or not p13._is_sha256_hex(value)
+            ):
+                errors.append(
+                    f"artifact_sha256[{key!r}] must be a canonical 64-hex SHA-256; "
+                    f"got {value!r}"
+                )
+
+    return errors
+
+
 def _validate_p14_manifest_updates(updates: dict) -> None:
     unknown = set(updates) - set(ALLOWED_P14_MANIFEST_KEYS)
     if unknown:
@@ -678,8 +834,11 @@ def _validate_p14_manifest_document(manifest: dict, *, require_initialized: bool
             "provenance",
         },
         "PROFILE_IN_PROGRESS": {"profile_started_at_utc", "resolved_ncu_metrics", "preflight_reference_profile"},
-        "COMPLETE": {"profile_completed_at_utc", "profile_order", "profile_count_completed", "case_results"},
-        "ANALYZED": {"analyzed_at_utc", "artifact_sha256"},
+        "COMPLETE": {
+            "profile_completed_at_utc", "profile_order", "profile_count_completed",
+            "case_results", "artifact_sha256",
+        },
+        "ANALYZED": {"analyzed_at_utc"},
     }
     if state in required_by_state:
         gate_order = list(required_by_state)
@@ -692,13 +851,34 @@ def _validate_p14_manifest_document(manifest: dict, *, require_initialized: bool
                 f"P1.4 manifest in state {state!r} missing required field(s): {sorted(missing)}"
             )
 
-    if state == "COMPLETE" and manifest.get("profile_count_completed") != EXPECTED_NCU_CASE_COUNT:
+    if state in ("COMPLETE", "ANALYZED") and manifest.get(
+        "profile_count_completed"
+    ) != EXPECTED_NCU_CASE_COUNT:
         raise p13.ManifestTransitionError(
-            f"P1.4 manifest state=COMPLETE requires profile_count_completed="
+            f"P1.4 manifest state={state} requires profile_count_completed="
             f"{EXPECTED_NCU_CASE_COUNT}, got {manifest.get('profile_count_completed')!r}"
         )
-    if state in ("COMPLETE", "ANALYZED") and manifest.get("failure_stage") is not None:
-        raise p13.ManifestTransitionError(f"P1.4 manifest state={state!r} cannot retain failure_stage")
+    failure_keys = {"failure_stage", "failure_detail"}
+    present_failure_keys = failure_keys & set(manifest)
+    if state in ("FAILED", "INTERRUPTED"):
+        missing_failure_keys = failure_keys - set(manifest)
+        if missing_failure_keys:
+            raise p13.ManifestTransitionError(
+                f"P1.4 manifest state={state!r} missing failure telemetry field(s): "
+                f"{sorted(missing_failure_keys)}"
+            )
+    elif present_failure_keys:
+        raise p13.ManifestTransitionError(
+            f"P1.4 manifest state={state!r} cannot contain failure telemetry field(s): "
+            f"{sorted(present_failure_keys)}"
+        )
+
+    terminal_errors = validate_terminal_manifest_content(manifest)
+    if terminal_errors:
+        raise p13.ManifestTransitionError(
+            f"P1.4 manifest state={state!r} has non-canonical terminal content: "
+            f"{terminal_errors}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -746,8 +926,8 @@ P14_FIELD_SET_ONCE = frozenset({
 })
 P14_FIELD_STATE_DERIVED = frozenset({"state", "profile_count_completed"})
 P14_FIELD_APPEND_ONLY = frozenset({"case_results", "artifact_sha256"})
-# failure_stage/failure_detail: valid only alongside a FAILED/INTERRUPTED
-# state, and must be absent/None otherwise. Not immutable (they start
+# failure_stage/failure_detail: required together alongside a
+# FAILED/INTERRUPTED state, and absent otherwise. Not immutable (they start
 # absent), not set-once in the usual sense (a FAILED/INTERRUPTED campaign is
 # always terminal in practice, so in effect they are set at most once, at
 # the terminal transition), not state-derived in the state/count sense --
@@ -766,6 +946,39 @@ assert _P14_FIELD_CLASSIFICATION_UNION == frozenset(ALLOWED_P14_MANIFEST_KEYS), 
     f"extra={_P14_FIELD_CLASSIFICATION_UNION - frozenset(ALLOWED_P14_MANIFEST_KEYS)!r}"
 )
 
+# Exact mutation matrix for every non-failure adjacent transition. Values
+# are the content fields (excluding `state`) whose presence or value must
+# change in that one revision. This is intentionally stricter than the
+# broad immutable/set-once/append-only classifications above: those
+# classifications say how a field behaves over its lifetime, while this
+# table says the one exact transition on which it may mutate.
+P14_EXACT_TRANSITION_MUTATIONS: dict[tuple[str, str], frozenset[str]] = {
+    ("PILOT_IN_PROGRESS", "PILOT_COMPLETE"): frozenset({
+        "pilot_completed_at_utc",
+        "pilot_campaign_reference",
+        "preflight_reference_pilot",
+        "provenance",
+    }),
+    ("PILOT_COMPLETE", "PROFILE_IN_PROGRESS"): frozenset({
+        "profile_started_at_utc",
+        "resolved_ncu_metrics",
+        "preflight_reference_profile",
+    }),
+    ("PROFILE_IN_PROGRESS", "PROFILE_IN_PROGRESS"): frozenset({
+        "case_results",
+        "profile_count_completed",
+    }),
+    ("PROFILE_IN_PROGRESS", "COMPLETE"): frozenset({
+        "profile_completed_at_utc",
+        "profile_order",
+        "artifact_sha256",
+    }),
+    ("COMPLETE", "ANALYZED"): frozenset({
+        "analyzed_at_utc",
+        "artifact_sha256",
+    }),
+}
+
 
 # ---------------------------------------------------------------------------
 # Manifest state-shape validation (Task 4 remediation, Section 9). The
@@ -774,10 +987,12 @@ assert _P14_FIELD_CLASSIFICATION_UNION == frozenset(ALLOWED_P14_MANIFEST_KEYS), 
 # the *first* time at the wrong state -- e.g. a manifest with
 # state=PILOT_IN_PROGRESS that already carries resolved_ncu_metrics or
 # profile_completed_at_utc previously passed unnoticed, since nothing
-# checked that those fields were still absent this early. The exact
-# 7-row mutation matrix below binds every field to the ONE state at which
-# it may first go from absent/None to present (a small, empty-here
-# allowlist below documents anything that would ever need an exception).
+# checked that those fields were still absent this early. The 7-row
+# state-availability matrix below bounds which fields may exist in each
+# state. The adjacent-revision mutation matrix above then narrows that
+# availability to the exact transition that may change each field (needed
+# because PROFILE_IN_PROGRESS covers both its entering revision and its six
+# case-result self-loops).
 # validate_manifest_state_shape() is a pure function of one revision's own
 # content -- it needs no "previous" revision, since "which fields are legal
 # at state X" never depends on transition history, only on X itself.
@@ -801,13 +1016,11 @@ P14_FIELDS_INTRODUCED_BY_STATE: dict[str, frozenset[str]] = {
         "preflight_reference_pilot", "provenance",
     }),
     # PILOT_COMPLETE -> PROFILE_IN_PROGRESS (discover-metrics) introduces
-    # the first three; case_results/profile_count_completed are introduced
-    # by the first PROFILE_IN_PROGRESS -> PROFILE_IN_PROGRESS self-loop
-    # revision (the first validated case) in the actual workflow, but are
-    # also permitted at the entering transition itself (e.g. an explicit
-    # empty case_results / zero count) -- see
-    # _p14_cumulative_allowed_fields(), which treats both PROFILE_IN_PROGRESS
-    # and its own self-loop as one reachable state for this purpose.
+    # the first three. A manifest in PROFILE_IN_PROGRESS may also contain
+    # case_results/profile_count_completed after one or more case-validation
+    # self-loops, so the state-shape layer permits them here; the exact
+    # transition-mutation matrix separately forbids them on the entering
+    # transition and requires their first appearance on the first self-loop.
     "PROFILE_IN_PROGRESS": frozenset({
         "profile_started_at_utc", "resolved_ncu_metrics", "preflight_reference_profile",
         "case_results", "profile_count_completed",
@@ -826,7 +1039,7 @@ P14_FIELDS_INTRODUCED_BY_STATE: dict[str, frozenset[str]] = {
 # "introducing state" is not a fixed point in P14_STATE_ORDER at all, but
 # "wherever the campaign transitions to FAILED or INTERRUPTED" -- which can
 # happen from any non-terminal state. Their own state-based presence rule
-# (must be None outside FAILED/INTERRUPTED) is already enforced in
+# (required together in FAILED/INTERRUPTED and absent otherwise) is already enforced in
 # _validate_p14_manifest_document(); no separate introducing-state entry is
 # needed above because "the transition's target is FAILED/INTERRUPTED" IS
 # their entire legality condition.
@@ -834,14 +1047,14 @@ P14_FAILURE_ONLY_FIELDS = frozenset({"failure_stage", "failure_detail"})
 
 _P14_FIELD_INTRODUCTION_UNION = frozenset().union(*P14_FIELDS_INTRODUCED_BY_STATE.values()) | P14_FAILURE_ONLY_FIELDS
 assert _P14_FIELD_INTRODUCTION_UNION == frozenset(ALLOWED_P14_MANIFEST_KEYS), (
-    "every P1.4 manifest field must be bound to exactly one legal introducing state (or the "
-    "failure-only exception) in the Task 4 Section 9 mutation matrix -- an unbound field must "
+    "every P1.4 manifest field must be bound to a legal state-availability bucket (or the "
+    "failure-only exception) in the Task 4 Section 9 matrix -- an unbound field must "
     "never be able to appear at an arbitrary state unnoticed: "
     f"missing={frozenset(ALLOWED_P14_MANIFEST_KEYS) - _P14_FIELD_INTRODUCTION_UNION!r} "
     f"extra={_P14_FIELD_INTRODUCTION_UNION - frozenset(ALLOWED_P14_MANIFEST_KEYS)!r}"
 )
 assert len(P14_FIELDS_INTRODUCED_BY_STATE) == 5 and len(ALLOWED_P14_STATES) == 7, (
-    "the mutation matrix is documented as exactly 7 rows (one per P1.4 state: the 5 "
+    "the state-availability matrix is documented as exactly 7 rows (one per P1.4 state: the 5 "
     "non-terminal/analysis states above, plus FAILED and INTERRUPTED, whose shared rule is the "
     "P14_FAILURE_ONLY_FIELDS exception rather than a P14_STATE_ORDER entry) -- update this "
     "assertion deliberately if that count ever changes"
@@ -1089,6 +1302,42 @@ def validate_manifest_revision_transition(
                 f"illegal state transition: {prev_state!r} -> {curr_state!r} "
                 f"(allowed next state(s) from {prev_state!r}: {sorted(allowed_next_states)!r})"
             )
+        else:
+            # Compare key presence as well as value. `dict.get()` would make
+            # an absent key and a present key holding None look identical,
+            # precisely the class of ambiguity the manifest schema forbids.
+            changed_content_fields = {
+                key
+                for key in set(previous) | set(current)
+                if key != "state"
+                and (
+                    (key in previous) != (key in current)
+                    or (
+                        key in previous
+                        and key in current
+                        and previous[key] != current[key]
+                    )
+                )
+            }
+            if curr_state in ("FAILED", "INTERRUPTED"):
+                expected_changed_fields = P14_FIELD_FAILURE
+            else:
+                expected_changed_fields = P14_EXACT_TRANSITION_MUTATIONS.get(
+                    (prev_state, curr_state)
+                )
+            if (
+                expected_changed_fields is not None
+                and changed_content_fields != expected_changed_fields
+            ):
+                missing_changes = sorted(expected_changed_fields - changed_content_fields)
+                unexpected_changes = sorted(changed_content_fields - expected_changed_fields)
+                errors.append(
+                    f"exact transition mutation matrix violation for "
+                    f"{prev_state!r} -> {curr_state!r}: changed content fields "
+                    f"{sorted(changed_content_fields)!r}, expected exactly "
+                    f"{sorted(expected_changed_fields)!r}; missing changes="
+                    f"{missing_changes!r}; unexpected changes={unexpected_changes!r}"
+                )
 
     return errors
 
@@ -3886,6 +4135,19 @@ def _do_analyze(
         (figures_dir / "tma_to_ldgsts_ratio.svg", ratio_svg),
         (figures_dir / "dram_read_ratio.svg", dram_svg),
     ]
+    planned_analysis_paths = tuple(
+        path.relative_to(campaign_dir).as_posix()
+        for path in [*(item[0] for item in outputs), *(item[0] for item in file_writes)]
+    )
+    if (
+        len(planned_analysis_paths) != len(ANALYSIS_ARTIFACT_RELATIVE_PATHS)
+        or set(planned_analysis_paths) != set(ANALYSIS_ARTIFACT_RELATIVE_PATHS)
+    ):
+        return False, [
+            "internal analysis artifact inventory differs from the canonical terminal "
+            f"manifest contract: planned={sorted(planned_analysis_paths)!r} "
+            f"canonical={sorted(ANALYSIS_ARTIFACT_RELATIVE_PATHS)!r}"
+        ]
     for path, _ in file_writes:
         for candidate in (path, path.with_suffix(path.suffix + ".tmp")):
             if os.path.lexists(candidate):
@@ -5200,7 +5462,11 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             # mechanics these tests are actually about.
             def _build_two_revision_campaign(campaign_id: str) -> Path:
                 p14_c = _do_init_campaign(campaign_id=campaign_id, started_at_utc=campaign_id)
-                p14_merge_manifest(p14_c, {"failure_stage": "self_test_synthetic"}, state="FAILED")
+                p14_merge_manifest(
+                    p14_c,
+                    {"failure_stage": "self_test_synthetic", "failure_detail": []},
+                    state="FAILED",
+                )
                 return p14_c
 
             p14_mrev = _do_init_campaign(campaign_id="20260728T170500Z", started_at_utc="20260728T170500Z")
@@ -5217,7 +5483,11 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             merge_raised = False
             with mock.patch.object(p13, "write_manifest_atomic", side_effect=_poison_write_manifest_atomic):
                 try:
-                    p14_merge_manifest(p14_mrev, {"failure_stage": "self_test_synthetic"}, state="FAILED")
+                    p14_merge_manifest(
+                        p14_mrev,
+                        {"failure_stage": "self_test_synthetic", "failure_detail": []},
+                        state="FAILED",
+                    )
                 except AssertionError:
                     merge_raised = True
             rec.check(
@@ -6552,6 +6822,269 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             )
             gate2_combined_path.write_bytes(gate2_original_combined)
 
+            # --- Final independent-audit regressions (commit 3d92a6b).
+            # These are deliberately full-chain tests whose forged revisions
+            # retain a correct manifest_revision/previous_manifest_sha256
+            # relationship. Rejection must therefore come from the semantic
+            # transition/content rules, never from a conveniently broken hash
+            # chain. -------------------------------------------------------
+
+            # The runner installs its interruption trap before --profile
+            # leaves PILOT_COMPLETE. A signal in that interval must be
+            # recordable with the strict list[str] failure_detail schema.
+            _interrupt_id = _next_reaudit_ts()
+            _interrupt_p13, _ = _build_p13_pilot_campaign_fixture(tmp_path, _interrupt_id)
+            _interrupt_p14 = _do_init_campaign(
+                campaign_id=_interrupt_id, started_at_utc="20260728T100000Z",
+            )
+            ok, errors = _do_record_pilot(
+                campaign_dir=_interrupt_p14, p13_campaign_dir=_interrupt_p13,
+                preflight_path=good_preflight_rp, git_commit=_FIXED_GIT_COMMIT,
+                completed_at_utc="20260728T103000Z", now_utc=now_rp,
+            )
+            assert ok, errors
+            _interrupt_recorded = False
+            _interrupt_error = ""
+            try:
+                p14_merge_manifest(
+                    _interrupt_p14,
+                    {
+                        "failure_stage": "signal_TERM",
+                        "failure_detail": [],
+                    },
+                    state="INTERRUPTED",
+                )
+                _interrupt_recorded = (
+                    load_p14_manifest_chain(_interrupt_p14)[0].get("state") == "INTERRUPTED"
+                )
+            except (p13.ManifestTransitionError, p13.UnsafePathError) as _exc:
+                _interrupt_error = str(_exc)
+            rec.check(
+                "PILOT_COMPLETE -> INTERRUPTED records a runner signal with list[str] "
+                "failure_detail (final audit: failure telemetry)",
+                _interrupt_recorded,
+                detail=f"error={_interrupt_error}",
+            )
+
+            # One real six-case PROFILE_IN_PROGRESS campaign supplies a
+            # canonical case result and correctly hashed adjacent revisions.
+            # Its immutable revision bytes are saved so three independent
+            # forged-chain scenarios can be exercised without rebuilding the
+            # expensive fixture.
+            _matrix_campaign, _ = _run_profile_pipeline(tmp_path, _next_reaudit_ts())
+            _matrix_paths = sorted((_matrix_campaign / "manifest").glob("*.json"))
+            _matrix_bytes = {i: path.read_bytes() for i, path in enumerate(_matrix_paths)}
+            _matrix_docs = [
+                {k: v for k, v in json.loads(_matrix_bytes[i]).items() if k not in MANIFEST_REVISION_KEYS}
+                for i in range(len(_matrix_paths))
+            ]
+            _matrix_plan = build_ncu_plan()
+            _matrix_first_name = _matrix_plan[0]["case_name"]
+            _matrix_sixth_name = _matrix_plan[-1]["case_name"]
+            _matrix_first_result = copy.deepcopy(
+                _matrix_docs[3]["case_results"][_matrix_first_name]
+            )
+            _matrix_sixth_result = copy.deepcopy(
+                _matrix_docs[8]["case_results"][_matrix_sixth_name]
+            )
+
+            def _restore_matrix_revisions(first: int = 0) -> None:
+                for _i in range(first, len(_matrix_paths)):
+                    _manifest_revision_path(_matrix_campaign, _i).write_bytes(_matrix_bytes[_i])
+
+            def _drop_matrix_revisions(first: int) -> None:
+                for _i in range(first, len(_matrix_paths)):
+                    _path = _manifest_revision_path(_matrix_campaign, _i)
+                    if _path.exists():
+                        _path.unlink()
+
+            # PILOT_COMPLETE -> PROFILE_IN_PROGRESS may introduce only the
+            # profiling preconditions. The first case belongs exclusively to
+            # the first PROFILE_IN_PROGRESS self-loop.
+            _drop_matrix_revisions(2)
+
+            def _forge_profile_entry_with_case(d: dict) -> None:
+                d["state"] = "PROFILE_IN_PROGRESS"
+                for _field in (
+                    "profile_started_at_utc",
+                    "resolved_ncu_metrics",
+                    "preflight_reference_profile",
+                ):
+                    d[_field] = copy.deepcopy(_matrix_docs[2][_field])
+                d["case_results"] = {_matrix_first_name: copy.deepcopy(_matrix_first_result)}
+                d["profile_count_completed"] = 1
+
+            _append_tampered_manifest_revision(
+                _matrix_campaign, _forge_profile_entry_with_case,
+            )
+            _raised, _errmsg = False, ""
+            try:
+                load_p14_manifest_chain(_matrix_campaign)
+            except p13.ManifestTransitionError as _exc:
+                _raised, _errmsg = True, str(_exc)
+            rec.check(
+                "PILOT_COMPLETE -> PROFILE_IN_PROGRESS cannot introduce the first case "
+                "(final audit: exact transition matrix)",
+                _raised and "transition" in _errmsg,
+                detail=f"raised={_raised} errmsg={_errmsg}",
+            )
+            _drop_matrix_revisions(2)
+            _restore_matrix_revisions(2)
+
+            # PROFILE_IN_PROGRESS(5) -> COMPLETE may add terminal metadata
+            # only; it must not smuggle in the sixth profile result.
+            _drop_matrix_revisions(8)
+
+            def _canonical_base_artifacts_for_test(d: dict) -> dict[str, str]:
+                artifacts = {
+                    "profile_plan.csv": d["profile_plan_sha256"],
+                    "pilot_manifest_sha256": d["pilot_campaign_reference"]["manifest_sha256"],
+                    "pilot_combined_samples_sha256": d["pilot_campaign_reference"][
+                        "combined_samples_sha256"
+                    ],
+                    "pilot_summary_sha256": d["pilot_campaign_reference"]["summary_sha256"],
+                    "preflight_reference_pilot": d["preflight_reference_pilot"]["sha256"],
+                    "preflight_reference_profile": d["preflight_reference_profile"]["sha256"],
+                }
+                for _entry in build_ncu_plan():
+                    _name = _entry["case_name"]
+                    for _hash_field in (
+                        "application_csv_sha256",
+                        "metrics_csv_sha256",
+                        "ncu_rep_sha256",
+                    ):
+                        artifacts[f"{_name}.{_hash_field}"] = d["case_results"][_name][
+                            _hash_field
+                        ]
+                return artifacts
+
+            def _forge_complete_with_sixth(d: dict) -> None:
+                d["case_results"][_matrix_sixth_name] = copy.deepcopy(_matrix_sixth_result)
+                d["profile_count_completed"] = 6
+                d["profile_completed_at_utc"] = "20260728T103200Z"
+                d["profile_order"] = copy.deepcopy(_matrix_plan)
+                d["state"] = "COMPLETE"
+                d["artifact_sha256"] = _canonical_base_artifacts_for_test(d)
+
+            _append_tampered_manifest_revision(_matrix_campaign, _forge_complete_with_sixth)
+            _raised, _errmsg = False, ""
+            try:
+                load_p14_manifest_chain(_matrix_campaign)
+            except p13.ManifestTransitionError as _exc:
+                _raised, _errmsg = True, str(_exc)
+            rec.check(
+                "PROFILE_IN_PROGRESS(5) -> COMPLETE cannot add the sixth case "
+                "(final audit: exact transition matrix)",
+                _raised and "transition" in _errmsg,
+                detail=f"raised={_raised} errmsg={_errmsg}",
+            )
+            _drop_matrix_revisions(8)
+            _restore_matrix_revisions(8)
+
+            # A failure revision preserves the exact already-recorded prefix;
+            # it may add only state/failure telemetry, never new progress.
+            _drop_matrix_revisions(3)
+
+            def _forge_failed_with_progress(d: dict) -> None:
+                d["state"] = "FAILED"
+                d["failure_stage"] = "synthetic_failure"
+                d["failure_detail"] = ["synthetic"]
+                d["case_results"] = {_matrix_first_name: copy.deepcopy(_matrix_first_result)}
+                d["profile_count_completed"] = 1
+
+            _append_tampered_manifest_revision(_matrix_campaign, _forge_failed_with_progress)
+            _raised, _errmsg = False, ""
+            try:
+                load_p14_manifest_chain(_matrix_campaign)
+            except p13.ManifestTransitionError as _exc:
+                _raised, _errmsg = True, str(_exc)
+            rec.check(
+                "PROFILE_IN_PROGRESS -> FAILED cannot invent profile progress "
+                "(final audit: exact transition matrix)",
+                _raised and "transition" in _errmsg,
+                detail=f"raised={_raised} errmsg={_errmsg}",
+            )
+
+            # COMPLETE must carry the exact frozen profile order and the
+            # exact canonical base-evidence hash map. Exercise three
+            # independent corruptions against the same valid terminal
+            # revision, restoring its original immutable bytes after each.
+            _terminal_campaign = p14_d_table
+            _terminal_manifest, _terminal_revision = load_p14_manifest_chain(_terminal_campaign)
+            _terminal_path = _manifest_revision_path(_terminal_campaign, _terminal_revision)
+            _terminal_original = _terminal_path.read_bytes()
+
+            def _terminal_mutation_rejected(label: str, mutate_fn, needle: str) -> None:
+                _terminal_path.write_bytes(_terminal_original)
+                _rewrite_revision_in_place(_terminal_campaign, _terminal_revision, mutate_fn)
+                _bad_raised, _bad_error = False, ""
+                try:
+                    load_p14_manifest_chain(_terminal_campaign)
+                except p13.ManifestTransitionError as _exc:
+                    _bad_raised, _bad_error = True, str(_exc)
+                rec.check(
+                    f"{label} is rejected (final audit: canonical COMPLETE content)",
+                    _bad_raised and needle in _bad_error,
+                    detail=f"raised={_bad_raised} errmsg={_bad_error}",
+                )
+                _terminal_path.write_bytes(_terminal_original)
+
+            _terminal_mutation_rejected(
+                "a reversed profile_order",
+                lambda d: d.__setitem__("profile_order", list(reversed(d["profile_order"]))),
+                "profile_order",
+            )
+            _terminal_mutation_rejected(
+                "an incomplete artifact_sha256 map",
+                lambda d: d.__setitem__(
+                    "artifact_sha256",
+                    {"profile_plan.csv": d["artifact_sha256"]["profile_plan.csv"]},
+                ),
+                "artifact_sha256",
+            )
+
+            def _corrupt_one_terminal_hash(d: dict) -> None:
+                _key = next(iter(d["artifact_sha256"]))
+                d["artifact_sha256"][_key] = "0" * 64
+
+            _terminal_mutation_rejected(
+                "an internally incorrect artifact_sha256 value",
+                _corrupt_one_terminal_hash,
+                "artifact_sha256",
+            )
+
+            ok, errors = _do_analyze(
+                campaign_dir=_terminal_campaign, analyzed_at_utc=_next_reaudit_ts(),
+            )
+            rec.check(
+                "a canonical COMPLETE campaign still analyzes successfully after the stricter "
+                "terminal validation",
+                ok and load_p14_manifest_chain(_terminal_campaign)[0].get("state") == "ANALYZED",
+                detail=f"ok={ok} errors={errors}",
+            )
+            _analyzed_manifest, _analyzed_revision = load_p14_manifest_chain(_terminal_campaign)
+            _analyzed_path = _manifest_revision_path(_terminal_campaign, _analyzed_revision)
+            _analyzed_doc = json.loads(_analyzed_path.read_text(encoding="utf-8"))
+            _analysis_key = next(
+                key for key in _analyzed_doc["artifact_sha256"] if key.startswith("analysis/")
+            )
+            del _analyzed_doc["artifact_sha256"][_analysis_key]
+            _analyzed_path.write_text(
+                json.dumps(_analyzed_doc, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            _raised, _errmsg = False, ""
+            try:
+                load_p14_manifest_chain(_terminal_campaign)
+            except p13.ManifestTransitionError as _exc:
+                _raised, _errmsg = True, str(_exc)
+            rec.check(
+                "ANALYZED requires the exact complete analysis-artifact inventory "
+                "(final audit: canonical ANALYZED content)",
+                _raised and "artifact_sha256" in _errmsg,
+                detail=f"raised={_raised} errmsg={_errmsg}",
+            )
+
     if rec.failures:
         print(
             f"analyze_exp01_memory_paths_p14: self-test: FAILED ({len(rec.failures)}/{rec.total} case(s)): "
@@ -6632,10 +7165,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     an_parser.add_argument("--analyzed-at-utc", required=True)
     an_parser.set_defaults(func=cmd_analyze)
 
-    mw_parser = subparsers.add_parser("manifest-write", help="Mark FAILED/INTERRUPTED (never a completing state).")
+    mw_parser = subparsers.add_parser(
+        "manifest-write",
+        help="Mark FAILED/INTERRUPTED with required failure metadata (never a completing state).",
+    )
     mw_parser.add_argument("--campaign-dir", required=True)
     mw_parser.add_argument("--status", required=True, choices=("FAILED", "INTERRUPTED"))
-    mw_parser.add_argument("--merge-json", default=None)
+    mw_parser.add_argument("--merge-json", required=True)
     mw_parser.set_defaults(func=cmd_manifest_write)
 
     return parser

@@ -1,13 +1,14 @@
 # P1.4 frozen protocol — profiling, HBM validation, analysis, pilot
 
-**Status: implemented, remediated after FOUR independent GPU-free audits.
-P1.4 Implemented: YES — remediated. Independent audit: PENDING RE-AUDIT.
-Verified on GB300: NO. Fresh preflight: PENDING. Pilot executed: NO.
-NCU/HBM validation: NO. Publishable results: NONE. Phase 1: OPEN. No
-performance result exists yet. GPU-free self-tests passing in this
-repository are not, and are never described here as, an independent audit —
-only a human reviewer working outside this codebase can close the
-"Independent audit" line above.**
+**Status: implemented, remediated after FIVE independent GPU-free audits.
+The final remediation passes the repository's GPU-free acceptance suite;
+independent post-remediation sign-off remains pending. P1.4 Implemented:
+YES — remediated. Independent audit: PENDING SIGN-OFF. Verified on GB300:
+NO. Fresh preflight: PENDING. Pilot executed: NO. NCU/HBM validation: NO.
+Publishable results: NONE. Phase 1: OPEN. No performance result exists yet.
+GPU-free self-tests passing in this repository are not, and are never
+described here as, an independent audit — only a reviewer who did not author
+this remediation can close the "Independent audit" line above.**
 
 ## 0. Trust model (binding on every remediation in this document)
 
@@ -142,7 +143,22 @@ rephrasing it as an entry condition with an explicit current-status line,
 and by adding this trust-model section (Section 0) to this document and to
 `results/README.md`.
 
-None of these twenty fixes, across all four rounds, changed the frozen
+A **fifth** independent GPU-free audit of commit
+`3d92a6b375ce3d0e803afd3e62723b08e471f3c8` found three final functional
+blockers: (1) the runner wrote `failure_detail: null`, which the corrected
+manifest schema rejects, and it could not record a signal received while a
+profile campaign was still `PILOT_COMPLETE`; (2) the semantic loader did not
+enforce an exact mutation set per transition, so profile progress could be
+introduced on entry to profiling, while finalizing, or while failing; (3)
+`COMPLETE` did not require the exact frozen `profile_order` and canonical
+base-evidence `artifact_sha256` map, allowing a malformed `COMPLETE` revision
+to be analyzed. These are closed respectively by typed runner failure
+telemetry plus the real `PILOT_COMPLETE -> INTERRUPTED` edge, an exact
+per-transition mutation matrix, and strict canonical `COMPLETE`/`ANALYZED`
+terminal-content validation. Eight new full-chain adversarial regressions
+first fail on `3d92a6b` and pass after this remediation.
+
+None of these twenty-three fixes, across all five rounds, changed the frozen
 pilot matrix, the six-case NCU plan, the statistical calculations, the
 bootstrap seed/resample count, the outlier-retention policy, the saturation
 rule, or the HBM thresholds below.
@@ -713,7 +729,10 @@ merge file is a transient argument-passing mechanism between the shell and
 `manifest-write` (which reads it once via a plain path and republishes the
 *real* manifest revision through the descriptor-anchored, hash-chained,
 no-clobber writer below), not campaign evidence, so moving it outside the
-raw tree removes the concern entirely rather than narrowing it.
+raw tree removes the concern entirely rather than narrowing it. The helper
+always emits `failure_stage` plus `failure_detail: []` (a JSON list, never
+`null`) and rejects a stage label outside its small internal basename-safe
+alphabet before invoking `manifest-write`.
 
 ### Append-only, hash-chained manifest (never `os.replace()`)
 
@@ -751,13 +770,14 @@ strictly additive to P1.3's own manifest discipline: P1.4 never calls
 P1.3's `write_manifest_atomic`/`os.replace()`-based writer for its own
 manifest.
 
-### Semantic manifest transition validation (two explicit layers)
+### Semantic manifest validation
 
 The hash chain above proves a revision was appended without altering an
 earlier byte; it says nothing about whether the new revision's *content* is
 a legitimate continuation of the previous one, nor whether a field appeared
-for the first time at the *wrong* state altogether. Two explicit functions
-close this, run together for revision 0 and every later revision alike:
+for the first time at the *wrong* state altogether. The schema/terminal
+content validator and the following two complementary functions close this,
+run together for revision 0 and every later revision alike:
 
 * `validate_manifest_state_shape(current, expected_campaign_id)` — a pure
   function of *one* revision's own content, taken in isolation, with no
@@ -779,15 +799,19 @@ close this, run together for revision 0 and every later revision alike:
   `case_results`/`artifact_sha256` append-only and never reordered/edited,
   `case_results` growing by exactly one entry per
   `PROFILE_IN_PROGRESS -> PROFILE_IN_PROGRESS` self-loop revision (neither a
-  same-state no-op nor two cases appended at once), and the state transition
-  itself legal per `ALLOWED_P14_TRANSITIONS`.
+  same-state no-op nor two cases appended at once), the state transition
+  itself legal per `ALLOWED_P14_TRANSITIONS`, and the set of content fields
+  changed by that revision exactly equal to the transition-specific
+  allowlist below. This last condition is presence-aware and distinguishes
+  an absent key from a present null-valued key.
 
-`load_p14_manifest_chain` applies both to every adjacent revision pair while
-walking the chain (never only to the latest revision), and
-`write_next_p14_manifest_revision` applies both once more, defensively,
-immediately before writing. `expected_campaign_id` always comes from the
-safely resolved campaign directory's own basename — a revision's own stored
-`campaign_id` is never trusted by itself.
+`load_p14_manifest_chain` applies the schema, canonical terminal-content,
+state-shape, transition, and timestamp-chronology checks to every revision
+while walking the chain (never only to the latest revision), and
+`write_next_p14_manifest_revision` applies the same checks once more,
+defensively, immediately before writing. `expected_campaign_id` always comes
+from the safely resolved campaign directory's own basename — a revision's
+own stored `campaign_id` is never trusted by itself.
 
 Every top-level P1.4 manifest field is classified into exactly one category
 for `validate_manifest_revision_transition`'s purposes (a module-level
@@ -800,7 +824,7 @@ assertion fails at import time if any field is ever left unclassified):
 | set-once | `pilot_campaign_reference`, `preflight_reference_pilot`, `provenance`, `preflight_reference_profile`, `resolved_ncu_metrics`, `profile_order` | may be absent, then take a fixed value at its own specific transition; never changes once set (non-timestamp analogue of the row above) |
 | state-derived | `state`, `profile_count_completed` | governed by the state machine below (state) or monotonically non-decreasing (the count) |
 | append-only | `case_results`, `artifact_sha256` | may only gain new entries; an existing entry is never edited, deleted, or reordered; `case_results` must also grow strictly in the frozen six-case order (its key set is always exactly a prefix of the frozen order) |
-| (failure fields) | `failure_stage`, `failure_detail` | may be non-`None` only alongside `state in (FAILED, INTERRUPTED)` |
+| (failure fields) | `failure_stage`, `failure_detail` | required together on a transition to `FAILED`/`INTERRUPTED`; absent everywhere else |
 
 `validate_manifest_state_shape` independently classifies every field by
 *which state may first introduce it* — a second, separate 7-row matrix (one
@@ -813,9 +837,10 @@ PILOT_IN_PROGRESS` may introduce only `schema_version`, `experiment_id`,
 `profile_plan_sha256`; `-> PILOT_COMPLETE` adds `pilot_completed_at_utc`,
 `pilot_campaign_reference`, `preflight_reference_pilot`, `provenance`; `->
 PROFILE_IN_PROGRESS` adds `profile_started_at_utc`, `resolved_ncu_metrics`,
-`preflight_reference_profile`, and (at the entering transition or, as the
-actual workflow does it, the first self-loop revision) `case_results`/
-`profile_count_completed`; `-> COMPLETE` adds `profile_completed_at_utc`,
+`preflight_reference_profile`; later revisions in that same state may carry
+`case_results`/`profile_count_completed`, but only after the first
+`PROFILE_IN_PROGRESS -> PROFILE_IN_PROGRESS` self-loop introduces them; `->
+COMPLETE` adds `profile_completed_at_utc`,
 `profile_order`, `artifact_sha256`; `-> ANALYZED` adds `analyzed_at_utc`
 (and permits `artifact_sha256` to gain `analysis/`-prefixed keys, which is
 also independently checked by `validate_manifest_revision_transition`). This
@@ -823,6 +848,26 @@ is strictly more precise than the broad category table above: e.g.
 `resolved_ncu_metrics` is "set-once" in that table (never *changes* once
 set), but only the state-shape matrix asserts it cannot appear *at all*
 before `PROFILE_IN_PROGRESS`.
+
+The adjacent-revision mutation matrix is exact:
+
+| Transition | Content fields that must change |
+| --- | --- |
+| `PILOT_IN_PROGRESS -> PILOT_COMPLETE` | `pilot_completed_at_utc`, `pilot_campaign_reference`, `preflight_reference_pilot`, `provenance` |
+| `PILOT_COMPLETE -> PROFILE_IN_PROGRESS` | `profile_started_at_utc`, `resolved_ncu_metrics`, `preflight_reference_profile` |
+| `PROFILE_IN_PROGRESS -> PROFILE_IN_PROGRESS` | `case_results`, `profile_count_completed` (exactly the next one-case prefix) |
+| `PROFILE_IN_PROGRESS -> COMPLETE` | `profile_completed_at_utc`, `profile_order`, `artifact_sha256` |
+| `COMPLETE -> ANALYZED` | `analyzed_at_utc`, `artifact_sha256` |
+| any legal `-> FAILED/INTERRUPTED` | `failure_stage`, `failure_detail` only; all prior progress is preserved exactly |
+
+`COMPLETE` additionally requires `profile_order == build_ncu_plan()` and an
+`artifact_sha256` map whose keys and values exactly match the canonical
+profile plan, both preflights, the three P1.3 pilot artifacts, and all three
+evidence hashes for each of the six frozen profile cases. `ANALYZED`
+preserves that base map and adds exactly the nine deterministic
+`analysis/` artifacts, with no missing or extra key and a canonical SHA-256
+for every value. Thus terminal metadata is validated as content, not merely
+as an append-only dictionary.
 
 `state` transitions (including a same-state "self-loop," which only
 `PROFILE_IN_PROGRESS` has — once per validated case, appending exactly one
@@ -914,7 +959,7 @@ its CLI accepted, and used verbatim, exactly such an argument).
 ```text
 None              -> PILOT_IN_PROGRESS
 PILOT_IN_PROGRESS -> PILOT_COMPLETE | FAILED | INTERRUPTED
-PILOT_COMPLETE     -> PROFILE_IN_PROGRESS | FAILED
+PILOT_COMPLETE     -> PROFILE_IN_PROGRESS | FAILED | INTERRUPTED
 PROFILE_IN_PROGRESS -> PROFILE_IN_PROGRESS | COMPLETE | FAILED | INTERRUPTED
 COMPLETE           -> ANALYZED
 ANALYZED           -> (terminal)
@@ -935,7 +980,8 @@ separate field, always `false`, at every state). `ANALYZED` means
 `analysis/*` was generated from a `COMPLETE` campaign; it is still not
 publishable. A terminal state (`FAILED`, `INTERRUPTED`, `ANALYZED`) is never
 reopened or rewritten. `failure_stage`/`failure_detail` record where and why
-a campaign stopped, exactly like P1.3's manifest.
+a campaign stopped; both fields are required together, with
+`failure_detail` always a JSON list of strings.
 
 ## 9. Analysis artifacts
 

@@ -9,8 +9,9 @@ baseline) — implemented, audited, functionally verified on GB300`. `P1.2
 verified on GB300`. `P1.3 (joint LDGSTS/TMA sweep infrastructure) —
 implemented, remediation completed, independently audited, and functionally
 verified on GB300`. `P1.4 (profiling, HBM validation, analysis, pilot) —
-implemented, remediated after FOUR independent GPU-free audits; a further
-independent re-audit PENDING; verified on GB300: NO; fresh preflight:
+implemented, remediated after FIVE independent GPU-free audits; final
+GPU-free acceptance suite PASS; independent post-remediation sign-off
+PENDING; verified on GB300: NO; fresh preflight:
 PENDING; pilot executed: NO; NCU/HBM validation: NO; publishable results:
 NONE; Phase 1: OPEN`.**
 
@@ -116,8 +117,14 @@ terminal manifest's `artifact_sha256` from values already in memory before
 the evidence-integrity gate ran, and `analyze` never re-ran that gate a
 second time immediately before publishing `ANALYZED`; the NCU bundle
 publisher's cleanup could unlink a file it no longer owned; and `PLAN.md`
-stated a phase gate had passed when it had not). All twenty blockers,
-across all four rounds, were remediated GPU-free, each with a new
+stated a phase gate had passed when it had not). A **fifth** independent
+GPU-free audit of commit `3d92a6b375ce3d0e803afd3e62723b08e471f3c8`
+found three final functional blockers: failure telemetry used
+`failure_detail: null` and could not record an interruption while still
+`PILOT_COMPLETE`; manifest revisions lacked an exact per-transition mutation
+matrix; and `COMPLETE` did not require the frozen `profile_order` plus the
+canonical complete evidence-hash map. All twenty-three blockers, across all
+five rounds, were remediated GPU-free, each with a new
 adversarial test that first demonstrably failed against the original
 behavior and then passed against the fix — the third round's fix for the
 NCU path-escape blockers is a new container-side bridge
@@ -127,9 +134,12 @@ bundle over its own stdout, so NCU never receives a campaign-relative
 pathname at all; the fourth round documents a trusted, single-writer
 filesystem model explicitly, rather than expanding P1.4 into a
 hostile-concurrency-resistant design (see `src/memory/P1_4_PROTOCOL.md`
-for the closed design of every blocker and the trust model). P1.4 has not
-yet been independently re-audited, has not been verified on GB300, and its
-pilot has not been executed; no P1.4 performance result exists.
+for the closed design of every blocker and the trust model); the fifth adds
+typed failure telemetry, the exact transition-mutation matrix, and canonical
+terminal-content validation. The final remediation passes the GPU-free
+acceptance suite but still requires sign-off from a reviewer who did not
+author it. P1.4 has not been verified on GB300, and its pilot has not been
+executed; no P1.4 performance result exists.
 
 ## Research question
 
@@ -264,10 +274,11 @@ automatically and never exposes all GPUs to a container.
 Phase 0 provides environment and tooling validation only. Experiment 1 has
 completed P1.1, P1.2, and P1.3: all three units are implemented,
 independently audited, and functionally verified on GB300. P1.4 is
-implemented and both rounds of audit blockers found so far have been
-remediated GPU-free (see above and `src/memory/P1_4_PROTOCOL.md`), but it
-has not yet passed independent re-audit, not yet verified on GB300, and its
-pilot has not been executed; experiments 2-3 have not started. The repository contains no
+implemented and all blockers found across five independent audit rounds
+have been remediated GPU-free (see above and
+`src/memory/P1_4_PROTOCOL.md`). Its final acceptance suite passes, but
+independent post-remediation sign-off and GB300 verification remain pending,
+and its pilot has not been executed; experiments 2-3 have not started. The repository contains no
 publishable bandwidth, throughput, GEMM performance, or cuBLASLt comparison
 results; campaign `20260728T103315Z` and the earlier P1.1/P1.2 smoke runs
 are functional checks only. A fresh preflight is required before any P1.4

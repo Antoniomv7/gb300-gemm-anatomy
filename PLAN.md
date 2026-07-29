@@ -120,16 +120,23 @@ basename, fixes its failure-cleanup control flow, and — together with the
 central evidence-integrity gate and `load_p14_manifest_chain` — extends
 descriptor-anchored, no-follow discipline to profile-directory inventory,
 per-case evidence reads, and the manifest revision directory itself. See
-`src/memory/P1_4_PROTOCOL.md` for the full design of each. Independent
-re-audit, GB300 verification, and pilot execution are all still pending; no
-performance result exists yet. A fresh preflight is required before any
-P1.4 GPU work because the host driver changed after the Phase 0
-verification.
+`src/memory/P1_4_PROTOCOL.md` for the full design of each. A fourth audit
+then closed presence-vs-null state shape, timestamp chronology,
+count/result co-occurrence, final evidence-gate placement, inode-owned
+cleanup, and status/trust-model defects. A fifth audit of `3d92a6b` found
+the final three functional blockers: invalid runner failure telemetry, no
+exact per-transition mutation matrix, and non-canonical terminal
+`profile_order`/`artifact_sha256`. Those blockers are now covered by eight
+new full-chain regressions and the final GPU-free acceptance suite passes.
+Independent post-remediation sign-off, GB300 verification, and pilot
+execution are still pending; no performance result exists yet. A fresh
+preflight is required before any P1.4 GPU work because the host driver
+changed after the Phase 0 verification.
 
 ## Phase 2 — BF16 UMMA throughput (27 July–2 August 2026)
 
 Entry condition for Phase 2: the Phase 1 gate must pass. Current status:
-Phase 1 remains open pending independent P1.4 re-audit and GB300
+Phase 1 remains open pending independent P1.4 sign-off and GB300
 verification.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
