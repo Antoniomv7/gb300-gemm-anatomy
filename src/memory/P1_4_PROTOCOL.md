@@ -512,7 +512,10 @@ before any value is trusted, unless all of the following hold:
 * every candidate metric column's entry in the units row equals its expected
   unit exactly, after only case/whitespace normalization — `byte`, `Byte`,
   and `BYTE` are the same unit; `kilobyte`/`Kbyte`/`KB` are a **different**,
-  rejected unit, never silently rescaled to bytes;
+  rejected unit, never silently rescaled to bytes. The exact unit row
+  observed in the live GB300/NCU 2025.4 export canary on 29 July 2026 is
+  frozen as `byte`, `byte`, `%`, `byte`, `ns` in the candidate order above;
+  notably, `gpu__time_duration.sum` uses `ns`, not `nsecond`;
 * every candidate metric value in the launch row is present, numeric,
   finite, and non-negative (no empty/NaN/±infinity value is ever treated as
   zero or missing-but-ignorable);

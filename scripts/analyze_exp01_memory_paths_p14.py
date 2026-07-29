@@ -1931,16 +1931,15 @@ class NcuCsvParseError(ValueError):
 
 REQUIRED_NCU_CSV_COLUMNS = ("ID", "Kernel Name")
 
-# Documented, NCU-2025.4-specific assumption for the one percentage-valued
-# candidate metric: base-unit CSV export reports it as "%". This has not
-# been verified against a live GPU collection (see P1_4_PROTOCOL.md); the
-# first real profiling run should confirm it before trusting a mismatch (or
-# lack of one) for dram__throughput.avg.pct_of_peak_sustained_elapsed.
+# NCU 2025.4 unit spellings observed in the live GB300 raw-page export
+# canary on 2026-07-29. Keep the exact profiler spellings here: in
+# particular, `--print-units base` emits "ns", not "nsecond", for
+# gpu__time_duration.sum.
 EXPECTED_METRIC_UNITS = {
     "dram__bytes_read.sum": "byte",
     "dram__bytes_write.sum": "byte",
     "lts__t_bytes.sum": "byte",
-    "gpu__time_duration.sum": "nsecond",
+    "gpu__time_duration.sum": "ns",
     "dram__throughput.avg.pct_of_peak_sustained_elapsed": "%",
 }
 
@@ -4831,6 +4830,29 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
                 and parsed["launch_id"] == "0"
                 and parsed["launch_count"] == 1,
                 detail=f"parsed={parsed}",
+            )
+
+            # Exact unit-row regression from the live GB300/Nsight Compute
+            # 2025.4 export canary collected on 2026-07-29. These literals
+            # are intentionally independent of EXPECTED_METRIC_UNITS so a
+            # mistaken constant cannot make both fixture and parser agree.
+            live_metric_header = _NCU_METADATA_HEADER + list(CANDIDATE_METRICS)
+            live_metric_units = _NCU_METADATA_UNITS + [
+                "byte", "byte", "%", "byte", "ns",
+            ]
+            live_metric_values = _NCU_METADATA_VALUES + [
+                "17228217600", "5010176", "40.55", "25844105184", "5539840",
+            ]
+            live_units_csv = _write_ncu_csv(
+                tmp_path / "metrics_live_gb300_units.csv",
+                live_metric_header, live_metric_units, [live_metric_values],
+            )
+            live_units_parsed = parse_ncu_raw_csv(live_units_csv)
+            rec.check(
+                "live GB300 NCU 2025.4 unit row is accepted exactly, including gpu duration 'ns'",
+                live_units_parsed["units"]
+                == dict(zip(CANDIDATE_METRICS, live_metric_units[-5:])),
+                detail=f"units={live_units_parsed['units']}",
             )
 
             for label, value in (
