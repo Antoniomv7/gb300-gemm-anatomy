@@ -5,7 +5,10 @@ diagnostic preflight, and the P1.1/P1.2 GB300 self-test plus one-shot
 `run_kind=smoke` runs, completed successfully as *functional* verification.
 P1.3 joint smoke campaign `20260728T103315Z` also completed both full-binary
 self-tests and all 18 planned invocations on GB300. None of those smoke
-bandwidth values are experimental results.
+bandwidth values are experimental results. P1.4 pilot campaign
+`20260730T073045Z` completed its frozen benchmark, six-case NCU validation,
+analysis, integrity check, and independent review. It is reviewed pilot
+evidence, but remains `publishable: false` and is not a final campaign.
 
 ## Trust model
 
@@ -38,9 +41,42 @@ against TMA. P1.4 owns the pilot benchmark campaign, Nsight Compute/HBM
 validation, figures, and interpretation; it is implemented — and the
 twenty-three blockers found by five independent GPU-free audits of that
 implementation have all been remediated GPU-free (see
-`src/memory/P1_4_PROTOCOL.md`). The final GPU-free acceptance suite passes,
-but independent post-remediation sign-off is pending; its pilot has not
-been executed, and no P1.4 raw campaign exists yet either.
+`src/memory/P1_4_PROTOCOL.md`). Its post-remediation review and GB300
+verification are recorded below.
+
+## Recorded P1.4 pilot and HBM validation
+
+```text
+Date:                     2026-07-30
+Git commit:               e2d01b86f53177bd48d18b215be48b422dc3c53b
+Preflight:                20260730T072946Z (OVERALL=PASS)
+Campaign:                 20260730T073045Z
+GPU:                      NVIDIA B300 SXM6 AC
+P1.3 pilot:               COMPLETE (18 configurations, 540 samples)
+P1.4 profiles:            COMPLETE (6/6)
+P1.4 analysis:            ANALYZED (manifest revision 10)
+HBM validation:           6/6 HBM_VALIDATED, no diagnostic flags
+Technical closure:        PASS
+Publishable:              false
+```
+
+The final validator reloaded the append-only manifest chain, verified every
+analysis-artifact hash, checked the linked P1.3 campaign, and printed
+`CIERRE TÉCNICO P1.4 / FASE 1: PASS`. The six NCU classifications apply only
+to the six frozen profiled cases and are not extrapolated to the other
+twelve configurations. The candidate-saturation result is limited to the
+tested 16/32/64 KiB points, and the fixed non-randomized sweep order remains
+a named limitation.
+
+Independent review found one presentation-only erratum in this campaign's
+immutable `analysis/report.md`: all 18 stability cells render as `REVIEW`
+even though their CV values are 0.01–0.18%, below the strict `>5%` review
+threshold. The CSV/JSON statistics path already carries the correct `ok`
+labels; the error was caused only by truth-testing the non-empty string
+`"ok"` while rendering Markdown. The closing code fix renders the exact
+`ok`/`REVIEW` label and adds a regression test. It changes no samples,
+statistics, profiler evidence, HBM classifications, kernels, or GPU
+execution. The original raw campaign remains untouched and hash-valid.
 
 ### `results/raw/exp01_memory_paths_p14/<campaign_id>/` (raw, not committed)
 

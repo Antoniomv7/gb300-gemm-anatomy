@@ -2485,11 +2485,19 @@ def render_report_markdown(
     lines.append("| method | stages | BIF KiB | median GB/s | 95% CI | CV% | stability review | IQR-flagged |")
     lines.append("| --- | ---: | ---: | ---: | --- | ---: | --- | ---: |")
     for row in stats_rows:
+        # stats_rows is deliberately CSV-shaped, so this field is a string.
+        # Never truth-test it: both "ok" and "REVIEW" are non-empty.
+        stability_review = row["stability_review"]
+        if stability_review not in {"ok", "REVIEW"}:
+            raise ValueError(
+                "pilot-statistics stability_review must be exactly 'ok' or "
+                f"'REVIEW', got {stability_review!r}"
+            )
         lines.append(
             f"| {row['method']} | {row['stages']} | {row['bytes_in_flight_kib']} | "
             f"{row['median_gbps']:.3f} | [{row['median_ci_low_gbps']:.3f}, "
             f"{row['median_ci_high_gbps']:.3f}] | {row['cv_percent']:.2f} | "
-            f"{'REVIEW' if row['stability_review'] else 'ok'} | {row['iqr_flagged_count']} |"
+            f"{stability_review} | {row['iqr_flagged_count']} |"
         )
     lines.append("")
     lines.append("## Pairwise LDGSTS/TMA comparison")
@@ -5056,6 +5064,50 @@ def run_self_test() -> int:  # noqa: C901 - a long, linear, itemized test list i
             rec.check(
                 "high-variance data is flagged for stability review",
                 high_cv_stats["stability_review"] and high_cv_stats["cv_percent"] > CV_STABILITY_REVIEW_PERCENT,
+            )
+            stability_stats_by_config = compute_all_config_stats(
+                {
+                    ("ldgsts", 2, 16): [100.0, 100.0, 100.0, 100.0],
+                    ("tma", 2, 16): high_cv_values,
+                },
+                random.Random(BOOTSTRAP_SEED),
+            )
+            stability_report = render_report_markdown(
+                campaign_id="20260730T073045Z",
+                stats_rows=[
+                    _stats_to_csv_row(
+                        "ldgsts", 2, 16,
+                        stability_stats_by_config[("ldgsts", 2, 16)],
+                    ),
+                    _stats_to_csv_row(
+                        "tma", 2, 16,
+                        stability_stats_by_config[("tma", 2, 16)],
+                    ),
+                ],
+                pairwise_rows=[],
+                saturation_rows=[],
+                ncu_rows=[],
+                provenance={},
+                dram_read_metric_available=False,
+            )
+            low_stability_line = next(
+                line for line in stability_report.splitlines()
+                if line.startswith("| ldgsts | 2 | 16 |")
+            )
+            high_stability_line = next(
+                line for line in stability_report.splitlines()
+                if line.startswith("| tma | 2 | 16 |")
+            )
+            rec.check(
+                "report renders the string label 'ok' as ok and 'REVIEW' as REVIEW "
+                "instead of treating both non-empty strings as truthy",
+                "| ok |" in low_stability_line
+                and "| REVIEW |" not in low_stability_line
+                and "| REVIEW |" in high_stability_line,
+                detail=(
+                    f"low={low_stability_line!r} "
+                    f"high={high_stability_line!r}"
+                ),
             )
 
             # --- pairwise ratio direction (item 20) -----------------------------------

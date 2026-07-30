@@ -105,8 +105,8 @@ help:
 	@echo "  P1.4 (below) owns the pilot, profiling, and interpretation."
 	@echo ""
 	@echo "  -- P1.4 profiling, HBM validation, analysis, pilot (see"
-	@echo "     src/memory/P1_4_PROTOCOL.md; implemented, audit PENDING, not verified,"
-	@echo "     pilot NOT executed) --"
+	@echo "     src/memory/P1_4_PROTOCOL.md; implemented, audited, verified on GB300;"
+	@echo "     reviewed pilot complete, publishable=false) --"
 	@echo "  GPU-free P1.4 planning/checking (no GPU, no Docker, no network):"
 	@echo "  make memory-paths-p14-plan     Print the frozen P1.3 18-invocation pilot plan"
 	@echo "                                 and the frozen P1.4 six-case NCU plan."
@@ -114,7 +114,7 @@ help:
 	@echo "                                 synthetic/adversarial tests, and exact-plan"
 	@echo "                                 validation (18-way P1.3, six-way P1.4)."
 	@echo "  GPU-executing (requires BLACKWELL_GPU_INDEX, P1_4_CAMPAIGN_ID, and"
-	@echo "  P1_4_PREFLIGHT_SUMMARY; never selects a GPU automatically; not run by this task):"
+	@echo "  P1_4_PREFLIGHT_SUMMARY; never selects a GPU automatically):"
 	@echo "  make memory-paths-p14-pilot    The frozen 18-configuration run_kind=benchmark"
 	@echo "                                 pilot, through the unmodified P1.3 runner."
 	@echo "  make memory-paths-p14-profile  Nsight Compute on exactly the six frozen cases"
@@ -234,7 +234,8 @@ check-static:
 	@grep -Fq 'P1.1 | Standalone LDGSTS baseline | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P1.2 | Equivalent TMA path | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P1.3 | Joint sweep (≤18 configurations) | YES | YES | YES |' PLAN.md
-	@grep -Fq 'P1.4 | Profiling, validation, analysis, pilot | YES | NO | NO |' PLAN.md
+	@grep -Fq 'P1.4 | Profiling, validation, analysis, pilot | YES | YES | YES |' PLAN.md
+	@grep -Fq 'Phase 1 gate passed; Phase 2 may begin.' PLAN.md
 	@! grep -F 'P1.3, P1.4, and experiments 2' README.md
 	@! grep -F 'P1.3 (the joint LDGSTS/TMA sweep) has not started' README.md
 	@! grep -F 'P1.3 (the joint sweep) and P1.4' src/memory/README.md

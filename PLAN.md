@@ -36,7 +36,7 @@ Gate: Phase 0 gate passed; correctness validated before any timing/profiling.
 | P1.1 | Standalone LDGSTS baseline | YES | YES | YES |
 | P1.2 | Equivalent TMA path | YES | YES | YES |
 | P1.3 | Joint sweep (≤18 configurations) | YES | YES | YES |
-| P1.4 | Profiling, validation, analysis, pilot | YES | NO | NO |
+| P1.4 | Profiling, validation, analysis, pilot | YES | YES | YES |
 
 P1.3's remediated implementation passed a new independent GPU-free audit and
 was functionally verified on GB300 on 28 July 2026. At Git commit
@@ -128,16 +128,29 @@ the final three functional blockers: invalid runner failure telemetry, no
 exact per-transition mutation matrix, and non-canonical terminal
 `profile_order`/`artifact_sha256`. Those blockers are now covered by eight
 new full-chain regressions and the final GPU-free acceptance suite passes.
-Independent post-remediation sign-off, GB300 verification, and pilot
-execution are still pending; no performance result exists yet. A fresh
-preflight is required before any P1.4 GPU work because the host driver
-changed after the Phase 0 verification.
+The final post-remediation review also covered the four NCU-2025.4
+compatibility fixes made after the fifth audit: the real help layout,
+namespace-qualified metric identifiers, the wide raw-page CSV schema, and
+the live `ns` duration unit. Fresh preflight `20260730T072946Z` then passed,
+and GB300 campaign `20260730T073045Z` at commit
+`e2d01b86f53177bd48d18b215be48b422dc3c53b` reached `ANALYZED`: 18/18
+pilot configurations, 540/540 retained samples, six/six predefined NCU
+profiles, and six `HBM_VALIDATED` classifications with no diagnostic flags.
+The final evidence/hash validator reported
+`CIERRE TÉCNICO P1.4 / FASE 1: PASS`.
+
+Review of the generated Markdown exposed one presentation-only defect:
+string label `ok` was truth-tested and rendered as `REVIEW`. The closing
+GPU-free fix now renders the exact label and adds a regression test; it
+changes no GPU path, measurement, statistic, or HBM classification. P1.4 is
+therefore audited and verified on GB300, and Phase 1 is closed. The campaign
+is still a single pilot and remains `publishable: false`; final experimental
+campaigns remain Phase 4 work.
 
 ## Phase 2 — BF16 UMMA throughput (27 July–2 August 2026)
 
 Entry condition for Phase 2: the Phase 1 gate must pass. Current status:
-Phase 1 remains open pending independent P1.4 sign-off and GB300
-verification.
+Phase 1 gate passed; Phase 2 may begin.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|

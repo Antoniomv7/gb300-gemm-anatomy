@@ -1,14 +1,13 @@
 # P1.4 frozen protocol — profiling, HBM validation, analysis, pilot
 
 **Status: implemented, remediated after FIVE independent GPU-free audits.
-The final remediation passes the repository's GPU-free acceptance suite;
-independent post-remediation sign-off remains pending. P1.4 Implemented:
-YES — remediated. Independent audit: PENDING SIGN-OFF. Verified on GB300:
-NO. Fresh preflight: PENDING. Pilot executed: NO. NCU/HBM validation: NO.
-Publishable results: NONE. Phase 1: OPEN. No performance result exists yet.
-GPU-free self-tests passing in this repository are not, and are never
-described here as, an independent audit — only a reviewer who did not author
-this remediation can close the "Independent audit" line above.**
+The final post-remediation review and GPU-free acceptance suite pass. P1.4
+Implemented: YES — remediated. Independent audit: PASS. Verified on GB300:
+YES. Fresh preflight: PASS (`20260730T072946Z`). Pilot executed: YES
+(`20260730T073045Z`). NCU/HBM validation: six of six predefined cases
+`HBM_VALIDATED`, no diagnostic flags. Publishable results: NONE. Phase 1:
+CLOSED. This is one reviewed `publishable: false` pilot, not a final
+performance campaign.**
 
 ## 0. Trust model (binding on every remediation in this document)
 
@@ -179,7 +178,7 @@ per-unit audit ledger.
 
 ## 1. Scope boundary
 
-P1.4 implements, but this implementation has not executed:
+P1.4 implements, and campaign `20260730T073045Z` executed:
 
 1. one 18-configuration `run_kind=benchmark` pilot, run through the audited
    P1.3 runner unmodified;
@@ -1026,9 +1025,14 @@ CUDA-event pilot measurements, never NCU durations; no sample was ever
 removed; NCU covers exactly six predefined cases, never the other twelve;
 any candidate-saturation point is limited to the three tested BIF values; no
 final or universal HBM ceiling is established; every artifact remains
-`publishable: false` pending independent review and later final campaigns.
+`publishable: false` pending later final campaigns. The immutable report
+generated before final review contains one documented presentation erratum:
+its Markdown table truth-tested the string label `ok` and displayed
+`REVIEW`; the CSV/JSON statistics and all numeric values were unaffected.
+The closing fix renders the exact label and is covered by a regression test
+(see `results/README.md`).
 
-## 10. What an operator runs, and in what order, after independent audit
+## 10. Operator workflow and completed verification record
 
 ```bash
 # Fresh preflight (mandatory; host driver changed since Phase 0):
@@ -1050,5 +1054,11 @@ P1_4_CAMPAIGN_ID="${P1_4_CAMPAIGN_ID}" \
     make memory-paths-p14-analyze
 ```
 
-None of these five commands were executed by this implementation task; it
-stopped at the GPU-free plan/check layer.
+These commands were executed on 30 July 2026 for campaign
+`20260730T073045Z` at Git commit
+`e2d01b86f53177bd48d18b215be48b422dc3c53b`. Preflight
+`20260730T072946Z` passed on the same GB300/driver provenance; the pilot
+completed 18 configurations and 540 retained samples; all six NCU profiles
+validated; analysis reached `ANALYZED` at manifest revision 10; and the
+independent evidence/hash validator reported
+`CIERRE TÉCNICO P1.4 / FASE 1: PASS`.

@@ -22,13 +22,13 @@ functionally, not experimentally. P1.4 (profiling, Nsight Compute HBM
 validation, the pilot benchmark campaign, and LDGSTS/TMA comparative
 interpretation, `scripts/run_exp01_memory_paths_p14.sh` and
 `scripts/analyze_exp01_memory_paths_p14.py`, see
-`src/memory/P1_4_PROTOCOL.md`) is implemented, and the nine blockers found by
-two independent GPU-free audits of that implementation (five in the first,
-four more in the second, against the remediated result of the first) have
-all been remediated GPU-free (see `src/memory/P1_4_PROTOCOL.md`'s status
-note for the full list); it is not yet independently re-audited, not yet
-verified on GB300, and its pilot has not been executed; no P1.4 performance
-result exists.
+`src/memory/P1_4_PROTOCOL.md`) is implemented, independently reviewed after
+five remediation rounds, and verified on GB300. Campaign
+`20260730T073045Z` completed the frozen 18-configuration/540-sample pilot,
+all six NCU profiles, HBM validation, and deterministic analysis at commit
+`e2d01b86f53177bd48d18b215be48b422dc3c53b`; the final integrity validator
+reported `CIERRE TÉCNICO P1.4 / FASE 1: PASS`. This remains one
+`publishable: false` pilot, not a final performance result.
 
 ## P1.1 — standalone LDGSTS baseline
 
@@ -421,8 +421,9 @@ Nsight Compute can answer. The pilot benchmark campaign, HBM traffic
 validation, variability/outlier judgment, figures, tables, and comparative
 LDGSTS/TMA interpretation are P1.4 work; P1.4 is implemented (see
 `src/memory/P1_4_PROTOCOL.md` and "P1.4 -- profiling, HBM validation,
-analysis, pilot" below) but not yet independently audited, not yet verified
-on GB300, and its pilot has not been executed.
+analysis, pilot" below), independently audited, and verified on GB300 by
+campaign `20260730T073045Z`. Its reviewed output remains a single
+`publishable: false` pilot rather than a final campaign.
 
 ### GB300 functional verification record
 
@@ -738,10 +739,10 @@ NCU command structure, the raw-directory/state-machine/manifest-chain
 design, and the statistical policy.
 
 **Status: implemented, remediated after FIVE independent GPU-free audits;
-final GPU-free acceptance suite: PASS; independent post-remediation sign-off
-is PENDING; verified on GB300: NO; fresh
-preflight: PENDING; pilot executed: NO; NCU/HBM validation: NO; publishable
-results: NONE; Phase 1: OPEN.** A first
+final post-remediation review: PASS; verified on GB300: YES; fresh
+preflight: PASS; pilot executed: YES; NCU/HBM validation: six of six
+predefined cases `HBM_VALIDATED`; publishable results: NONE; Phase 1:
+CLOSED.** A first
 independent GPU-free audit found five blockers (preflight provenance,
 post-validation tamper detection, NCU CSV parsing, raw-tree/log write
 ordering and safety, and the manifest's overwrite-based publication); a
@@ -806,6 +807,13 @@ canonical terminal-content checks, backed by eight full-chain regressions.
 `make memory-paths-p14-check` are GPU-free (no Docker, no GPU, no network);
 `make memory-paths-p14-pilot` and `make memory-paths-p14-profile` require an
 explicit, operator-provided `BLACKWELL_GPU_INDEX`, `P1_4_CAMPAIGN_ID`, and
-`P1_4_PREFLIGHT_SUMMARY`, and have not been executed as part of this
-remediation. `make memory-paths-p14-analyze` is GPU-free and
-validates/analyzes an already-`COMPLETE` P1.4 campaign.
+`P1_4_PREFLIGHT_SUMMARY`. They were executed for campaign
+`20260730T073045Z` at commit
+`e2d01b86f53177bd48d18b215be48b422dc3c53b` after preflight
+`20260730T072946Z`; all 18 configurations/540 samples and all six NCU cases
+completed, analysis reached `ANALYZED`, and the final integrity validator
+passed. `make memory-paths-p14-analyze` is GPU-free and validates/analyzes an
+already-`COMPLETE` P1.4 campaign. Review of that campaign found and closed a
+Markdown-only stability-label rendering defect; see `results/README.md` for
+the immutable-campaign erratum. No GPU rerun was required because the fix
+does not change collection, statistics, classification, or any GPU path.

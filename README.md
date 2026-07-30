@@ -10,10 +10,9 @@ verified on GB300`. `P1.3 (joint LDGSTS/TMA sweep infrastructure) —
 implemented, remediation completed, independently audited, and functionally
 verified on GB300`. `P1.4 (profiling, HBM validation, analysis, pilot) —
 implemented, remediated after FIVE independent GPU-free audits; final
-GPU-free acceptance suite PASS; independent post-remediation sign-off
-PENDING; verified on GB300: NO; fresh preflight:
-PENDING; pilot executed: NO; NCU/HBM validation: NO; publishable results:
-NONE; Phase 1: OPEN`.**
+post-remediation review PASS; verified on GB300: YES; fresh preflight: PASS;
+pilot executed: YES; NCU/HBM validation: six of six predefined cases
+`HBM_VALIDATED`; publishable results: NONE; Phase 1: CLOSED`.**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -26,6 +25,17 @@ both full-binary self-tests and all 18 planned invocations passing. These
 smoke runs establish functional verification only: their bandwidth values are
 not experimental results. No publishable experimental performance results
 exist yet.
+
+P1.4 campaign `20260730T073045Z` was executed on GB300 at Git commit
+`e2d01b86f53177bd48d18b215be48b422dc3c53b`, after fresh preflight
+`20260730T072946Z` passed on the same GPU and driver. The frozen pilot reached
+`ANALYZED`: all 18 configurations completed all 30 retained repetitions
+(540 samples), and all six predefined Nsight Compute cases were classified
+`HBM_VALIDATED` with no diagnostic flags. The final integrity validator
+reloaded the append-only manifest chain (revision 10), re-hashed the
+evidence, and reported `CIERRE TÉCNICO P1.4 / FASE 1: PASS`. This is one
+reviewed pilot, not a final campaign; every artifact remains
+`publishable: false`.
 
 P1.1, the standalone LDGSTS arm of the "LDGSTS versus TMA" experiment
 (`src/memory/ldgsts.cu`), is implemented as a global-memory-to-SMEM effective
@@ -136,10 +146,16 @@ filesystem model explicitly, rather than expanding P1.4 into a
 hostile-concurrency-resistant design (see `src/memory/P1_4_PROTOCOL.md`
 for the closed design of every blocker and the trust model); the fifth adds
 typed failure telemetry, the exact transition-mutation matrix, and canonical
-terminal-content validation. The final remediation passes the GPU-free
-acceptance suite but still requires sign-off from a reviewer who did not
-author it. P1.4 has not been verified on GB300, and its pilot has not been
-executed; no P1.4 performance result exists.
+terminal-content validation. The final post-remediation review additionally
+covered the four live-NCU compatibility corrections required by NCU 2025.4
+on GB300 (help capability, qualified metric identifiers, wide raw-page CSV,
+and the `ns` duration unit). The live campaign above then verified the
+complete pilot/profile/analyze path. Review of its generated Markdown found
+one presentation-only defect: the already-computed string label `ok` was
+tested for truthiness and therefore rendered as `REVIEW`. The closing fix
+renders the exact `ok`/`REVIEW` value and adds a regression test; it changes
+no sample, statistic, profiler evidence, HBM classification, kernel, or GPU
+path. No P1.4 result is publishable yet.
 
 ## Research question
 
@@ -272,17 +288,13 @@ BLACKWELL_GPU_INDEX=<physical-index> make preflight
 automatically and never exposes all GPUs to a container.
 
 Phase 0 provides environment and tooling validation only. Experiment 1 has
-completed P1.1, P1.2, and P1.3: all three units are implemented,
-independently audited, and functionally verified on GB300. P1.4 is
-implemented and all blockers found across five independent audit rounds
-have been remediated GPU-free (see above and
-`src/memory/P1_4_PROTOCOL.md`). Its final acceptance suite passes, but
-independent post-remediation sign-off and GB300 verification remain pending,
-and its pilot has not been executed; experiments 2-3 have not started. The repository contains no
-publishable bandwidth, throughput, GEMM performance, or cuBLASLt comparison
-results; campaign `20260728T103315Z` and the earlier P1.1/P1.2 smoke runs
-are functional checks only. A fresh preflight is required before any P1.4
-GPU work because the host driver changed after the Phase 0 verification;
-the pinned CUDA 13.1 container contract remains unchanged. See `PLAN.md` for
-the remaining schedule and `AGENTS.md` for the mandatory shared-cluster
-rules.
+completed P1.1–P1.4: every unit is implemented, independently audited, and
+verified on GB300. P1.1/P1.2 and P1.3 campaign `20260728T103315Z` are
+functional checks only. P1.4 campaign `20260730T073045Z` is a reviewed,
+HBM-validated pilot with 18 configurations, 540 retained samples, and six
+successful NCU cases; it closes the Phase 1 technical gate but remains
+`publishable: false` pending later final campaigns. Experiments 2–3 have not
+started, and the repository still contains no publishable bandwidth,
+throughput, GEMM-performance, or cuBLASLt-comparison result. The pinned CUDA
+13.1 container contract remains unchanged. See `PLAN.md` for the remaining
+schedule and `AGENTS.md` for the mandatory shared-cluster rules.
