@@ -14,7 +14,9 @@ post-remediation review PASS; verified on GB300: YES; fresh preflight: PASS;
 pilot executed: YES; NCU/HBM validation: six of six predefined cases
 `HBM_VALIDATED`; publishable results: NONE; Phase 1: CLOSED`. `P2.1 (1-SM
 BF16 UMMA) — implemented, independently audited, and functionally verified
-on GB300; publishable results: NONE`.**
+on GB300; publishable results: NONE`. `P2.2 (2-SM BF16 UMMA) — implemented;
+independently audited: NO; verified on GB300: NO; publishable results:
+NONE`.**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -159,7 +161,7 @@ renders the exact `ok`/`REVIEW` value and adds a regression test; it changes
 no sample, statistic, profiler evidence, HBM classification, kernel, or GPU
 path. No P1.4 result is publishable yet.
 
-## Phase 2 status: P2.1 (1-SM BF16 UMMA)
+## Phase 2 status: P2.1 (1-SM BF16 UMMA), P2.2 (2-SM BF16 UMMA)
 
 P2.1, the 1-SM arm of the "BF16 UMMA throughput" experiment
 (`src/compute/umma_1sm.cu`), is implemented: twelve `tcgen05.mma.
@@ -186,7 +188,33 @@ mismatches; and both a short `run_kind=smoke` and a short
 `git_dirty=false`, and three rows each. These brief runs validate the
 implementation and both CLI routes; their cycle values are not experimental
 performance results, and every row is unconditionally `publishable=false`.
-P2.2 (2-SM UMMA), P2.3 (joint sweep), and P2.4 (profiling and empirical
+P2.2, the 2-SM arm of the "BF16 UMMA throughput" experiment
+(`src/compute/umma_2sm.cu`), is implemented: twelve `tcgen05.mma.
+cta_group::2.kind::f16` (BF16 x BF16 -> FP32) specializations, one static
+two-CTA cluster (128 threads per CTA, 128 local output rows per CTA, joint
+M=256), N in `{64,128,256}` and depth in `{4,16,64,256}`, with a GPU-free
+SASS/ELF/source gate (`scripts/check_umma_2sm_sass.py`) that disassembles
+the real compiled binary and requires exactly those twelve symbols, a
+compile-time-unrolled `UTCHMMA.2CTA` burst of exactly `depth` instructions
+per symbol, a real `UTCBAR.2CTA.MULTICAST` completion sequence with the
+exact `0x0003` cluster mask, a complete collective (both-CTA, warp-0-only)
+TMEM allocate/commit/wait/load/deallocate/relinquish lifecycle with cluster
+synchronization before deallocation, ELF-level `EIATTR_EXPLICIT_CLUSTER`/
+`EIATTR_CTA_PER_CLUSTER` evidence of the compile-time two-CTA cluster
+declaration, and the absence of any non-`.2CTA` (1-SM-fallback), WGMMA,
+`mma.sync`, TMA, LDGSTS, FP8/FP4, or sparse instruction. See
+`src/compute/P2_2_PROTOCOL.md` for the full frozen contract, the PTX ISA
+citations behind every descriptor and synchronization step, and the audit
+of the pinned secondary reference. The build and SASS checks above may only
+be declared successful when they have actually been executed (`make
+compute-umma-2sm-build`, `make compute-umma-2sm-sass`, `make
+compute-umma-2sm-check`); nothing here is simulated. The real `sm_103a`
+binary passed the twelve-specialization SASS/ELF contract during
+implementation. **P2.2 has not been independently audited and has not been
+verified on GB300**: no GPU command of any kind was executed to produce
+this implementation, so no `SELF_TEST`, `smoke`, or `benchmark` result
+exists yet, and every future CSV row remains unconditionally
+`publishable=false`. P2.3 (joint sweep) and P2.4 (profiling and empirical
 ceiling) are **not implemented**.
 
 ## Research question
@@ -325,10 +353,11 @@ verified on GB300. P1.1/P1.2 and P1.3 campaign `20260728T103315Z` are
 functional checks only. P1.4 campaign `20260730T073045Z` is a reviewed,
 HBM-validated pilot with 18 configurations, 540 retained samples, and six
 successful NCU cases; it closes the Phase 1 technical gate but remains
-`publishable: false` pending later final campaigns. Experiment 2 has begun:
-P2.1 is implemented, independently audited, and functionally verified on
-GB300, while P2.2–P2.4 and experiment 3 remain unimplemented. The repository
-still contains no publishable bandwidth, throughput, GEMM-performance, or
-cuBLASLt-comparison result. The pinned CUDA 13.1 container contract remains
-unchanged. See `PLAN.md` for the remaining schedule and `AGENTS.md` for the
-mandatory shared-cluster rules.
+`publishable: false` pending later final campaigns. Experiment 2 is
+underway: P2.1 is implemented, independently audited, and functionally
+verified on GB300; P2.2 is implemented but not yet independently audited
+and not yet verified on GB300; P2.3–P2.4 and experiment 3 remain
+unimplemented. The repository still contains no publishable bandwidth,
+throughput, GEMM-performance, or cuBLASLt-comparison result. The pinned
+CUDA 13.1 container contract remains unchanged. See `PLAN.md` for the
+remaining schedule and `AGENTS.md` for the mandatory shared-cluster rules.

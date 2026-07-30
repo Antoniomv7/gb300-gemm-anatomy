@@ -150,12 +150,13 @@ campaigns remain Phase 4 work.
 ## Phase 2 — BF16 UMMA throughput (27 July–2 August 2026)
 
 Entry condition for Phase 2: the Phase 1 gate must pass. Current status:
-Phase 1 gate passed; Phase 2 may begin. P2.1 is closed and P2.2 may begin.
+Phase 1 gate passed; Phase 2 may begin. P2.1 is closed. P2.2 is implemented
+but not yet independently audited and not yet verified on GB300.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
 | P2.1 | 1-SM UMMA | YES | YES | YES |
-| P2.2 | 2-SM UMMA | NO | NO | NO |
+| P2.2 | 2-SM UMMA | YES | NO | NO |
 | P2.3 | Sweep (≤24 configurations) | NO | NO | NO |
 | P2.4 | Profiling and empirical ceiling | NO | NO | NO |
 
@@ -171,6 +172,32 @@ GPU self-test reported `SELF_TEST: PASS (12/12)`, and short `smoke` and
 close P2.1 as audited, functionally verified infrastructure only: every row
 remained `publishable=false`, and no throughput or empirical-ceiling result
 is claimed before P2.4.
+
+P2.2 (`src/compute/umma_2sm.cu`, `scripts/check_umma_2sm_sass.py`,
+`src/compute/P2_2_PROTOCOL.md`) is implemented: twelve `tcgen05.mma.
+cta_group::2.kind::f16` (BF16 x BF16 -> FP32, joint M=256 across one static
+two-CTA cluster, 128 local rows per CTA) specializations, N in
+{64,128,256} and depth in {4,16,64,256}, with a GPU-free SASS/ELF/source
+gate that disassembles the real compiled binary and requires exactly those
+twelve symbols, a compile-time-unrolled `UTCHMMA.2CTA` burst of exactly
+`depth` instructions per symbol, a real `UTCBAR.2CTA.MULTICAST` completion
+sequence, a complete collective (both-CTA, warp-0-only) TMEM
+allocate/commit/wait/load/deallocate/relinquish lifecycle with cluster
+synchronization before deallocation, ELF-level `EIATTR_EXPLICIT_CLUSTER`/
+`EIATTR_CTA_PER_CLUSTER` evidence of the compile-time two-CTA cluster, and
+the absence of any non-`.2CTA` (1-SM-fallback-shaped) UTCHMMA/UTCBAR/
+allocation, WGMMA, `mma.sync`, TMA, LDGSTS, FP8/FP4, or sparse instruction.
+The real `sm_103a` binary was compiled and disassembled during
+implementation (GPU-free) and passed this full contract for all twelve
+specializations. P2.2 has **not** been independently audited and has
+**not** been verified on GB300: no `--self-test`, `smoke`, or `benchmark`
+invocation has been executed on a physical device, and no GPU command of
+any kind was run to produce this implementation. No publishable result
+exists or is claimed; every CSV row P2.2 can ever emit carries
+`publishable=false` unconditionally. See `src/compute/P2_2_PROTOCOL.md` for
+the full frozen contract and the PTX ISA citations behind every descriptor,
+synchronization step, and SASS/ELF check. P2.3 (joint sweep) and P2.4
+(profiling and empirical ceiling) remain entirely unimplemented.
 
 ## Phase 3 — CuTe DSL GEMM versus cuBLASLt (3–9 August 2026)
 

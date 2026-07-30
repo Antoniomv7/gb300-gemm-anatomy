@@ -6,7 +6,9 @@
 # memory-paths-check, memory-paths-smoke, memory-paths-p14-plan,
 # memory-paths-p14-check, memory-paths-p14-pilot, memory-paths-p14-profile,
 # memory-paths-p14-analyze, compute-umma-1sm-build, compute-umma-1sm-sass,
-# compute-umma-1sm-check, compute-umma-1sm-self-test, compute-umma-1sm-smoke.
+# compute-umma-1sm-check, compute-umma-1sm-self-test, compute-umma-1sm-smoke,
+# compute-umma-2sm-build, compute-umma-2sm-sass, compute-umma-2sm-check,
+# compute-umma-2sm-self-test, compute-umma-2sm-smoke.
 # No target selects a GPU automatically, elevates privileges, or exceeds two
 # build jobs.
 
@@ -57,6 +59,20 @@ COMPUTE_UMMA_1SM_PROTOCOL := src/compute/P2_PROTOCOL.md
 # VERSIONS.env or the pinned architecture string itself.
 COMPUTE_UMMA_1SM_ARCH_FLAGS := -arch=compute_$(patsubst sm_%,%,$(CUDA_ARCH)) -code=$(CUDA_ARCH)
 
+COMPUTE_UMMA_2SM_SRC := src/compute/umma_2sm.cu
+COMPUTE_UMMA_2SM_BIN := build/compute/umma_2sm
+COMPUTE_UMMA_2SM_SASS := build/compute/umma_2sm.sass
+COMPUTE_UMMA_2SM_CHECKER := scripts/check_umma_2sm_sass.py
+COMPUTE_UMMA_2SM_PROTOCOL := src/compute/P2_2_PROTOCOL.md
+# Same pinned-toolchain requirement as P2.1 (see the COMPUTE_UMMA_1SM_ARCH_FLAGS
+# comment above and src/compute/P2_PROTOCOL.md section 20): nvcc's single-flag
+# "-arch=sm_103a" shorthand does not propagate the "a" suffix to ptxas's
+# SASS-generation target on this pinned CUDA 13.1.80 toolchain, so every
+# tcgen05 instruction fails to compile under that literal form. The explicit
+# virtual/real split below, derived from the same pinned CUDA_ARCH value, is
+# required and reproducibly verified for umma_2sm.cu as well.
+COMPUTE_UMMA_2SM_ARCH_FLAGS := -arch=compute_$(patsubst sm_%,%,$(CUDA_ARCH)) -code=$(CUDA_ARCH)
+
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
 	Dockerfile Makefile \
@@ -68,7 +84,8 @@ REQUIRED_FILES := \
 	$(EXP01_RUNNER) $(EXP01_AGGREGATOR) \
 	$(EXP01_P14_RUNNER) $(EXP01_P14_ANALYZER) $(EXP01_P14_SAFE_CAPTURE) $(EXP01_P14_NCU_BRIDGE) \
 	$(EXP01_P14_PROTOCOL) \
-	$(COMPUTE_UMMA_1SM_SRC) $(COMPUTE_UMMA_1SM_CHECKER) $(COMPUTE_UMMA_1SM_PROTOCOL)
+	$(COMPUTE_UMMA_1SM_SRC) $(COMPUTE_UMMA_1SM_CHECKER) $(COMPUTE_UMMA_1SM_PROTOCOL) \
+	$(COMPUTE_UMMA_2SM_SRC) $(COMPUTE_UMMA_2SM_CHECKER) $(COMPUTE_UMMA_2SM_PROTOCOL)
 
 .DEFAULT_GOAL := help
 .PHONY: help check-static build-image check-env preflight \
@@ -78,7 +95,9 @@ REQUIRED_FILES := \
 	memory-paths-p14-plan memory-paths-p14-check memory-paths-p14-pilot \
 	memory-paths-p14-profile memory-paths-p14-analyze \
 	compute-umma-1sm-build compute-umma-1sm-sass compute-umma-1sm-check \
-	compute-umma-1sm-self-test compute-umma-1sm-smoke
+	compute-umma-1sm-self-test compute-umma-1sm-smoke \
+	compute-umma-2sm-build compute-umma-2sm-sass compute-umma-2sm-check \
+	compute-umma-2sm-self-test compute-umma-2sm-smoke
 
 help:
 	@echo "gb300-gemm-anatomy — Phase 0 + P1.1 (LDGSTS) + P1.2 (TMA) + P1.3 (sweep) targets"
@@ -166,6 +185,26 @@ help:
 	@echo "  make compute-umma-1sm-self-test  Validate all twelve specializations on GPU (no"
 	@echo "                                   publishable numbers)."
 	@echo "  make compute-umma-1sm-smoke      Self-test, then one short run_kind=smoke"
+	@echo "                                   measurement (NOT a final result)."
+	@echo ""
+	@echo "  -- P2.2 2-SM BF16 UMMA (tcgen05.mma, kind::f16, cta_group::2, one static"
+	@echo "     two-CTA cluster; see src/compute/P2_2_PROTOCOL.md; implemented, NOT yet"
+	@echo "     independently audited, NOT yet verified on GB300, no publishable result) --"
+	@echo "  GPU-free build/SASS/check (no GPU, no network):"
+	@echo "  make compute-umma-2sm-build    Compile the twelve P2.2 specializations. No GPU."
+	@echo "  make compute-umma-2sm-sass     Disassemble and verify the real cubin: exactly"
+	@echo "                                 twelve UTCHMMA.2CTA bursts of depth instructions"
+	@echo "                                 each, a full collective TMEM lifecycle, ELF"
+	@echo "                                 two-CTA cluster attributes, no forbidden/1-SM-"
+	@echo "                                 fallback instruction. No GPU."
+	@echo "  make compute-umma-2sm-check    Python syntax, checker self-test, exactly-twelve-"
+	@echo "                                 specializations and forbidden-pattern source"
+	@echo "                                 checks, honest status reporting, plus the real"
+	@echo "                                 cubin SASS gate above. No GPU, no network."
+	@echo "  GPU-executing (requires BLACKWELL_GPU_INDEX; never selects a GPU automatically):"
+	@echo "  make compute-umma-2sm-self-test  Validate all twelve specializations on GPU (no"
+	@echo "                                   publishable numbers)."
+	@echo "  make compute-umma-2sm-smoke      Self-test, then one short run_kind=smoke"
 	@echo "                                   measurement (NOT a final result)."
 	@echo ""
 	@echo "Pinned contract (VERSIONS.env): CUDA $(CUDA_VERSION), CUTLASS $(CUTLASS_VERSION),"
@@ -357,6 +396,57 @@ check-static:
 	@grep -Fq '* Independent audit: **passed**.' $(COMPUTE_UMMA_1SM_PROTOCOL)
 	@grep -Fq '* GB300 verification: **passed**.' $(COMPUTE_UMMA_1SM_PROTOCOL)
 	@grep -Fq '* Publishable result: **none**.' $(COMPUTE_UMMA_1SM_PROTOCOL)
+	@echo "== P2.2 required files present, executable, and syntactically valid =="
+	@test -x $(COMPUTE_UMMA_2SM_CHECKER)
+	python3 -m py_compile $(COMPUTE_UMMA_2SM_CHECKER)
+	@rm -rf scripts/__pycache__
+	@echo "== P2.2 SASS checker GPU-free synthetic self-test =="
+	python3 $(COMPUTE_UMMA_2SM_CHECKER) --self-test
+	@echo "== P2.2 source declares exactly the twelve-configuration matrix =="
+	@test "$$(grep -oE 'UMMA_2SM_DEFINE_KERNEL\([0-9]+, [0-9]+\)' $(COMPUTE_UMMA_2SM_SRC) | wc -l | tr -d ' ')" -eq 12
+	@test "$$(grep -oE 'UMMA_2SM_SPEC_ENTRY\([0-9]+, [0-9]+\)' $(COMPUTE_UMMA_2SM_SRC) | wc -l | tr -d ' ')" -eq 12
+	@for n in 64 128 256; do \
+		for d in 4 16 64 256; do \
+			grep -Fq "UMMA_2SM_DEFINE_KERNEL($$n, $$d)" $(COMPUTE_UMMA_2SM_SRC) \
+				|| { echo "check-static: MISSING UMMA_2SM_DEFINE_KERNEL($$n, $$d)"; exit 1; }; \
+			grep -Fq "UMMA_2SM_SPEC_ENTRY($$n, $$d)" $(COMPUTE_UMMA_2SM_SRC) \
+				|| { echo "check-static: MISSING UMMA_2SM_SPEC_ENTRY($$n, $$d)"; exit 1; }; \
+		done; \
+	done
+	@echo "== P2.2 source uses the frozen tcgen05 cta_group::2 CTA-pair contract =="
+	@grep -Fq 'tcgen05.mma.cta_group::2.kind::f16' $(COMPUTE_UMMA_2SM_SRC)
+	@grep -Fq 'tcgen05.wait::ld.sync.aligned' $(COMPUTE_UMMA_2SM_SRC)
+	@grep -Fq 'tcgen05.fence::after_thread_sync' $(COMPUTE_UMMA_2SM_SRC)
+	@grep -Fq 'tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32' $(COMPUTE_UMMA_2SM_SRC)
+	@grep -Fq 'tcgen05.dealloc.cta_group::2.sync.aligned.b32' $(COMPUTE_UMMA_2SM_SRC)
+	@grep -Fq 'tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned' $(COMPUTE_UMMA_2SM_SRC)
+	@grep -Fq 'tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64' $(COMPUTE_UMMA_2SM_SRC)
+	@grep -Fq '__cluster_dims__(2, 1, 1)' $(COMPUTE_UMMA_2SM_SRC)
+	@grep -Fq 'get_sreg_cluster_ctarank' $(COMPUTE_UMMA_2SM_SRC)
+	@grep -Fq 'get_sreg_cluster_nctarank' $(COMPUTE_UMMA_2SM_SRC)
+	@grep -Fq 'barrier_cluster_arrive' $(COMPUTE_UMMA_2SM_SRC)
+	@grep -Fq 'barrier_cluster_wait' $(COMPUTE_UMMA_2SM_SRC)
+	@grep -Fq '0x0003' $(COMPUTE_UMMA_2SM_SRC)
+	@echo "== P2.2 forbidden patterns absent (no 1-SM cta_group::1, sparse, block-scaled, or"
+	@echo "   non-kind::f16 form; no P0/P1-style forbidden shell patterns) =="
+	@echo "   (checked against code with '//' comments stripped, so a comment explaining"
+	@echo "   why e.g. cta_group::1 is absent cannot itself trip these checks)"
+	@! sed 's#//.*##' $(COMPUTE_UMMA_2SM_SRC) | grep -nE 'cta_group::1\b'
+	@! sed 's#//.*##' $(COMPUTE_UMMA_2SM_SRC) | grep -nE '\.kind::(tf32|f8f6f4|mxf8f6f4|mxf4nvf4|mxf4|i8)\b'
+	@! sed 's#//.*##' $(COMPUTE_UMMA_2SM_SRC) | grep -nE '\.sp\b|block_scale'
+	@pat='--gpus[ =]+all|NVIDIA_VISIBLE_DEVICES=all|--privileged|--pid[ =]+host|docker\.sock|--cap-add|SYS_ADMIN|set -x'; \
+	pat="$$pat|\bs""udo\b|\$$\(np""roc\)"; \
+	pat="$$pat|nvidia-smi[^|]*(-pm|--persistence-mode|-lgc|--lock-gpu-clocks|-pl|--power-limit)"; \
+	! sed 's#//.*##' $(COMPUTE_UMMA_2SM_SRC) | grep -nE -- "$$pat" && \
+	! grep -nE -- "$$pat" $(COMPUTE_UMMA_2SM_CHECKER)
+	@echo "== P2.2 Makefile target derives its arch/code flags from the pinned CUDA_ARCH =="
+	@grep -Fq 'COMPUTE_UMMA_2SM_ARCH_FLAGS := -arch=compute_$$(patsubst sm_%,%,$$(CUDA_ARCH)) -code=$$(CUDA_ARCH)' Makefile
+	@echo "== P2.2 documentation reports implemented-but-unaudited status honestly =="
+	@grep -Fq 'P2.2 | 2-SM UMMA | YES | NO | NO |' PLAN.md
+	@! grep -nF 'publishable P2.2 result' README.md PLAN.md $(COMPUTE_UMMA_2SM_PROTOCOL)
+	@grep -Fq '* Independent audit: **pending**.' $(COMPUTE_UMMA_2SM_PROTOCOL)
+	@grep -Fq '* GB300 verification: **pending**.' $(COMPUTE_UMMA_2SM_PROTOCOL)
+	@grep -Fq '* Publishable result: **none**.' $(COMPUTE_UMMA_2SM_PROTOCOL)
 	@echo "check-static: OK"
 
 build-image:
@@ -753,6 +843,104 @@ compute-umma-1sm-smoke: compute-umma-1sm-sass
 	scripts/run_container.sh $(COMPUTE_UMMA_1SM_BIN) --self-test
 	@echo "== compute-umma-1sm-smoke: short run_kind=smoke measurement (NOT a final result) =="
 	scripts/run_container.sh $(COMPUTE_UMMA_1SM_BIN) \
+		--run-kind smoke --n 128 --depth 16 \
+		--iterations 20 --warmup-iterations 5 --repetitions 3
+	@echo "=============================================================================="
+	@echo "The run_kind=smoke output above is a functional smoke check only. It is NOT a"
+	@echo "final experimental result, is not a TFLOP/s or saturation claim, and must not"
+	@echo "be cited as a performance number."
+	@echo "=============================================================================="
+
+# --- P2.2: 2-SM BF16 UMMA microbenchmark (tcgen05.mma, kind::f16, cta_group::2, ---
+# --- one static two-CTA cluster) -----------------------------------------------
+# compute-umma-2sm-build and compute-umma-2sm-sass never touch a GPU: they
+# compile and disassemble inside the pinned, network-less, unprivileged image,
+# the same secure pattern as compute-umma-1sm-build/sass. compute-umma-2sm-check
+# is also GPU-free (Python syntax, the checker's own synthetic self-test,
+# source-level contract checks) but depends on compute-umma-2sm-sass to also
+# validate the real compiled cubin. compute-umma-2sm-self-test and
+# compute-umma-2sm-smoke are the only P2.2 targets that execute on GPU; each
+# requires an explicit BLACKWELL_GPU_INDEX and goes exclusively through
+# scripts/run_container.sh. See src/compute/P2_2_PROTOCOL.md for the complete
+# frozen contract; P2.2 is implemented but NOT YET independently audited and
+# NOT YET verified on GB300, and produces no publishable result.
+
+compute-umma-2sm-build:
+	@mkdir -p build/compute
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-v "$(CURDIR):/workspace" \
+		-w /workspace \
+		"$(IMAGE_TAG)" \
+		nvcc -std=c++17 -O3 -lineinfo $(COMPUTE_UMMA_2SM_ARCH_FLAGS) \
+			-o $(COMPUTE_UMMA_2SM_BIN) $(COMPUTE_UMMA_2SM_SRC)
+
+compute-umma-2sm-sass: compute-umma-2sm-build
+	@mkdir -p build/compute
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-v "$(CURDIR):/workspace" \
+		-w /workspace \
+		"$(IMAGE_TAG)" \
+		python3 $(COMPUTE_UMMA_2SM_CHECKER) $(COMPUTE_UMMA_2SM_BIN) $(COMPUTE_UMMA_2SM_SASS)
+
+compute-umma-2sm-check: compute-umma-2sm-sass
+	@test -x $(COMPUTE_UMMA_2SM_CHECKER)
+	python3 -m py_compile $(COMPUTE_UMMA_2SM_CHECKER)
+	@rm -rf scripts/__pycache__
+	python3 $(COMPUTE_UMMA_2SM_CHECKER) --self-test
+	@test "$$(grep -oE 'UMMA_2SM_DEFINE_KERNEL\([0-9]+, [0-9]+\)' $(COMPUTE_UMMA_2SM_SRC) | wc -l | tr -d ' ')" -eq 12
+	@echo "== P2.2 CLI contract: --help exits 0 and -h is rejected, both without GPU access =="
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-v "$(CURDIR):/workspace" \
+		-w /workspace \
+		"$(IMAGE_TAG)" \
+		sh -c '$(COMPUTE_UMMA_2SM_BIN) --help >/dev/null && echo "--help: exit 0 (OK)"'
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-v "$(CURDIR):/workspace" \
+		-w /workspace \
+		"$(IMAGE_TAG)" \
+		sh -c '$(COMPUTE_UMMA_2SM_BIN) -h >/dev/null 2>&1; test $$? -eq 2 && echo "-h: exit 2 (rejected, OK)"'
+	@echo "compute-umma-2sm-check: OK"
+
+compute-umma-2sm-self-test: compute-umma-2sm-sass
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make compute-umma-2sm-self-test"; \
+		echo "       This project never selects a GPU automatically."; \
+		exit 2; \
+	fi
+	scripts/run_container.sh $(COMPUTE_UMMA_2SM_BIN) --self-test
+
+compute-umma-2sm-smoke: compute-umma-2sm-sass
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make compute-umma-2sm-smoke"; \
+		echo "       This project never selects a GPU automatically."; \
+		exit 2; \
+	fi
+	@echo "== compute-umma-2sm-smoke: self-test =="
+	scripts/run_container.sh $(COMPUTE_UMMA_2SM_BIN) --self-test
+	@echo "== compute-umma-2sm-smoke: short run_kind=smoke measurement (NOT a final result) =="
+	scripts/run_container.sh $(COMPUTE_UMMA_2SM_BIN) \
 		--run-kind smoke --n 128 --depth 16 \
 		--iterations 20 --warmup-iterations 5 --repetitions 3
 	@echo "=============================================================================="
