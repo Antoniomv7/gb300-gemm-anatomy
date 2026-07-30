@@ -45,10 +45,16 @@ COMPUTE_UMMA_1SM_PROTOCOL := src/compute/P2_PROTOCOL.md
 # (architecture-specific) suffix to ptxas's SASS-generation target on this
 # pinned CUDA 13.1.80 toolchain: it compiles P0/P1's LDGSTS/TMA code (which
 # needs no sm_103a-only instruction) but fails every tcgen05 instruction with
-# "not supported on .target 'sm_103'" (the "a" silently dropped). Verified by
-# direct compilation (see src/compute/P2_PROTOCOL.md section 15/19); splitting
-# the same pinned CUDA_ARCH value into an explicit virtual/real pair fixes it
-# without changing VERSIONS.env or the pinned architecture string itself.
+# "not supported on .target 'sm_103'" (the "a" silently dropped; nvcc's own
+# intermediate PTX file is even named "*.compute_103.ptx", confirming the "a"
+# is lost before ptxas ever runs). Directly reproduced in this container: `nvcc
+# -std=c++17 -O3 -lineinfo -arch=sm_103a -o ... src/compute/umma_1sm.cu` exits
+# 255 with 3336 "not supported on .target 'sm_103'" errors and produces no
+# binary, while the explicit split below (same pinned CUDA_ARCH value) exits 0
+# and disassembles to all twelve expected UTCHMMA specializations (see
+# src/compute/P2_PROTOCOL.md section 20 for the full recorded evidence).
+# Splitting CUDA_ARCH into a virtual/real pair fixes it without changing
+# VERSIONS.env or the pinned architecture string itself.
 COMPUTE_UMMA_1SM_ARCH_FLAGS := -arch=compute_$(patsubst sm_%,%,$(CUDA_ARCH)) -code=$(CUDA_ARCH)
 
 REQUIRED_FILES := \
@@ -699,8 +705,7 @@ compute-umma-1sm-sass: compute-umma-1sm-build
 		-v "$(CURDIR):/workspace" \
 		-w /workspace \
 		"$(IMAGE_TAG)" \
-		python3 $(COMPUTE_UMMA_1SM_CHECKER) $(COMPUTE_UMMA_1SM_BIN) $(COMPUTE_UMMA_1SM_SASS) \
-			--source $(COMPUTE_UMMA_1SM_SRC)
+		python3 $(COMPUTE_UMMA_1SM_CHECKER) $(COMPUTE_UMMA_1SM_BIN) $(COMPUTE_UMMA_1SM_SASS)
 
 compute-umma-1sm-check: compute-umma-1sm-sass
 	@test -x $(COMPUTE_UMMA_1SM_CHECKER)
@@ -708,6 +713,27 @@ compute-umma-1sm-check: compute-umma-1sm-sass
 	@rm -rf scripts/__pycache__
 	python3 $(COMPUTE_UMMA_1SM_CHECKER) --self-test
 	@test "$$(grep -oE 'UMMA_1SM_DEFINE_KERNEL\([0-9]+, [0-9]+\)' $(COMPUTE_UMMA_1SM_SRC) | wc -l | tr -d ' ')" -eq 12
+	@echo "== P2.1 CLI contract: --help exits 0 and -h is rejected, both without GPU access =="
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-v "$(CURDIR):/workspace" \
+		-w /workspace \
+		"$(IMAGE_TAG)" \
+		sh -c '$(COMPUTE_UMMA_1SM_BIN) --help >/dev/null && echo "--help: exit 0 (OK)"'
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-v "$(CURDIR):/workspace" \
+		-w /workspace \
+		"$(IMAGE_TAG)" \
+		sh -c '$(COMPUTE_UMMA_1SM_BIN) -h >/dev/null 2>&1; test $$? -eq 2 && echo "-h: exit 2 (rejected, OK)"'
 	@echo "compute-umma-1sm-check: OK"
 
 compute-umma-1sm-self-test: compute-umma-1sm-sass

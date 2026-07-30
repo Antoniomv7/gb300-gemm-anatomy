@@ -71,6 +71,13 @@ constexpr const char* kOperandPath = "smem_smem";
 constexpr const char* kInputType = "bf16";
 constexpr const char* kAccumulatorType = "fp32";
 
+// TimingMode: propagated as an explicit kernel argument (repair brief section
+// 5) so that --self-test, pre-timing correctness validation, and warm-up
+// launches never execute a %clock64 read, while only genuinely timed
+// repetitions do. The mode is uniform across the whole grid (a launch
+// argument, not a per-thread value), so branching on it is not divergent.
+enum class TimingMode : int32_t { kUntimed = 0, kTimed = 1 };
+
 int g_cleanup_failures = 0;
 
 [[noreturn]] void fail(const char* fmt, ...) {
@@ -306,17 +313,80 @@ __device__ __forceinline__ void tcgen05_wait_ld() {
 }
 
 // ---------------------------------------------------------------------------
+// TMEM load address construction (PTX ISA 9.3 section 9.7.17.1.1, "Tensor
+// Memory Addressing"): a 32-bit TMEM address packs a lane index in bits 31-16
+// and a column index in bits 15-0. Section 9.7.17.8.1, "Access restrictions",
+// further requires that the Tensor Memory of a CTA be split into four
+// 32-lane chunks, one per warp of the warpgroup (warp 0 -> lanes 0-31, warp 1
+// -> lanes 32-63, warp 2 -> lanes 64-95, warp 3 -> lanes 96-127), and that
+// every thread of the issuing warp supply the identical collective taddr.
+// tmem_base (the address returned by tcgen05.alloc) is always lane 0 of the
+// allocated columns, so each warp must add its own lane contribution before
+// issuing tcgen05.ld; omitting it (the original defect) makes every warp
+// read warp 0's lanes instead of its own.
+// ---------------------------------------------------------------------------
+constexpr uint32_t kTmemLaneShift = 16;        // PTX ISA 9.3 9.7.17.1.1: lane index occupies bits 31-16.
+constexpr uint32_t kTmemRowsPerWarp = 32;      // PTX ISA 9.3 9.7.17.8.1: each warp owns a 32-lane chunk.
+constexpr uint32_t kTmemColsPerFragment = 32;  // This kernel's fixed 32-column tcgen05.ld.x32 fragment width.
+
+// make_tmem_load_address: the actual collective taddr passed to
+// tcgen05_ld_32x32b_x32 for warp warp_id's fragment frag. Replaces the
+// defective "tmem_d + frag * 32" expression, which carried no lane
+// contribution at all.
+__device__ __forceinline__ uint32_t make_tmem_load_address(uint32_t tmem_base, int warp_id, int frag) {
+    const uint32_t lane_contribution = (static_cast<uint32_t>(warp_id) * kTmemRowsPerWarp) << kTmemLaneShift;
+    const uint32_t column_contribution = static_cast<uint32_t>(frag) * kTmemColsPerFragment;
+    return tmem_base + lane_contribution + column_contribution;
+}
+
+// ---------------------------------------------------------------------------
+// Launch contract: every visible kernel must reject any launch that is not
+// exactly grid=(1,1,1), block=(128,1,1). __launch_bounds__(128) only caps the
+// maximum thread count, so this is an explicit guard evaluated before any
+// __syncthreads(), mbarrier initialization, TMEM allocation, or UMMA
+// instruction (see the top of umma_1sm_body below), so a rejected launch can
+// never leave TMEM allocated or block on a barrier.
+// ---------------------------------------------------------------------------
+constexpr int kExpectedGridDim = kGridBlocks;
+constexpr int kExpectedBlockDimX = kThreadsPerCta;
+
+__device__ __forceinline__ bool launch_contract_is_valid() {
+    return gridDim.x == kExpectedGridDim && gridDim.y == kExpectedGridDim && gridDim.z == kExpectedGridDim &&
+           blockDim.x == kExpectedBlockDimX && blockDim.y == 1 && blockDim.z == 1;
+}
+
+// ---------------------------------------------------------------------------
 // Device: templated kernel body, instantiated once per (N, DEPTH)
 // specialization by the extern "C" wrappers below (section 7 requires
 // stable extern "C" symbols with a shared templated, force-inlined body so
 // each symbol keeps its own SASS specialization).
 // ---------------------------------------------------------------------------
 template <int N, int DEPTH>
-__device__ __forceinline__ void umma_1sm_body(int64_t iterations, float* __restrict__ g_d_out,
-                                               unsigned long long* __restrict__ g_elapsed_cycles) {
+__device__ __forceinline__ void umma_1sm_body(int64_t iterations, TimingMode timing_mode,
+                                               float* __restrict__ g_d_out,
+                                               unsigned long long* __restrict__ g_elapsed_cycles,
+                                               int* __restrict__ g_launch_ok) {
     static_assert(N == 64 || N == 128 || N == 256, "N must be 64, 128, or 256");
     static_assert(DEPTH == 4 || DEPTH == 16 || DEPTH == 64 || DEPTH == 256,
                   "DEPTH must be 4, 16, 64, or 256");
+
+    const int tid = threadIdx.x;
+
+    // ---- Launch contract: must precede any __syncthreads(), mbarrier init, ----
+    // ---- TMEM allocation, or UMMA instruction (see launch_contract_is_valid --
+    // ---- above). A rejected launch writes 0 and returns immediately, before --
+    // ---- touching any shared state, so it can never allocate TMEM or block --
+    // ---- on a barrier. A silent early return alone would not be observable --
+    // ---- by the host, so every accepted launch also confirms itself. --------
+    if (!launch_contract_is_valid()) {
+        if (tid == 0) {
+            g_launch_ok[0] = 0;
+        }
+        return;
+    }
+    if (tid == 0) {
+        g_launch_ok[0] = 1;
+    }
 
     constexpr int kABytes = kM * kK * 2;  // BF16 = 2 bytes/element
 
@@ -324,7 +394,6 @@ __device__ __forceinline__ void umma_1sm_body(int64_t iterations, float* __restr
     __nv_bfloat16* A = reinterpret_cast<__nv_bfloat16*>(smem);
     __nv_bfloat16* B = reinterpret_cast<__nv_bfloat16*>(smem + kABytes);
 
-    const int tid = threadIdx.x;
     const int warp_id = tid / 32;
 
     // ---- Fill A and B with the frozen validation pattern (section 9), ----
@@ -383,7 +452,9 @@ __device__ __forceinline__ void umma_1sm_body(int64_t iterations, float* __restr
         uint64_t start_clock = 0, end_clock = 0;
         uint32_t parity = 0;
 
-        asm volatile("mov.u64 %0, %%clock64;" : "=l"(start_clock) : : "memory");
+        if (timing_mode == TimingMode::kTimed) {
+            asm volatile("mov.u64 %0, %%clock64;" : "=l"(start_clock) : : "memory");
+        }
         for (int64_t it = 0; it < iterations; ++it) {
             issue_one_umma(tmem_d, a_desc, b_desc, idesc, /*enable_input_d=*/0);
 #pragma unroll
@@ -395,8 +466,10 @@ __device__ __forceinline__ void umma_1sm_body(int64_t iterations, float* __restr
             }
             parity ^= 1u;
         }
-        asm volatile("mov.u64 %0, %%clock64;" : "=l"(end_clock) : : "memory");
-        elapsed_cycles = static_cast<unsigned long long>(end_clock - start_clock);
+        if (timing_mode == TimingMode::kTimed) {
+            asm volatile("mov.u64 %0, %%clock64;" : "=l"(end_clock) : : "memory");
+            elapsed_cycles = static_cast<unsigned long long>(end_clock - start_clock);
+        }
         g_elapsed_cycles[0] = elapsed_cycles;
     }
 
@@ -416,7 +489,7 @@ __device__ __forceinline__ void umma_1sm_body(int64_t iterations, float* __restr
 #pragma unroll
     for (int frag = 0; frag < kFragments; ++frag) {
         uint32_t regs[32];
-        tcgen05_ld_32x32b_x32(tmem_d + frag * 32, regs);
+        tcgen05_ld_32x32b_x32(make_tmem_load_address(tmem_d, warp_id, frag), regs);
         tcgen05_wait_ld();
 #pragma unroll
         for (int i = 0; i < 32; ++i) {
@@ -443,10 +516,11 @@ __device__ __forceinline__ void umma_1sm_body(int64_t iterations, float* __restr
 // ---------------------------------------------------------------------------
 // The twelve mandatory extern "C" specializations (section 7).
 // ---------------------------------------------------------------------------
-#define UMMA_1SM_DEFINE_KERNEL(N, DEPTH)                                                    \
-    extern "C" __global__ __launch_bounds__(128) void umma_1sm_m128n##N##k16_d##DEPTH(       \
-        int64_t iterations, float* g_d_out, unsigned long long* g_elapsed_cycles) {          \
-        umma_1sm_body<N, DEPTH>(iterations, g_d_out, g_elapsed_cycles);                      \
+#define UMMA_1SM_DEFINE_KERNEL(N, DEPTH)                                                     \
+    extern "C" __global__ __launch_bounds__(128) void umma_1sm_m128n##N##k16_d##DEPTH(        \
+        int64_t iterations, TimingMode timing_mode, float* g_d_out,                           \
+        unsigned long long* g_elapsed_cycles, int* g_launch_ok) {                             \
+        umma_1sm_body<N, DEPTH>(iterations, timing_mode, g_d_out, g_elapsed_cycles, g_launch_ok); \
     }
 
 UMMA_1SM_DEFINE_KERNEL(64, 4)
@@ -469,7 +543,7 @@ UMMA_1SM_DEFINE_KERNEL(256, 256)
 // ---------------------------------------------------------------------------
 namespace {
 
-typedef void (*KernelFn)(int64_t, float*, unsigned long long*);
+typedef void (*KernelFn)(int64_t, TimingMode, float*, unsigned long long*, int*);
 
 struct Specialization {
     int n = 0;
@@ -710,7 +784,7 @@ bool parse_cli(int argc, char** argv, CliConfig* cfg, std::string* err) {
             return std::string(argv[++i]);
         };
 
-        if (arg == "--help" || arg == "-h") {
+        if (arg == "--help") {
             if (cfg->help) { *err = "--help specified more than once"; return false; }
             cfg->help = true;
             continue;
@@ -759,8 +833,8 @@ bool parse_cli(int argc, char** argv, CliConfig* cfg, std::string* err) {
             if (cfg->has_iterations) { *err = "--iterations specified more than once"; return false; }
             const auto v = next_value();
             int64_t iv = 0;
-            if (!v || !parse_int_arg(*v, &iv) || iv < 1 || iv > 1000000000LL) {
-                *err = "--iterations must be an integer in [1, 1000000000]";
+            if (!v || !parse_int_arg(*v, &iv) || iv < 1) {
+                *err = "--iterations must be an integer >= 1";
                 return false;
             }
             cfg->iterations = iv;
@@ -771,8 +845,8 @@ bool parse_cli(int argc, char** argv, CliConfig* cfg, std::string* err) {
             if (cfg->has_warmup_iterations) { *err = "--warmup-iterations specified more than once"; return false; }
             const auto v = next_value();
             int64_t iv = 0;
-            if (!v || !parse_int_arg(*v, &iv) || iv < 0 || iv > 1000000000LL) {
-                *err = "--warmup-iterations must be an integer in [0, 1000000000]";
+            if (!v || !parse_int_arg(*v, &iv) || iv < 0) {
+                *err = "--warmup-iterations must be an integer >= 0";
                 return false;
             }
             cfg->warmup_iterations = iv;
@@ -783,8 +857,8 @@ bool parse_cli(int argc, char** argv, CliConfig* cfg, std::string* err) {
             if (cfg->has_repetitions) { *err = "--repetitions specified more than once"; return false; }
             const auto v = next_value();
             int64_t iv = 0;
-            if (!v || !parse_int_arg(*v, &iv) || iv < 1 || iv > 1000000) {
-                *err = "--repetitions must be an integer in [1, 1000000]";
+            if (!v || !parse_int_arg(*v, &iv) || iv < 1) {
+                *err = "--repetitions must be an integer >= 1";
                 return false;
             }
             cfg->repetitions = iv;
@@ -939,21 +1013,29 @@ struct RunResult {
     unsigned long long elapsed_cycles = 0;
 };
 
-RunResult run_once(const Specialization& spec, int64_t iterations) {
+RunResult run_once(const Specialization& spec, int64_t iterations, TimingMode mode) {
     RunResult result;
     const size_t d_elems = static_cast<size_t>(kM) * static_cast<size_t>(spec.n);
     float* d_out_device = nullptr;
     unsigned long long* cycles_device = nullptr;
+    int* launch_ok_device = nullptr;
     CUDA_CHECK_FATAL(cudaMalloc(&d_out_device, d_elems * sizeof(float)));
     CUDA_CHECK_FATAL(cudaMalloc(&cycles_device, sizeof(unsigned long long)));
+    CUDA_CHECK_FATAL(cudaMalloc(&launch_ok_device, sizeof(int)));
     CUDA_CHECK_FATAL(cudaMemset(cycles_device, 0, sizeof(unsigned long long)));
+    // 0 means "not confirmed": both an explicit device-side rejection and a
+    // kernel that never ran at all collapse to this same not-OK value.
+    CUDA_CHECK_FATAL(cudaMemset(launch_ok_device, 0, sizeof(int)));
 
     const int smem_bytes = kM * kK * 2 + spec.n * kK * 2;
-    spec.kernel<<<kGridBlocks, kThreadsPerCta, static_cast<size_t>(smem_bytes)>>>(iterations, d_out_device,
-                                                                                   cycles_device);
+    spec.kernel<<<kGridBlocks, kThreadsPerCta, static_cast<size_t>(smem_bytes)>>>(
+        iterations, mode, d_out_device, cycles_device, launch_ok_device);
     CUDA_CHECK_FATAL(cudaGetLastError());
     CUDA_CHECK_FATAL(cudaDeviceSynchronize());
 
+    int launch_ok_host = 0;
+    CUDA_CHECK_FATAL(cudaMemcpy(&launch_ok_host, launch_ok_device, sizeof(launch_ok_host),
+                                 cudaMemcpyDeviceToHost));
     std::vector<float> d_out_host(d_elems);
     CUDA_CHECK_FATAL(
         cudaMemcpy(d_out_host.data(), d_out_device, d_elems * sizeof(float), cudaMemcpyDeviceToHost));
@@ -961,28 +1043,49 @@ RunResult run_once(const Specialization& spec, int64_t iterations) {
                                  cudaMemcpyDeviceToHost));
     CUDA_CHECK_FATAL(cudaFree(d_out_device));
     CUDA_CHECK_FATAL(cudaFree(cycles_device));
+    CUDA_CHECK_FATAL(cudaFree(launch_ok_device));
+
+    // The host launcher below always requests grid=(1,1,1) block=(128,1,1),
+    // so this can only fire if the launch contract check itself regresses;
+    // it must still abort loudly rather than silently validating garbage D.
+    if (launch_ok_host != 1) {
+        fail("launch-contract violation for %s: kernel did not confirm grid=(1,1,1) "
+             "block=(128,1,1) (launch_ok=%d)",
+             spec.symbol, launch_ok_host);
+    }
 
     result.validation = validate_d(d_out_host, spec.n, spec.depth);
     return result;
 }
 
-// Runs one specialization and aborts the process (nonzero exit) on any
-// mismatch or on an unexpectedly-zero cycle count: section 9/14 require that
-// a numerical error prevent any subsequent timing and terminate with a
-// nonzero exit code, so every caller on the main run path needs exactly this
+// Reports a correctness mismatch and terminates with a nonzero exit code:
+// section 9/14 require that a numerical error prevent any subsequent timing
+// or CSV output, so every caller on the main run path needs exactly this
 // abort-on-failure behavior.
-unsigned long long run_and_validate_once(const Specialization& spec, int64_t iterations) {
-    const RunResult result = run_once(spec, iterations);
-    if (!result.validation.ok) {
-        std::fprintf(stderr,
-                     "umma_1sm: ERROR: correctness validation FAILED for %s: mismatches=%lld "
-                     "first_index=%lld expected=%.1f obtained=%.1f max_abs_error=%.6g\n",
-                     spec.symbol, (long long)result.validation.mismatches,
-                     (long long)result.validation.first_mismatch_index,
-                     result.validation.first_mismatch_expected, result.validation.first_mismatch_obtained,
-                     result.validation.max_abs_error);
-        fail("correctness validation failed for %s; no timing or CSV output was produced", spec.symbol);
-    }
+[[noreturn]] void die_on_validation_failure(const Specialization& spec, const ValidationResult& validation) {
+    std::fprintf(stderr,
+                 "umma_1sm: ERROR: correctness validation FAILED for %s: mismatches=%lld "
+                 "first_index=%lld expected=%.1f obtained=%.1f max_abs_error=%.6g\n",
+                 spec.symbol, (long long)validation.mismatches, (long long)validation.first_mismatch_index,
+                 validation.first_mismatch_expected, validation.first_mismatch_obtained,
+                 validation.max_abs_error);
+    fail("correctness validation failed for %s; no timing or CSV output was produced", spec.symbol);
+}
+
+// Runs one specialization untimed (timing_mode=kUntimed, so neither %clock64
+// read executes -- section 5) and aborts on any correctness mismatch. Used
+// for pre-timing validation and warm-up, neither of which may be timed.
+void run_untimed_or_die(const Specialization& spec, int64_t iterations) {
+    const RunResult result = run_once(spec, iterations, TimingMode::kUntimed);
+    if (!result.validation.ok) die_on_validation_failure(spec, result.validation);
+}
+
+// Runs one specialization timed (timing_mode=kTimed) and aborts on any
+// correctness mismatch or on an unexpectedly-zero cycle count. Used only for
+// genuinely timed repetitions.
+unsigned long long run_timed_or_die(const Specialization& spec, int64_t iterations) {
+    const RunResult result = run_once(spec, iterations, TimingMode::kTimed);
+    if (!result.validation.ok) die_on_validation_failure(spec, result.validation);
     if (result.elapsed_cycles == 0) {
         fail("internal error: elapsed_cycles was not greater than zero for %s", spec.symbol);
     }
@@ -995,7 +1098,7 @@ int run_self_test() {
     std::fprintf(stderr, "umma_1sm: SELF_TEST start\n");
     int passed = 0;
     for (const auto& spec : kSpecializations) {
-        const RunResult result = run_once(spec, kSelfTestIterations);
+        const RunResult result = run_once(spec, kSelfTestIterations, TimingMode::kUntimed);
         std::fprintf(stderr,
                      "umma_1sm: SELF_TEST %s n=%d depth=%d result=%s mismatches=%lld "
                      "max_abs_error=%.6g\n",
@@ -1047,12 +1150,12 @@ int main(int argc, char** argv) {
                  (long long)cli.warmup_iterations, (long long)cli.repetitions);
 
     // Step 1 (section 15): validate without timing before anything else.
-    run_and_validate_once(*spec, cli.iterations);
+    run_untimed_or_die(*spec, cli.iterations);
     std::fprintf(stderr, "umma_1sm: correctness=OK mismatches=0 (pre-timing check)\n");
 
-    // Step 2: warm-up, discarded.
+    // Step 2: warm-up, discarded, also untimed.
     for (int64_t w = 0; w < cli.warmup_iterations; ++w) {
-        run_and_validate_once(*spec, cli.iterations);
+        run_untimed_or_die(*spec, cli.iterations);
     }
 
     // Steps 3-5: timed repetitions, each re-validated before its CSV row.
@@ -1066,8 +1169,7 @@ int main(int argc, char** argv) {
     const std::string git_dirty_str = git_dirty_flag();
 
     for (int64_t rep = 0; rep < cli.repetitions; ++rep) {
-        const unsigned long long elapsed_cycles =
-            run_and_validate_once(*spec, cli.iterations);
+        const unsigned long long elapsed_cycles = run_timed_or_die(*spec, cli.iterations);
 
         CsvRow row;
         row.timestamp_utc = now_utc_iso8601();

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPU-free SASS verification for the P2.1 1-SM BF16 UMMA microbenchmark.
+"""GPU-free SASS and source verification for the P2.1 1-SM BF16 UMMA microbenchmark.
 
 Disassemble the compiled binary with ``cuobjdump -sass`` (PTX is not accepted
 as proof), identify all twelve ``umma_1sm_m128n{N}k16_d{DEPTH}`` symbols, and
@@ -38,7 +38,7 @@ CUDA 13.1.80 ptxas, not guessed from documentation or the PTX ISA text):
                                                  documented for TMA's mbarrier wait in
                                                  check_tma_sass.py -- presence, not an exact
                                                  count, is required)
-  tcgen05.dealloc.cta_group::1...               UVIRTCOUNT.DEALLOC.SMPOOL
+  tcgen05.dealloc.cta_group::1...                UVIRTCOUNT.DEALLOC.SMPOOL
   tcgen05.relinquish_alloc_permit...             (folded into UTCATOMSWS.AND; not checked)
   mbarrier.try_wait.parity                      SYNCS.PHASECHK.TRANS64.TRYWAIT
   mbarrier.inval.shared.b64                     SYNCS.CCTL.IV (same lowering documented for
@@ -54,12 +54,39 @@ kernel) but ptxas emits no separate SASS instruction for either on this
 pinned toolchain: register scoreboarding (the same mechanism an ordinary
 load-then-use dependency relies on) already serializes the load, and the
 fence is a pure code-motion constraint with no runtime effect once ptxas's
-own scheduling already respects it. Per the P2.1 task brief's own guidance
-("If the disassembler does not expose an attribute required to prove a
-property, do not invent a check"), this checker proves both instructions'
-presence with a static source check (--source, optional) instead of
-inventing a SASS signal that does not exist; when --source is not given,
-these two checks are skipped and reported as such, never silently assumed.
+own scheduling already respects it. This checker therefore proves both
+instructions' presence with a mandatory static source check instead of
+inventing a SASS signal that does not exist.
+
+Source validation is mandatory, not optional: the two-positional-argument
+invocation (``<binary> <output-sass-path>``) always validates the canonical
+source ``src/compute/umma_1sm.cu``, resolved relative to this script (never
+the caller's current directory). ``--source <path>`` may override which file
+is checked (e.g. for testing), but omitting it never skips the check -- there
+is no code path in which the real binary/SASS check can return success while
+source validation was skipped. If the canonical source cannot be found,
+opened, or safely lexically scanned (e.g. an unterminated block comment or
+string literal), this checker exits 1.
+
+The source scanner strips both ``//`` and ``/* ... */`` comments while
+preserving the exact text of every string and character literal (required
+inline PTX text lives inside C++ string literals passed to inline asm), so a
+comment can satisfy neither a required-pattern check nor accidentally trip a
+forbidden-pattern check. All forbidden- and required-pattern checks below run
+against this comment-stripped, literal-preserving view of the source, never
+against the raw text.
+
+Beyond the original TMA/WGMMA/etc. forbidden-instruction checks, the source
+gate also proves that the repaired per-warp TMEM load address is real
+executable code (a ``make_tmem_load_address`` helper combining a
+``warp_id * kTmemRowsPerWarp`` lane contribution shifted by
+``kTmemLaneShift`` with a ``frag * kTmemColsPerFragment`` column
+contribution, feeding the actual ``tcgen05_ld_32x32b_x32`` call site, with
+the original defective ``tmem_d + frag * 32`` operand absent), that an
+explicit launch-contract guard (``launch_contract_is_valid()``) is checked
+before the kernel's first ``__syncthreads()``, and that the timed ``%clock64``
+reads are each guarded by a ``timing_mode == TimingMode::kTimed`` check with
+at least one call site routed through ``TimingMode::kUntimed``.
 
 Usage:
   check_umma_1sm_sass.py --self-test
@@ -67,13 +94,14 @@ Usage:
   check_umma_1sm_sass.py <binary> <output-sass-path> [--source <umma_1sm.cu>]
 
 Exit code: 0 only when the selected validation passes, 1 on a contract,
-synthetic-test, I/O, or ``cuobjdump``/source-check failure, and 2 on a usage
-error.
+synthetic-test, I/O, source-scan, or ``cuobjdump``/source-check failure, and
+2 on a usage error.
 """
 
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 
 FUNCTION_MARKER = "umma_1sm_m128n"
@@ -109,7 +137,7 @@ FORBIDDEN_PATTERNS = (
 # A cluster-scoped barrier or an explicit cluster-dimension header attribute
 # would be the observable trace of a 2-SM/2-CTA (__cluster_dims__) kernel;
 # this binary must show neither. No 2-SM UTCHMMA sample was available to
-# compile for direct comparison, so this is combined with the --source
+# compile for direct comparison, so this is combined with the source-level
 # static check below (documented limitation, not invented SASS evidence).
 CLUSTER_BARRIER_PATTERN = re.compile(r"\bBAR\.SYNC\.[A-Z0-9_.]*CLUSTER\b|\bCLUSTER\b")
 
@@ -125,6 +153,184 @@ REQUIRED_SOURCE_PATTERNS = (
     (re.compile(r"tcgen05\.wait::ld\.sync\.aligned"), "tcgen05.wait::ld.sync.aligned"),
     (re.compile(r"tcgen05\.fence::after_thread_sync"), "tcgen05.fence::after_thread_sync"),
 )
+
+# TMEM load address construction (repair brief section 7.3): the source gate
+# must prove that the repaired per-warp lane/column addressing is real
+# executable code, not merely a comment, and that the original defective
+# direct operand is gone. Exact values are checked (not just presence of the
+# constant names) so a regression that keeps the names but changes a value
+# -- e.g. an incorrect lane shift -- is still caught.
+REQUIRED_TMEM_ADDRESS_PATTERNS = (
+    (re.compile(r"kTmemLaneShift\s*=\s*16\b"), "kTmemLaneShift defined as 16 (TMEM lane index occupies bits 31-16)"),
+    (re.compile(r"kTmemRowsPerWarp\s*=\s*32\b"), "kTmemRowsPerWarp defined as 32 (rows per warp)"),
+    (re.compile(r"kTmemColsPerFragment\s*=\s*32\b"), "kTmemColsPerFragment defined as 32 (columns per fragment)"),
+    (re.compile(r"\bmake_tmem_load_address\s*\("), "an executable make_tmem_load_address(...) helper"),
+    (re.compile(r"warp_id\)\s*\*\s*kTmemRowsPerWarp\b"),
+     "warp contribution using warp_id * kTmemRowsPerWarp in the lane bits"),
+    (re.compile(r"<<\s*kTmemLaneShift\b"), "the lane contribution shifted into bits 31-16 by kTmemLaneShift"),
+    (re.compile(r"frag\)\s*\*\s*kTmemColsPerFragment\b"),
+     "fragment contribution using frag * kTmemColsPerFragment in the column bits"),
+    (re.compile(r"tcgen05_ld_32x32b_x32\(\s*make_tmem_load_address\("),
+     "the TMEM load operand built by make_tmem_load_address(...)"),
+)
+FORBIDDEN_TMEM_ADDRESS_PATTERNS = (
+    (re.compile(r"tmem_d\s*\+\s*frag\s*\*\s*32\b"), "the original defective direct operand tmem_d + frag * 32"),
+)
+
+DEFAULT_SOURCE_RELATIVE_PARTS = ("src", "compute", "umma_1sm.cu")
+
+
+def resolve_default_source_path() -> Path:
+    """The canonical P2.1 source, resolved relative to this checker script
+    (never the caller's current working directory), so the two-positional-
+    argument invocation always validates the real repository source.
+    """
+    root = Path(__file__).resolve().parent.parent
+    return root.joinpath(*DEFAULT_SOURCE_RELATIVE_PARTS)
+
+
+class SourceScanError(Exception):
+    """Raised when the comment/literal scanner cannot safely determine which
+    text is executable: an unterminated block comment or an unterminated
+    string/character literal. Callers must treat this as a hard failure, not
+    a skip.
+    """
+
+
+def strip_comments_preserving_literals(source_text: str) -> str:
+    """Remove '//' and '/* ... */' comments while preserving the exact text
+    of every string and character literal (escaped characters included).
+
+    This is necessary because required inline PTX text lives inside C++
+    string literals passed to inline asm, and because a comment must never
+    be able to satisfy a required-pattern check or accidentally trip a
+    forbidden-pattern check. Raises SourceScanError on an unterminated block
+    comment or string/char literal, since the lexical state cannot then be
+    safely determined.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(source_text)
+    while i < n:
+        two = source_text[i:i + 2]
+        if two == "//":
+            newline = source_text.find("\n", i)
+            if newline == -1:
+                i = n
+            else:
+                out.append("\n")
+                i = newline + 1
+            continue
+        if two == "/*":
+            end = source_text.find("*/", i + 2)
+            if end == -1:
+                raise SourceScanError("unterminated /* block comment (no matching */)")
+            out.append("\n" * source_text.count("\n", i, end + 2))
+            i = end + 2
+            continue
+        c = source_text[i]
+        if c in ("\"", "'"):
+            quote = c
+            j = i + 1
+            closed = False
+            while j < n:
+                cj = source_text[j]
+                if cj == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if cj == quote:
+                    j += 1
+                    closed = True
+                    break
+                if cj == "\n":
+                    break
+                j += 1
+            if not closed:
+                raise SourceScanError(f"unterminated {quote!r} literal")
+            out.append(source_text[i:j])
+            i = j
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def check_launch_guard_ordering(code_only: str) -> list[str]:
+    """The launch-contract guard must be checked inside umma_1sm_body before
+    its first __syncthreads(), so a rejected launch can never reach mbarrier
+    initialization or TMEM allocation (repair brief section 6).
+    """
+    start = code_only.find("umma_1sm_body")
+    if start == -1:
+        return ["source is missing the umma_1sm_body kernel definition"]
+    first_sync = code_only.find("__syncthreads()", start)
+    window = code_only[start:first_sync] if first_sync != -1 else code_only[start:]
+    if not re.search(r"launch_contract_is_valid\s*\(", window):
+        return [
+            "missing launch-contract guard: launch_contract_is_valid() must be checked in "
+            "umma_1sm_body before its first __syncthreads()"
+        ]
+    return []
+
+
+def check_timing_routing(code_only: str) -> list[str]:
+    """Every %clock64 read must be guarded by timing_mode == TimingMode::kTimed
+    (repair brief section 5); self-test/pre-timing validation/warm-up must
+    route through TimingMode::kUntimed at least once. A regression to the
+    original bug (unconditional clock64 reads) shows zero guards.
+    """
+    errors: list[str] = []
+    guard_count = len(re.findall(r"timing_mode\s*==\s*TimingMode::kTimed\b", code_only))
+    if guard_count < 2:
+        errors.append(
+            f"found only {guard_count} 'timing_mode == TimingMode::kTimed' guard(s) in the kernel "
+            "body; expected at least 2 (one around each %clock64 read), or a clock64 read may "
+            "execute unconditionally regardless of timing mode"
+        )
+    untimed_count = len(re.findall(r"TimingMode::kUntimed\b", code_only))
+    if untimed_count < 1:
+        errors.append(
+            "no call site uses TimingMode::kUntimed; self-test, pre-timing validation, and "
+            "warm-up must all route through an explicitly untimed launch"
+        )
+    return errors
+
+
+def check_source(source_text: str) -> list[str]:
+    """Full source-level contract: comment/literal-aware forbidden/required
+    PTX text, the repaired TMEM address construction, the launch-contract
+    guard, and timing-mode routing. Fails closed (non-empty list) if the
+    lexical scan itself cannot be trusted.
+    """
+    try:
+        code_only = strip_comments_preserving_literals(source_text)
+    except SourceScanError as exc:
+        return [f"cannot safely scan source: {exc}"]
+
+    errors: list[str] = []
+    for pattern, description in FORBIDDEN_SOURCE_PATTERNS:
+        if pattern.search(code_only):
+            errors.append(f"source contains forbidden pattern: {description}")
+    for pattern, description in REQUIRED_SOURCE_PATTERNS:
+        if not pattern.search(code_only):
+            errors.append(f"source is missing required PTX instruction text: {description}")
+    for pattern, description in REQUIRED_TMEM_ADDRESS_PATTERNS:
+        if not pattern.search(code_only):
+            errors.append(f"source is missing required TMEM address construction: {description}")
+    for pattern, description in FORBIDDEN_TMEM_ADDRESS_PATTERNS:
+        if pattern.search(code_only):
+            errors.append(f"source contains forbidden pattern: {description}")
+    errors.extend(check_launch_guard_ordering(code_only))
+    errors.extend(check_timing_routing(code_only))
+    return errors
+
+
+def validate_source_file(path: Path) -> list[str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [f"cannot read canonical source {path}: {exc}"]
+    return check_source(text)
 
 
 def split_function_blocks(sass_text: str) -> list[list[str]]:
@@ -266,30 +472,6 @@ def analyze_sass(sass_text: str) -> tuple[list[str], list[str]]:
     return status_lines, errors
 
 
-def strip_line_comments(source_text: str) -> str:
-    """Drop everything from '//' to end-of-line on every line.
-
-    A deliberately simple heuristic (no string-literal awareness), sufficient
-    for this one source file, which contains no '//' inside a string or
-    inline-asm literal. This keeps forbidden-pattern matching scoped to code
-    that could actually execute, so a comment explaining *why* a qualifier
-    (e.g. ".multicast::cluster") is absent does not itself trip the check.
-    """
-    return "\n".join(line.split("//", 1)[0] for line in source_text.splitlines())
-
-
-def check_source(source_text: str) -> list[str]:
-    errors: list[str] = []
-    code_only = strip_line_comments(source_text)
-    for pattern, description in FORBIDDEN_SOURCE_PATTERNS:
-        if pattern.search(code_only):
-            errors.append(f"source contains forbidden pattern: {description}")
-    for pattern, description in REQUIRED_SOURCE_PATTERNS:
-        if not pattern.search(source_text):
-            errors.append(f"source is missing required PTX instruction text: {description}")
-    return errors
-
-
 # ---------------------------------------------------------------------------
 # Synthetic SASS for --self-test, shaped after this project's own real
 # cuobjdump -sass output for build/compute/umma_1sm on sm_103a (CUDA 13.1.80
@@ -374,6 +556,58 @@ def synthetic_sass(overrides: dict[tuple[int, int], dict[str, object]] | None = 
     if extra:
         blocks.extend(extra)
     return "\n\n".join(blocks) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Synthetic source snippet for the source-level self-test cases below. Built
+# from named fields so a single targeted override isolates exactly one
+# defect, while every other required property (TMEM helper, launch guard,
+# timing routing, required PTX text) stays intact -- mirroring the actual
+# structure of src/compute/umma_1sm.cu closely enough to exercise the real
+# regexes without needing the full file.
+# ---------------------------------------------------------------------------
+def golden_source_snippet(**overrides: str) -> str:
+    fields = {
+        "lane_shift_const": "constexpr uint32_t kTmemLaneShift = 16;",
+        "rows_per_warp_const": "constexpr uint32_t kTmemRowsPerWarp = 32;",
+        "cols_per_fragment_const": "constexpr uint32_t kTmemColsPerFragment = 32;",
+        "lane_contribution": "(static_cast<uint32_t>(warp_id) * kTmemRowsPerWarp) << kTmemLaneShift",
+        "column_contribution": "static_cast<uint32_t>(frag) * kTmemColsPerFragment",
+        "tmem_return": "return tmem_base + lane_contribution + column_contribution;",
+        "tmem_call_site": "tcgen05_ld_32x32b_x32(make_tmem_load_address(tmem_d, warp_id, frag), regs);",
+        "launch_guard": "if (!launch_contract_is_valid()) { g_launch_ok[0] = 0; return; }",
+        "timing_guard_a": "if (timing_mode == TimingMode::kTimed) { /* start clock64 */ }",
+        "timing_guard_b": "if (timing_mode == TimingMode::kTimed) { /* end clock64 */ }",
+        "untimed_call_a": "run_once(spec, iterations, TimingMode::kUntimed);",
+        "untimed_call_b": "run_once(spec, kSelfTestIterations, TimingMode::kUntimed);",
+        "wait_ld_text": "tcgen05.wait::ld.sync.aligned;",
+        "fence_text": "tcgen05.fence::after_thread_sync;",
+        "extra_forbidden_line": "",
+    }
+    fields.update(overrides)
+    return (
+        f"{fields['lane_shift_const']}\n"
+        f"{fields['rows_per_warp_const']}\n"
+        f"{fields['cols_per_fragment_const']}\n"
+        "__device__ uint32_t make_tmem_load_address(uint32_t tmem_base, int warp_id, int frag) {\n"
+        f"    const uint32_t lane_contribution = {fields['lane_contribution']};\n"
+        f"    const uint32_t column_contribution = {fields['column_contribution']};\n"
+        f"    {fields['tmem_return']}\n"
+        "}\n"
+        "__device__ void umma_1sm_body(int64_t iterations, TimingMode timing_mode) {\n"
+        f"    {fields['launch_guard']}\n"
+        "    __syncthreads();\n"
+        f"    {fields['tmem_call_site']}\n"
+        f"    {fields['timing_guard_a']}\n"
+        f"    {fields['timing_guard_b']}\n"
+        "}\n"
+        f"{fields['wait_ld_text']}\n"
+        f"{fields['fence_text']}\n"
+        f"{fields['untimed_call_a']}\n"
+        f"{fields['untimed_call_b']}\n"
+        "run_once(spec, iterations, TimingMode::kTimed);\n"
+        f"{fields['extra_forbidden_line']}\n"
+    )
 
 
 def run_self_test() -> int:
@@ -481,30 +715,92 @@ def run_self_test() -> int:
 
     source_cases: list[tuple[str, str, str | None]] = [
         (
-            "source check accepts required PTX text and no forbidden pattern",
-            "tcgen05.wait::ld.sync.aligned;\ntcgen05.fence::after_thread_sync;\n"
-            "tcgen05.mma.cta_group::1.kind::f16 [x], a, b, i, p;\n",
+            "source check accepts a fully valid source (TMEM helper, launch guard, timing "
+            "routing, required PTX text, no forbidden pattern)",
+            golden_source_snippet(),
             None,
         ),
         (
             "source check rejects cta_group::2",
-            "tcgen05.mma.cta_group::2.kind::f16 [x], a, b, i, p;\n",
+            golden_source_snippet(extra_forbidden_line="tcgen05.mma.cta_group::2.kind::f16 [x], a, b, i, p;"),
             "cta_group::2",
         ),
         (
             "source check rejects __cluster_dims__",
-            "__global__ __cluster_dims__(2,1,1) void k() {}\n",
+            golden_source_snippet(extra_forbidden_line="__global__ __cluster_dims__(2,1,1) void k() {}"),
             "__cluster_dims__",
         ),
         (
             "source check rejects a missing tcgen05.wait::ld",
-            "tcgen05.fence::after_thread_sync;\n",
+            golden_source_snippet(wait_ld_text=""),
             "tcgen05.wait::ld.sync.aligned",
         ),
         (
             "source check rejects a missing tcgen05.fence::after_thread_sync",
-            "tcgen05.wait::ld.sync.aligned;\n",
+            golden_source_snippet(fence_text=""),
             "tcgen05.fence::after_thread_sync",
+        ),
+        (
+            "source check rejects required PTX text present only in a // comment",
+            golden_source_snippet(wait_ld_text="// tcgen05.wait::ld.sync.aligned"),
+            "tcgen05.wait::ld.sync.aligned",
+        ),
+        (
+            "source check rejects required PTX text present only in a /* */ comment",
+            golden_source_snippet(fence_text="/* tcgen05.fence::after_thread_sync */"),
+            "tcgen05.fence::after_thread_sync",
+        ),
+        (
+            "source check accepts forbidden text present only inside a /* */ comment",
+            golden_source_snippet(
+                extra_forbidden_line="/* cta_group::2 __cluster_dims__ multicast block_scale */"
+            ),
+            None,
+        ),
+        (
+            "source check rejects a missing warp-derived TMEM lane offset",
+            golden_source_snippet(lane_contribution="kTmemRowsPerWarp << kTmemLaneShift"),
+            "warp contribution using warp_id * kTmemRowsPerWarp",
+        ),
+        (
+            "source check rejects an incorrect TMEM lane shift constant",
+            golden_source_snippet(lane_shift_const="constexpr uint32_t kTmemLaneShift = 15;"),
+            "kTmemLaneShift defined as 16",
+        ),
+        (
+            "source check rejects a missing TMEM fragment column offset",
+            golden_source_snippet(column_contribution="static_cast<uint32_t>(frag)"),
+            "fragment contribution using frag * kTmemColsPerFragment",
+        ),
+        (
+            "source check rejects the original defective tmem_d + frag * 32 read operand",
+            golden_source_snippet(tmem_call_site="tcgen05_ld_32x32b_x32(tmem_d + frag * 32, regs);"),
+            "tmem_d + frag * 32",
+        ),
+        (
+            "source check rejects a missing launch-contract guard",
+            golden_source_snippet(launch_guard=""),
+            "missing launch-contract guard",
+        ),
+        (
+            "source check rejects unconditional (unguarded) timed clock64 reads",
+            golden_source_snippet(timing_guard_a="", timing_guard_b=""),
+            "guard(s) in the kernel body",
+        ),
+        (
+            "source check rejects a missing TimingMode::kUntimed call site",
+            golden_source_snippet(untimed_call_a="", untimed_call_b=""),
+            "TimingMode::kUntimed",
+        ),
+        (
+            "source check fails closed on an unterminated /* block comment",
+            "/* this block comment never closes\nint x = 1;\n",
+            "cannot safely scan",
+        ),
+        (
+            "source check fails closed on an unterminated string literal",
+            'const char* s = "this string never closes;\n',
+            "cannot safely scan",
         ),
     ]
     for name, source_text, expected_error in source_cases:
@@ -519,7 +815,24 @@ def run_self_test() -> int:
             failures.append(name)
             print(f"check_umma_1sm_sass: self-test: FAIL: {name}; errors={errors}", file=sys.stderr)
 
-    total = len(cases) + len(source_cases)
+    mandatory_validation_cases: list[tuple[str, bool]] = [
+        (
+            "mandatory source validation: default path resolves to src/compute/umma_1sm.cu",
+            resolve_default_source_path().as_posix().endswith("src/compute/umma_1sm.cu"),
+        ),
+        (
+            "mandatory source validation: a missing canonical source fails closed (non-empty errors)",
+            bool(validate_source_file(Path("/nonexistent-path-should-never-exist/umma_1sm.cu"))),
+        ),
+    ]
+    for name, ok in mandatory_validation_cases:
+        if ok:
+            print(f"check_umma_1sm_sass: self-test: PASS: {name}", file=sys.stderr)
+        else:
+            failures.append(name)
+            print(f"check_umma_1sm_sass: self-test: FAIL: {name}", file=sys.stderr)
+
+    total = len(cases) + len(source_cases) + len(mandatory_validation_cases)
     if failures:
         print(f"check_umma_1sm_sass: self-test: FAILED ({len(failures)}/{total} case(s))", file=sys.stderr)
         return 1
@@ -527,7 +840,7 @@ def run_self_test() -> int:
     return 0
 
 
-def check_binary(binary_path: str, out_path: str, source_path: str | None) -> int:
+def check_binary(binary_path: str, out_path: str, explicit_source_path: str | None) -> int:
     try:
         result = subprocess.run(["cuobjdump", "-sass", binary_path], capture_output=True, text=True)
     except OSError as exc:
@@ -550,27 +863,19 @@ def check_binary(binary_path: str, out_path: str, source_path: str | None) -> in
     for status in status_lines:
         print(f"check_umma_1sm_sass: {status}", file=sys.stderr)
 
-    if source_path is not None:
-        try:
-            with open(source_path, "r", encoding="utf-8") as f:
-                source_text = f.read()
-        except OSError as exc:
-            print(f"check_umma_1sm_sass: unable to read {source_path}: {exc}", file=sys.stderr)
-            return 1
-        source_errors = check_source(source_text)
-        if source_errors:
-            errors.extend(source_errors)
-        else:
-            print(
-                "check_umma_1sm_sass: source check OK: tcgen05.wait::ld and "
-                "tcgen05.fence::after_thread_sync are present; no forbidden pattern found",
-                file=sys.stderr,
-            )
+    # Source validation is mandatory: --source may override which file is
+    # checked, but omitting it resolves the canonical repository path below
+    # instead of skipping the check. There is no bypass.
+    source_path = Path(explicit_source_path) if explicit_source_path is not None else resolve_default_source_path()
+    source_errors = validate_source_file(source_path)
+    if source_errors:
+        errors.extend(f"[source {source_path}] {detail}" for detail in source_errors)
     else:
         print(
-            "check_umma_1sm_sass: LIMITATION: no --source given, so tcgen05.wait::ld and "
-            "tcgen05.fence::after_thread_sync presence was NOT verified (ptxas emits no distinct "
-            "SASS instruction for either on this toolchain; see this file's module docstring)",
+            f"check_umma_1sm_sass: source check OK ({source_path}): tcgen05.wait::ld and "
+            "tcgen05.fence::after_thread_sync are present, the TMEM address helper/launch-contract "
+            "guard/timing-mode routing are real executable code, and no forbidden pattern was found "
+            "(comment- and string-literal-aware scan)",
             file=sys.stderr,
         )
 
@@ -583,7 +888,7 @@ def check_binary(binary_path: str, out_path: str, source_path: str | None) -> in
     print(
         "check_umma_1sm_sass: OK: all twelve specializations contain a genuine 1-SM UTCHMMA burst "
         "of exactly depth instructions, a real commit/wait completion sequence, a complete TMEM "
-        "lifecycle, and no forbidden or 2-SM instruction",
+        "lifecycle, correct per-warp TMEM addressing, and no forbidden or 2-SM instruction",
         file=sys.stderr,
     )
     return 0
@@ -612,8 +917,11 @@ def main(argv: list[str] | None = None) -> int:
         return check_binary(positional[0], positional[1], source_path)
 
     print(
-        "usage: check_umma_1sm_sass.py <binary> <output-sass-path> [--source <umma_1sm.cu>]\n"
-        "       check_umma_1sm_sass.py --self-test",
+        "usage: check_umma_1sm_sass.py <binary> <output-sass-path> [--source <path>]\n"
+        "       check_umma_1sm_sass.py --self-test\n"
+        "the two-positional-argument form always validates the canonical source\n"
+        "(src/compute/umma_1sm.cu, resolved relative to this script) even when\n"
+        "--source is omitted; --source only overrides which file is checked.",
         file=sys.stderr,
     )
     return 2

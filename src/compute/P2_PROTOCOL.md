@@ -191,6 +191,25 @@ differs between the A and B descriptors, and between specializations.
 
 ## 9. TMEM lifecycle
 
+Before any of the numbered steps below, every kernel first evaluates an
+explicit launch-contract guard (`launch_contract_is_valid()` in
+`umma_1sm.cu`): a launch that is not exactly `grid=(1,1,1)`,
+`block=(128,1,1)` writes `0` to a host-visible `g_launch_ok` output and
+returns immediately, before touching `__syncthreads()`, mbarrier
+initialization, TMEM allocation, or any UMMA instruction. A launch that
+passes writes `1` to the same location before continuing to step 1, so the
+host can distinguish "the kernel ran and confirmed its own launch shape"
+from every other outcome -- a silent early return alone would not be
+observable by the host. `run_once()` always allocates and zero-initializes
+`g_launch_ok` before the launch and treats any value other than `1` as
+fatal, checked before any correctness validation of `D`. The frozen host
+launcher (`kGridBlocks=1`, `kThreadsPerCta=128`) always satisfies this
+guard; it exists so a regression to a different launch shape fails loudly
+instead of allocating TMEM against an unexpected thread/warp count or
+silently computing a wrong `D`. `__launch_bounds__(128)` alone is not
+sufficient here since it only constrains the maximum thread count, not the
+actual launch configuration.
+
 Per kernel, in order (PTX ISA 9.3 sections 9.7.17.1.2, 9.7.17.7.1):
 
 1. All 128 threads fill A and B directly into the physical layout above
@@ -212,17 +231,77 @@ Per kernel, in order (PTX ISA 9.3 sections 9.7.17.1.2, 9.7.17.7.1):
    (required before the new asynchronous `tcgen05.ld` -- PTX ISA 9.3 section
    9.7.17.6.4.2's Example 2, and composes with the preceding barrier per
    section 9.7.17.6.3, matching the canonical "different-thread" pattern of
-   section 9.7.17.6.4.4), then `tcgen05.ld.sync.aligned.32x32b.x32.b32` +
-   `tcgen05.wait::ld.sync.aligned` per 32-column fragment (N/32 fragments;
-   8 for N=256), storing D to global memory.
+   section 9.7.17.6.4.4), then, for each 32-column fragment `frag` (N/32
+   fragments; 8 for N=256): `tcgen05.ld.sync.aligned.32x32b.x32.b32` at the
+   collective address `make_tmem_load_address(tmem_d, warp_id, frag)` +
+   `tcgen05.wait::ld.sync.aligned`, storing D to global memory. See section
+   9.1 below for the corrected address construction (repair, 2026-07-30).
 6. `__syncthreads()`.
 7. Warp 0 (the same warp that allocated): `tcgen05.dealloc.cta_group::1`,
    then `tcgen05.relinquish_alloc_permit.cta_group::1`.
 8. Thread 0: `mbarrier.inval.shared.b64`, ending the mbarrier's lifetime.
 
-There is exactly one exit path (the function's natural end); every kernel
-invocation reaches all of steps 1-8 unconditionally, so no path leaves TMEM
-allocated. All `tcgen05` instructions use `cta_group::1` throughout.
+There are exactly two exit paths: the launch-contract rejection above
+(before step 1, so TMEM is never allocated and no barrier is ever reached on
+this path) and the function's natural end after step 8. Every accepted
+launch reaches all of steps 1-8 unconditionally, so no accepted-launch path
+leaves TMEM allocated. All `tcgen05` instructions use `cta_group::1`
+throughout.
+
+### 9.1 TMEM load address construction (repair, 2026-07-30)
+
+PTX ISA 9.3 section 9.7.17.1.1 ("Tensor Memory Addressing") specifies that a
+Tensor Memory address is 32 bits wide with two components: bits 31-16 are
+the lane index, bits 15-0 are the column index. Section 9.7.17.8.1 ("Access
+restrictions") further specifies that the Tensor Memory of a CTA is split
+into four equal 32-lane chunks, one per warp of the warpgroup, and that
+every thread of the issuing warp must supply the identical collective
+`taddr`:
+
+| Warp ID within the warpgroup | Accessible lanes |
+|-------------------------------|-------------------|
+| 0 | 0-31 |
+| 1 | 32-63 |
+| 2 | 64-95 |
+| 3 | 96-127 |
+
+`tcgen05.alloc` returns a base address at lane 0 of the allocated columns (a
+column allocation spans all 128 lanes, PTX ISA 9.3 section 9.7.17.1.2), so
+every warp other than warp 0 must add its own lane contribution before
+issuing `tcgen05.ld`, or it reads warp 0's lanes instead of its own. The
+originally audited defect used `tmem_d + frag * 32` for all four warps -- a
+plain column offset with no lane contribution at all, so warps 1-3 all read
+the wrong 32-row band of `D` (warp 0's rows 0-31, repeated four times, in
+place of their own rows 32-63/64-95/96-127).
+
+The fix, `make_tmem_load_address()` in `umma_1sm.cu`:
+
+```cpp
+constexpr uint32_t kTmemLaneShift = 16;        // bits 31-16
+constexpr uint32_t kTmemRowsPerWarp = 32;      // one warpgroup chunk
+constexpr uint32_t kTmemColsPerFragment = 32;  // this kernel's fragment width
+
+uint32_t make_tmem_load_address(uint32_t tmem_base, int warp_id, int frag) {
+    const uint32_t lane_contribution = (static_cast<uint32_t>(warp_id) * kTmemRowsPerWarp) << kTmemLaneShift;
+    const uint32_t column_contribution = static_cast<uint32_t>(frag) * kTmemColsPerFragment;
+    return tmem_base + lane_contribution + column_contribution;
+}
+```
+
+`tmem_base`'s lane bits are always 0 (lane 0 of the allocation), and
+`lane_contribution`/`column_contribution` occupy disjoint bit ranges (31-16
+and 15-0 respectively -- `frag * 32` never exceeds `7 * 32 = 224`, the
+largest fragment index for N=256, so it never carries into bit 16), so plain
+addition is equivalent to a bitwise OR of the three components. The
+resulting mapping is exactly the access-restriction table above: warp 0 ->
+D rows 0-31, warp 1 -> rows 32-63, warp 2 -> rows 64-95, warp 3 -> rows
+96-127, matching the row index (`warp_id * 32 + lane`) already used for the
+global-store side of the same readback loop. `scripts/check_umma_1sm_sass.py`'s
+source gate (section 15.1) proves this helper is real executable code, that
+the warp/lane/column contributions use the named constants with their
+correct values, that the call site feeding `tcgen05_ld_32x32b_x32` is built
+by this helper, and that the original defective `tmem_d + frag * 32`
+operand is absent.
 
 ## 10. Synchronization and completion (timed region)
 
@@ -235,6 +314,28 @@ D from TMEM, global-memory stores, TMEM allocation/deallocation, A/B
 initialization, descriptor construction, and mbarrier init/invalidate are
 all outside this region (see section 12 for the exact included/excluded
 list, reproduced from the task brief).
+
+### 10.1 Timing mode: validation-only, warm-up, and timed execution (repair, 2026-07-30)
+
+An explicit `TimingMode` (`kUntimed` / `kTimed`) kernel argument, propagated
+through `run_once()` and `umma_1sm_body()`, decides at each launch whether
+either `%clock64` read may execute: each read is guarded by
+`if (timing_mode == TimingMode::kTimed)`. `TimingMode` is a launch argument
+(uniform across the whole grid, not a per-thread value), so this guard is
+never warp-divergent. Three call sites always launch with
+`TimingMode::kUntimed` and therefore never execute a clock64 read:
+`--self-test` (`run_self_test()`), the pre-timing correctness validation,
+and every warm-up iteration (the latter two both routed through
+`run_untimed_or_die()` in `main()`). Only the per-repetition timed loop
+launches with `TimingMode::kTimed` (`run_timed_or_die()`). Correctness is
+still required on every launch regardless of mode; only the cycle-count
+expectation differs: `run_untimed_or_die()` requires validation to pass but
+makes no claim about `elapsed_cycles` (legitimately `0` when untimed), while
+`run_timed_or_die()` requires both validation to pass and
+`elapsed_cycles > 0`. This closes the originally audited defect, in which
+every launch -- including `--self-test`, pre-timing validation, and warm-up
+-- unconditionally executed both clock64 reads despite being described as
+untimed.
 
 ## 11. Validation pattern and CPU reference
 
@@ -311,9 +412,9 @@ Enforced by `scripts/check_umma_1sm_sass.py` against real
 guessed -- see that script's module docstring for the full PTX-to-SASS
 mapping table and the two instructions, `tcgen05.wait::ld` and
 `tcgen05.fence::after_thread_sync`, that ptxas emits with no distinct SASS
-footprint on this toolchain and are instead proven present via an optional
-`--source` static check of the compiled `.cu` file). Summary of what is
-proved for every one of the twelve symbols:
+footprint on this toolchain and are instead proven present via a mandatory
+source check of the compiled `.cu` file -- see 15.1 below). Summary of what
+is proved for every one of the twelve symbols:
 
 1. Exactly the twelve expected symbols exist, no missing/extra/duplicate.
 2. Every symbol's SASS contains `UTCHMMA` (sm_103a's lowering of
@@ -333,20 +434,74 @@ proved for every one of the twelve symbols:
    (TMA), `LDGSTS`, `UBLKCP`, or sparse (`.sp`) `UTCHMMA` qualifier appears
    anywhere in the binary; no cluster-scoped barrier or `CLUSTER` header
    attribute appears (2-SM evidence).
-8. (`--source`) the compiled `.cu` text contains `tcgen05.wait::ld.sync.
-   aligned` and `tcgen05.fence::after_thread_sync`, and contains none of
+8. (mandatory source check, section 15.1) the compiled `.cu` text contains
+   `tcgen05.wait::ld.sync.aligned` and `tcgen05.fence::after_thread_sync` as
+   executable code (not merely inside a comment), and contains none of
    `cta_group::2`, `__cluster_dims__`, a real (non-comment) `multicast`
    qualifier, a non-`.kind::f16` MMA kind, a `.sp` sparse form, or
-   `block_scale`.
+   `block_scale`, likewise as executable code.
+9. (source check) the corrected TMEM load address is real executable code:
+   `make_tmem_load_address()` exists, its warp contribution uses
+   `warp_id * kTmemRowsPerWarp` shifted by `kTmemLaneShift` (=16, the lane
+   bits), its fragment contribution uses `frag * kTmemColsPerFragment`
+   (=32, the column bits), the `tcgen05_ld_32x32b_x32` call site is built by
+   this helper, and the original defective `tmem_d + frag * 32` operand is
+   absent (section 9.1).
+10. (source check) an explicit launch-contract guard
+    (`launch_contract_is_valid()`) is checked inside `umma_1sm_body` before
+    its first `__syncthreads()`.
+11. (source check) every timed `%clock64` read is guarded by
+    `timing_mode == TimingMode::kTimed`, and at least one call site uses
+    `TimingMode::kUntimed` (section 10.1).
 
-`scripts/check_umma_1sm_sass.py --self-test` exercises all of the above with
-synthetic SASS/source text shaped after the real observed output, including
-positive and negative cases for every one of the twelve properties listed in
-the P2.1 task brief (missing symbol, extra symbol, duplicate configuration,
-missing `UTCHMMA`, incorrect depth in both directions, a non-uniformly
-spaced burst, missing commit, missing wait, missing alloc/dealloc,
-deallocation before final use, and every forbidden instruction/2-SM
-marker).
+### 15.1 Mandatory, fail-closed source validation (repair, 2026-07-30)
+
+The two-positional-argument invocation
+(`check_umma_1sm_sass.py <binary> <sass-path>`) always validates the
+canonical source `src/compute/umma_1sm.cu`, resolved relative to the
+checker script itself (never the caller's current working directory) by
+`resolve_default_source_path()`. `--source <path>` may override which file
+is checked (used for ad hoc testing); omitting it never skips the check. If
+the resolved source cannot be opened, this checker exits 1 -- there is no
+code path in which the real binary/SASS check can report success while
+source validation was skipped or merely reported as a documented
+limitation.
+
+The source scanner (`strip_comments_preserving_literals()`) strips both
+`//` line comments and `/* ... */` block comments while preserving the
+exact text of every string and character literal (required inline-PTX text
+lives inside C++ string literals passed to inline asm, so it must never be
+mistaken for a comment). Every forbidden- and required-pattern check in
+this checker runs against this comment-stripped, literal-preserving view,
+never against the raw source text -- closing the originally audited defect
+in which a file containing only comments such as
+
+```cpp
+// tcgen05.wait::ld.sync.aligned
+// tcgen05.fence::after_thread_sync
+```
+
+passed the required-source checks (the comparison used the raw text, not a
+comment-stripped view). The scanner fails closed (raises, and the checker
+reports a "cannot safely scan" error) on an unterminated `/*` block comment
+or an unterminated string/character literal, since the lexical state cannot
+then be safely determined.
+
+`scripts/check_umma_1sm_sass.py --self-test` exercises all of the above (37
+cases total): the original eighteen SASS-contract cases (missing symbol,
+extra symbol, duplicate configuration, missing `UTCHMMA`, incorrect depth
+in both directions, a non-uniformly spaced burst, missing commit, missing
+wait, missing alloc/dealloc, deallocation before final use, incorrect
+LDTM.x32 count, and every forbidden instruction/2-SM marker) plus
+source-level positive and negative cases for: required PTX text present
+only in a `//` or `/* */` comment (reject), forbidden text present only in
+a `/* */` comment (accept), a missing warp-derived TMEM lane offset, an
+incorrect TMEM lane shift constant, a missing TMEM fragment column offset,
+the original defective `tmem_d + frag * 32` operand, a missing
+launch-contract guard, unconditional (unguarded) timed clock64 reads, a
+missing `TimingMode::kUntimed` call site, an unterminated block comment, an
+unterminated string literal, and the mandatory default-source-path
+resolution and fail-closed-on-missing-file behavior itself.
 
 ## 16. Commands
 
@@ -396,6 +551,20 @@ BLACKWELL_GPU_INDEX=<physical-index> make compute-umma-1sm-smoke
   row claims otherwise.
 
 ## 18. Status
+
+A first independent review of this implementation found seven defects: the
+TMEM readback used the wrong lane address for warps 1-3 (section 9.1); the
+SASS checker could pass without mandatory source validation and required
+PTX-text checks could be satisfied by a comment (section 15.1);
+`--self-test`, pre-timing validation, and warm-up executed `%clock64` reads
+despite being described as untimed (section 10.1); kernels did not reject
+an invalid grid/CTA size (section 9); the CLI accepted an unauthorized `-h`
+alias and arbitrary upper limits absent from the frozen contract; and the
+non-literal architecture-flag workaround lacked recorded evidence (section
+20). All seven were repaired on 2026-07-30, each with new GPU-free
+regression coverage (`scripts/check_umma_1sm_sass.py --self-test`, 37
+cases). This repair does not itself constitute an audit or GB300
+verification:
 
 * P2.1: **implemented**.
 * Independent audit: **pending**.
@@ -452,3 +621,57 @@ findings, and how this implementation diverges:
 Also consulted (conceptual only, no bit-level detail found there for
 tcgen05 descriptors): NVIDIA CUTLASS Blackwell functionality documentation,
 <https://docs.nvidia.com/cutlass/latest/media/docs/cpp/blackwell_functionality.html>.
+
+## 20. Architecture-flag evidence (repair, 2026-07-30)
+
+The frozen contract requested the literal single-flag form
+`nvcc -std=c++17 -O3 -lineinfo -arch=$(CUDA_ARCH)`. Before this repair, the
+Makefile instead derived `-arch=compute_103a -code=sm_103a` with only a
+comment asserting the literal form fails; that assertion was not backed by
+recorded command output. Both forms were directly executed in the pinned,
+networkless `gb300-gemm-anatomy:phase0` container, with no GPU, to settle
+this with evidence rather than memory.
+
+Literal form (`CUDA_ARCH=sm_103a`, single flag):
+
+```bash
+docker run --rm --network none --security-opt no-new-privileges --cap-drop ALL \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$(pwd):/workspace" -w /workspace \
+  gb300-gemm-anatomy:phase0 \
+  nvcc -std=c++17 -O3 -lineinfo -arch=sm_103a -o build/compute/umma_1sm_probe_literal src/compute/umma_1sm.cu
+```
+
+Result: `nvcc` exits **255**. No binary is produced. `ptxas` reports 3336
+lines of the form `error: Instruction 'tcgen05.alloc' not supported on
+.target 'sm_103'` / `error: Feature '.cta_group::1' not supported on
+.target 'sm_103'` / `error: Instruction 'tcgen05.mma' not supported on
+.target 'sm_103'` / `error: Feature '.kind::f16' not supported on .target
+'sm_103'`, one set per `tcgen05` instruction across all twelve
+specializations. `nvcc`'s own intermediate PTX file for this invocation is
+named `.../tmpxft_...-7_umma_1sm.compute_103.ptx` -- **not**
+`compute_103a.ptx` -- confirming the "a" (architecture-specific) suffix is
+already lost before `ptxas` ever runs, exactly as the pre-repair comment
+claimed but had not recorded.
+
+Split form (`CUDA_ARCH=sm_103a`, explicit virtual/real pair, unchanged from
+before this repair):
+
+```bash
+docker run --rm --network none --security-opt no-new-privileges --cap-drop ALL \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$(pwd):/workspace" -w /workspace \
+  gb300-gemm-anatomy:phase0 \
+  nvcc -std=c++17 -O3 -lineinfo -arch=compute_103a -code=sm_103a -o build/compute/umma_1sm_probe_split src/compute/umma_1sm.cu
+```
+
+Result: `nvcc` exits **0**. The resulting binary disassembles (`cuobjdump
+-sass`) to all twelve expected `umma_1sm_m128n{N}k16_d{DEPTH}` symbols, each
+with the expected exact `UTCHMMA` count (`depth`) and `LDTM.x32` count
+(`N/32`), a real TMEM allocate/commit/wait/deallocate lifecycle, and no
+forbidden or 2-SM instruction -- the same real-cubin evidence table produced
+by `make compute-umma-1sm-sass` (section 15).
+
+Decision: the pinned CUDA 13.1.80 toolchain reproducibly requires the
+explicit virtual/real pair for this file; the Makefile retains
+`COMPUTE_UMMA_1SM_ARCH_FLAGS := -arch=compute_$(patsubst sm_%,%,$(CUDA_ARCH)) -code=$(CUDA_ARCH)`,
+derived from the same pinned `CUDA_ARCH` value in `VERSIONS.env` (unchanged),
+never a hardcoded literal independent of the pinned contract.
