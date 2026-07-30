@@ -154,7 +154,7 @@ Phase 1 gate passed; Phase 2 may begin.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
-| P2.1 | 1-SM UMMA | NO | NO | NO |
+| P2.1 | 1-SM UMMA | YES | NO | NO |
 | P2.2 | 2-SM UMMA | NO | NO | NO |
 | P2.3 | Sweep (≤24 configurations) | NO | NO | NO |
 | P2.4 | Profiling and empirical ceiling | NO | NO | NO |

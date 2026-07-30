@@ -5,7 +5,8 @@
 # memory-tma-self-test, memory-tma-smoke, memory-paths-plan,
 # memory-paths-check, memory-paths-smoke, memory-paths-p14-plan,
 # memory-paths-p14-check, memory-paths-p14-pilot, memory-paths-p14-profile,
-# memory-paths-p14-analyze.
+# memory-paths-p14-analyze, compute-umma-1sm-build, compute-umma-1sm-sass,
+# compute-umma-1sm-check, compute-umma-1sm-self-test, compute-umma-1sm-smoke.
 # No target selects a GPU automatically, elevates privileges, or exceeds two
 # build jobs.
 
@@ -35,6 +36,21 @@ EXP01_P14_NCU_BRIDGE := scripts/p14_ncu_bridge.py
 EXP01_P14_PROTOCOL := src/memory/P1_4_PROTOCOL.md
 EXP01_P14_RAW_ROOT := results/raw/exp01_memory_paths_p14
 
+COMPUTE_UMMA_1SM_SRC := src/compute/umma_1sm.cu
+COMPUTE_UMMA_1SM_BIN := build/compute/umma_1sm
+COMPUTE_UMMA_1SM_SASS := build/compute/umma_1sm.sass
+COMPUTE_UMMA_1SM_CHECKER := scripts/check_umma_1sm_sass.py
+COMPUTE_UMMA_1SM_PROTOCOL := src/compute/P2_PROTOCOL.md
+# nvcc's single-flag "-arch=sm_103a" shorthand does not propagate the "a"
+# (architecture-specific) suffix to ptxas's SASS-generation target on this
+# pinned CUDA 13.1.80 toolchain: it compiles P0/P1's LDGSTS/TMA code (which
+# needs no sm_103a-only instruction) but fails every tcgen05 instruction with
+# "not supported on .target 'sm_103'" (the "a" silently dropped). Verified by
+# direct compilation (see src/compute/P2_PROTOCOL.md section 15/19); splitting
+# the same pinned CUDA_ARCH value into an explicit virtual/real pair fixes it
+# without changing VERSIONS.env or the pinned architecture string itself.
+COMPUTE_UMMA_1SM_ARCH_FLAGS := -arch=compute_$(patsubst sm_%,%,$(CUDA_ARCH)) -code=$(CUDA_ARCH)
+
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
 	Dockerfile Makefile \
@@ -45,7 +61,8 @@ REQUIRED_FILES := \
 	results/README.md \
 	$(EXP01_RUNNER) $(EXP01_AGGREGATOR) \
 	$(EXP01_P14_RUNNER) $(EXP01_P14_ANALYZER) $(EXP01_P14_SAFE_CAPTURE) $(EXP01_P14_NCU_BRIDGE) \
-	$(EXP01_P14_PROTOCOL)
+	$(EXP01_P14_PROTOCOL) \
+	$(COMPUTE_UMMA_1SM_SRC) $(COMPUTE_UMMA_1SM_CHECKER) $(COMPUTE_UMMA_1SM_PROTOCOL)
 
 .DEFAULT_GOAL := help
 .PHONY: help check-static build-image check-env preflight \
@@ -53,7 +70,9 @@ REQUIRED_FILES := \
 	memory-tma-build memory-tma-sass memory-tma-self-test memory-tma-smoke \
 	memory-paths-plan memory-paths-check memory-paths-smoke \
 	memory-paths-p14-plan memory-paths-p14-check memory-paths-p14-pilot \
-	memory-paths-p14-profile memory-paths-p14-analyze
+	memory-paths-p14-profile memory-paths-p14-analyze \
+	compute-umma-1sm-build compute-umma-1sm-sass compute-umma-1sm-check \
+	compute-umma-1sm-self-test compute-umma-1sm-smoke
 
 help:
 	@echo "gb300-gemm-anatomy — Phase 0 + P1.1 (LDGSTS) + P1.2 (TMA) + P1.3 (sweep) targets"
@@ -122,6 +141,25 @@ help:
 	@echo "  GPU-free P1.4 analysis (requires P1_4_CAMPAIGN_ID; a completed pilot+profile):"
 	@echo "  make memory-paths-p14-analyze  Validate and analyze a COMPLETE P1.4 campaign;"
 	@echo "                                 all outputs remain publishable=false."
+	@echo ""
+	@echo "  -- P2.1 1-SM BF16 UMMA (tcgen05.mma, kind::f16, cta_group::1; see"
+	@echo "     src/compute/P2_PROTOCOL.md; implemented, NOT audited, NOT verified on"
+	@echo "     GB300, no publishable result; P2.2-P2.4 not implemented) --"
+	@echo "  GPU-free build/SASS/check (no GPU, no network):"
+	@echo "  make compute-umma-1sm-build    Compile the twelve P2.1 specializations. No GPU."
+	@echo "  make compute-umma-1sm-sass     Disassemble and verify the real cubin: exactly"
+	@echo "                                 twelve UTCHMMA bursts of depth instructions each,"
+	@echo "                                 a full TMEM lifecycle, no forbidden/2-SM"
+	@echo "                                 instruction. No GPU."
+	@echo "  make compute-umma-1sm-check    Python syntax, checker self-test, exactly-twelve-"
+	@echo "                                 specializations and forbidden-pattern source"
+	@echo "                                 checks, honest status reporting, plus the real"
+	@echo "                                 cubin SASS gate above. No GPU, no network."
+	@echo "  GPU-executing (requires BLACKWELL_GPU_INDEX; never selects a GPU automatically):"
+	@echo "  make compute-umma-1sm-self-test  Validate all twelve specializations on GPU (no"
+	@echo "                                   publishable numbers)."
+	@echo "  make compute-umma-1sm-smoke      Self-test, then one short run_kind=smoke"
+	@echo "                                   measurement (NOT a final result)."
 	@echo ""
 	@echo "Pinned contract (VERSIONS.env): CUDA $(CUDA_VERSION), CUTLASS $(CUTLASS_VERSION),"
 	@echo "arch $(CUDA_ARCH), max build jobs $(MAX_BUILD_JOBS)."
@@ -276,6 +314,46 @@ check-static:
 	@grep -Fq -- '--passes 32' $(EXP01_P14_RUNNER)
 	@grep -Fq -- '--warmup-ms 2000' $(EXP01_P14_RUNNER)
 	@grep -Fq -- '--repetitions 30' $(EXP01_P14_RUNNER)
+	@echo "== P2.1 required files present, executable, and syntactically valid =="
+	@test -x $(COMPUTE_UMMA_1SM_CHECKER)
+	python3 -m py_compile $(COMPUTE_UMMA_1SM_CHECKER)
+	@rm -rf scripts/__pycache__
+	@echo "== P2.1 SASS checker GPU-free synthetic self-test =="
+	python3 $(COMPUTE_UMMA_1SM_CHECKER) --self-test
+	@echo "== P2.1 source declares exactly twelve specializations =="
+	@test "$$(grep -oE 'UMMA_1SM_DEFINE_KERNEL\([0-9]+, [0-9]+\)' $(COMPUTE_UMMA_1SM_SRC) | wc -l | tr -d ' ')" -eq 12
+	@test "$$(grep -oE 'UMMA_1SM_SPEC_ENTRY\([0-9]+, [0-9]+\)' $(COMPUTE_UMMA_1SM_SRC) | wc -l | tr -d ' ')" -eq 12
+	@echo "== P2.1 source uses the frozen tcgen05.mma kind::f16 cta_group::1 contract =="
+	@grep -Fq 'tcgen05.mma.cta_group::1.kind::f16' $(COMPUTE_UMMA_1SM_SRC)
+	@grep -Fq 'tcgen05.wait::ld.sync.aligned' $(COMPUTE_UMMA_1SM_SRC)
+	@grep -Fq 'tcgen05.fence::after_thread_sync' $(COMPUTE_UMMA_1SM_SRC)
+	@grep -Fq 'tcgen05.alloc.cta_group::1' $(COMPUTE_UMMA_1SM_SRC)
+	@grep -Fq 'tcgen05.dealloc.cta_group::1' $(COMPUTE_UMMA_1SM_SRC)
+	@grep -Fq 'tcgen05.relinquish_alloc_permit.cta_group::1' $(COMPUTE_UMMA_1SM_SRC)
+	@grep -Fq 'tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64' $(COMPUTE_UMMA_1SM_SRC)
+	@echo "== P2.1 forbidden patterns absent (no 2-SM, cluster, sparse, block-scaled, or"
+	@echo "   non-kind::f16 form; no P0/P1-style forbidden shell patterns) =="
+	@echo "   (checked against code with '//' comments stripped, so a comment explaining"
+	@echo "   why e.g. cta_group::2 is absent cannot itself trip these checks)"
+	@! sed 's#//.*##' $(COMPUTE_UMMA_1SM_SRC) | grep -nE 'cta_group::2|__cluster_dims__|multicast|block_scale|\.sp\b'
+	@! sed 's#//.*##' $(COMPUTE_UMMA_1SM_SRC) | grep -nE '\.kind::(tf32|f8f6f4|mxf8f6f4|mxf4|mxf4nvf4|i8)\b'
+	@pat='--gpus[ =]+all|NVIDIA_VISIBLE_DEVICES=all|--privileged|--pid[ =]+host|docker\.sock|--cap-add|SYS_ADMIN|set -x'; \
+	pat="$$pat|\bs""udo\b|\$$\(np""roc\)"; \
+	pat="$$pat|nvidia-smi[^|]*(-pm|--persistence-mode|-lgc|--lock-gpu-clocks|-pl|--power-limit)"; \
+	! sed 's#//.*##' $(COMPUTE_UMMA_1SM_SRC) | grep -nE -- "$$pat" && \
+	! grep -nE -- "$$pat" $(COMPUTE_UMMA_1SM_CHECKER)
+	@echo "== P2.1 Makefile target derives its arch/code flags from the pinned CUDA_ARCH =="
+	@grep -Fq 'COMPUTE_UMMA_1SM_ARCH_FLAGS := -arch=compute_$$(patsubst sm_%,%,$$(CUDA_ARCH)) -code=$$(CUDA_ARCH)' Makefile
+	@echo "== P2.1 documentation reports an honest, unaudited, GB300-unverified status =="
+	@grep -Fq 'P2.1 | 1-SM UMMA | YES | NO | NO |' PLAN.md
+	@! grep -nF 'P2.1 has been independently audited' README.md PLAN.md $(COMPUTE_UMMA_1SM_PROTOCOL)
+	@! grep -nF 'P2.1 has been verified on GB300' README.md PLAN.md $(COMPUTE_UMMA_1SM_PROTOCOL)
+	@! grep -nF 'P2.1 is audited' README.md PLAN.md $(COMPUTE_UMMA_1SM_PROTOCOL)
+	@! grep -nF 'P2.1 is verified on GB300' README.md PLAN.md $(COMPUTE_UMMA_1SM_PROTOCOL)
+	@! grep -nF 'publishable P2.1 result' README.md PLAN.md $(COMPUTE_UMMA_1SM_PROTOCOL)
+	@grep -Fq '* Independent audit: **pending**.' $(COMPUTE_UMMA_1SM_PROTOCOL)
+	@grep -Fq '* GB300 verification: **pending**.' $(COMPUTE_UMMA_1SM_PROTOCOL)
+	@grep -Fq '* Publishable result: **none**.' $(COMPUTE_UMMA_1SM_PROTOCOL)
 	@echo "check-static: OK"
 
 build-image:
@@ -582,3 +660,80 @@ memory-paths-p14-analyze:
 	python3 $(EXP01_P14_ANALYZER) analyze \
 		--campaign-dir $(EXP01_P14_RAW_ROOT)/$${P1_4_CAMPAIGN_ID} \
 		--analyzed-at-utc "$$(date -u +%Y%m%dT%H%M%SZ)"
+
+# --- P2.1: 1-SM BF16 UMMA microbenchmark (tcgen05.mma, kind::f16, cta_group::1) ---
+# compute-umma-1sm-build and compute-umma-1sm-sass never touch a GPU: they
+# compile and disassemble inside the pinned, network-less, unprivileged image,
+# the same secure pattern as memory-ldgsts-build/sass. compute-umma-1sm-check
+# is also GPU-free (Python syntax, the checker's own synthetic self-test,
+# source-level contract checks) but depends on compute-umma-1sm-sass to also
+# validate the real compiled cubin. compute-umma-1sm-self-test and
+# compute-umma-1sm-smoke are the only P2.1 targets that execute on GPU; each
+# requires an explicit BLACKWELL_GPU_INDEX and goes exclusively through
+# scripts/run_container.sh. See src/compute/P2_PROTOCOL.md for the complete
+# frozen contract; P2.1 is implemented but not yet independently audited or
+# verified on GB300, and produces no publishable result.
+
+compute-umma-1sm-build:
+	@mkdir -p build/compute
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-v "$(CURDIR):/workspace" \
+		-w /workspace \
+		"$(IMAGE_TAG)" \
+		nvcc -std=c++17 -O3 -lineinfo $(COMPUTE_UMMA_1SM_ARCH_FLAGS) \
+			-o $(COMPUTE_UMMA_1SM_BIN) $(COMPUTE_UMMA_1SM_SRC)
+
+compute-umma-1sm-sass: compute-umma-1sm-build
+	@mkdir -p build/compute
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-v "$(CURDIR):/workspace" \
+		-w /workspace \
+		"$(IMAGE_TAG)" \
+		python3 $(COMPUTE_UMMA_1SM_CHECKER) $(COMPUTE_UMMA_1SM_BIN) $(COMPUTE_UMMA_1SM_SASS) \
+			--source $(COMPUTE_UMMA_1SM_SRC)
+
+compute-umma-1sm-check: compute-umma-1sm-sass
+	@test -x $(COMPUTE_UMMA_1SM_CHECKER)
+	python3 -m py_compile $(COMPUTE_UMMA_1SM_CHECKER)
+	@rm -rf scripts/__pycache__
+	python3 $(COMPUTE_UMMA_1SM_CHECKER) --self-test
+	@test "$$(grep -oE 'UMMA_1SM_DEFINE_KERNEL\([0-9]+, [0-9]+\)' $(COMPUTE_UMMA_1SM_SRC) | wc -l | tr -d ' ')" -eq 12
+	@echo "compute-umma-1sm-check: OK"
+
+compute-umma-1sm-self-test: compute-umma-1sm-sass
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make compute-umma-1sm-self-test"; \
+		echo "       This project never selects a GPU automatically."; \
+		exit 2; \
+	fi
+	scripts/run_container.sh $(COMPUTE_UMMA_1SM_BIN) --self-test
+
+compute-umma-1sm-smoke: compute-umma-1sm-sass
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make compute-umma-1sm-smoke"; \
+		echo "       This project never selects a GPU automatically."; \
+		exit 2; \
+	fi
+	@echo "== compute-umma-1sm-smoke: self-test =="
+	scripts/run_container.sh $(COMPUTE_UMMA_1SM_BIN) --self-test
+	@echo "== compute-umma-1sm-smoke: short run_kind=smoke measurement (NOT a final result) =="
+	scripts/run_container.sh $(COMPUTE_UMMA_1SM_BIN) \
+		--run-kind smoke --n 128 --depth 16 \
+		--iterations 20 --warmup-iterations 5 --repetitions 3
+	@echo "=============================================================================="
+	@echo "The run_kind=smoke output above is a functional smoke check only. It is NOT a"
+	@echo "final experimental result, is not a TFLOP/s or saturation claim, and must not"
+	@echo "be cited as a performance number."
+	@echo "=============================================================================="

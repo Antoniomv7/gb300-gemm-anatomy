@@ -157,6 +157,27 @@ renders the exact `ok`/`REVIEW` value and adds a regression test; it changes
 no sample, statistic, profiler evidence, HBM classification, kernel, or GPU
 path. No P1.4 result is publishable yet.
 
+## Phase 2 status: P2.1 (1-SM BF16 UMMA)
+
+P2.1, the 1-SM arm of the "BF16 UMMA throughput" experiment
+(`src/compute/umma_1sm.cu`), is implemented: twelve `tcgen05.mma.
+cta_group::1.kind::f16` (BF16 x BF16 -> FP32) specializations, one CTA of
+128 threads each, N in `{64,128,256}` and depth in `{4,16,64,256}`, with a
+GPU-free SASS gate (`scripts/check_umma_1sm_sass.py`) that disassembles the
+real compiled binary and requires exactly those twelve symbols, a
+compile-time-unrolled `UTCHMMA` burst of exactly `depth` instructions per
+symbol, a complete TMEM allocate/commit/wait/load/deallocate lifecycle, and
+the absence of any WGMMA, `mma.sync`, TMA, LDGSTS, FP8/FP4, sparse, or 2-SM
+instruction. See `src/compute/P2_PROTOCOL.md` for the full frozen contract,
+the PTX ISA citations behind every descriptor bit, and the audit of the
+pinned secondary reference. The build and SASS checks above may only be
+declared successful when they have actually been executed (`make
+compute-umma-1sm-build`, `make compute-umma-1sm-sass`,
+`make compute-umma-1sm-check`); nothing here is simulated. P2.1 has **not**
+been independently audited and has **not** been executed on GB300; no
+publishable result exists. P2.2 (2-SM UMMA), P2.3 (joint sweep), and P2.4
+(profiling and empirical ceiling) are **not implemented**.
+
 ## Research question
 
 How do HBM-to-SMEM data movement and fifth-generation Tensor Core throughput
