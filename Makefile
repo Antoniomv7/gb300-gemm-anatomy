@@ -149,8 +149,9 @@ help:
 	@echo "                                 all outputs remain publishable=false."
 	@echo ""
 	@echo "  -- P2.1 1-SM BF16 UMMA (tcgen05.mma, kind::f16, cta_group::1; see"
-	@echo "     src/compute/P2_PROTOCOL.md; implemented, NOT audited, NOT verified on"
-	@echo "     GB300, no publishable result; P2.2-P2.4 not implemented) --"
+	@echo "     src/compute/P2_PROTOCOL.md; implemented, independently audited,"
+	@echo "     functionally verified on GB300, no publishable result;"
+	@echo "     P2.2-P2.4 not implemented) --"
 	@echo "  GPU-free build/SASS/check (no GPU, no network):"
 	@echo "  make compute-umma-1sm-build    Compile the twelve P2.1 specializations. No GPU."
 	@echo "  make compute-umma-1sm-sass     Disassemble and verify the real cubin: exactly"
@@ -350,15 +351,11 @@ check-static:
 	! grep -nE -- "$$pat" $(COMPUTE_UMMA_1SM_CHECKER)
 	@echo "== P2.1 Makefile target derives its arch/code flags from the pinned CUDA_ARCH =="
 	@grep -Fq 'COMPUTE_UMMA_1SM_ARCH_FLAGS := -arch=compute_$$(patsubst sm_%,%,$$(CUDA_ARCH)) -code=$$(CUDA_ARCH)' Makefile
-	@echo "== P2.1 documentation reports an honest, unaudited, GB300-unverified status =="
-	@grep -Fq 'P2.1 | 1-SM UMMA | YES | NO | NO |' PLAN.md
-	@! grep -nF 'P2.1 has been independently audited' README.md PLAN.md $(COMPUTE_UMMA_1SM_PROTOCOL)
-	@! grep -nF 'P2.1 has been verified on GB300' README.md PLAN.md $(COMPUTE_UMMA_1SM_PROTOCOL)
-	@! grep -nF 'P2.1 is audited' README.md PLAN.md $(COMPUTE_UMMA_1SM_PROTOCOL)
-	@! grep -nF 'P2.1 is verified on GB300' README.md PLAN.md $(COMPUTE_UMMA_1SM_PROTOCOL)
+	@echo "== P2.1 documentation reports audited and GB300-verified closure honestly =="
+	@grep -Fq 'P2.1 | 1-SM UMMA | YES | YES | YES |' PLAN.md
 	@! grep -nF 'publishable P2.1 result' README.md PLAN.md $(COMPUTE_UMMA_1SM_PROTOCOL)
-	@grep -Fq '* Independent audit: **pending**.' $(COMPUTE_UMMA_1SM_PROTOCOL)
-	@grep -Fq '* GB300 verification: **pending**.' $(COMPUTE_UMMA_1SM_PROTOCOL)
+	@grep -Fq '* Independent audit: **passed**.' $(COMPUTE_UMMA_1SM_PROTOCOL)
+	@grep -Fq '* GB300 verification: **passed**.' $(COMPUTE_UMMA_1SM_PROTOCOL)
 	@grep -Fq '* Publishable result: **none**.' $(COMPUTE_UMMA_1SM_PROTOCOL)
 	@echo "check-static: OK"
 
@@ -677,8 +674,8 @@ memory-paths-p14-analyze:
 # compute-umma-1sm-smoke are the only P2.1 targets that execute on GPU; each
 # requires an explicit BLACKWELL_GPU_INDEX and goes exclusively through
 # scripts/run_container.sh. See src/compute/P2_PROTOCOL.md for the complete
-# frozen contract; P2.1 is implemented but not yet independently audited or
-# verified on GB300, and produces no publishable result.
+# frozen contract; P2.1 is implemented, independently audited, and
+# functionally verified on GB300, and produces no publishable result.
 
 compute-umma-1sm-build:
 	@mkdir -p build/compute

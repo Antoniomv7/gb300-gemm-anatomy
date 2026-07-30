@@ -17,7 +17,7 @@ estimated from documentation.
 
 | Unit | Scope | Status in this document |
 |------|-------|--------------------------|
-| P2.1 | 1-SM UMMA: single CTA, `cta_group::1`, M=128, N in {64,128,256}, depth in {4,16,64,256}, 12 configurations. | **Implemented by this change.** |
+| P2.1 | 1-SM UMMA: single CTA, `cta_group::1`, M=128, N in {64,128,256}, depth in {4,16,64,256}, 12 configurations. | **Implemented, independently audited, and functionally verified on GB300.** |
 | P2.2 | 2-SM UMMA: CTA pair, `cta_group::2`, M=256, cluster of 2 CTAs. | **Not implemented.** No `cta_group::2`, cluster, or multicast code exists anywhere in this repository. |
 | P2.3 | Joint 1-SM/2-SM sweep infrastructure, at most 24 configurations (AGENTS.md ceiling). | **Not implemented.** No runner, no campaign, no sweep script exists. |
 | P2.4 | Profiling and empirical ceiling: Nsight Compute, TFLOP/s and saturation analysis. | **Not implemented.** No profiling script, no TFLOP/s conversion, no saturation claim exists. `elapsed_cycles` in the P2.1 CSV is a raw `%clock64` delta, never converted to seconds or FLOP/s here. |
@@ -487,7 +487,7 @@ reports a "cannot safely scan" error) on an unterminated `/*` block comment
 or an unterminated string/character literal, since the lexical state cannot
 then be safely determined.
 
-`scripts/check_umma_1sm_sass.py --self-test` exercises all of the above (37
+`scripts/check_umma_1sm_sass.py --self-test` exercises all of the above (42
 cases total): the original eighteen SASS-contract cases (missing symbol,
 extra symbol, duplicate configuration, missing `UTCHMMA`, incorrect depth
 in both directions, a non-uniformly spaced burst, missing commit, missing
@@ -497,9 +497,11 @@ source-level positive and negative cases for: required PTX text present
 only in a `//` or `/* */` comment (reject), forbidden text present only in
 a `/* */` comment (accept), a missing warp-derived TMEM lane offset, an
 incorrect TMEM lane shift constant, a missing TMEM fragment column offset,
-the original defective `tmem_d + frag * 32` operand, a missing
-launch-contract guard, unconditional (unguarded) timed clock64 reads, a
-missing `TimingMode::kUntimed` call site, an unterminated block comment, an
+a live helper return that omits either the lane or column contribution, the
+original defective `tmem_d + frag * 32` operand, a missing or inverted
+launch-contract guard, unconditional clock reads hidden beside empty timed
+guards, a self-test routed through `TimingMode::kTimed`, a missing
+`TimingMode::kUntimed` call site, an unterminated block comment, an
 unterminated string literal, and the mandatory default-source-path
 resolution and fail-closed-on-missing-file behavior itself.
 
@@ -517,24 +519,30 @@ make compute-umma-1sm-sass
 make compute-umma-1sm-check
 ```
 
-Future GB300 commands (not run in this task; require an operator-selected
-physical GPU index):
+GB300 functional-verification commands (executed successfully on 30 July
+2026 with an explicitly selected free physical device):
 
 ```bash
 BLACKWELL_GPU_INDEX=<physical-index> make preflight
 BLACKWELL_GPU_INDEX=<physical-index> make compute-umma-1sm-self-test
 BLACKWELL_GPU_INDEX=<physical-index> make compute-umma-1sm-smoke
+
+BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
+  build/compute/umma_1sm \
+  --run-kind benchmark --n 128 --depth 16 \
+  --iterations 20 --warmup-iterations 5 --repetitions 3
 ```
 
-## 17. Scientific limitations
+## 17. Verification and scientific limitations
 
-* GB300-unverified: this implementation has never executed on GPU hardware
-  in this task. The K-major SMEM byte layout (section 8) is derived from
-  the PTX ISA's documented formula, not copied from a validated reference,
-  and its correctness is only provable by the numerical validation
-  (section 11) actually running on real hardware. `--self-test` and
-  `--run-kind smoke`/`benchmark` must both pass on GB300 before P2.1 can be
-  considered functionally verified.
+* GB300 functional verification completed on 30 July 2026 at Git commit
+  `1004666db7a2eef1ec499c60740cafc1e2f41328`. The K-major SMEM byte layout
+  (section 8), derived from the PTX ISA's documented formula rather than
+  copied from a reference, passed the full numerical device self-test for
+  all twelve `(N, depth)` specializations (`SELF_TEST: PASS (12/12)`, zero
+  mismatches). Short `smoke` and `benchmark` routing checks also passed.
+  This proves functional correctness for the frozen P2.1 matrix; it does
+  not establish a throughput ceiling.
 * `tcgen05.wait::ld` and `tcgen05.fence::after_thread_sync` have no
   distinct SASS footprint on the observed toolchain (section 15); their
   presence is proved only via a static source check, not SASS evidence.
@@ -561,14 +569,20 @@ despite being described as untimed (section 10.1); kernels did not reject
 an invalid grid/CTA size (section 9); the CLI accepted an unauthorized `-h`
 alias and arbitrary upper limits absent from the frozen contract; and the
 non-literal architecture-flag workaround lacked recorded evidence (section
-20). All seven were repaired on 2026-07-30, each with new GPU-free
-regression coverage (`scripts/check_umma_1sm_sass.py --self-test`, 37
-cases). This repair does not itself constitute an audit or GB300
-verification:
+20). All seven were repaired on 2026-07-30. A subsequent review found that
+five of those properties could still be disabled while leaving superficial
+source patterns behind: either TMEM return contribution could be omitted,
+the launch guard could be inverted, the self-test could be routed through
+the timed path, or the clock reads could be moved outside empty timed
+guards. Commit `1004666db7a2eef1ec499c60740cafc1e2f41328` made those checks
+structural and fail-closed and expanded the synthetic suite to 42 cases.
+That commit then passed an independent audit and the real-GB300
+compilation/SASS, twelve-case device self-test, `smoke`, and `benchmark`
+routing checks described in sections 16-17:
 
-* P2.1: **implemented**.
-* Independent audit: **pending**.
-* GB300 verification: **pending**.
+* P2.1: **implemented and closed**.
+* Independent audit: **passed**.
+* GB300 verification: **passed**.
 * Publishable result: **none**. Every CSV row P2.1 can ever emit carries
   `publishable=false` unconditionally.
 * P2.2, P2.3, P2.4: **not implemented**.

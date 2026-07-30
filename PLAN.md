@@ -150,14 +150,27 @@ campaigns remain Phase 4 work.
 ## Phase 2 — BF16 UMMA throughput (27 July–2 August 2026)
 
 Entry condition for Phase 2: the Phase 1 gate must pass. Current status:
-Phase 1 gate passed; Phase 2 may begin.
+Phase 1 gate passed; Phase 2 may begin. P2.1 is closed and P2.2 may begin.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
-| P2.1 | 1-SM UMMA | YES | NO | NO |
+| P2.1 | 1-SM UMMA | YES | YES | YES |
 | P2.2 | 2-SM UMMA | NO | NO | NO |
 | P2.3 | Sweep (≤24 configurations) | NO | NO | NO |
 | P2.4 | Profiling and empirical ceiling | NO | NO | NO |
+
+P2.1 at Git commit
+`1004666db7a2eef1ec499c60740cafc1e2f41328` passed an independent audit
+after its source-validation repairs and was functionally verified on a
+physical NVIDIA B300 on 30 July 2026. The real `sm_103a` binary contained
+all twelve frozen specializations with the exact depth-dependent `UTCHMMA`
+and N-dependent `LDTM.x32` counts and the required TMEM lifecycle. The full
+GPU self-test reported `SELF_TEST: PASS (12/12)`, and short `smoke` and
+`benchmark` routing checks both completed with `correctness=OK`,
+`mismatches=0`, the expected commit, and `git_dirty=false`. These checks
+close P2.1 as audited, functionally verified infrastructure only: every row
+remained `publishable=false`, and no throughput or empirical-ceiling result
+is claimed before P2.4.
 
 ## Phase 3 — CuTe DSL GEMM versus cuBLASLt (3–9 August 2026)
 

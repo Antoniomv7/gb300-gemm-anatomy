@@ -12,7 +12,9 @@ verified on GB300`. `P1.4 (profiling, HBM validation, analysis, pilot) —
 implemented, remediated after FIVE independent GPU-free audits; final
 post-remediation review PASS; verified on GB300: YES; fresh preflight: PASS;
 pilot executed: YES; NCU/HBM validation: six of six predefined cases
-`HBM_VALIDATED`; publishable results: NONE; Phase 1: CLOSED`.**
+`HBM_VALIDATED`; publishable results: NONE; Phase 1: CLOSED`. `P2.1 (1-SM
+BF16 UMMA) — implemented, independently audited, and functionally verified
+on GB300; publishable results: NONE`.**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -173,10 +175,19 @@ the PTX ISA citations behind every descriptor bit, and the audit of the
 pinned secondary reference. The build and SASS checks above may only be
 declared successful when they have actually been executed (`make
 compute-umma-1sm-build`, `make compute-umma-1sm-sass`,
-`make compute-umma-1sm-check`); nothing here is simulated. P2.1 has **not**
-been independently audited and has **not** been executed on GB300; no
-publishable result exists. P2.2 (2-SM UMMA), P2.3 (joint sweep), and P2.4
-(profiling and empirical ceiling) are **not implemented**.
+`make compute-umma-1sm-check`); nothing here is simulated. The remediated
+implementation at Git commit
+`1004666db7a2eef1ec499c60740cafc1e2f41328` passed an independent audit and
+was functionally verified on a physical NVIDIA B300 on 30 July 2026. The
+real `sm_103a` binary passed the twelve-specialization SASS contract; the
+full device self-test reported `SELF_TEST: PASS (12/12)` with zero
+mismatches; and both a short `run_kind=smoke` and a short
+`run_kind=benchmark` routing check completed with `correctness=OK`,
+`git_dirty=false`, and three rows each. These brief runs validate the
+implementation and both CLI routes; their cycle values are not experimental
+performance results, and every row is unconditionally `publishable=false`.
+P2.2 (2-SM UMMA), P2.3 (joint sweep), and P2.4 (profiling and empirical
+ceiling) are **not implemented**.
 
 ## Research question
 
@@ -314,8 +325,10 @@ verified on GB300. P1.1/P1.2 and P1.3 campaign `20260728T103315Z` are
 functional checks only. P1.4 campaign `20260730T073045Z` is a reviewed,
 HBM-validated pilot with 18 configurations, 540 retained samples, and six
 successful NCU cases; it closes the Phase 1 technical gate but remains
-`publishable: false` pending later final campaigns. Experiments 2–3 have not
-started, and the repository still contains no publishable bandwidth,
-throughput, GEMM-performance, or cuBLASLt-comparison result. The pinned CUDA
-13.1 container contract remains unchanged. See `PLAN.md` for the remaining
-schedule and `AGENTS.md` for the mandatory shared-cluster rules.
+`publishable: false` pending later final campaigns. Experiment 2 has begun:
+P2.1 is implemented, independently audited, and functionally verified on
+GB300, while P2.2–P2.4 and experiment 3 remain unimplemented. The repository
+still contains no publishable bandwidth, throughput, GEMM-performance, or
+cuBLASLt-comparison result. The pinned CUDA 13.1 container contract remains
+unchanged. See `PLAN.md` for the remaining schedule and `AGENTS.md` for the
+mandatory shared-cluster rules.
