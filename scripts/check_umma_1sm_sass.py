@@ -77,16 +77,16 @@ against this comment-stripped, literal-preserving view of the source, never
 against the raw text.
 
 Beyond the original TMA/WGMMA/etc. forbidden-instruction checks, the source
-gate also proves that the repaired per-warp TMEM load address is real
-executable code (a ``make_tmem_load_address`` helper combining a
-``warp_id * kTmemRowsPerWarp`` lane contribution shifted by
-``kTmemLaneShift`` with a ``frag * kTmemColsPerFragment`` column
-contribution, feeding the actual ``tcgen05_ld_32x32b_x32`` call site, with
-the original defective ``tmem_d + frag * 32`` operand absent), that an
-explicit launch-contract guard (``launch_contract_is_valid()``) is checked
-before the kernel's first ``__syncthreads()``, and that the timed ``%clock64``
-reads are each guarded by a ``timing_mode == TimingMode::kTimed`` check with
-at least one call site routed through ``TimingMode::kUntimed``.
+gate structurally proves that the repaired per-warp TMEM load address is real
+executable code: the helper's returned value must combine its allocation base
+with both the shifted warp-lane contribution and the fragment-column
+contribution, and that returned value must feed the actual
+``tcgen05_ld_32x32b_x32`` call. It also proves that the launch-contract
+predicate is negated on the rejection path before the first
+``__syncthreads()``, and that the rejection path writes failure status and
+returns. Finally, it locates both ``%clock64`` reads inside their actual
+``timing_mode == TimingMode::kTimed`` lexical scopes and checks the self-test,
+pre-validation, warm-up, and timed-repetition routes individually.
 
 Usage:
   check_umma_1sm_sass.py --self-test
@@ -255,44 +255,457 @@ def strip_comments_preserving_literals(source_text: str) -> str:
     return "".join(out)
 
 
-def check_launch_guard_ordering(code_only: str) -> list[str]:
-    """The launch-contract guard must be checked inside umma_1sm_body before
-    its first __syncthreads(), so a rejected launch can never reach mbarrier
-    initialization or TMEM allocation (repair brief section 6).
+class SourceStructureError(Exception):
+    """Raised when a required function or braced scope cannot be identified
+    uniquely and safely in the comment-free source.
     """
-    start = code_only.find("umma_1sm_body")
-    if start == -1:
-        return ["source is missing the umma_1sm_body kernel definition"]
-    first_sync = code_only.find("__syncthreads()", start)
-    window = code_only[start:first_sync] if first_sync != -1 else code_only[start:]
-    if not re.search(r"launch_contract_is_valid\s*\(", window):
-        return [
-            "missing launch-contract guard: launch_contract_is_valid() must be checked in "
-            "umma_1sm_body before its first __syncthreads()"
-        ]
-    return []
+
+
+def find_matching_brace(code_only: str, open_brace: int) -> int:
+    """Return the closing brace paired with ``open_brace``.
+
+    ``code_only`` has already had comments removed, but inline PTX and
+    diagnostics remain as C/C++ string literals. Braces inside those literals
+    must not affect structural scope checks.
+    """
+    if open_brace < 0 or open_brace >= len(code_only) or code_only[open_brace] != "{":
+        raise SourceStructureError("internal source-check error: expected an opening brace")
+
+    depth = 0
+    i = open_brace
+    while i < len(code_only):
+        c = code_only[i]
+        if c in ("\"", "'"):
+            quote = c
+            i += 1
+            while i < len(code_only):
+                if code_only[i] == "\\" and i + 1 < len(code_only):
+                    i += 2
+                    continue
+                if code_only[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            else:
+                raise SourceStructureError(f"unterminated {quote!r} literal while matching braces")
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+            if depth < 0:
+                break
+        i += 1
+
+    raise SourceStructureError("unterminated braced scope")
+
+
+def extract_single_function_body(
+    code_only: str, definition_pattern: re.Pattern, description: str
+) -> tuple[str, int, int]:
+    """Extract one uniquely identifiable function body.
+
+    The returned start/end offsets delimit the body contents (excluding the
+    braces) in ``code_only``. Requiring exactly one definition prevents an
+    unused duplicate helper from satisfying a gate while the live definition
+    has regressed.
+    """
+    matches = list(definition_pattern.finditer(code_only))
+    if len(matches) != 1:
+        raise SourceStructureError(
+            f"expected exactly one {description} definition, found {len(matches)}"
+        )
+    open_brace = matches[0].end() - 1
+    close_brace = find_matching_brace(code_only, open_brace)
+    return code_only[open_brace + 1:close_brace], open_brace + 1, close_brace
+
+
+def extract_single_control_block(
+    code_only: str,
+    header_pattern: re.Pattern,
+    description: str,
+) -> tuple[str, int, int]:
+    """Extract the body of one uniquely identifiable ``if``/``for`` block."""
+    matches = list(header_pattern.finditer(code_only))
+    if len(matches) != 1:
+        raise SourceStructureError(
+            f"expected exactly one {description} block, found {len(matches)}"
+        )
+    open_brace = matches[0].end() - 1
+    close_brace = find_matching_brace(code_only, open_brace)
+    return code_only[open_brace + 1:close_brace], open_brace + 1, close_brace
+
+
+TMEM_HELPER_DEFINITION = re.compile(
+    r"\buint32_t\s+make_tmem_load_address\s*\([^;{}]*\)\s*\{", re.DOTALL
+)
+LAUNCH_PREDICATE_DEFINITION = re.compile(
+    r"\bbool\s+launch_contract_is_valid\s*\(\s*\)\s*\{", re.DOTALL
+)
+UMMA_BODY_DEFINITION = re.compile(
+    r"\bvoid\s+umma_1sm_body\s*\([^;{}]*\)\s*\{", re.DOTALL
+)
+RUN_ONCE_DEFINITION = re.compile(
+    r"\bRunResult\s+run_once\s*\([^;{}]*\)\s*\{", re.DOTALL
+)
+RUN_UNTIMED_DEFINITION = re.compile(
+    r"\bvoid\s+run_untimed_or_die\s*\([^;{}]*\)\s*\{", re.DOTALL
+)
+RUN_TIMED_DEFINITION = re.compile(
+    r"\bunsigned\s+long\s+long\s+run_timed_or_die\s*\([^;{}]*\)\s*\{", re.DOTALL
+)
+SELF_TEST_DEFINITION = re.compile(
+    r"\bint\s+run_self_test\s*\(\s*\)\s*\{", re.DOTALL
+)
+MAIN_DEFINITION = re.compile(
+    r"\bint\s+main\s*\([^;{}]*\)\s*\{", re.DOTALL
+)
+
+
+def check_tmem_address_construction(code_only: str) -> list[str]:
+    """Prove that the live helper's returned address and the live load call
+    both use the repaired per-warp/per-fragment mapping.
+    """
+    errors: list[str] = []
+    try:
+        helper_body, _, _ = extract_single_function_body(
+            code_only, TMEM_HELPER_DEFINITION, "make_tmem_load_address"
+        )
+    except SourceStructureError as exc:
+        return [f"invalid TMEM address construction: {exc}"]
+
+    lane_definition = re.compile(
+        r"\bconst\s+uint32_t\s+lane_contribution\s*=\s*"
+        r"\(\s*static_cast<uint32_t>\s*\(\s*warp_id\s*\)\s*\*\s*"
+        r"kTmemRowsPerWarp\s*\)\s*<<\s*kTmemLaneShift\s*;"
+    )
+    column_definition = re.compile(
+        r"\bconst\s+uint32_t\s+column_contribution\s*=\s*"
+        r"static_cast<uint32_t>\s*\(\s*frag\s*\)\s*\*\s*"
+        r"kTmemColsPerFragment\s*;"
+    )
+    returned_address = re.compile(
+        r"\breturn\s+tmem_base\s*\+\s*lane_contribution\s*\+\s*"
+        r"column_contribution\s*;"
+    )
+    if not lane_definition.search(helper_body):
+        errors.append(
+            "TMEM helper does not define lane_contribution from "
+            "(warp_id * kTmemRowsPerWarp) << kTmemLaneShift"
+        )
+    if not column_definition.search(helper_body):
+        errors.append(
+            "TMEM helper does not define column_contribution from "
+            "frag * kTmemColsPerFragment"
+        )
+    if not returned_address.search(helper_body):
+        errors.append(
+            "TMEM helper return must combine tmem_base + lane_contribution + "
+            "column_contribution"
+        )
+
+    try:
+        umma_body, _, _ = extract_single_function_body(
+            code_only, UMMA_BODY_DEFINITION, "umma_1sm_body"
+        )
+    except SourceStructureError as exc:
+        errors.append(f"invalid TMEM load call site: {exc}")
+        return errors
+
+    all_load_calls = len(re.findall(r"\btcgen05_ld_32x32b_x32\s*\(", umma_body))
+    repaired_load_calls = len(
+        re.findall(
+            r"\btcgen05_ld_32x32b_x32\s*\(\s*"
+            r"make_tmem_load_address\s*\(\s*tmem_d\s*,\s*warp_id\s*,\s*frag\s*\)"
+            r"\s*,\s*regs\s*\)",
+            umma_body,
+        )
+    )
+    if all_load_calls != 1 or repaired_load_calls != 1:
+        errors.append(
+            "umma_1sm_body must contain exactly one TMEM load call whose actual "
+            "address operand is make_tmem_load_address(tmem_d, warp_id, frag)"
+        )
+    return errors
+
+
+def check_launch_guard_ordering(code_only: str) -> list[str]:
+    """Prove the predicate and its negative, observable rejection path."""
+    errors: list[str] = []
+    try:
+        predicate_body, _, _ = extract_single_function_body(
+            code_only, LAUNCH_PREDICATE_DEFINITION, "launch_contract_is_valid"
+        )
+    except SourceStructureError as exc:
+        errors.append(f"invalid launch-contract predicate: {exc}")
+        return errors
+
+    return_matches = re.findall(r"\breturn\s+([^;]+);", predicate_body, re.DOTALL)
+    expected_predicate = (
+        "gridDim.x==kExpectedGridDim&&gridDim.y==kExpectedGridDim&&"
+        "gridDim.z==kExpectedGridDim&&blockDim.x==kExpectedBlockDimX&&"
+        "blockDim.y==1&&blockDim.z==1"
+    )
+    if len(return_matches) != 1 or re.sub(r"\s+", "", return_matches[0]) != expected_predicate:
+        errors.append(
+            "launch_contract_is_valid() must return the exact grid=(1,1,1), "
+            "block=(128,1,1) conjunction"
+        )
+
+    try:
+        umma_body, _, _ = extract_single_function_body(
+            code_only, UMMA_BODY_DEFINITION, "umma_1sm_body"
+        )
+    except SourceStructureError as exc:
+        errors.append(f"invalid launch-contract guard: {exc}")
+        return errors
+
+    first_sync = umma_body.find("__syncthreads()")
+    if first_sync == -1:
+        errors.append(
+            "missing launch-contract ordering anchor: umma_1sm_body has no __syncthreads()"
+        )
+        return errors
+    prefix = umma_body[:first_sync]
+    negative_guard = re.compile(
+        r"\bif\s*\(\s*!\s*launch_contract_is_valid\s*\(\s*\)\s*\)\s*\{",
+        re.DOTALL,
+    )
+    try:
+        rejected_body, _, rejected_end = extract_single_control_block(
+            prefix, negative_guard, "negative launch-contract rejection"
+        )
+    except SourceStructureError as exc:
+        errors.append(
+            "missing launch-contract guard: expected "
+            "if (!launch_contract_is_valid()) before the first __syncthreads(): "
+            f"{exc}"
+        )
+        return errors
+
+    if not re.search(r"\bg_launch_ok\s*\[\s*0\s*\]\s*=\s*0\s*;", rejected_body):
+        errors.append("launch-contract rejection must write g_launch_ok[0] = 0")
+    if not re.search(r"\breturn\s*;", rejected_body):
+        errors.append("launch-contract rejection must return before synchronization")
+
+    accepted_prefix = prefix[rejected_end + 1:]
+    if not re.search(r"\bg_launch_ok\s*\[\s*0\s*\]\s*=\s*1\s*;", accepted_prefix):
+        errors.append(
+            "accepted launch path must write g_launch_ok[0] = 1 before the first "
+            "__syncthreads()"
+        )
+    return errors
 
 
 def check_timing_routing(code_only: str) -> list[str]:
-    """Every %clock64 read must be guarded by timing_mode == TimingMode::kTimed
-    (repair brief section 5); self-test/pre-timing validation/warm-up must
-    route through TimingMode::kUntimed at least once. A regression to the
-    original bug (unconditional clock64 reads) shows zero guards.
+    """Prove lexical clock guards and every host orchestration route.
+
+    Counting guard tokens is insufficient: two empty timed guards elsewhere
+    in the function must not legitimize unconditional clock reads. Likewise,
+    one untimed call elsewhere must not legitimize a timed self-test.
     """
     errors: list[str] = []
-    guard_count = len(re.findall(r"timing_mode\s*==\s*TimingMode::kTimed\b", code_only))
-    if guard_count < 2:
-        errors.append(
-            f"found only {guard_count} 'timing_mode == TimingMode::kTimed' guard(s) in the kernel "
-            "body; expected at least 2 (one around each %clock64 read), or a clock64 read may "
-            "execute unconditionally regardless of timing mode"
+
+    try:
+        umma_body, _, _ = extract_single_function_body(
+            code_only, UMMA_BODY_DEFINITION, "umma_1sm_body"
         )
-    untimed_count = len(re.findall(r"TimingMode::kUntimed\b", code_only))
-    if untimed_count < 1:
+    except SourceStructureError as exc:
+        return [f"invalid timing structure: {exc}"]
+
+    clock_positions = [match.start() for match in re.finditer(r"%%clock64\b", umma_body)]
+    if len(clock_positions) != 2:
         errors.append(
-            "no call site uses TimingMode::kUntimed; self-test, pre-timing validation, and "
-            "warm-up must all route through an explicitly untimed launch"
+            f"umma_1sm_body contains {len(clock_positions)} %clock64 read(s); expected exactly "
+            "two (start and end)"
         )
+
+    timed_guard_pattern = re.compile(
+        r"\bif\s*\(\s*timing_mode\s*==\s*TimingMode::kTimed\s*\)\s*\{",
+        re.DOTALL,
+    )
+    timed_guard_matches = list(timed_guard_pattern.finditer(umma_body))
+    guard_scopes: list[tuple[int, int, str]] = []
+    if len(timed_guard_matches) != 2:
+        errors.append(
+            f"umma_1sm_body contains {len(timed_guard_matches)} exact timed guard(s); "
+            "expected exactly two"
+        )
+    for match in timed_guard_matches:
+        try:
+            close_brace = find_matching_brace(umma_body, match.end() - 1)
+        except SourceStructureError as exc:
+            errors.append(f"cannot validate timed guard scope: {exc}")
+            continue
+        guard_scopes.append(
+            (match.end(), close_brace, umma_body[match.end():close_brace])
+        )
+
+    for clock_position in clock_positions:
+        containing_scopes = [
+            (start, end, body)
+            for start, end, body in guard_scopes
+            if start <= clock_position < end
+        ]
+        if len(containing_scopes) != 1:
+            errors.append(
+                "a %clock64 read is outside an exact "
+                "if (timing_mode == TimingMode::kTimed) lexical scope"
+            )
+
+    if len(guard_scopes) == 2:
+        if "start_clock" not in guard_scopes[0][2] or "end_clock" in guard_scopes[0][2]:
+            errors.append("the first timed guard must contain only the start_clock read")
+        if (
+            "end_clock" not in guard_scopes[1][2]
+            or "elapsed_cycles" not in guard_scopes[1][2]
+        ):
+            errors.append(
+                "the second timed guard must contain the end_clock read and elapsed-cycle "
+                "calculation"
+            )
+
+    wait_position = umma_body.find("mbarrier_try_wait_parity")
+    if len(clock_positions) == 2 and not (
+        clock_positions[0] < wait_position < clock_positions[1]
+    ):
+        errors.append(
+            "clock ordering must be start read, real mbarrier completion wait, then end read"
+        )
+
+    try:
+        run_once_body, _, _ = extract_single_function_body(
+            code_only, RUN_ONCE_DEFINITION, "run_once"
+        )
+        run_untimed_body, _, _ = extract_single_function_body(
+            code_only, RUN_UNTIMED_DEFINITION, "run_untimed_or_die"
+        )
+        run_timed_body, _, _ = extract_single_function_body(
+            code_only, RUN_TIMED_DEFINITION, "run_timed_or_die"
+        )
+        self_test_body, _, _ = extract_single_function_body(
+            code_only, SELF_TEST_DEFINITION, "run_self_test"
+        )
+        main_body, _, _ = extract_single_function_body(
+            code_only, MAIN_DEFINITION, "main"
+        )
+    except SourceStructureError as exc:
+        errors.append(f"cannot validate timing routes: {exc}")
+        return errors
+
+    kernel_mode_forward = re.compile(
+        r"spec\.kernel\s*<<<.*?>>>\s*\(\s*iterations\s*,\s*mode\s*,\s*"
+        r"d_out_device\s*,",
+        re.DOTALL,
+    )
+    if not kernel_mode_forward.search(run_once_body):
+        errors.append(
+            "run_once must pass its TimingMode mode argument to the selected kernel launch"
+        )
+    if not re.search(
+        r"\bumma_1sm_body\s*<\s*N\s*,\s*DEPTH\s*>\s*"
+        r"\(\s*iterations\s*,\s*timing_mode\s*,",
+        code_only,
+    ):
+        errors.append(
+            "visible kernel wrappers must forward timing_mode to umma_1sm_body"
+        )
+
+    untimed_wrapper_call = re.compile(
+        r"\brun_once\s*\(\s*spec\s*,\s*iterations\s*,\s*"
+        r"TimingMode::kUntimed\s*\)\s*;"
+    )
+    if not untimed_wrapper_call.search(run_untimed_body) or "TimingMode::kTimed" in run_untimed_body:
+        errors.append(
+            "run_untimed_or_die must route exclusively through "
+            "run_once(..., TimingMode::kUntimed)"
+        )
+
+    timed_wrapper_call = re.compile(
+        r"\brun_once\s*\(\s*spec\s*,\s*iterations\s*,\s*"
+        r"TimingMode::kTimed\s*\)\s*;"
+    )
+    if not timed_wrapper_call.search(run_timed_body) or "TimingMode::kUntimed" in run_timed_body:
+        errors.append(
+            "run_timed_or_die must route exclusively through "
+            "run_once(..., TimingMode::kTimed)"
+        )
+
+    self_test_untimed_call = re.compile(
+        r"\brun_once\s*\(\s*spec\s*,\s*kSelfTestIterations\s*,\s*"
+        r"TimingMode::kUntimed\s*\)\s*;"
+    )
+    if not self_test_untimed_call.search(self_test_body) or "TimingMode::kTimed" in self_test_body:
+        errors.append(
+            "self-test must call run_once(..., TimingMode::kUntimed) and never use kTimed"
+        )
+
+    prevalidation_call = re.compile(
+        r"\brun_untimed_or_die\s*\(\s*\*spec\s*,\s*cli\.iterations\s*\)\s*;"
+    )
+    timed_repetition_call = re.compile(
+        r"\brun_timed_or_die\s*\(\s*\*spec\s*,\s*cli\.iterations\s*\)\s*;"
+    )
+    warmup_loop_pattern = re.compile(
+        r"\bfor\s*\(\s*int64_t\s+w\s*=\s*0\s*;\s*"
+        r"w\s*<\s*cli\.warmup_iterations\s*;\s*\+\+w\s*\)\s*\{",
+        re.DOTALL,
+    )
+    repetition_loop_pattern = re.compile(
+        r"\bfor\s*\(\s*int64_t\s+rep\s*=\s*0\s*;\s*"
+        r"rep\s*<\s*cli\.repetitions\s*;\s*\+\+rep\s*\)\s*\{",
+        re.DOTALL,
+    )
+
+    warmup_matches = list(warmup_loop_pattern.finditer(main_body))
+    if len(warmup_matches) != 1:
+        errors.append(
+            f"main must contain exactly one warm-up loop, found {len(warmup_matches)}"
+        )
+    else:
+        warmup_match = warmup_matches[0]
+        try:
+            warmup_close = find_matching_brace(main_body, warmup_match.end() - 1)
+            warmup_body = main_body[warmup_match.end():warmup_close]
+        except SourceStructureError as exc:
+            errors.append(f"cannot validate warm-up timing route: {exc}")
+        else:
+            if not prevalidation_call.search(warmup_body) or "run_timed_or_die" in warmup_body:
+                errors.append(
+                    "every warm-up launch must route through run_untimed_or_die"
+                )
+            main_before_warmup = main_body[:warmup_match.start()]
+            if not prevalidation_call.search(main_before_warmup):
+                errors.append(
+                    "pre-timing correctness validation must route through "
+                    "run_untimed_or_die before the warm-up loop"
+                )
+
+    repetition_matches = list(repetition_loop_pattern.finditer(main_body))
+    if len(repetition_matches) != 1:
+        errors.append(
+            f"main must contain exactly one timed-repetition loop, found "
+            f"{len(repetition_matches)}"
+        )
+    else:
+        repetition_match = repetition_matches[0]
+        try:
+            repetition_close = find_matching_brace(
+                main_body, repetition_match.end() - 1
+            )
+            repetition_body = main_body[repetition_match.end():repetition_close]
+        except SourceStructureError as exc:
+            errors.append(f"cannot validate timed-repetition route: {exc}")
+        else:
+            if (
+                not timed_repetition_call.search(repetition_body)
+                or "run_untimed_or_die" in repetition_body
+            ):
+                errors.append(
+                    "every measured repetition must route through run_timed_or_die"
+                )
     return errors
 
 
@@ -320,6 +733,7 @@ def check_source(source_text: str) -> list[str]:
     for pattern, description in FORBIDDEN_TMEM_ADDRESS_PATTERNS:
         if pattern.search(code_only):
             errors.append(f"source contains forbidden pattern: {description}")
+    errors.extend(check_tmem_address_construction(code_only))
     errors.extend(check_launch_guard_ordering(code_only))
     errors.extend(check_timing_routing(code_only))
     return errors
@@ -575,11 +989,35 @@ def golden_source_snippet(**overrides: str) -> str:
         "column_contribution": "static_cast<uint32_t>(frag) * kTmemColsPerFragment",
         "tmem_return": "return tmem_base + lane_contribution + column_contribution;",
         "tmem_call_site": "tcgen05_ld_32x32b_x32(make_tmem_load_address(tmem_d, warp_id, frag), regs);",
+        "launch_predicate": (
+            "return gridDim.x == kExpectedGridDim && gridDim.y == kExpectedGridDim && "
+            "gridDim.z == kExpectedGridDim && blockDim.x == kExpectedBlockDimX && "
+            "blockDim.y == 1 && blockDim.z == 1;"
+        ),
         "launch_guard": "if (!launch_contract_is_valid()) { g_launch_ok[0] = 0; return; }",
-        "timing_guard_a": "if (timing_mode == TimingMode::kTimed) { /* start clock64 */ }",
-        "timing_guard_b": "if (timing_mode == TimingMode::kTimed) { /* end clock64 */ }",
+        "timing_guard_a": (
+            'if (timing_mode == TimingMode::kTimed) { '
+            'asm volatile("mov.u64 %0, %%clock64;" : "=l"(start_clock)); }'
+        ),
+        "timing_guard_b": (
+            'if (timing_mode == TimingMode::kTimed) { '
+            'asm volatile("mov.u64 %0, %%clock64;" : "=l"(end_clock)); '
+            "elapsed_cycles = end_clock - start_clock; }"
+        ),
+        "kernel_mode_forward": (
+            "umma_1sm_body<N, DEPTH>(iterations, timing_mode, g_d_out, "
+            "g_elapsed_cycles, g_launch_ok);"
+        ),
+        "run_once_mode_forward": (
+            "spec.kernel<<<1, 128>>>(iterations, mode, d_out_device, "
+            "cycles_device, launch_ok_device);"
+        ),
         "untimed_call_a": "run_once(spec, iterations, TimingMode::kUntimed);",
         "untimed_call_b": "run_once(spec, kSelfTestIterations, TimingMode::kUntimed);",
+        "timed_call": "run_once(spec, iterations, TimingMode::kTimed);",
+        "prevalidation_call": "run_untimed_or_die(*spec, cli.iterations);",
+        "warmup_call": "run_untimed_or_die(*spec, cli.iterations);",
+        "timed_repetition_call": "run_timed_or_die(*spec, cli.iterations);",
         "wait_ld_text": "tcgen05.wait::ld.sync.aligned;",
         "fence_text": "tcgen05.fence::after_thread_sync;",
         "extra_forbidden_line": "",
@@ -594,18 +1032,45 @@ def golden_source_snippet(**overrides: str) -> str:
         f"    const uint32_t column_contribution = {fields['column_contribution']};\n"
         f"    {fields['tmem_return']}\n"
         "}\n"
+        "__device__ bool launch_contract_is_valid() {\n"
+        f"    {fields['launch_predicate']}\n"
+        "}\n"
         "__device__ void umma_1sm_body(int64_t iterations, TimingMode timing_mode) {\n"
         f"    {fields['launch_guard']}\n"
+        "    g_launch_ok[0] = 1;\n"
         "    __syncthreads();\n"
-        f"    {fields['tmem_call_site']}\n"
         f"    {fields['timing_guard_a']}\n"
+        "    while (!mbarrier_try_wait_parity()) {}\n"
         f"    {fields['timing_guard_b']}\n"
+        f"    {fields['tmem_call_site']}\n"
+        "}\n"
+        "template <int N, int DEPTH>\n"
+        "void visible_kernel(int64_t iterations, TimingMode timing_mode) {\n"
+        f"    {fields['kernel_mode_forward']}\n"
+        "}\n"
+        "RunResult run_once(const Specialization& spec, int64_t iterations, TimingMode mode) {\n"
+        f"    {fields['run_once_mode_forward']}\n"
+        "}\n"
+        "void run_untimed_or_die(const Specialization& spec, int64_t iterations) {\n"
+        f"    {fields['untimed_call_a']}\n"
+        "}\n"
+        "unsigned long long run_timed_or_die(const Specialization& spec, int64_t iterations) {\n"
+        f"    {fields['timed_call']}\n"
+        "}\n"
+        "int run_self_test() {\n"
+        f"    {fields['untimed_call_b']}\n"
+        "}\n"
+        "int main(int argc, char** argv) {\n"
+        f"    {fields['prevalidation_call']}\n"
+        "    for (int64_t w = 0; w < cli.warmup_iterations; ++w) {\n"
+        f"        {fields['warmup_call']}\n"
+        "    }\n"
+        "    for (int64_t rep = 0; rep < cli.repetitions; ++rep) {\n"
+        f"        {fields['timed_repetition_call']}\n"
+        "    }\n"
         "}\n"
         f"{fields['wait_ld_text']}\n"
         f"{fields['fence_text']}\n"
-        f"{fields['untimed_call_a']}\n"
-        f"{fields['untimed_call_b']}\n"
-        "run_once(spec, iterations, TimingMode::kTimed);\n"
         f"{fields['extra_forbidden_line']}\n"
     )
 
@@ -773,6 +1238,20 @@ def run_self_test() -> int:
             "fragment contribution using frag * kTmemColsPerFragment",
         ),
         (
+            "source check rejects a live TMEM return that omits lane_contribution",
+            golden_source_snippet(
+                tmem_return="return tmem_base + column_contribution;"
+            ),
+            "return must combine tmem_base + lane_contribution + column_contribution",
+        ),
+        (
+            "source check rejects a live TMEM return that omits column_contribution",
+            golden_source_snippet(
+                tmem_return="return tmem_base + lane_contribution;"
+            ),
+            "return must combine tmem_base + lane_contribution + column_contribution",
+        ),
+        (
             "source check rejects the original defective tmem_d + frag * 32 read operand",
             golden_source_snippet(tmem_call_site="tcgen05_ld_32x32b_x32(tmem_d + frag * 32, regs);"),
             "tmem_d + frag * 32",
@@ -783,9 +1262,43 @@ def run_self_test() -> int:
             "missing launch-contract guard",
         ),
         (
-            "source check rejects unconditional (unguarded) timed clock64 reads",
+            "source check rejects an inverted launch-contract guard",
+            golden_source_snippet(
+                launch_guard=(
+                    "if (launch_contract_is_valid()) "
+                    "{ g_launch_ok[0] = 0; return; }"
+                )
+            ),
+            "if (!launch_contract_is_valid())",
+        ),
+        (
+            "source check rejects missing timed clock guards and reads",
             golden_source_snippet(timing_guard_a="", timing_guard_b=""),
-            "guard(s) in the kernel body",
+            "%clock64 read(s)",
+        ),
+        (
+            "source check rejects unconditional clock reads hidden beside empty timed guards",
+            golden_source_snippet(
+                timing_guard_a=(
+                    "if (timing_mode == TimingMode::kTimed) {} "
+                    'asm volatile("mov.u64 %0, %%clock64;" : "=l"(start_clock));'
+                ),
+                timing_guard_b=(
+                    "if (timing_mode == TimingMode::kTimed) {} "
+                    'asm volatile("mov.u64 %0, %%clock64;" : "=l"(end_clock)); '
+                    "elapsed_cycles = end_clock - start_clock;"
+                ),
+            ),
+            "outside an exact if (timing_mode == TimingMode::kTimed) lexical scope",
+        ),
+        (
+            "source check rejects a self-test routed through TimingMode::kTimed",
+            golden_source_snippet(
+                untimed_call_b=(
+                    "run_once(spec, kSelfTestIterations, TimingMode::kTimed);"
+                )
+            ),
+            "self-test must call run_once(..., TimingMode::kUntimed)",
         ),
         (
             "source check rejects a missing TimingMode::kUntimed call site",

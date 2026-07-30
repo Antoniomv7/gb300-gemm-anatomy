@@ -291,9 +291,10 @@ __device__ __forceinline__ void tcgen05_fence_after_thread_sync() {
 // tcgen05.ld.sync.aligned.32x32b.x32.b32: a warp-collective load of one
 // 32-lane x 32-column fragment (PTX ISA 9.3 Table 54 and section
 // 9.7.17.8.3). All 32 threads of the issuing warp must pass the same
-// taddr; the hardware automatically restricts which 32 physical TMEM lanes
-// a given warp reaches (PTX ISA 9.3 section 9.7.17.8.1, Access
-// restrictions), so no lane offset needs to be encoded in taddr here.
+// taddr. Its bits 31-16 select the first physical TMEM lane, and the access
+// restrictions assign each warp a different 32-lane chunk (PTX ISA 9.3
+// section 9.7.17.8.1), so the caller must encode that warp-specific lane
+// base in taddr.
 __device__ __forceinline__ void tcgen05_ld_32x32b_x32(uint32_t taddr, uint32_t out[32]) {
     asm volatile(
         "tcgen05.ld.sync.aligned.32x32b.x32.b32 "
