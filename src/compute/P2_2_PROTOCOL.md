@@ -164,8 +164,10 @@ only on K=16 and BF16's T=8, never on M, `.cta_group`, or which CTA rank is
 executing, so it is re-derived (not merely copied) for P2.2 and is
 byte-identical in form to P2.1's -- exactly what section 6's task
 requirement to "independently re-derive and validate the descriptors" asks
-for, arriving at the same LBO/SBO because the underlying operand shape (128
-local rows/N columns, K=16) is genuinely unchanged per CTA.
+for, arriving at the same LBO/SBO because each physical operand slice still
+uses K=16 and groups its local rows/columns in blocks of eight. The number of
+local B columns is `N/2`, not `N`; that changes the allocated extent, not the
+K-major address formula or descriptor strides.
 
 ## 7. Operand distribution and CTA-pair synchronization
 
@@ -173,34 +175,45 @@ Each CTA owns, in its own local shared/Tensor Memory:
 
 ```
 A: 128 local rows x 16 BF16 values   (value depends on the GLOBAL row)
-B: a complete 16 x N BF16 copy       (identical in both CTAs)
+B: 16 x (N/2) BF16 values            (value depends on the GLOBAL column)
 D: 128 local output rows x N FP32 values, in local TMEM
 ```
 
 Global output mapping: `global_row = cta_rank * 128 + local_row`. CTA rank 0
 owns global rows 0-127; CTA rank 1 owns global rows 128-255.
 
-**Why B is replicated and why A/B/mbarrier/TMEM-address must share the same
-relative SMEM offset.** PTX ISA 9.3 section 9.7.17.10's introduction states:
-"the B matrix has shape KxN, in Shared Memory of the current CTA and
-*optionally* in peer CTA." A 64-bit shared-memory descriptor (Table 45)
-encodes an address that is always relative to the *issuing* thread's own
-CTA (section 9.7.17.4.1: "location in the shared memory of the current
-CTA"); only CTA rank 0's leader thread ever builds and passes `a_desc`/
-`b_desc`. For the CTA-pair hardware to locate CTA rank 1's own local
-contribution to the joint M=256 operation (A rows 128-255) and its own local
-copy of B without a second, explicit descriptor, it must apply the *same*
-descriptor -- interpreted as a relative offset -- to each CTA's own local
-shared memory bank. This is why task section 6 requires A, B, the mbarrier,
-and the TMEM-address shared variable to occupy **identical relative
-shared-memory offsets in both CTAs**: since both CTAs execute the textually
-identical kernel body (ordinary SPMD CUDA C++, no per-rank divergent
-`__shared__`/`extern __shared__` declaration), the compiler lays these
-variables out identically for every CTA instance, satisfying the requirement
-by construction. B is therefore filled identically and redundantly in both
-CTAs (task section 6's explicit requirement), and A's *value* -- never its
-physical SMEM position -- depends on the global row, so the two halves can
-never be silently exchanged or duplicated (section 11).
+**Why B is partitioned and why A/B/mbarrier/TMEM-address still share the same
+relative SMEM offset.** PTX ISA 9.3 section 9.7.17.10 states that B has
+logical shape KxN and may reside in the current and peer CTAs. The official
+CUTLASS v4.6.1 traits pinned by `VERSIONS.env` make the CTA-level mapping
+explicit for `SM100_MMA_F16BF16_2x1SM_SS`:
+
+```
+BLayout = Layout<Shape<_2, Shape<N/2, K>>,
+                 Stride<N/2, Stride<1, N>>>
+```
+
+The first mode is the peer-CTA coordinate. Therefore CTA rank 0 contributes
+global columns `[0,N/2)` and CTA rank 1 contributes `[N/2,N)`. Both store
+their contribution at local SMEM columns `[0,N/2)`, so the device mapping is:
+
+```
+kNLocal   = N / 2
+local_col = idx / K
+global_col = cta_rank * kNLocal + local_col
+B_local(local_col, k) = B_global(k, global_col)
+```
+
+A 64-bit shared-memory descriptor (Table 45) encodes an address relative to
+the issuing thread's CTA; only CTA rank 0's leader explicitly passes
+`a_desc`/`b_desc`. The pair hardware applies the descriptor at the same
+relative B base in each CTA and the CTA-level layout selects the logical
+half. Consequently A, B, the mbarrier, and the TMEM-address shared variable
+must still occupy identical relative offsets in both CTAs, but B's **values
+must not be replicated**. Both CTAs execute the same SPMD kernel and use the
+same local allocation shape, while `cta_rank` selects the global A-row and
+B-column values. This distinction is enforced by the source checker and the
+full numerical self-test (sections 11 and 14).
 
 Before any of the numbered steps below, every kernel first reads
 `%cluster_ctarank`/`%cluster_nctarank` (`cuda::ptx::get_sreg_cluster_ctarank
@@ -340,12 +353,12 @@ ptx::space_shared)`, which the pinned CUDA 13.1 `<cuda/ptx>` header lowers
 to `fence.proxy.async.shared::cta` -- a **CTA-scoped** fence, sufficient
 because P2.1's single-CTA MMA only ever reads that same CTA's own SMEM.
 
-For `cta_group::2`, CTA rank 0's issued MMA reads CTA rank 1's own local A
-(and, under either plausible reading of the CTA-pair hardware mechanism --
-a genuine remote read over the inter-SM interconnect, or an
-identically-applied local read on each CTA's own datapath -- CTA rank 1's
-own local B) at the identical relative SMEM offset (section 7). The public
-PTX ISA text does not fully disambiguate which of those two physical
+For `cta_group::2`, CTA rank 0's issued MMA consumes CTA rank 1's own local A
+and its rank-partitioned local B half. Under either plausible reading of the
+CTA-pair mechanism -- genuine remote reads over the inter-SM interconnect or
+an identically applied local read on each CTA's own datapath -- those
+operands use the identical relative SMEM offsets established in section 7.
+The public PTX ISA text does not fully disambiguate which of those two physical
 mechanisms is used. This implementation therefore uses `cuda::ptx::
 fence_proxy_async(cuda::ptx::space_cluster)`, confirmed by inspection of the
 pinned toolchain's `<cuda/ptx>` header to lower to `fence.proxy.async.
@@ -479,7 +492,7 @@ successful wait.
 
 Per-element validation pattern, deterministic, chosen so a wrong
 global-row mapping, rank duplication, missing rank offset, wrong B
-replication, column-addressing error, TMEM fragment-offset error, missing
+partition, column-addressing error, TMEM fragment-offset error, missing
 depth accumulation, or cross-CTA synchronization error all manifest as a
 numerical mismatch:
 
@@ -504,9 +517,14 @@ defects produces a nonzero `max_abs_error`:
 * **Incorrect global-row mapping** (off-by-128, wrong stride, forgetting the
   offset) -- any deviation from `cta_rank * 128 + local_row` changes A's
   value pattern by the same residue-shift argument.
-* **Incorrect B replication** -- both CTAs fill B identically by construction
-  (section 7); the source checker additionally proves B's fill loop body
-  never references `cta_rank` (section 14).
+* **Incorrect B partition** -- the correct local extent is `N/2`, and each
+  CTA stores values generated from
+  `global_col = cta_rank * (N/2) + local_col` at the physical `local_col`
+  address. Replicating global columns `[0,N/2)` in both CTAs makes the second
+  logical half reuse the first half; using `global_col` as the physical SMEM
+  address instead would overrun/misplace rank 1's local slice. The checker
+  rejects the full-replica, wrong-extent, missing-rank, local-value, and
+  global-address variants independently (section 14).
 * **Column-addressing / TMEM fragment-offset errors** -- caught the same way
   P2.1's identical readback loop catches them (`src/compute/P2_PROTOCOL.md`
   section 9.1's repair history is the precedent for why this class of bug is
@@ -654,10 +672,19 @@ Summary of what is proved for every one of the twelve symbols:
     `blockDim`, `cluster_nctarank`, and `cluster_ctarank`, is evaluated
     (negated) before `umma_2sm_body`'s first `__syncthreads()`, and both the
     rejection and acceptance paths write **both** ranks' `g_launch_ok` slots.
-11. (source check) A's fill loop references `cta_rank`; B's fill loop does
-    not; the TMEM load call site is exactly `make_tmem_load_address(tmem_d,
-    warp_id, frag)` with no `cta_rank` token in its arguments; the `g_d_out`
-    write is indexed by `global_row`, not `local_row`.
+11. (source check) A's fill loop maps
+    `global_row = cta_rank * kMLocal + local_row`; B defines
+    `kNLocal = N / kClusterCtas`, covers exactly `kNLocal * kK` elements,
+    maps `global_col = cta_rank * kNLocal + local_col`, generates the value
+    from `global_col`, and stores it at the physical `local_col` SMEM
+    address. On the host, `run_once` derives
+    `n_local = spec.n / kClusterCtas`, reserves exactly
+    `kMLocal * kK * 2 + n_local * kK * 2` dynamic shared-memory bytes, and
+    passes that byte count as the real launch's dynamic-SMEM argument. The
+    TMEM load call site is exactly
+    `make_tmem_load_address(tmem_d, warp_id, frag)` with no `cta_rank` token
+    in its arguments; the `g_d_out` write is indexed by `global_row`, not
+    `local_row`.
 12. (source check) `tcgen05_alloc_2sm`/`tcgen05_dealloc_2sm`/
     `tcgen05_relinquish_alloc_permit_2sm` are issued only from an
     `if (warp_id == 0)` block, never from inside a `cta_rank == 0` or
@@ -710,19 +737,24 @@ Summary of what is proved for every one of the twelve symbols:
     direct `tcgen05_ld_32x32b_x32(...)` call followed by exactly one live
     `tcgen05_wait_ld()` call before the loaded registers are written.
 
-`scripts/check_umma_2sm_sass.py --self-test` exercises all of the above (93
+`scripts/check_umma_2sm_sass.py --self-test` exercises all of the above (101
 cases total): 23 SASS-contract cases (missing/extra/duplicate symbol,
 missing/incorrect-depth/non-uniformly-spaced burst, missing commit/wait/
 alloc/dealloc, non-`.2CTA` fallback forms for MMA/commit/alloc, incorrect
 `LDTM.x32` count, missing cluster-barrier evidence in two distinct forms,
 every forbidden whole-binary instruction), 4 ELF-attribute cases (accept,
 missing attribute, missing section, wrong `EIATTR_CTA_PER_CLUSTER` value),
-63 source-level positive and negative cases (every required/forbidden
+71 source-level positive and negative cases (every required/forbidden
 pattern individually, comment- and ordinary-non-asm-string-literal-only
 placement of required PTX text -- so a decoy never counts as evidence --
-launch-guard structure and both ranks' status writes, A/B rank-dependence in
-both directions, collective-vs-single-lane/rank-0-only TMEM lifecycle gating
-in both directions, rank-0-confinement and the exact mask for MMA/commit
+launch-guard structure and both ranks' status writes, A/D row partitioning,
+the CTA-pair B extent/global-value/local-address mapping (including five
+independent regressions reproducing the GB300 failure and a separate string-
+decoy case), the matching host-side local-B extent, exact A-plus-B dynamic-
+SMEM allocation, and real launch argument (three independent regressions),
+collective-vs-
+single-lane/rank-0-only TMEM lifecycle gating in both directions,
+rank-0-confinement and the exact mask for MMA/commit
 issue, the wait/readback non-confinement, TMEM-address-vs-global-index
 separation in both directions, cluster-sync-before-dealloc, every timing-
 route defect, both lexical-scan failure modes, exact-geometry regressions,
@@ -775,15 +807,22 @@ make compute-umma-2sm-sass
 make compute-umma-2sm-check
 ```
 
-GB300 functional-verification commands (**not executed by this
-implementation task**; recorded here only as the commands an operator should
-later run -- see section 17):
+GB300 functional revalidation commands. Commit
+`5cd00bb4a09fce32eab6295e8faeca110e7485c9` was run on GB300 and failed
+`--self-test` in all twelve specializations because it replicated B instead
+of applying the CTA-level `N/2` partition; `smoke` was not reached. These
+commands must be repeated on the repair commit described in section 17:
 
 ```bash
 BLACKWELL_GPU_INDEX=<physical-index> make preflight
 BLACKWELL_GPU_INDEX=<physical-index> make compute-umma-2sm-self-test
 BLACKWELL_GPU_INDEX=<physical-index> make compute-umma-2sm-smoke
+```
 
+Only after both functional targets pass may a non-publishable benchmark be
+run:
+
+```bash
 BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
   build/compute/umma_2sm \
   --run-kind benchmark --n 128 --depth 16 \
@@ -792,9 +831,12 @@ BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
 
 ## 17. Verification status and scientific limitations
 
-* P2.2 is **implemented**: the real `sm_103a` binary compiled cleanly under
-  the pinned CUDA 13.1.80 toolchain and passed the full SASS/ELF/source
-  contract above for all twelve specializations (section 14, section 15).
+* P2.2 remains **implemented but unapproved**. The last published binary at
+  commit `5cd00bb4a09fce32eab6295e8faeca110e7485c9` compiled under the pinned
+  CUDA 13.1.80 toolchain and passed its twelve-specialization SASS/ELF/source
+  contract, but its real GB300 numerical validation failed as described
+  below. The current B-partition repair must therefore be rebuilt,
+  disassembled, independently audited, and rerun on GB300 before approval.
 * A first independent audit of commit `e00046a415eec77663867dfd2c6691a1ab5a26d2`
   found four blockers, all in synchronization correctness, the source
   checker, and documentation honesty: (1) `mbarrier_init` was never followed
@@ -819,20 +861,33 @@ BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
   it could accept removal of the live `tcgen05_wait_ld()` call, a second
   rank-0 condition around the local wait, a rank-0-only per-phase
   rendezvous, removal of the parity phase advance, and an unreachable
-  mbarrier-init fence call. The 93-case checker described in section 14
+  mbarrier-init fence call. The 93-case checker published in commit
+  `5cd00bb4a09fce32eab6295e8faeca110e7485c9`
   repairs those five paths with direct-scope, reachability, sequence, and
-  live-call checks. This checker-only remediation is GPU-free and has
-  **not** itself been independently audited.
+  live-call checks.
+* GB300 validation of that exact `5cd00bb` commit passed preflight, CUDA 13.1
+  `sm_103a` compilation, and the real SASS/ELF checks for all twelve
+  specializations, but failed numerical execution with
+  `SELF_TEST_RESULT 0/12`; `smoke` was not run because the fail-closed command
+  sequence stopped at the failed self-test. The mismatch counts and maximum
+  errors matched a duplicated first half of B: both CTAs initialized local B
+  from global column zero, while the 2-SM MMA's CTA-level B layout maps CTA
+  rank 1 to global columns `[N/2,N)`.
+* The current repair defines `kNLocal=N/kClusterCtas`, initializes exactly
+  `kNLocal*K` values per CTA with
+  `global_col=cta_rank*kNLocal+local_col`, stores them at the physical
+  `local_col` address, reduces the dynamic B allocation to `N/2`, and extends
+  the checker from 93 to 101 cases with five independent device-side
+  B-partition regressions, a string-decoy variant, and three host-side
+  dynamic-shared-memory regressions. This repair has passed only
+  GPU-free source validation in its implementation environment so far.
 * P2.2 has **not** been independently audited (a static self-check, however
   thorough, is not an audit -- AGENTS.md, `PLAN.md`). This includes the
-  repair above: a fresh independent audit of the repaired implementation
-  remains pending.
-* P2.2 has **not** been verified on GB300 hardware. No `--self-test`,
-  `smoke`, or `benchmark` invocation of `build/compute/umma_2sm` has been
-  executed on a physical device by this implementation task; no GPU command
-  of any kind (`nvidia-smi`, a CUDA kernel launch, Nsight Compute,
-  `scripts/run_container.sh`, or any target requiring
-  `BLACKWELL_GPU_INDEX`) was run.
+  B-partition repair above: a fresh independent audit remains pending.
+* P2.2 has **not** been verified on GB300 hardware: verification was
+  attempted and failed at `--self-test`, so no successful `smoke` or
+  benchmark exists. The repaired commit must pass all twelve self-test
+  specializations and the smoke route before this field can become YES.
 * No publishable result exists or is claimed. Every CSV row P2.2 can ever
   emit carries `publishable=false` unconditionally; `elapsed_cycles` is a
   raw `%clock64` delta on CTA rank 0's one thread, not wall-clock time, not
@@ -859,19 +914,23 @@ BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
 
 ## 18. Status
 
-* P2.2: **implemented**. A first independent audit found four blockers
-  (missing mbarrier-initialization fence, invalid per-phase CTA-pair
-  handshake, a source checker that accepted both defects, and stale
-  "unimplemented" documentation); all four were remediated GPU-free
-  (sections 7.1, 10.1, 14, and this document/`src/compute/P2_PROTOCOL.md`/
-  `Makefile`).
-* Independent audit: **pending**. The audit above found and this round
-  fixed four blockers; a fresh independent audit of the repaired
-  implementation has not yet been performed.
-* GB300 verification: **pending**.
+* P2.2: **implemented, repair pending validation**. The current source fixes
+  the CTA-level B partition exposed by the failed `5cd00bb` GB300 self-test.
+* Independent audit: **pending**. Previous audits found synchronization,
+  checker, and B-partition blockers; the current repair requires a fresh
+  audit.
+* GB300 verification: **pending**. The only functional attempt ended with
+  `SELF_TEST_RESULT 0/12`; the repaired commit has not yet been run, so the
+  machine-readable verified field remains NO.
 * Publishable result: **none**. Every CSV row P2.2 can ever emit carries
   `publishable=false` unconditionally.
 * P2.3, P2.4: **not implemented**.
+
+Machine-readable project status remains:
+
+```text
+P2.2 = YES / NO / NO
+```
 
 ## 19. References
 
@@ -890,6 +949,15 @@ A for M=256, Figures 205-206), 9.7.17.10.9.1 (the `tcgen05.mma` syntax
 block and its cta_group::2/kind::tf32 worked example), 9.7.17.12.1
 (`tcgen05.commit`'s multicast form and its cta_group::2 worked example),
 and chapter 10 sections 10.16-10.17 (`%cluster_ctarank`/`%cluster_nctarank`).
+
+Official NVIDIA implementation cross-check: CUTLASS v4.6.1, pinned by
+`VERSIONS.env` to commit `e05f953a5b3d38adc240df2ff928e0421c2abba3`,
+specifically `include/cute/atom/mma_traits_sm100.hpp`'s
+`MMA_Traits<SM100_MMA_F16BF16_2x1SM_SS<...>>` specialization and
+`examples/cute/tutorial/blackwell/04_mma_tma_2sm_sm100.cu`. The traits encode
+both A and B with an explicit two-CTA mode and encode B's per-CTA value shape
+as `(N/2,K)` with CTA stride `N/2`; this is the independent source-level
+cross-check for section 7's corrected B partition.
 
 Secondary (conceptual, adapted and independently audited against the PTX
 ISA, not copied): pinned commit `9a068d853d5c3676939eb46fe21ff6d6a2a4133b`

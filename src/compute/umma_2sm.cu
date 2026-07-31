@@ -124,11 +124,11 @@ int64_t checked_mul_i64(int64_t a, int64_t b, const char* what) {
 
 // ---------------------------------------------------------------------------
 // Device-side shared-memory layout: a single fixed, non-swizzled, K-major
-// packing for both A (128 local rows x K) and B (K x N), documented bit-by-
+// packing for both A (128 local rows x K) and B (K x N/2 per CTA), documented bit-by-
 // bit in P2_2_PROTOCOL.md section 7. This formula depends only on K=16 and
 // BF16's 128-bit-normalization factor T=8 (PTX ISA 9.3 section 9.7.17.3.3);
 // it does not depend on M or on the .cta_group qualifier, so each CTA's own
-// local 128-row A tile and its local N-column B tile use exactly the same
+// local 128-row A tile and its local N/2-column B tile use exactly the same
 // per-operand packing independently re-derived here for M=256/cta_group::2
 // (P2_2_PROTOCOL.md section 6 requires this re-derivation, not an assumption
 // carried over from P2.1's M=128/cta_group::1 case).
@@ -490,7 +490,9 @@ __device__ __forceinline__ void umma_2sm_body(int64_t iterations, TimingMode tim
 
     const int cta_rank = static_cast<int>(cluster_ctarank);  // 0 or 1, confirmed valid by the guard above
 
-    constexpr int kABytes = kMLocal * kK * 2;  // BF16 = 2 bytes/element; local 128 rows, shared by both CTAs
+    constexpr int kNLocal = N / kClusterCtas;
+    static_assert(N % kClusterCtas == 0, "N must divide evenly across the two peer CTAs");
+    constexpr int kABytes = kMLocal * kK * 2;  // BF16 = 2 bytes/element; 128 local A rows per CTA
 
     extern __shared__ __align__(128) unsigned char smem[];
     __nv_bfloat16* A = reinterpret_cast<__nv_bfloat16*>(smem);
@@ -498,14 +500,16 @@ __device__ __forceinline__ void umma_2sm_body(int64_t iterations, TimingMode tim
 
     const int warp_id = tid / 32;
 
-    // ---- Step 1: fill this CTA's local A (128 rows) and B (N cols) with --
+    // ---- Step 1: fill this CTA's local A (128 rows) and B (N/2 cols) ----
     // ---- the frozen validation pattern, placed into the fixed K-major ----
     // ---- physical layout. A's *value* depends on the GLOBAL row (cta_rank
     // ---- * 128 + local_row) so the two CTA halves cannot be accidentally -
     // ---- exchanged or duplicated (task section 6); its *physical* SMEM ---
     // ---- position stays local (128 rows) since Tensor Memory and Shared -
-    // ---- Memory are both per-CTA. B's value depends only on (k, col), ----
-    // ---- identically in both CTAs (task section 6). -----------------------
+    // ---- Memory are both per-CTA. The cta_group::2 B layout likewise -----
+    // ---- assigns N/2 logical columns to each peer CTA: CTA rank 0 stores -
+    // ---- global columns [0,N/2), CTA rank 1 stores [N/2,N), both at ------
+    // ---- local SMEM column positions [0,N/2). -----------------------------
     for (int idx = tid; idx < kMLocal * kK; idx += kThreadsPerCta) {
         const int local_row = idx / kK;
         const int k = idx % kK;
@@ -513,11 +517,13 @@ __device__ __forceinline__ void umma_2sm_body(int64_t iterations, TimingMode tim
         const int value = ((global_row + 3 * k) % 7) - 3;
         A[smem_core_tile_index(local_row / 8, local_row % 8, k)] = __float2bfloat16(static_cast<float>(value));
     }
-    for (int idx = tid; idx < N * kK; idx += kThreadsPerCta) {
-        const int col = idx / kK;
+    for (int idx = tid; idx < kNLocal * kK; idx += kThreadsPerCta) {
+        const int local_col = idx / kK;
         const int k = idx % kK;
-        const int value = ((2 * k + col) % 5) - 2;
-        B[smem_core_tile_index(col / 8, col % 8, k)] = __float2bfloat16(static_cast<float>(value));
+        const int global_col = cta_rank * kNLocal + local_col;
+        const int value = ((2 * k + global_col) % 5) - 2;
+        B[smem_core_tile_index(local_col / 8, local_col % 8, k)] =
+            __float2bfloat16(static_cast<float>(value));
     }
 
     __shared__ uint64_t mbar;
@@ -1256,7 +1262,8 @@ RunResult run_once(const Specialization& spec, int64_t iterations, TimingMode mo
     // kernel that never ran at all collapse to this same not-OK value.
     CUDA_CHECK_FATAL(cudaMemset(launch_ok_device, 0, kClusterCtas * sizeof(int)));
 
-    const int smem_bytes = kMLocal * kK * 2 + spec.n * kK * 2;
+    const int n_local = spec.n / kClusterCtas;
+    const int smem_bytes = kMLocal * kK * 2 + n_local * kK * 2;
     spec.kernel<<<kGridBlocks, kThreadsPerCta, static_cast<size_t>(smem_bytes)>>>(
         iterations, mode, d_out_device, cycles_device, launch_ok_device);
     CUDA_CHECK_FATAL(cudaGetLastError());

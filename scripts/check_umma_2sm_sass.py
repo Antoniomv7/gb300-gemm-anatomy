@@ -620,12 +620,15 @@ def check_launch_guard_ordering(code_only: str) -> list[str]:
 
 
 def check_rank_mapping(code_only: str) -> list[str]:
-    """(task section 12: "Per-rank A and D mapping", "Identical B copies",
-    "Correct local TMEM versus global output addressing") Prove that A's
-    fill value and D's global write index both use
-    cta_rank * kMLocal + local_row, that B's fill loop does not reference
-    cta_rank at all, and that the TMEM load address helper is never given a
-    rank-based offset.
+    """Prove the CTA-level operand/output partitioning used by the 2-SM MMA.
+
+    A and D split the global M=256 rows into 128 rows per CTA.  CUTLASS's
+    official SM100 2x1SM BF16 MMA traits independently encode B as
+    ``(_2, (N/2, K))``: each CTA therefore stores N/2 local columns, with
+    CTA rank selecting the corresponding global-column half.  The SMEM
+    address remains local while the validation value uses the global column.
+    TMEM addressing likewise remains CTA-local; only the global D write gets
+    the rank-based row offset.
     """
     errors: list[str] = []
     try:
@@ -656,18 +659,88 @@ def check_rank_mapping(code_only: str) -> list[str]:
         if "cta_rank" not in a_loop_body:
             errors.append("A initialization must depend on cta_rank (via global_row)")
 
+    n_local_defs = list(
+        re.finditer(
+            r"\bconstexpr\s+int\s+kNLocal\s*=\s*N\s*/\s*kClusterCtas\s*;",
+            umma_body,
+        )
+    )
+    if len(n_local_defs) != 1:
+        errors.append(
+            "B initialization must define exactly one "
+            "'constexpr int kNLocal = N / kClusterCtas;'"
+        )
+    if not re.search(
+        r"\bstatic_assert\s*\(\s*N\s*%\s*kClusterCtas\s*==\s*0\s*(?:,[^;]*)?\)\s*;",
+        umma_body,
+        re.DOTALL,
+    ):
+        errors.append("B initialization must statically require N % kClusterCtas == 0")
+
     b_loop_header = re.compile(
-        r"\bfor\s*\(\s*int\s+idx\s*=\s*tid\s*;\s*idx\s*<\s*N\s*\*\s*kK\s*;\s*"
+        r"\bfor\s*\(\s*int\s+idx\s*=\s*tid\s*;\s*idx\s*<\s*kNLocal\s*\*\s*kK\s*;\s*"
         r"idx\s*\+=\s*kThreadsPerCta\s*\)\s*\{",
         re.DOTALL,
     )
     try:
         b_loop_body, _, _ = extract_single_control_block(umma_body, b_loop_header, "B initialization loop")
     except SourceStructureError as exc:
-        errors.append(f"cannot validate B initialization loop: {exc}")
+        errors.append(
+            "B initialization loop must cover exactly kNLocal * kK elements: "
+            f"{exc}"
+        )
     else:
-        if "cta_rank" in b_loop_body:
-            errors.append("B initialization must NOT depend on cta_rank (identical in both CTAs)")
+        local_col = re.search(
+            r"\bconst\s+int\s+local_col\s*=\s*idx\s*/\s*kK\s*;",
+            b_loop_body,
+        )
+        k_value = re.search(r"\bconst\s+int\s+k\s*=\s*idx\s*%\s*kK\s*;", b_loop_body)
+        global_col = re.search(
+            r"\bconst\s+int\s+global_col\s*=\s*cta_rank\s*\*\s*kNLocal\s*\+\s*local_col\s*;",
+            b_loop_body,
+        )
+        value = re.search(
+            r"\bconst\s+int\s+value\s*=\s*\(\(\s*2\s*\*\s*k\s*\+\s*global_col\s*\)\s*"
+            r"%\s*5\s*\)\s*-\s*2\s*;",
+            b_loop_body,
+            re.DOTALL,
+        )
+        store = re.search(
+            r"\bB\s*\[\s*smem_core_tile_index\s*\(\s*local_col\s*/\s*8\s*,\s*"
+            r"local_col\s*%\s*8\s*,\s*k\s*\)\s*\]\s*=",
+            b_loop_body,
+            re.DOTALL,
+        )
+
+        if local_col is None:
+            errors.append("B initialization must derive local_col = idx / kK")
+        if k_value is None:
+            errors.append("B initialization must derive k = idx % kK")
+        if global_col is None:
+            errors.append(
+                "B initialization must map each local column with "
+                "global_col = cta_rank * kNLocal + local_col"
+            )
+        if value is None:
+            errors.append("B initialization value must use global_col, not a replicated local column")
+        if store is None:
+            errors.append(
+                "B initialization must store the global-column value at the local_col SMEM position"
+            )
+        if all(match is not None for match in (local_col, k_value, global_col, value, store)):
+            positions = [
+                local_col.start(),
+                k_value.start(),
+                global_col.start(),
+                value.start(),
+                store.start(),
+            ]
+            if positions != sorted(positions):
+                errors.append(
+                    "B initialization must order local_col, k, global_col, value, then the local SMEM store"
+                )
+        if len(re.findall(r"\bB\s*\[", b_loop_body)) != 1:
+            errors.append("B initialization loop must contain exactly one B SMEM store")
 
     forbidden_tmem_rank_offset = re.compile(r"tcgen05_ld_32x32b_x32\s*\([^;]*\bcta_rank\b", re.DOTALL)
     if forbidden_tmem_rank_offset.search(umma_body):
@@ -757,6 +830,71 @@ def check_exact_geometry(masked: str) -> list[str]:
             "the host launch (run_once) must launch spec.kernel<<<kGridBlocks, "
             "kThreadsPerCta, ...>>> -- the exact grid=(2,1,1)/block=(128,1,1) launch contract"
         )
+    return errors
+
+
+def check_dynamic_smem_allocation(masked: str) -> list[str]:
+    """Prove the host launch reserves exactly the CTA-local A and B slices.
+
+    The repaired 2-SM operand mapping stores ``N / kClusterCtas`` B columns
+    per CTA.  Checking only the device fill loop is insufficient: a host-side
+    regression can still under-allocate dynamic shared memory while leaving
+    the kernel mapping text intact.  Require the exact local-N derivation,
+    the exact A-plus-local-B byte expression, and that this byte count is the
+    dynamic-SMEM argument of the real kernel launch, in that order.
+    """
+    errors: list[str] = []
+    try:
+        run_once_body, _, _ = extract_single_function_body(
+            masked, RUN_ONCE_DEFINITION, "run_once"
+        )
+    except SourceStructureError as exc:
+        return [f"invalid dynamic shared-memory allocation check: {exc}"]
+
+    n_local_pattern = re.compile(
+        r"\bconst\s+int\s+n_local\s*=\s*spec\.n\s*/\s*kClusterCtas\s*;"
+    )
+    smem_bytes_pattern = re.compile(
+        r"\bconst\s+int\s+smem_bytes\s*=\s*kMLocal\s*\*\s*kK\s*\*\s*2\s*\+\s*"
+        r"n_local\s*\*\s*kK\s*\*\s*2\s*;",
+        re.DOTALL,
+    )
+    launch_pattern = re.compile(
+        r"\bspec\.kernel\s*<<<\s*kGridBlocks\s*,\s*kThreadsPerCta\s*,\s*"
+        r"static_cast\s*<\s*size_t\s*>\s*\(\s*smem_bytes\s*\)\s*>>>",
+        re.DOTALL,
+    )
+
+    n_local_matches = list(n_local_pattern.finditer(run_once_body))
+    smem_bytes_matches = list(smem_bytes_pattern.finditer(run_once_body))
+    launch_matches = list(launch_pattern.finditer(run_once_body))
+
+    if len(n_local_matches) != 1:
+        errors.append(
+            "run_once must derive exactly one 'const int n_local = "
+            "spec.n / kClusterCtas;' for the CTA-local B extent"
+        )
+    if len(smem_bytes_matches) != 1:
+        errors.append(
+            "run_once must reserve exactly kMLocal * kK * 2 + "
+            "n_local * kK * 2 dynamic shared-memory bytes"
+        )
+    if len(launch_matches) != 1:
+        errors.append(
+            "run_once must pass static_cast<size_t>(smem_bytes) as the "
+            "dynamic shared-memory argument of spec.kernel"
+        )
+
+    if len(n_local_matches) == len(smem_bytes_matches) == len(launch_matches) == 1:
+        positions = (
+            n_local_matches[0].start(),
+            smem_bytes_matches[0].start(),
+            launch_matches[0].start(),
+        )
+        if positions != tuple(sorted(positions)):
+            errors.append(
+                "run_once must derive n_local, compute smem_bytes, then launch the kernel"
+            )
     return errors
 
 
@@ -1553,8 +1691,9 @@ def check_source(source_text: str) -> list[str]:
         if not pattern.search(masked):
             errors.append(f"source is missing required text: {description}")
     errors.extend(check_exact_geometry(masked))
+    errors.extend(check_dynamic_smem_allocation(masked))
     errors.extend(check_launch_guard_ordering(code_only))
-    errors.extend(check_rank_mapping(code_only))
+    errors.extend(check_rank_mapping(masked))
     errors.extend(check_collective_tmem_lifecycle(code_only))
     errors.extend(check_mbarrier_init_fence(masked))
     errors.extend(check_iteration_structure(masked))
@@ -1944,6 +2083,10 @@ def golden_source_snippet(**overrides: str) -> str:
             "if (cluster_ctarank == 0) g_launch_ok[0] = 1; else if (cluster_ctarank == 1) "
             "g_launch_ok[1] = 1;"
         ),
+        "b_local_extent": (
+            "constexpr int kNLocal = N / kClusterCtas; "
+            "static_assert(N % kClusterCtas == 0, \"N must divide evenly\");"
+        ),
         "a_loop": (
             "for (int idx = tid; idx < kMLocal * kK; idx += kThreadsPerCta) { "
             "const int local_row = idx / kK; const int k = idx % kK; "
@@ -1951,9 +2094,12 @@ def golden_source_snippet(**overrides: str) -> str:
             "A[smem_core_tile_index(local_row/8, local_row%8, k)] = __float2bfloat16(1.0f); }"
         ),
         "b_loop": (
-            "for (int idx = tid; idx < N * kK; idx += kThreadsPerCta) { "
-            "const int col = idx / kK; const int k = idx % kK; "
-            "B[smem_core_tile_index(col/8, col%8, k)] = __float2bfloat16(1.0f); }"
+            "for (int idx = tid; idx < kNLocal * kK; idx += kThreadsPerCta) { "
+            "const int local_col = idx / kK; const int k = idx % kK; "
+            "const int global_col = cta_rank * kNLocal + local_col; "
+            "const int value = ((2 * k + global_col) % 5) - 2; "
+            "B[smem_core_tile_index(local_col/8, local_col%8, k)] = "
+            "__float2bfloat16(static_cast<float>(value)); }"
         ),
         "alloc_call": "if (warp_id == 0) { tcgen05_alloc_2sm(x, N); }",
         "dealloc_call": "if (warp_id == 0) { tcgen05_dealloc_2sm(tmem_d, N); tcgen05_relinquish_alloc_permit_2sm(); }",
@@ -2001,8 +2147,12 @@ def golden_source_snippet(**overrides: str) -> str:
             "umma_2sm_body<N, DEPTH>(iterations, timing_mode, g_d_out, g_elapsed_cycles, g_launch_ok);"
         ),
         "run_once_mode_forward": (
-            "spec.kernel<<<kGridBlocks, kThreadsPerCta>>>(iterations, mode, d_out_device, "
-            "cycles_device, launch_ok_device);"
+            "spec.kernel<<<kGridBlocks, kThreadsPerCta, static_cast<size_t>(smem_bytes)>>>("
+            "iterations, mode, d_out_device, cycles_device, launch_ok_device);"
+        ),
+        "host_smem_setup": (
+            "const int n_local = spec.n / kClusterCtas; "
+            "const int smem_bytes = kMLocal * kK * 2 + n_local * kK * 2;"
         ),
         "untimed_call_a": "run_once(spec, iterations, TimingMode::kUntimed);",
         "untimed_call_b": "run_once(spec, kSelfTestIterations, TimingMode::kUntimed);",
@@ -2027,6 +2177,7 @@ def golden_source_snippet(**overrides: str) -> str:
         f"    {fields['launch_guard']}\n"
         f"    {fields['accepted_path']}\n"
         "    const int cta_rank = static_cast<int>(cluster_ctarank);\n"
+        f"    {fields['b_local_extent']}\n"
         f"    {fields['a_loop']}\n"
         f"    {fields['b_loop']}\n"
         "    __syncthreads();\n"
@@ -2074,6 +2225,7 @@ def golden_source_snippet(**overrides: str) -> str:
         f"    {fields['kernel_mode_forward']}\n"
         "}\n"
         "RunResult run_once(const Specialization& spec, int64_t iterations, TimingMode mode) {\n"
+        f"    {fields['host_smem_setup']}\n"
         f"    {fields['run_once_mode_forward']}\n"
         "}\n"
         "void run_untimed_or_die(const Specialization& spec, int64_t iterations) {\n"
@@ -2412,16 +2564,113 @@ def run_self_test() -> int:
             "A initialization must depend on cta_rank",
         ),
         (
-            "source check rejects B initialization that depends on cta_rank (should be identical)",
+            "GPU regression: rejects a full replicated B tile in both CTAs",
             golden_source_snippet(
                 b_loop=(
                     "for (int idx = tid; idx < N * kK; idx += kThreadsPerCta) { "
                     "const int col = idx / kK; const int k = idx % kK; "
-                    "const int v = cta_rank + col; "
-                    "B[smem_core_tile_index(col/8, col%8, k)] = __float2bfloat16(1.0f); }"
+                    "const int value = ((2 * k + col) % 5) - 2; "
+                    "B[smem_core_tile_index(col/8, col%8, k)] = "
+                    "__float2bfloat16(static_cast<float>(value)); }"
                 )
             ),
-            "B initialization must NOT depend on cta_rank",
+            "B initialization loop must cover exactly kNLocal * kK elements",
+        ),
+        (
+            "GPU regression: rejects a local B extent that is not N / kClusterCtas",
+            golden_source_snippet(
+                b_local_extent=(
+                    "constexpr int kNLocal = N; "
+                    "static_assert(N % kClusterCtas == 0, \"N must divide evenly\");"
+                )
+            ),
+            "constexpr int kNLocal = N / kClusterCtas;",
+        ),
+        (
+            "GPU regression: a string decoy cannot hide the wrong local B extent",
+            golden_source_snippet(
+                b_local_extent=(
+                    "constexpr int kNLocal = N; "
+                    "static_assert(N % kClusterCtas == 0, \"N must divide evenly\");"
+                ),
+                extra_forbidden_line=(
+                    'const char* b_extent_decoy = '
+                    '"constexpr int kNLocal = N / kClusterCtas;";'
+                ),
+            ),
+            "constexpr int kNLocal = N / kClusterCtas;",
+        ),
+        (
+            "GPU regression: rejects a rank-independent B global column",
+            golden_source_snippet(
+                b_loop=(
+                    "for (int idx = tid; idx < kNLocal * kK; idx += kThreadsPerCta) { "
+                    "const int local_col = idx / kK; const int k = idx % kK; "
+                    "const int global_col = local_col; "
+                    "const int value = ((2 * k + global_col) % 5) - 2; "
+                    "B[smem_core_tile_index(local_col/8, local_col%8, k)] = "
+                    "__float2bfloat16(static_cast<float>(value)); }"
+                )
+            ),
+            "global_col = cta_rank * kNLocal + local_col",
+        ),
+        (
+            "GPU regression: rejects B values computed from local_col despite a global_col decoy",
+            golden_source_snippet(
+                b_loop=(
+                    "for (int idx = tid; idx < kNLocal * kK; idx += kThreadsPerCta) { "
+                    "const int local_col = idx / kK; const int k = idx % kK; "
+                    "const int global_col = cta_rank * kNLocal + local_col; "
+                    "const int value = ((2 * k + local_col) % 5) - 2; "
+                    "B[smem_core_tile_index(local_col/8, local_col%8, k)] = "
+                    "__float2bfloat16(static_cast<float>(value)); }"
+                )
+            ),
+            "B initialization value must use global_col",
+        ),
+        (
+            "GPU regression: rejects using global_col as the local B SMEM address",
+            golden_source_snippet(
+                b_loop=(
+                    "for (int idx = tid; idx < kNLocal * kK; idx += kThreadsPerCta) { "
+                    "const int local_col = idx / kK; const int k = idx % kK; "
+                    "const int global_col = cta_rank * kNLocal + local_col; "
+                    "const int value = ((2 * k + global_col) % 5) - 2; "
+                    "B[smem_core_tile_index(global_col/8, global_col%8, k)] = "
+                    "__float2bfloat16(static_cast<float>(value)); }"
+                )
+            ),
+            "store the global-column value at the local_col SMEM position",
+        ),
+        (
+            "GPU regression: rejects a host local-B extent smaller than N / kClusterCtas",
+            golden_source_snippet(
+                host_smem_setup=(
+                    "const int n_local = spec.n / 4; "
+                    "const int smem_bytes = kMLocal * kK * 2 + n_local * kK * 2;"
+                )
+            ),
+            "const int n_local = spec.n / kClusterCtas;",
+        ),
+        (
+            "GPU regression: rejects host dynamic SMEM that omits the local B slice",
+            golden_source_snippet(
+                host_smem_setup=(
+                    "const int n_local = spec.n / kClusterCtas; "
+                    "const int smem_bytes = kMLocal * kK * 2;"
+                )
+            ),
+            "n_local * kK * 2 dynamic shared-memory bytes",
+        ),
+        (
+            "GPU regression: rejects a kernel launch that omits the computed dynamic SMEM size",
+            golden_source_snippet(
+                run_once_mode_forward=(
+                    "spec.kernel<<<kGridBlocks, kThreadsPerCta>>>(iterations, mode, "
+                    "d_out_device, cycles_device, launch_ok_device);"
+                )
+            ),
+            "pass static_cast<size_t>(smem_bytes) as the dynamic shared-memory argument",
         ),
         (
             "source check rejects TMEM allocation gated by cta_rank instead of warp_id",
