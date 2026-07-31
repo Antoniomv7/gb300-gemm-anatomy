@@ -150,13 +150,13 @@ campaigns remain Phase 4 work.
 ## Phase 2 — BF16 UMMA throughput (27 July–2 August 2026)
 
 Entry condition for Phase 2: the Phase 1 gate must pass. Current status:
-Phase 1 gate passed; Phase 2 may begin. P2.1 is closed. P2.2 is implemented
-but not yet independently audited and not yet verified on GB300.
+Phase 1 gate passed; Phase 2 may begin. P2.1 and P2.2 are closed. P2.3 and
+P2.4 remain unimplemented.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
 | P2.1 | 1-SM UMMA | YES | YES | YES |
-| P2.2 | 2-SM UMMA | YES | NO | NO |
+| P2.2 | 2-SM UMMA | YES | YES | YES |
 | P2.3 | Sweep (≤24 configurations) | NO | NO | NO |
 | P2.4 | Profiling and empirical ceiling | NO | NO | NO |
 
@@ -187,17 +187,21 @@ synchronization before deallocation, ELF-level `EIATTR_EXPLICIT_CLUSTER`/
 `EIATTR_CTA_PER_CLUSTER` evidence of the compile-time two-CTA cluster, and
 the absence of any non-`.2CTA` (1-SM-fallback-shaped) UTCHMMA/UTCBAR/
 allocation, WGMMA, `mma.sync`, TMA, LDGSTS, FP8/FP4, or sparse instruction.
-The real `sm_103a` binary was compiled and disassembled during
-implementation (GPU-free) and passed this full contract for all twelve
-specializations. P2.2 has **not** been independently audited and has
-**not** been verified on GB300: no `--self-test`, `smoke`, or `benchmark`
-invocation has been executed on a physical device, and no GPU command of
-any kind was run to produce this implementation. No publishable result
-exists or is claimed; every CSV row P2.2 can ever emit carries
-`publishable=false` unconditionally. See `src/compute/P2_2_PROTOCOL.md` for
-the full frozen contract and the PTX ISA citations behind every descriptor,
-synchronization step, and SASS/ELF check. P2.3 (joint sweep) and P2.4
-(profiling and empirical ceiling) remain entirely unimplemented.
+The repaired implementation at Git commit
+`637b6a7e2efbe77b1c9c5d3dfc7ece527f522bba` passed an independent audit,
+the 101-case fail-closed checker, the pinned CUDA 13.1 `sm_103a` build, and
+the full real-cubin SASS/ELF contract for all twelve specializations. It was
+then functionally verified on a physical NVIDIA B300 on 31 July 2026: fresh
+preflight campaign `20260731T115848Z` reported `OVERALL=PASS`, the device
+self-test reported `SELF_TEST: PASS (12/12)`, and the short smoke route
+completed with `correctness=OK`, `mismatches=0`, the expected commit, and
+`git_dirty=false`. These checks close P2.2 as audited, functionally verified
+infrastructure only. No publishable result exists or is claimed; every CSV
+row remains `publishable=false`, and no throughput, ceiling, or 1-SM/2-SM
+scaling claim is made before P2.3-P2.4. See
+`src/compute/P2_2_PROTOCOL.md` for the full audit and validation history.
+P2.3 (joint sweep) and P2.4 (profiling and empirical ceiling) remain entirely
+unimplemented.
 
 ## Phase 3 — CuTe DSL GEMM versus cuBLASLt (3–9 August 2026)
 

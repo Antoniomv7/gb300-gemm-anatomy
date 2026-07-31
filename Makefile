@@ -170,9 +170,8 @@ help:
 	@echo "  -- P2.1 1-SM BF16 UMMA (tcgen05.mma, kind::f16, cta_group::1; see"
 	@echo "     src/compute/P2_PROTOCOL.md; implemented, independently audited,"
 	@echo "     functionally verified on GB300, no publishable result;"
-	@echo "     P2.2 implemented; independent re-audit pending; GB300 verification"
-	@echo "     pending. P2.3 and P2.4 not implemented. No publishable P2.2 result"
-	@echo "     exists.) --"
+	@echo "     P2.2 implemented; independently audited; GB300 verification passed."
+	@echo "     P2.3 and P2.4 not implemented. No publishable P2.2 result exists.) --"
 	@echo "  GPU-free build/SASS/check (no GPU, no network):"
 	@echo "  make compute-umma-1sm-build    Compile the twelve P2.1 specializations. No GPU."
 	@echo "  make compute-umma-1sm-sass     Disassemble and verify the real cubin: exactly"
@@ -190,8 +189,8 @@ help:
 	@echo "                                   measurement (NOT a final result)."
 	@echo ""
 	@echo "  -- P2.2 2-SM BF16 UMMA (tcgen05.mma, kind::f16, cta_group::2, one static"
-	@echo "     two-CTA cluster; see src/compute/P2_2_PROTOCOL.md; implemented, NOT yet"
-	@echo "     independently audited, NOT yet verified on GB300, no publishable result) --"
+	@echo "     two-CTA cluster; see src/compute/P2_2_PROTOCOL.md; implemented,"
+	@echo "     independently audited, verified on GB300, no publishable result) --"
 	@echo "  GPU-free build/SASS/check (no GPU, no network):"
 	@echo "  make compute-umma-2sm-build    Compile the twelve P2.2 specializations. No GPU."
 	@echo "  make compute-umma-2sm-sass     Disassemble and verify the real cubin: exactly"
@@ -443,14 +442,20 @@ check-static:
 	! grep -nE -- "$$pat" $(COMPUTE_UMMA_2SM_CHECKER)
 	@echo "== P2.2 Makefile target derives its arch/code flags from the pinned CUDA_ARCH =="
 	@grep -Fq 'COMPUTE_UMMA_2SM_ARCH_FLAGS := -arch=compute_$$(patsubst sm_%,%,$$(CUDA_ARCH)) -code=$$(CUDA_ARCH)' Makefile
-	@echo "== P2.2 documentation reports implemented-but-unaudited status honestly =="
-	@grep -Fq 'P2.2 | 2-SM UMMA | YES | NO | NO |' PLAN.md
+	@echo "== P2.2 documentation reports audited and GB300-verified closure honestly =="
+	@grep -Fq 'P2.2 | 2-SM UMMA | YES | YES | YES |' PLAN.md
+	@grep -Fq 'independently audited: YES; verified on GB300: YES; publishable results:' README.md
+	@grep -Fq '* P2.2: **implemented and closed**' $(COMPUTE_UMMA_2SM_PROTOCOL)
 	@! grep -nF 'publishable P2.2 result' README.md PLAN.md $(COMPUTE_UMMA_2SM_PROTOCOL)
-	@grep -Fq '* Independent audit: **pending**.' $(COMPUTE_UMMA_2SM_PROTOCOL)
-	@grep -Fq '* GB300 verification: **pending**.' $(COMPUTE_UMMA_2SM_PROTOCOL)
+	@grep -Fq '* Independent audit: **passed**.' $(COMPUTE_UMMA_2SM_PROTOCOL)
+	@grep -Fq '* GB300 verification: **passed**.' $(COMPUTE_UMMA_2SM_PROTOCOL)
 	@grep -Fq '* Publishable result: **none**.' $(COMPUTE_UMMA_2SM_PROTOCOL)
+	@grep -Fq 'P2.2 = YES / YES / YES' $(COMPUTE_UMMA_2SM_PROTOCOL)
+	@! grep -nF 'P2.2 = YES / NO / NO' PLAN.md README.md $(COMPUTE_UMMA_1SM_PROTOCOL) $(COMPUTE_UMMA_2SM_PROTOCOL)
+	@! grep -nF 'Independent audit: **pending**.' PLAN.md README.md $(COMPUTE_UMMA_1SM_PROTOCOL) $(COMPUTE_UMMA_2SM_PROTOCOL)
+	@! grep -nF 'GB300 verification: **pending**.' PLAN.md README.md $(COMPUTE_UMMA_1SM_PROTOCOL) $(COMPUTE_UMMA_2SM_PROTOCOL)
 	@echo "== P2.2 repair (audit round 1): stale 'unimplemented' phrases cannot silently return =="
-	@grep -Fq 'P2.2 implemented; independent re-audit pending; GB300 verification pending.' Makefile
+	@grep -Fq 'P2.2 implemented; independently audited; GB300 verification passed.' Makefile
 	@! grep -F "P2.2's unimplemented scope" $(COMPUTE_UMMA_1SM_PROTOCOL)
 	@! grep -F 'P2.2 (unimplemented, 12 configs)' $(COMPUTE_UMMA_1SM_PROTOCOL)
 	@! grep -F 'P2.2 (2-SM), P2.3 (joint sweep), and P2.4 (profiling/ceiling) remain' $(COMPUTE_UMMA_1SM_PROTOCOL)
@@ -878,8 +883,8 @@ compute-umma-1sm-smoke: compute-umma-1sm-sass
 # compute-umma-2sm-smoke are the only P2.2 targets that execute on GPU; each
 # requires an explicit BLACKWELL_GPU_INDEX and goes exclusively through
 # scripts/run_container.sh. See src/compute/P2_2_PROTOCOL.md for the complete
-# frozen contract; P2.2 is implemented but NOT YET independently audited and
-# NOT YET verified on GB300, and produces no publishable result.
+# frozen contract; P2.2 is implemented, independently audited, functionally
+# verified on GB300, and produces no publishable result.
 
 compute-umma-2sm-build:
 	@mkdir -p build/compute

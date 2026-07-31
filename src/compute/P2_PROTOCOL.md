@@ -18,7 +18,7 @@ estimated from documentation.
 | Unit | Scope | Status in this document |
 |------|-------|--------------------------|
 | P2.1 | 1-SM UMMA: single CTA, `cta_group::1`, M=128, N in {64,128,256}, depth in {4,16,64,256}, 12 configurations. | **Implemented, independently audited, and functionally verified on GB300.** |
-| P2.2 | 2-SM UMMA: CTA pair, `cta_group::2`, M=256, cluster of 2 CTAs. | **Implemented in `src/compute/umma_2sm.cu`; not yet independently audited; not yet verified on GB300.** This P2.1 document's own closed scope and evidence (sections 4-20 below) remain unchanged and describe only the `cta_group::1` arm. See `src/compute/P2_2_PROTOCOL.md` for the complete, independently frozen P2.2 contract. |
+| P2.2 | 2-SM UMMA: CTA pair, `cta_group::2`, M=256, cluster of 2 CTAs. | **Implemented, independently audited, and functionally verified on GB300** at commit `637b6a7e2efbe77b1c9c5d3dfc7ece527f522bba`. This P2.1 document's own closed scope and evidence (sections 4-20 below) remain unchanged and describe only the `cta_group::1` arm. See `src/compute/P2_2_PROTOCOL.md` for the complete, independently frozen P2.2 contract and closure evidence. |
 | P2.3 | Joint 1-SM/2-SM sweep infrastructure, at most 24 configurations (AGENTS.md ceiling). | **Not implemented.** No runner, no campaign, no sweep script exists. |
 | P2.4 | Profiling and empirical ceiling: Nsight Compute, TFLOP/s and saturation analysis. | **Not implemented.** No profiling script, no TFLOP/s conversion, no saturation claim exists. `elapsed_cycles` in the P2.1 CSV is a raw `%clock64` delta, never converted to seconds or FLOP/s here. |
 
@@ -27,8 +27,9 @@ estimated from documentation.
 AGENTS.md caps experiment 2 at 24 configurations: 1-SM (M=128) and 2-SM
 (M=256), each with N in {64,128,256} and depth in {4,16,64,256} -- 2 x 3 x 4
 = 24. P2.1 implements exactly the 1-SM half (12 of the 24); the 2-SM half is
-P2.2's scope, implemented in `src/compute/umma_2sm.cu` (independent audit
-and GB300 verification pending; see `src/compute/P2_2_PROTOCOL.md`).
+P2.2's scope, implemented in `src/compute/umma_2sm.cu`, independently
+audited, and functionally verified on GB300 (see
+`src/compute/P2_2_PROTOCOL.md`).
 
 | cta_group | M | N | depth | Unit |
 |-----------|---|---|-------|------|
@@ -555,11 +556,11 @@ BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
   not wall-clock time, not corrected for clock throttling/boost state, and
   not a throughput or saturation claim. No TFLOP/s conversion exists in
   this unit (P2.4 work).
-* P2.2 (2-SM) is implemented (`src/compute/umma_2sm.cu`; see
-  `src/compute/P2_2_PROTOCOL.md`), with independent audit and GB300
-  verification pending. P2.3 (joint sweep) and P2.4 (profiling/ceiling)
-  remain entirely unimplemented. Nothing in this document or in `PLAN.md`'s
-  P2.1 row claims otherwise about P2.1's own closed scope.
+* P2.2 (2-SM) is implemented, independently audited, and functionally
+  verified on GB300 at commit `637b6a7e2efbe77b1c9c5d3dfc7ece527f522bba`
+  (see `src/compute/P2_2_PROTOCOL.md`). P2.3 (joint sweep) and P2.4
+  (profiling/ceiling) remain entirely unimplemented. Nothing in this
+  document or in `PLAN.md`'s P2.1 row changes P2.1's own closed scope.
 
 ## 18. Status
 
@@ -588,8 +589,9 @@ routing checks described in sections 16-17:
 * GB300 verification: **passed**.
 * Publishable result: **none**. Every CSV row P2.1 can ever emit carries
   `publishable=false` unconditionally.
-* P2.2: **implemented** (`src/compute/umma_2sm.cu`; independent audit and
-  GB300 verification pending -- see `src/compute/P2_2_PROTOCOL.md`).
+* P2.2: **implemented and closed** (`src/compute/umma_2sm.cu`; independent
+  audit and GB300 functional verification passed at commit `637b6a7` -- see
+  `src/compute/P2_2_PROTOCOL.md`).
   P2.3, P2.4: **not implemented**.
 
 ## 19. References

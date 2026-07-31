@@ -15,7 +15,7 @@ pilot executed: YES; NCU/HBM validation: six of six predefined cases
 `HBM_VALIDATED`; publishable results: NONE; Phase 1: CLOSED`. `P2.1 (1-SM
 BF16 UMMA) — implemented, independently audited, and functionally verified
 on GB300; publishable results: NONE`. `P2.2 (2-SM BF16 UMMA) — implemented;
-independently audited: NO; verified on GB300: NO; publishable results:
+independently audited: YES; verified on GB300: YES; publishable results:
 NONE`.**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
@@ -210,11 +210,17 @@ be declared successful when they have actually been executed (`make
 compute-umma-2sm-build`, `make compute-umma-2sm-sass`, `make
 compute-umma-2sm-check`); nothing here is simulated. The real `sm_103a`
 binary passed the twelve-specialization SASS/ELF contract during
-implementation. **P2.2 has not been independently audited and has not been
-verified on GB300**: no GPU command of any kind was executed to produce
-this implementation, so no `SELF_TEST`, `smoke`, or `benchmark` result
-exists yet, and every future CSV row remains unconditionally
-`publishable=false`. P2.3 (joint sweep) and P2.4 (profiling and empirical
+implementation. The repaired implementation at Git commit
+`637b6a7e2efbe77b1c9c5d3dfc7ece527f522bba` passed an independent audit,
+the 101-case checker, the pinned CUDA 13.1 `sm_103a` build, and the complete
+real-cubin SASS/ELF contract for all twelve specializations. It was
+functionally verified on a physical NVIDIA B300 on 31 July 2026: fresh
+preflight campaign `20260731T115848Z` passed, the device self-test reported
+`SELF_TEST: PASS (12/12)`, and the short smoke route emitted three rows with
+`correctness=OK`, `mismatches=0`, the expected commit, and
+`git_dirty=false`. These are functional checks only; every CSV row remains
+unconditionally `publishable=false`, and no throughput or 1-SM/2-SM scaling
+result is claimed. P2.3 (joint sweep) and P2.4 (profiling and empirical
 ceiling) are **not implemented**.
 
 ## Research question
@@ -355,8 +361,8 @@ HBM-validated pilot with 18 configurations, 540 retained samples, and six
 successful NCU cases; it closes the Phase 1 technical gate but remains
 `publishable: false` pending later final campaigns. Experiment 2 is
 underway: P2.1 is implemented, independently audited, and functionally
-verified on GB300; P2.2 is implemented but not yet independently audited
-and not yet verified on GB300; P2.3–P2.4 and experiment 3 remain
+verified on GB300; P2.2 is likewise implemented, independently audited, and
+functionally verified on GB300; P2.3–P2.4 and experiment 3 remain
 unimplemented. The repository still contains no publishable bandwidth,
 throughput, GEMM-performance, or cuBLASLt-comparison result. The pinned
 CUDA 13.1 container contract remains unchanged. See `PLAN.md` for the

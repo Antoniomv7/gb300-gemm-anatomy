@@ -27,7 +27,7 @@ sweep infrastructure).
 | Unit | Scope | Status in this document |
 |------|-------|--------------------------|
 | P2.1 | 1-SM UMMA: single CTA, `cta_group::1`, M=128, N in {64,128,256}, depth in {4,16,64,256}, 12 configurations. | **Implemented, independently audited, and functionally verified on GB300** (see `src/compute/P2_PROTOCOL.md`). |
-| P2.2 | 2-SM UMMA: CTA pair, `cta_group::2`, M=256, cluster of 2 CTAs, 12 configurations. | **Implemented in this document/commit. Not yet independently audited. Not yet verified on GB300.** |
+| P2.2 | 2-SM UMMA: CTA pair, `cta_group::2`, M=256, cluster of 2 CTAs, 12 configurations. | **Implemented, independently audited, and functionally verified on GB300** at commit `637b6a7e2efbe77b1c9c5d3dfc7ece527f522bba` on 31 July 2026. |
 | P2.3 | Joint 1-SM/2-SM sweep infrastructure, at most 24 configurations (AGENTS.md ceiling). | **Not implemented.** No runner, no campaign, no sweep script exists. |
 | P2.4 | Profiling and empirical ceiling: Nsight Compute, TFLOP/s and saturation analysis. | **Not implemented.** No profiling script, no TFLOP/s conversion, no saturation claim exists. `elapsed_cycles` in the P2.2 CSV is a raw `%clock64` delta, never converted to seconds or FLOP/s here. |
 
@@ -807,11 +807,13 @@ make compute-umma-2sm-sass
 make compute-umma-2sm-check
 ```
 
-GB300 functional revalidation commands. Commit
+GB300 functional-validation commands. Commit
 `5cd00bb4a09fce32eab6295e8faeca110e7485c9` was run on GB300 and failed
 `--self-test` in all twelve specializations because it replicated B instead
 of applying the CTA-level `N/2` partition; `smoke` was not reached. These
-commands must be repeated on the repair commit described in section 17:
+commands were repeated successfully on repair commit
+`637b6a7e2efbe77b1c9c5d3dfc7ece527f522bba` on 31 July 2026, as recorded in
+section 17:
 
 ```bash
 BLACKWELL_GPU_INDEX=<physical-index> make preflight
@@ -819,8 +821,8 @@ BLACKWELL_GPU_INDEX=<physical-index> make compute-umma-2sm-self-test
 BLACKWELL_GPU_INDEX=<physical-index> make compute-umma-2sm-smoke
 ```
 
-Only after both functional targets pass may a non-publishable benchmark be
-run:
+Both functional targets now pass. A later non-publishable benchmark may be
+run only through the following explicit route:
 
 ```bash
 BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
@@ -831,12 +833,11 @@ BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
 
 ## 17. Verification status and scientific limitations
 
-* P2.2 remains **implemented but unapproved**. The last published binary at
-  commit `5cd00bb4a09fce32eab6295e8faeca110e7485c9` compiled under the pinned
-  CUDA 13.1.80 toolchain and passed its twelve-specialization SASS/ELF/source
-  contract, but its real GB300 numerical validation failed as described
-  below. The current B-partition repair must therefore be rebuilt,
-  disassembled, independently audited, and rerun on GB300 before approval.
+* P2.2 is **implemented and closed** at commit
+  `637b6a7e2efbe77b1c9c5d3dfc7ece527f522bba`. The final repair passed the
+  101-case checker, the pinned CUDA 13.1.80 build, the complete real-cubin
+  SASS/ELF contract for all twelve specializations, an independent audit,
+  and the GB300 functional validation recorded below.
 * A first independent audit of commit `e00046a415eec77663867dfd2c6691a1ab5a26d2`
   found four blockers, all in synchronization correctness, the source
   checker, and documentation honesty: (1) `mbarrier_init` was never followed
@@ -873,21 +874,26 @@ BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
   errors matched a duplicated first half of B: both CTAs initialized local B
   from global column zero, while the 2-SM MMA's CTA-level B layout maps CTA
   rank 1 to global columns `[N/2,N)`.
-* The current repair defines `kNLocal=N/kClusterCtas`, initializes exactly
+* The final repair defines `kNLocal=N/kClusterCtas`, initializes exactly
   `kNLocal*K` values per CTA with
   `global_col=cta_rank*kNLocal+local_col`, stores them at the physical
   `local_col` address, reduces the dynamic B allocation to `N/2`, and extends
   the checker from 93 to 101 cases with five independent device-side
   B-partition regressions, a string-decoy variant, and three host-side
-  dynamic-shared-memory regressions. This repair has passed only
-  GPU-free source validation in its implementation environment so far.
-* P2.2 has **not** been independently audited (a static self-check, however
-  thorough, is not an audit -- AGENTS.md, `PLAN.md`). This includes the
-  B-partition repair above: a fresh independent audit remains pending.
-* P2.2 has **not** been verified on GB300 hardware: verification was
-  attempted and failed at `--self-test`, so no successful `smoke` or
-  benchmark exists. The repaired commit must pass all twelve self-test
-  specializations and the smoke route before this field can become YES.
+  dynamic-shared-memory regressions. That exact repair is commit `637b6a7`,
+  which passed the checker (`101/101`), `make check-static`, the CUDA 13.1
+  `sm_103a` build, and the real-cubin SASS/ELF gate.
+* P2.2's independent audit **passed** for commit `637b6a7`. The audit covered
+  the repaired peer-CTA B partition, the complete 101-case fail-closed source
+  checker, the twelve-specialization real-cubin evidence, and the functional
+  GB300 log. A static self-check alone was not treated as an audit.
+* P2.2's GB300 functional verification **passed** on 31 July 2026 on an
+  NVIDIA B300 SXM6 AC. Fresh preflight campaign `20260731T115848Z` reported
+  `OVERALL=PASS`; the device self-test reported `SELF_TEST: PASS (12/12)`
+  with zero mismatches in every specialization; and the short
+  `run_kind=smoke` route emitted three rows with `correctness=OK`,
+  `mismatches=0`, `git_commit=637b6a7e2efbe77b1c9c5d3dfc7ece527f522bba`,
+  and `git_dirty=false`. No benchmark was required for functional closure.
 * No publishable result exists or is claimed. Every CSV row P2.2 can ever
   emit carries `publishable=false` unconditionally; `elapsed_cycles` is a
   raw `%clock64` delta on CTA rank 0's one thread, not wall-clock time, not
@@ -914,22 +920,20 @@ BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
 
 ## 18. Status
 
-* P2.2: **implemented, repair pending validation**. The current source fixes
-  the CTA-level B partition exposed by the failed `5cd00bb` GB300 self-test.
-* Independent audit: **pending**. Previous audits found synchronization,
-  checker, and B-partition blockers; the current repair requires a fresh
-  audit.
-* GB300 verification: **pending**. The only functional attempt ended with
-  `SELF_TEST_RESULT 0/12`; the repaired commit has not yet been run, so the
-  machine-readable verified field remains NO.
+* P2.2: **implemented and closed** at commit
+  `637b6a7e2efbe77b1c9c5d3dfc7ece527f522bba`.
+* Independent audit: **passed**.
+* GB300 verification: **passed**. Fresh preflight, all twelve self-test
+  specializations, and the smoke route completed successfully on 31 July
+  2026 with zero mismatches.
 * Publishable result: **none**. Every CSV row P2.2 can ever emit carries
   `publishable=false` unconditionally.
 * P2.3, P2.4: **not implemented**.
 
-Machine-readable project status remains:
+Machine-readable project status:
 
 ```text
-P2.2 = YES / NO / NO
+P2.2 = YES / YES / YES
 ```
 
 ## 19. References
