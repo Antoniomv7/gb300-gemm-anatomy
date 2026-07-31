@@ -228,11 +228,13 @@ Per kernel, in order (PTX ISA 9.3 sections 9.7.17.1.2, 9.7.17.5.1,
 2. Local `__syncthreads()` after initialization.
 3. One local mbarrier per CTA (`mbarrier_init`, expected count 1), at the
    same relative SMEM offset in both CTAs by construction.
-4. Thread 0 of each CTA: `fence.proxy.async.shared::cluster`
-   (`cuda::ptx::fence_proxy_async(cuda::ptx::space_cluster)`), publishing
-   that CTA's A/B writes and mbarrier initialization to the async proxy at
-   **cluster** scope, then local `__syncthreads()` again. See section 8 for
-   why cluster scope (not P2.1's CTA scope) is used here.
+4. Thread 0 of each CTA, in order: `fence.mbarrier_init.release.cluster`
+   (publishing THIS CTA's own mbarrier initialization to the whole cluster,
+   distinct from and required in addition to the next fence -- see the new
+   section 7.1 below), then `fence.proxy.async.shared::cluster`
+   (`cuda::ptx::fence_proxy_async(cuda::ptx::space_cluster)`, publishing
+   that CTA's A/B writes to the async proxy at **cluster** scope -- section
+   8), then local `__syncthreads()` again.
 5. Cluster synchronization (`barrier_cluster_arrive()`/`_wait()`, called by
    all 128 threads of both CTAs, mirroring `cooperative_groups::cluster_
    group::sync()`'s full-block-collective semantics) before any collective
@@ -248,9 +250,16 @@ Per kernel, in order (PTX ISA 9.3 sections 9.7.17.1.2, 9.7.17.5.1,
    elect_sync`, gated additionally by `cta_rank == 0`).
 9. Completion multicast to the two CTA-local mbarriers (`tcgen05.commit.
    cta_group::2...multicast::cluster.b64`, ctaMask `0x0003`; section 9).
-10. Completion wait executed by both CTAs' own elected leader, on that
-    CTA's own local mbarrier (`mbarrier_try_wait_parity`), never enclosed
-    in a `cta_rank == 0` condition.
+10. Completion wait, CTA-wide publish, and cluster-wide rendezvous, once
+    per mbarrier phase (i.e. inside every outer iteration, before the next
+    commit -- see the new section 10.1 below): each CTA's own elected
+    leader waits on that CTA's own local mbarrier
+    (`mbarrier_try_wait_parity`), never enclosed in a `cta_rank == 0`
+    condition; that successful wait is then published to the whole CTA
+    with `__syncthreads()`; then every non-exited thread of BOTH CTAs
+    (never just leaders, never just rank 0) rendezvouses with a full
+    cluster arrive/wait (`barrier_cluster_arrive()`/`_wait()`) before the
+    loop's back-edge.
 11. TMEM readback executed by both CTAs, every thread, never enclosed in a
     `cta_rank == 0` condition; each CTA reads only its own local 128 TMEM
     rows (section 10).
@@ -271,6 +280,53 @@ this path) and the function's natural end after step 15. Every accepted
 launch reaches all fifteen steps unconditionally. All `tcgen05` instructions
 in `umma_2sm.cu` use `cta_group::2`; no executable `cta_group::1` instruction
 exists anywhere in the file (verified by the source checker, section 14).
+
+### 7.1 The mbarrier-initialization fence: `fence.mbarrier_init.release.cluster` (repair)
+
+Step 4 issues a fence that the pre-repair implementation omitted entirely:
+`fence.mbarrier_init.release.cluster` (PTX ISA 9.3, "Parallel
+Synchronization and Communication Instructions", Membar/Fence
+Instructions). It is issued BEFORE `fence.proxy.async` (section 8), and the
+two are not interchangeable -- neither substitutes for the other:
+
+* `fence.proxy.async` publishes ORDINARY (generic-proxy) memory writes --
+  the A/B shared-memory fill of step 1 -- to the ASYNC proxy that
+  `tcgen05.mma` reads through (PTX ISA 9.3 section 9.7.17.6.5).
+* `fence.mbarrier_init.release.cluster` instead publishes the
+  INITIALIZATION performed by `mbarrier.init` itself (step 3) to every
+  thread of the cluster, so that a later arrive-on operation targeting this
+  mbarrier from the PEER CTA -- CTA rank 0's multicast
+  `tcgen05.commit...multicast::cluster` (step 9), which arrives on CTA rank
+  1's own local mbarrier at the identical relative SMEM offset (section 7)
+  -- is guaranteed to observe a fully initialized barrier object rather
+  than racing its initialization.
+
+Implementation: `fence_mbarrier_init_release_cluster()`
+(`src/compute/umma_2sm.cu`) calls the pinned CUDA 13.1.80 toolchain's
+official wrapper, `cuda::ptx::fence_mbarrier_init(cuda::ptx::sem_release,
+cuda::ptx::scope_cluster)`
+(`cuda/__ptx/instructions/generated/fence_mbarrier_init.h`, included
+transitively by the top-level `<cuda/ptx>` header via
+`cuda/__ptx/instructions/fence.h`; confirmed present in the pinned image
+and unconditionally lowering to `fence.mbarrier_init.release.cluster;` for
+`__CUDA_ARCH__ >= 900`, which `sm_103a` satisfies) -- matching this file's
+existing convention of using the official wrapper for every primitive
+genuinely covered by `<cuda/ptx>` (`mbarrier_init`, `fence_proxy_async`,
+`elect_sync`, `get_sreg_cluster_ctarank`/`_nctarank`,
+`barrier_cluster_arrive`/`_wait`, `mbarrier_try_wait_parity`); only the
+tcgen05 family (unwrapped by this pinned toolchain, Blackwell-only) uses
+hand-written inline PTX in this file. `tcgen05.wait::ld` and
+`tcgen05.fence::after_thread_sync` have no distinct SASS footprint on this
+toolchain (section 15); `fence.mbarrier_init.release.cluster` is a
+comparable pure ordering/visibility fence with no data movement, so its
+presence is proved via a mandatory, structural source check of the real
+executable call site -- never a comment or an ordinary (non-asm) string
+literal (`scripts/check_umma_2sm_sass.py`, section 14).
+
+Ordering (source-checker-enforced): `fence_mbarrier_init_release_cluster()`
+must be called after `mbarrier_init(&mbar, ...)` (step 3) and before the
+first cluster barrier that publishes CTA-local initialization to the pair
+(step 5's `barrier_cluster_arrive()`/`_wait()`).
 
 ## 8. Memory ordering: why `fence.proxy.async` is issued at cluster scope
 
@@ -377,6 +433,48 @@ mbarrier.
 joint M=256 operation, issued once per depth-position per outer iteration,
 regardless of the fact that its effects land in two CTAs' Tensor Memory.
 
+### 10.1 Why the rendezvous is required once per mbarrier phase (repair)
+
+PTX requires at least one successful `mbarrier.test_wait`/`mbarrier.
+try_wait` observation of a given mbarrier phase before any later arrive-on
+operation targets that same mbarrier again. Because
+`tcgen05.commit...multicast::cluster` (this section's completion multicast)
+arrives on BOTH CTAs' local mbarriers from CTA rank 0's leader alone, CTA
+rank 0 must not be allowed to begin mbarrier phase P+1's commit until it is
+certain CTA rank 1's leader has already SUCCESSFULLY observed phase P's
+completion -- not merely that rank 0 itself issued it. A single elected
+leader's own local `mbarrier_try_wait_parity` call proves only that ITS OWN
+CTA's local mbarrier reached the expected phase; it says nothing about the
+PEER CTA's own local mbarrier or its leader's progress.
+
+The fix (task section 3): after each outer iteration's local wait succeeds,
+that success is published to the whole CTA with `__syncthreads()`, and then
+EVERY thread of BOTH CTAs -- never just elected leaders, never just rank 0
+-- rendezvouses with a full cluster arrive/wait
+(`barrier_cluster_arrive()`/`_wait()`) before the loop's back-edge. This
+rendezvous therefore runs once per mbarrier phase (every outer iteration),
+not once after the whole loop: rank 0's leader cannot proceed past the
+cluster barrier until rank 1's leader has also reached it, which cannot
+happen until rank 1's leader has itself completed its own successful local
+wait for that same phase. Because this sequence sits between the two
+`%clock64` reads (section 12), its cost is included in the measured timed
+region -- it is a real, unavoidable part of every measured iteration, not
+an artifact excluded from the numbers.
+
+The pre-repair implementation instead placed a single
+`barrier_cluster_arrive()`/`_wait()` pair only once, AFTER the entire
+`iterations` loop had already completed, with only the elected leaders
+(not the whole cluster) executing the loop at all -- so CTA rank 0's
+leader could freely begin the next iteration's commit as soon as its OWN
+local wait succeeded, with no guarantee that CTA rank 1's leader had
+observed the PRECEDING phase's completion first. `scripts/
+check_umma_2sm_sass.py`'s source gate (section 14) now proves structurally
+that the runtime outer loop is executed uniformly by the whole cluster,
+that the CTA sync/cluster rendezvous sequence sits INSIDE that loop (never
+after it), that it is reachable by every thread (never confined to
+`is_leader` or `cta_rank == 0`), and that it follows the leader block's
+successful wait.
+
 ## 11. Correctness method
 
 Per-element validation pattern, deterministic, chosen so a wrong
@@ -435,23 +533,29 @@ Correctness must pass before any timing (AGENTS.md, section 12).
 Timed region: identical exclusion list to P2.1's (`src/compute/P2_PROTOCOL.md`
 section 12), plus the CTA-pair-specific steps: included are the `depth`
 UMMA issues per iteration (rank 0 leader only), one multicast commit per
-iteration, and the completion wait for every iteration (both CTAs' elected
-leaders). Excluded: kernel launch, A/B initialization, descriptor
-construction, mbarrier initialization, cluster synchronization around TMEM
-allocation, TMEM allocation, warm-up, reading D from TMEM, global-memory
-stores, device-to-host copy, CPU validation, cluster synchronization before
-deallocation, TMEM deallocation. Cycles are never converted to seconds or
-TFLOP/s here (P2.4 work).
+iteration, the completion wait for every iteration (both CTAs' elected
+leaders), and -- required by the per-phase handshake (section 10.1) -- the
+CTA-wide `__syncthreads()` and the full cluster `barrier_cluster_arrive()`/
+`_wait()` rendezvous that follow it every iteration, since that rendezvous
+is what actually gates when rank 0's leader may issue the next commit.
+Excluded: kernel launch, A/B initialization, descriptor construction,
+mbarrier initialization and its dedicated fence (section 7.1), cluster
+synchronization around TMEM allocation, TMEM allocation, warm-up, reading D
+from TMEM, global-memory stores, device-to-host copy, CPU validation,
+cluster synchronization before deallocation, TMEM deallocation. Cycles are
+never converted to seconds or TFLOP/s here (P2.4 work).
 
 `%clock64` is read only by CTA rank 0's elected leader thread, and only when
 `timing_mode == TimingMode::kTimed` (identical `TimingMode` untimed/timed
-split to P2.1's -- section 10.1 of `src/compute/P2_PROTOCOL.md` -- with an
-added `cta_rank == 0` conjunct): `--self-test`, pre-timing correctness
-validation, and every warm-up iteration always launch with
-`TimingMode::kUntimed`; only the per-repetition timed loop launches with
-`TimingMode::kTimed`. CTA rank 1 never reads `%clock64` and never writes
-`g_elapsed_cycles`. Both CTAs still participate in every collective
-operation and completion wait regardless of timing mode.
+split to P2.1's -- section 10.1 of `src/compute/P2_PROTOCOL.md` -- with
+added `is_leader` and `cta_rank == 0` conjuncts, both explicit in the exact
+guard `if (is_leader && cta_rank == 0 && timing_mode == TimingMode::
+kTimed)`): `--self-test`, pre-timing correctness validation, and every
+warm-up iteration always launch with `TimingMode::kUntimed`; only the
+per-repetition timed loop launches with `TimingMode::kTimed`. CTA rank 1
+never reads `%clock64` and never writes `g_elapsed_cycles`. Both CTAs still
+participate in every collective operation, completion wait, and per-phase
+cluster rendezvous regardless of timing mode.
 
 FLOP/UMMA accounting:
 
@@ -560,32 +664,64 @@ Summary of what is proved for every one of the twelve symbols:
     `is_leader` conditional.
 13. (source check) `issue_one_umma_2sm`/`commit_umma_2sm_multicast` are
     confined to a single `if (cta_rank == 0)` block nested inside the
-    leader-only region, with the exact literal mask `0x0003`; the mbarrier
-    wait and the TMEM readback loop are present but **not** confined to any
-    `cta_rank == 0` block.
+    per-iteration `if (is_leader)` block (section 7 step 10), with the exact
+    literal mask `0x0003`, and no additional issue/commit call site exists
+    anywhere else in the function; the mbarrier wait and the TMEM readback
+    loop are present but **not** confined to any `cta_rank == 0` block.
 14. (source check) a `barrier_cluster_arrive()`/`barrier_cluster_wait()`
     pair appears, textually, between the final TMEM access and
     `tcgen05_dealloc_2sm`.
 15. (source check) every timed `%clock64` read is guarded by the exact
-    conjunction `cta_rank == 0 && timing_mode == TimingMode::kTimed`, and at
-    least one call site uses `TimingMode::kUntimed`.
+    conjunction `is_leader && cta_rank == 0 && timing_mode ==
+    TimingMode::kTimed`, and at least one call site uses
+    `TimingMode::kUntimed`.
+16. (source check, repair) exact geometry: `kThreadsPerCta = 128`,
+    `kClusterCtas = 2`, `kGridBlocks = 2`, and `__launch_bounds__(128)` are
+    real constants/attributes (`__cluster_dims__(2, 1, 1)` is independently
+    required by item 9 above), and the host launch (`run_once`) actually
+    launches `spec.kernel<<<kGridBlocks, kThreadsPerCta, ...>>>` -- proving
+    `grid=(2,1,1)`/`block=(128,1,1)` from the real launch call, not merely
+    from the constants' own declared values.
+17. (source check, repair) the mbarrier-initialization fence (section 7.1):
+    a single, real `fence_mbarrier_init_release_cluster()` helper is defined
+    and its own body genuinely calls the official
+    `cuda::ptx::fence_mbarrier_init(cuda::ptx::sem_release,
+    cuda::ptx::scope_cluster)` wrapper; `umma_2sm_body` calls this helper
+    exactly once, program-ordered after `mbarrier_init(&mbar, ...)` and
+    before the first cluster barrier that publishes CTA-local
+    initialization to the pair; a separate, real `fence_proxy_async` call
+    is also present.
+18. (source check, repair) the per-phase CTA-pair handshake (section 10.1):
+    the runtime outer iteration loop (`for (int64_t it = 0; it <
+    iterations; ++it)`) is executed uniformly by the whole cluster -- never
+    nested inside `is_leader` or `cta_rank == 0`; neither `__syncthreads()`
+    nor `barrier_cluster_arrive()`/`_wait()` may appear inside the loop's
+    per-iteration `if (is_leader)` block; and, inside that same loop body,
+    after the leader block, `__syncthreads()`, then
+    `barrier_cluster_arrive()`, then `barrier_cluster_wait()`, appear in
+    that exact order.
 
-`scripts/check_umma_2sm_sass.py --self-test` exercises all of the above (69
+`scripts/check_umma_2sm_sass.py --self-test` exercises all of the above (88
 cases total): 23 SASS-contract cases (missing/extra/duplicate symbol,
 missing/incorrect-depth/non-uniformly-spaced burst, missing commit/wait/
 alloc/dealloc, non-`.2CTA` fallback forms for MMA/commit/alloc, incorrect
 `LDTM.x32` count, missing cluster-barrier evidence in two distinct forms,
 every forbidden whole-binary instruction), 4 ELF-attribute cases (accept,
 missing attribute, missing section, wrong `EIATTR_CTA_PER_CLUSTER` value),
-40 source-level positive and negative cases (every required/forbidden
-pattern individually, comment-only placement of required/forbidden text,
+58 source-level positive and negative cases (every required/forbidden
+pattern individually, comment- and ordinary-non-asm-string-literal-only
+placement of required PTX text -- so a decoy never counts as evidence --
 launch-guard structure and both ranks' status writes, A/B rank-dependence in
 both directions, collective-vs-single-lane/rank-0-only TMEM lifecycle gating
 in both directions, rank-0-confinement and the exact mask for MMA/commit
 issue, the wait/readback non-confinement, TMEM-address-vs-global-index
 separation in both directions, cluster-sync-before-dealloc, every timing-
-route defect, and both lexical-scan failure modes), and 2 mandatory-
-source-path-resolution cases.
+route defect, both lexical-scan failure modes, exact-geometry regressions,
+mbarrier-init-fence presence/body-content/ordering defects including
+comment and string decoys, and every independent per-phase-handshake
+mutation from the fourteen listed in task section 5), and 3 mandatory-
+source-path-resolution cases (including that the repaired canonical source
+itself is accepted with zero errors).
 
 ## 15. Compile-time validation methodology (this implementation's process)
 
@@ -646,8 +782,29 @@ BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
 * P2.2 is **implemented**: the real `sm_103a` binary compiled cleanly under
   the pinned CUDA 13.1.80 toolchain and passed the full SASS/ELF/source
   contract above for all twelve specializations (section 14, section 15).
+* A first independent audit of commit `e00046a415eec77663867dfd2c6691a1ab5a26d2`
+  found four blockers, all in synchronization correctness, the source
+  checker, and documentation honesty: (1) `mbarrier_init` was never followed
+  by `fence.mbarrier_init.release.cluster` (section 7.1); (2) the runtime
+  outer loop's inter-phase CTA-pair handshake was invalid -- only elected
+  leaders executed the loop, and a single cluster barrier ran once after the
+  whole loop instead of once per mbarrier phase, so CTA rank 0 could begin a
+  new commit before CTA rank 1 had observed the preceding phase's completion
+  (section 10.1); (3) `scripts/check_umma_2sm_sass.py` accepted source that
+  violated (1) and (2) and could be satisfied by non-executable decoy text;
+  (4) this document, `src/compute/P2_PROTOCOL.md`, and the `Makefile` help
+  text still described P2.2 as unimplemented. All four were remediated
+  GPU-free: the dedicated fence helper and its ordering (section 7.1), the
+  restructured per-phase handshake (section 10.1), a hardened,
+  comment/string-decoy-resistant source checker with 88 self-test cases
+  including fourteen independent adversarial mutations of the handshake and
+  geometry (section 14), and the corrected documentation here and in the
+  files above. This repair round's own remediation is GPU-free and has
+  **not** itself been independently audited.
 * P2.2 has **not** been independently audited (a static self-check, however
-  thorough, is not an audit -- AGENTS.md, `PLAN.md`).
+  thorough, is not an audit -- AGENTS.md, `PLAN.md`). This includes the
+  repair above: a fresh independent audit of the repaired implementation
+  remains pending.
 * P2.2 has **not** been verified on GB300 hardware. No `--self-test`,
   `smoke`, or `benchmark` invocation of `build/compute/umma_2sm` has been
   executed on a physical device by this implementation task; no GPU command
@@ -680,8 +837,15 @@ BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
 
 ## 18. Status
 
-* P2.2: **implemented**.
-* Independent audit: **pending**.
+* P2.2: **implemented**. A first independent audit found four blockers
+  (missing mbarrier-initialization fence, invalid per-phase CTA-pair
+  handshake, a source checker that accepted both defects, and stale
+  "unimplemented" documentation); all four were remediated GPU-free
+  (sections 7.1, 10.1, 14, and this document/`src/compute/P2_PROTOCOL.md`/
+  `Makefile`).
+* Independent audit: **pending**. The audit above found and this round
+  fixed four blockers; a fresh independent audit of the repaired
+  implementation has not yet been performed.
 * GB300 verification: **pending**.
 * Publishable result: **none**. Every CSV row P2.2 can ever emit carries
   `publishable=false` unconditionally.

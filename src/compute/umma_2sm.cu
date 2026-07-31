@@ -388,6 +388,41 @@ __device__ __forceinline__ uint32_t make_tmem_load_address(uint32_t tmem_base, i
 }
 
 // ---------------------------------------------------------------------------
+// mbarrier-initialization fence: fence.mbarrier_init.release.cluster (PTX
+// ISA 9.3, "Parallel Synchronization and Communication Instructions ->
+// Membar/Fence Instructions"). This is a DIFFERENT fence from
+// fence.proxy.async (issued separately, immediately afterward -- see step
+// 3-4 in umma_2sm_body below) and neither substitutes for the other:
+// fence.proxy.async publishes ordinary (generic-proxy) memory writes -- here,
+// the A/B shared-memory fill from step 1 -- to the ASYNC proxy that
+// tcgen05.mma reads through (PTX ISA 9.3 section 9.7.17.6.5). This fence
+// instead publishes the INITIALIZATION performed by mbarrier.init itself to
+// every thread of the cluster, so that a later arrive-on operation targeting
+// this mbarrier from the PEER CTA (CTA rank 0's multicast
+// tcgen05.commit...multicast::cluster, which arrives on CTA rank 1's own
+// local mbarrier at the identical relative SMEM offset -- P2_2_PROTOCOL.md
+// section 7) is guaranteed to observe a fully initialized barrier object
+// rather than racing its initialization.
+//
+// The pinned CUDA 13.1.80 toolchain's <cuda/ptx> header wraps this exact
+// instruction (cuda/__ptx/instructions/generated/fence_mbarrier_init.h,
+// included transitively by the top-level <cuda/ptx> header via
+// cuda/__ptx/instructions/fence.h, confirmed present in this pinned image
+// and unconditionally lowering to "fence.mbarrier_init.release.cluster;" for
+// __CUDA_ARCH__ >= 900, which sm_103a satisfies), so this helper uses the
+// official wrapper rather than hand-written inline PTX -- matching this
+// file's existing convention for every other primitive with genuine
+// <cuda/ptx> coverage (mbarrier_init, fence_proxy_async, elect_sync,
+// get_sreg_cluster_ctarank/nctarank, barrier_cluster_arrive/wait,
+// mbarrier_try_wait_parity). Only the tcgen05 family (unwrapped by this
+// pinned toolchain, Blackwell-only) uses hand-written inline PTX in this
+// file.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void fence_mbarrier_init_release_cluster() {
+    cuda::ptx::fence_mbarrier_init(cuda::ptx::sem_release, cuda::ptx::scope_cluster);
+}
+
+// ---------------------------------------------------------------------------
 // Launch contract: every visible kernel must reject any launch that is not
 // exactly grid=(2,1,1), cluster=(2,1,1), block=(128,1,1). __cluster_dims__
 // and __launch_bounds__ only constrain the compiled kernel's launch
@@ -494,24 +529,35 @@ __device__ __forceinline__ void umma_2sm_body(int64_t iterations, TimingMode tim
     // ---- Step 3-4: one local mbarrier per CTA (same relative SMEM offset -
     // ---- in both CTAs by construction: both CTAs execute this identical --
     // ---- kernel body, so the compiler lays out __shared__ variables ------
-    // ---- identically for every CTA instance), plus the required async- ---
-    // ---- proxy and mbarrier-initialization fence. fence_proxy_async is ---
-    // ---- issued at CLUSTER scope (space_cluster -> fence.proxy.async. ----
-    // ---- shared::cluster), not merely CTA scope: this CTA's own A/B -----
-    // ---- writes must become visible to the OTHER CTA's hardware, since ---
-    // ---- the joint cta_group::2 MMA (issued by CTA rank 0 only) reads ----
-    // ---- CTA rank 1's own local A at the identical relative offset -------
-    // ---- (P2_2_PROTOCOL.md section 8 documents this choice: a cluster- ---
-    // ---- scoped fence is a strict superset of a CTA-scoped one, so it is -
-    // ---- the safe choice under either reading of the CTA-pair hardware ---
-    // ---- mechanism, and it costs nothing here since it runs outside the -
-    // ---- timed region). ---------------------------------------------------
+    // ---- identically for every CTA instance), plus TWO required, ---------
+    // ---- DIFFERENT fences (see fence_mbarrier_init_release_cluster's own -
+    // ---- comment above for why one does not substitute for the other): ---
+    // ---- first fence.mbarrier_init.release.cluster, publishing THIS ------
+    // ---- mbarrier's own initialization to the cluster so the peer CTA's --
+    // ---- later arrive-on operation cannot race it; then fence.proxy.async
+    // ---- at CLUSTER scope (space_cluster -> fence.proxy.async.shared:: ---
+    // ---- cluster), not merely CTA scope: this CTA's own A/B writes must --
+    // ---- become visible to the OTHER CTA's hardware, since the joint -----
+    // ---- cta_group::2 MMA (issued by CTA rank 0 only) reads CTA rank 1's -
+    // ---- own local A at the identical relative offset (P2_2_PROTOCOL.md --
+    // ---- section 8 documents this choice: a cluster-scoped fence is a ----
+    // ---- strict superset of a CTA-scoped one, so it is the safe choice ---
+    // ---- under either reading of the CTA-pair hardware mechanism, and it -
+    // ---- costs nothing here since it runs outside the timed region). -----
+    // ---- fence.proxy.async does NOT itself publish the mbarrier's own ----
+    // ---- initialization (it fences the async proxy's view of GENERIC- ----
+    // ---- proxy memory writes -- the A/B fill from step 1 -- not the ------
+    // ---- mbarrier object's own init flag), so neither fence may be -------
+    // ---- dropped or merged into the other. --------------------------------
     if (tid == 0) {
         cuda::ptx::mbarrier_init(&mbar, 1u);
+        fence_mbarrier_init_release_cluster();
         cuda::ptx::fence_proxy_async(cuda::ptx::space_cluster);
     }
-    // Publish the mbarrier initialization and the fence's effect to every
-    // thread, including whichever thread elect_sync selects as leader below.
+    // Publish the mbarrier initialization and both fences' effects to every
+    // thread, including whichever thread elect_sync selects as leader below;
+    // the cluster rendezvous immediately below (step 5) is what publishes
+    // them on to the peer CTA before any collective TMEM operation.
     __syncthreads();
 
     bool is_leader = false;
@@ -559,15 +605,32 @@ __device__ __forceinline__ void umma_2sm_body(int64_t iterations, TimingMode tim
     // ---- section 8), matching P2.1's identical depth-burst semantic. -----
     // ---- Only CTA rank 0's leader records %clock64, and only when -------
     // ---- timing_mode == kTimed (task section 10). ------------------------
+    //
+    // ---- Required per-phase CTA-pair handshake: PTX requires at least one
+    // ---- successful test_wait/try_wait observation of a given mbarrier ---
+    // ---- phase before any later arrive-on operation (here, the NEXT ------
+    // ---- iteration's multicast commit) targets that same mbarrier again. -
+    // ---- CTA rank 0's leader must therefore not be allowed to start phase-
+    // ---- P+1's commit until it is certain CTA rank 1's leader has already-
+    // ---- SUCCESSFULLY observed phase P's completion -- not merely that ---
+    // ---- rank 0 issued it. Each CTA's own successful local wait is first -
+    // ---- published to that whole CTA with __syncthreads(), and then EVERY
+    // ---- thread of BOTH CTAs (never just leaders, never just rank 0) -----
+    // ---- rendezvouses with a full cluster arrive/wait before the loop can-
+    // ---- take its back-edge and rank 0 can issue another commit. This ----
+    // ---- sequence therefore runs once per mbarrier phase (i.e. inside ----
+    // ---- every outer iteration, before the next commit), not once after -
+    // ---- the whole loop -- and, because it sits between the two timed ----
+    // ---- clock reads below, its cost is included in the measured region. -
     unsigned long long elapsed_cycles = 0;
-    if (is_leader) {
-        uint64_t start_clock = 0, end_clock = 0;
-        uint32_t parity = 0;
+    uint64_t start_clock = 0, end_clock = 0;
+    if (is_leader && cta_rank == 0 && timing_mode == TimingMode::kTimed) {
+        asm volatile("mov.u64 %0, %%clock64;" : "=l"(start_clock) : : "memory");
+    }
 
-        if (cta_rank == 0 && timing_mode == TimingMode::kTimed) {
-            asm volatile("mov.u64 %0, %%clock64;" : "=l"(start_clock) : : "memory");
-        }
-        for (int64_t it = 0; it < iterations; ++it) {
+    uint32_t parity = 0;
+    for (int64_t it = 0; it < iterations; ++it) {
+        if (is_leader) {
             if (cta_rank == 0) {
                 issue_one_umma_2sm(tmem_d, a_desc, b_desc, idesc, /*enable_input_d=*/0);
 #pragma unroll
@@ -576,17 +639,38 @@ __device__ __forceinline__ void umma_2sm_body(int64_t iterations, TimingMode tim
                 }
                 commit_umma_2sm_multicast(mbar_addr, /*cta_mask=*/0x0003u);
             }
+
+            // Each CTA's own elected leader waits on that CTA's own local
+            // mbarrier; never enclosed in a cta_rank == 0 condition (CTA
+            // rank 1's leader must wait too, even though it never issues
+            // anything).
             while (!cuda::ptx::mbarrier_try_wait_parity(&mbar, parity)) {
             }
             parity ^= 1u;
         }
-        if (cta_rank == 0 && timing_mode == TimingMode::kTimed) {
-            asm volatile("mov.u64 %0, %%clock64;" : "=l"(end_clock) : : "memory");
-            elapsed_cycles = static_cast<unsigned long long>(end_clock - start_clock);
-        }
-        if (cta_rank == 0) {
-            g_elapsed_cycles[0] = elapsed_cycles;
-        }
+
+        // Publish this CTA's successful local wait to every thread of this
+        // CTA (the other 127 threads have no wait of their own to publish,
+        // but must still rendezvous here so the cluster barrier below is
+        // reached uniformly by the whole CTA).
+        __syncthreads();
+
+        // Every non-exited thread in BOTH CTAs participates here -- not
+        // just leaders, not just rank 0. Rank 0 cannot start the next
+        // iteration's commit until this cluster barrier releases, which
+        // cannot happen until CTA rank 1's leader has also reached it,
+        // which in turn cannot happen until CTA rank 1's leader has itself
+        // successfully observed this phase's completion above.
+        cuda::ptx::barrier_cluster_arrive();
+        cuda::ptx::barrier_cluster_wait();
+    }
+
+    if (is_leader && cta_rank == 0 && timing_mode == TimingMode::kTimed) {
+        asm volatile("mov.u64 %0, %%clock64;" : "=l"(end_clock) : : "memory");
+        elapsed_cycles = static_cast<unsigned long long>(end_clock - start_clock);
+    }
+    if (is_leader && cta_rank == 0) {
+        g_elapsed_cycles[0] = elapsed_cycles;
     }
 
     // ---- Step 11: untimed TMEM readback, executed by BOTH CTAs, every ----

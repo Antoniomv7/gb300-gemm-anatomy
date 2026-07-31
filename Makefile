@@ -170,7 +170,9 @@ help:
 	@echo "  -- P2.1 1-SM BF16 UMMA (tcgen05.mma, kind::f16, cta_group::1; see"
 	@echo "     src/compute/P2_PROTOCOL.md; implemented, independently audited,"
 	@echo "     functionally verified on GB300, no publishable result;"
-	@echo "     P2.2-P2.4 not implemented) --"
+	@echo "     P2.2 implemented; independent re-audit pending; GB300 verification"
+	@echo "     pending. P2.3 and P2.4 not implemented. No publishable P2.2 result"
+	@echo "     exists.) --"
 	@echo "  GPU-free build/SASS/check (no GPU, no network):"
 	@echo "  make compute-umma-1sm-build    Compile the twelve P2.1 specializations. No GPU."
 	@echo "  make compute-umma-1sm-sass     Disassemble and verify the real cubin: exactly"
@@ -447,6 +449,20 @@ check-static:
 	@grep -Fq '* Independent audit: **pending**.' $(COMPUTE_UMMA_2SM_PROTOCOL)
 	@grep -Fq '* GB300 verification: **pending**.' $(COMPUTE_UMMA_2SM_PROTOCOL)
 	@grep -Fq '* Publishable result: **none**.' $(COMPUTE_UMMA_2SM_PROTOCOL)
+	@echo "== P2.2 repair (audit round 1): stale 'unimplemented' phrases cannot silently return =="
+	@grep -Fq 'P2.2 implemented; independent re-audit pending; GB300 verification pending.' Makefile
+	@! grep -F "P2.2's unimplemented scope" $(COMPUTE_UMMA_1SM_PROTOCOL)
+	@! grep -F 'P2.2 (unimplemented, 12 configs)' $(COMPUTE_UMMA_1SM_PROTOCOL)
+	@! grep -F 'P2.2 (2-SM), P2.3 (joint sweep), and P2.4 (profiling/ceiling) remain' $(COMPUTE_UMMA_1SM_PROTOCOL)
+	@! grep -F '* P2.2, P2.3, P2.4: **not implemented**.' $(COMPUTE_UMMA_1SM_PROTOCOL)
+	@echo "== P2.2 repair (audit round 1): mbarrier-init fence cannot silently regress =="
+	@grep -Fq 'fence_mbarrier_init_release_cluster' $(COMPUTE_UMMA_2SM_SRC)
+	@grep -Fq 'fence.mbarrier_init.release.cluster' $(COMPUTE_UMMA_2SM_SRC)
+	@grep -Fq 'fence_mbarrier_init_release_cluster' $(COMPUTE_UMMA_2SM_PROTOCOL)
+	@grep -Fq 'fence.mbarrier_init.release.cluster' $(COMPUTE_UMMA_2SM_PROTOCOL)
+	@echo "== P2.2 repair (audit round 1): per-phase CTA-pair handshake cannot silently regress =="
+	@grep -Fq 'is_leader && cta_rank == 0 && timing_mode == TimingMode::kTimed' $(COMPUTE_UMMA_2SM_SRC)
+	@test "$$(grep -coE 'if \(is_leader && cta_rank == 0 && timing_mode == TimingMode::kTimed\)' $(COMPUTE_UMMA_2SM_SRC))" -eq 2
 	@echo "check-static: OK"
 
 build-image:

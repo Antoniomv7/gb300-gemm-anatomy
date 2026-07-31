@@ -158,18 +158,20 @@ FORBIDDEN_PATTERNS = (
 
 FORBIDDEN_SOURCE_PATTERNS = (
     (re.compile(r"cta_group::1\b"), "cta_group::1"),
-    (re.compile(r"multicast::cluster", re.IGNORECASE), None),  # handled positively below; not forbidden
-)
-# The above placeholder is intentionally unused as a forbidden entry (P2.2
-# REQUIRES multicast::cluster); keep FORBIDDEN_SOURCE_PATTERNS limited to
-# genuinely forbidden text.
-FORBIDDEN_SOURCE_PATTERNS = (
-    (re.compile(r"cta_group::1\b"), "cta_group::1"),
     (re.compile(r"\.kind::(?!f16\b)[a-z0-9_]+"), "a non-kind::f16 MMA kind"),
     (re.compile(r"\.sp\b"), "a sparse (.sp) MMA form"),
     (re.compile(r"block_scale"), "block_scale"),
 )
-REQUIRED_SOURCE_PATTERNS = (
+
+# Required PTX-mnemonic text. Real occurrences of every one of these live
+# inside a C++ string literal passed as the template operand of a genuine
+# `asm`/`asm volatile(...)` statement. A mnemonic placed only in a comment
+# (already stripped upstream) or an ordinary, non-asm string literal (e.g. a
+# decoy `const char*`) must NOT satisfy the check -- so these are matched
+# only against text that falls inside a real asm-statement operand span (see
+# find_asm_string_operand_spans/pattern_has_asm_evidence below), never
+# against the raw comment-stripped text directly.
+REQUIRED_ASM_EVIDENCE_PATTERNS = (
     (re.compile(r"tcgen05\.wait::ld\.sync\.aligned"), "tcgen05.wait::ld.sync.aligned"),
     (re.compile(r"tcgen05\.fence::after_thread_sync"), "tcgen05.fence::after_thread_sync"),
     (re.compile(r"tcgen05\.mma\.cta_group::2\.kind::f16"), "tcgen05.mma.cta_group::2.kind::f16"),
@@ -182,13 +184,33 @@ REQUIRED_SOURCE_PATTERNS = (
      "tcgen05.dealloc.cta_group::2.sync.aligned.b32"),
     (re.compile(r"tcgen05\.relinquish_alloc_permit\.cta_group::2\.sync\.aligned"),
      "tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned"),
+)
+
+# Required C++ identifiers/attributes (never meant to live inside a string
+# literal in genuine code). Matched against the string-masked view (see
+# mask_string_and_char_literals below) so a decoy string containing the same
+# identifier text cannot satisfy the check.
+REQUIRED_IDENTIFIER_PATTERNS = (
     (re.compile(r"__cluster_dims__\s*\(\s*2\s*,\s*1\s*,\s*1\s*\)"), "__cluster_dims__(2, 1, 1)"),
     (re.compile(r"get_sreg_cluster_ctarank"), "cuda::ptx::get_sreg_cluster_ctarank"),
     (re.compile(r"get_sreg_cluster_nctarank"), "cuda::ptx::get_sreg_cluster_nctarank"),
     (re.compile(r"barrier_cluster_arrive"), "cuda::ptx::barrier_cluster_arrive"),
     (re.compile(r"barrier_cluster_wait"), "cuda::ptx::barrier_cluster_wait"),
     (re.compile(r"0x0003u?\b"), "the exact multicast CTA mask 0x0003"),
+    (re.compile(r"\bfence_mbarrier_init_release_cluster\s*\("),
+     "an executable fence_mbarrier_init_release_cluster() call"),
 )
+
+# Exact geometry (task section 4, "Exact geometry"). Matched against the
+# string-masked view for the same decoy-resistance reason as
+# REQUIRED_IDENTIFIER_PATTERNS.
+GEOMETRY_CONSTANT_PATTERNS = (
+    (re.compile(r"\bconstexpr\s+int\s+kThreadsPerCta\s*=\s*128\s*;"), "constexpr int kThreadsPerCta = 128;"),
+    (re.compile(r"\bconstexpr\s+int\s+kClusterCtas\s*=\s*2\s*;"), "constexpr int kClusterCtas = 2;"),
+    (re.compile(r"\bconstexpr\s+int\s+kGridBlocks\s*=\s*2\s*;"), "constexpr int kGridBlocks = 2;"),
+    (re.compile(r"__launch_bounds__\s*\(\s*128\s*\)"), "__launch_bounds__(128)"),
+)
+HOST_LAUNCH_PATTERN = re.compile(r"spec\.kernel\s*<<<\s*kGridBlocks\s*,\s*kThreadsPerCta\s*[,>]")
 
 DEFAULT_SOURCE_RELATIVE_PARTS = ("src", "compute", "umma_2sm.cu")
 
@@ -267,6 +289,100 @@ def strip_comments_preserving_literals(source_text: str) -> str:
         out.append(c)
         i += 1
     return "".join(out)
+
+
+def mask_string_and_char_literals(code_with_strings: str) -> str:
+    """Return ``code_with_strings`` (already comment-stripped) with the
+    CONTENTS of every string/character literal replaced by a neutral filler
+    character, same length and quote positions preserved, so a required- or
+    forbidden- C++ identifier/attribute pattern can never be satisfied by a
+    decoy string literal (e.g. ``const char* x = "get_sreg_cluster_ctarank";``
+    or ``"fence_mbarrier_init_release_cluster()"``) while genuine code
+    identifiers, control flow, and asm(...) call syntax are left completely
+    untouched. Positions are therefore identical between this view and
+    ``code_with_strings`` -- callers that need brace/structure matching may
+    use either interchangeably.
+
+    This view must NOT be used for checks that legitimately need to see PTX
+    text inside an asm string operand (e.g. the %clock64 reads or any
+    tcgen05.* mnemonic): use find_asm_string_operand_spans/
+    pattern_has_asm_evidence for those instead.
+    """
+    chars = list(code_with_strings)
+    i = 0
+    n = len(code_with_strings)
+    while i < n:
+        c = code_with_strings[i]
+        if c in ("\"", "'"):
+            quote = c
+            j = i + 1
+            while j < n:
+                if code_with_strings[j] == "\\" and j + 1 < n:
+                    chars[j] = "#"
+                    chars[j + 1] = "#"
+                    j += 2
+                    continue
+                if code_with_strings[j] == quote:
+                    j += 1
+                    break
+                chars[j] = "#"
+                j += 1
+            i = j
+            continue
+        i += 1
+    return "".join(chars)
+
+
+ASM_CALL_PATTERN = re.compile(r"\basm(?:\s+volatile)?\s*\(")
+
+
+def find_asm_string_operand_spans(code_with_strings: str) -> list[tuple[int, int]]:
+    """Return the (start, end) character spans, within ``code_with_strings``
+    (comment-stripped, strings preserved), of every string-literal PTX
+    template operand of a real ``asm``/``asm volatile(...)`` statement --
+    i.e. the text ptxas/nvcc actually sees, not the surrounding C++ call
+    syntax. Adjacent (C++-concatenated) string literals immediately after
+    ``asm(``/``asm volatile(`` are all included. An ``asm(`` not
+    immediately followed by a string literal contributes no span.
+    """
+    spans: list[tuple[int, int]] = []
+    n = len(code_with_strings)
+    for m in ASM_CALL_PATTERN.finditer(code_with_strings):
+        i = m.end()
+        while i < n and code_with_strings[i] in " \t\r\n":
+            i += 1
+        while i < n and code_with_strings[i] == '"':
+            start = i
+            j = i + 1
+            while j < n:
+                if code_with_strings[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if code_with_strings[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            spans.append((start, j))
+            i = j
+            while i < n and code_with_strings[i] in " \t\r\n":
+                i += 1
+    return spans
+
+
+def pattern_has_asm_evidence(
+    pattern: re.Pattern, code_with_strings: str, asm_spans: list[tuple[int, int]]
+) -> bool:
+    """True only if ``pattern`` matches text lying entirely within one of
+    ``asm_spans`` -- i.e. genuinely inside the string-literal PTX-template
+    operand of a real asm/asm volatile(...) statement. A match inside a
+    comment (already stripped upstream) or an ordinary, non-asm string
+    literal does not count.
+    """
+    for match in pattern.finditer(code_with_strings):
+        for start, end in asm_spans:
+            if start <= match.start() and match.end() <= end:
+                return True
+    return False
 
 
 class SourceStructureError(Exception):
@@ -376,6 +492,24 @@ SELF_TEST_DEFINITION = re.compile(
 MAIN_DEFINITION = re.compile(
     r"\bint\s+main\s*\([^;{}]*\)\s*\{", re.DOTALL
 )
+FENCE_MBARRIER_INIT_DEFINITION = re.compile(
+    r"\bvoid\s+fence_mbarrier_init_release_cluster\s*\(\s*\)\s*\{", re.DOTALL
+)
+
+# Per-phase CTA-pair handshake structure (task sections 3-4).
+ITERATION_LOOP_HEADER = re.compile(
+    r"\bfor\s*\(\s*int64_t\s+it\s*=\s*0\s*;\s*it\s*<\s*iterations\s*;\s*\+\+it\s*\)\s*\{",
+    re.DOTALL,
+)
+LEADER_BLOCK_HEADER = re.compile(r"\bif\s*\(\s*is_leader\s*\)\s*\{", re.DOTALL)
+RANK0_BLOCK_HEADER = re.compile(r"\bif\s*\(\s*cta_rank\s*==\s*0\s*\)\s*\{", re.DOTALL)
+SYNCTHREADS_PATTERN = re.compile(r"__syncthreads\s*\(\s*\)")
+CLUSTER_ARRIVE_PATTERN = re.compile(r"barrier_cluster_arrive\s*\(\s*\)")
+CLUSTER_WAIT_PATTERN = re.compile(r"barrier_cluster_wait\s*\(\s*\)")
+
+
+def _span_contains(span: tuple[int, int], pos: int) -> bool:
+    return span[0] <= pos < span[1]
 
 
 def check_launch_guard_ordering(code_only: str) -> list[str]:
@@ -563,79 +697,294 @@ def check_collective_tmem_lifecycle(code_only: str) -> list[str]:
     return errors
 
 
-def check_rank0_only_issue(code_only: str) -> list[str]:
-    """(task section 12: "Rank-0-only MMA and commit issue", "Exact
-    multicast mask 0x0003", "Wait and readback in both CTAs") Prove
-    issue_one_umma_2sm/commit_umma_2sm_multicast are lexically confined to an
-    'if (cta_rank == 0)' block nested inside 'if (is_leader)', that the
-    multicast mask is the literal 0x0003u, and that the mbarrier wait and
-    the TMEM readback loop are NOT confined to any cta_rank == 0 block.
+def check_exact_geometry(masked: str) -> list[str]:
+    """(task section 4, "Exact geometry") Prove kGridBlocks=2,
+    kThreadsPerCta=128, kClusterCtas=2, and __launch_bounds__(128) as real
+    constants/attributes, and that the host launch (run_once) actually uses
+    kGridBlocks/kThreadsPerCta as its <<<grid, block>>> launch configuration
+    (grid=(2,1,1), block=(128,1,1)). __cluster_dims__(2, 1, 1) (the
+    compile-time cluster=(2,1,1) declaration) is separately required by
+    REQUIRED_IDENTIFIER_PATTERNS and the device-side launch guard's
+    dependence on cluster_nctarank/cluster_ctarank is separately proved by
+    check_launch_guard_ordering. Matched against the string-masked view so a
+    decoy string cannot satisfy any of these.
+    """
+    errors: list[str] = []
+    for pattern, description in GEOMETRY_CONSTANT_PATTERNS:
+        if not pattern.search(masked):
+            errors.append(f"source is missing required geometry constant: {description}")
+    if not HOST_LAUNCH_PATTERN.search(masked):
+        errors.append(
+            "the host launch (run_once) must launch spec.kernel<<<kGridBlocks, "
+            "kThreadsPerCta, ...>>> -- the exact grid=(2,1,1)/block=(128,1,1) launch contract"
+        )
+    return errors
+
+
+def check_mbarrier_init_fence(masked: str) -> list[str]:
+    """(task sections 2 and 4, "Fence ordering") Prove:
+      * a single, real fence_mbarrier_init_release_cluster() helper is
+        defined, and its own body genuinely calls
+        cuda::ptx::fence_mbarrier_init(cuda::ptx::sem_release,
+        cuda::ptx::scope_cluster) -- the official CUDA 13.1 wrapper that
+        lowers unconditionally to "fence.mbarrier_init.release.cluster;" on
+        sm_103a (see that helper's own comment in umma_2sm.cu);
+      * umma_2sm_body calls this helper exactly once;
+      * that call is program-ordered after mbarrier_init(&mbar, ...) and
+        before the FIRST cluster barrier (the one that publishes CTA-local
+        initialization to the pair, i.e. step 5's barrier_cluster_arrive());
+      * a separate, real fence_proxy_async call is also present (the
+        independently required async-proxy fence).
+    Matched against the string-masked view so neither a comment nor a decoy
+    string can satisfy any part of this.
     """
     errors: list[str] = []
     try:
-        umma_body, _, _ = extract_single_function_body(
-            code_only, UMMA_BODY_DEFINITION, "umma_2sm_body"
+        fence_body, _, _ = extract_single_function_body(
+            masked, FENCE_MBARRIER_INIT_DEFINITION, "fence_mbarrier_init_release_cluster"
         )
     except SourceStructureError as exc:
-        return [f"invalid rank-0-issue check: {exc}"]
-
-    leader_header = re.compile(r"\bif\s*\(\s*is_leader\s*\)\s*\{", re.DOTALL)
-    try:
-        leader_body, _, _ = extract_single_control_block(umma_body, leader_header, "leader timed-region")
-    except SourceStructureError as exc:
-        errors.append(f"cannot locate the leader-only timed region: {exc}")
+        errors.append(f"invalid mbarrier-init fence helper: {exc}")
         return errors
 
-    rank0_header = re.compile(r"\bif\s*\(\s*cta_rank\s*==\s*0\s*\)\s*\{", re.DOTALL)
-    rank0_matches = list(rank0_header.finditer(leader_body))
-    issue_in_rank0 = False
+    if not re.search(
+        r"fence_mbarrier_init\s*\(\s*(?:cuda::ptx::)?sem_release\s*,\s*(?:cuda::ptx::)?scope_cluster\s*\)",
+        fence_body,
+    ):
+        errors.append(
+            "fence_mbarrier_init_release_cluster() must call cuda::ptx::fence_mbarrier_init"
+            "(cuda::ptx::sem_release, cuda::ptx::scope_cluster) (the official wrapper that "
+            "lowers to fence.mbarrier_init.release.cluster)"
+        )
+
+    try:
+        umma_body, _, _ = extract_single_function_body(masked, UMMA_BODY_DEFINITION, "umma_2sm_body")
+    except SourceStructureError as exc:
+        errors.append(f"invalid mbarrier-init fence ordering check: {exc}")
+        return errors
+
+    fence_calls = list(re.finditer(r"\bfence_mbarrier_init_release_cluster\s*\(\s*\)", umma_body))
+    if len(fence_calls) != 1:
+        errors.append(
+            "umma_2sm_body must call fence_mbarrier_init_release_cluster() exactly once, "
+            f"found {len(fence_calls)}"
+        )
+        return errors
+
+    mbarrier_init_match = re.search(r"\bmbarrier_init\s*\(\s*&mbar\b", umma_body)
+    if not mbarrier_init_match:
+        errors.append("umma_2sm_body must call mbarrier_init(&mbar, ...)")
+        return errors
+
+    arrive_match = CLUSTER_ARRIVE_PATTERN.search(umma_body)
+    if not arrive_match:
+        errors.append("umma_2sm_body must call barrier_cluster_arrive() at least once")
+        return errors
+
+    if not (mbarrier_init_match.start() < fence_calls[0].start() < arrive_match.start()):
+        errors.append(
+            "fence_mbarrier_init_release_cluster() must be called after mbarrier_init(&mbar, ...) "
+            "and before the first cluster barrier that publishes CTA-local initialization to the pair"
+        )
+
+    if not re.search(r"\bfence_proxy_async\s*\(", umma_body):
+        errors.append("umma_2sm_body must separately call fence_proxy_async(...) (the async-proxy fence)")
+
+    return errors
+
+
+def check_iteration_structure(masked: str) -> list[str]:
+    """(task sections 3-4: per-phase CTA-pair handshake; MMA/commit
+    dominance) All checks anchored on the single runtime outer iteration
+    loop in umma_2sm_body, working in that function's own absolute text
+    coordinates (regex ``pos``/``endpos``, never re-slicing) so nested spans
+    can be compared directly:
+
+      * the loop is executed uniformly by the whole cluster (never nested
+        inside is_leader or cta_rank == 0);
+      * issue_one_umma_2sm/commit_umma_2sm_multicast each appear EXACTLY
+        ONCE in the whole function, both confined to a single
+        'if (cta_rank == 0) { ... }' block nested inside the loop's single
+        'if (is_leader) { ... }' block, with the exact literal mask 0x0003;
+      * the mbarrier wait is present inside that is_leader block but NOT
+        nested inside any cta_rank == 0 block;
+      * neither __syncthreads() nor the cluster arrive/wait may appear
+        inside the is_leader block;
+      * __syncthreads(), then barrier_cluster_arrive(), then
+        barrier_cluster_wait(), appear (in that order) inside the loop body,
+        after the is_leader block;
+      * the TMEM readback loop, after the iteration loop, is not re-confined
+        to a cta_rank == 0 block.
+    Matched against the string-masked view for decoy resistance.
+    """
+    errors: list[str] = []
+    try:
+        umma_body, _, _ = extract_single_function_body(masked, UMMA_BODY_DEFINITION, "umma_2sm_body")
+    except SourceStructureError as exc:
+        return [f"invalid iteration-structure check: {exc}"]
+
+    loop_headers = list(ITERATION_LOOP_HEADER.finditer(umma_body))
+    if len(loop_headers) != 1:
+        errors.append(
+            "umma_2sm_body must contain exactly one runtime outer iteration loop "
+            f"('for (int64_t it = 0; it < iterations; ++it)'), found {len(loop_headers)}"
+        )
+        return errors
+    loop_open = loop_headers[0].end() - 1
+    try:
+        loop_close = find_matching_brace(umma_body, loop_open)
+    except SourceStructureError as exc:
+        errors.append(f"cannot validate the runtime outer iteration loop body: {exc}")
+        return errors
+    loop_body_start, loop_body_end = loop_open + 1, loop_close
+
+    for header_pat, label in ((LEADER_BLOCK_HEADER, "is_leader"), (RANK0_BLOCK_HEADER, "cta_rank == 0")):
+        for match in header_pat.finditer(umma_body, 0, loop_open):
+            try:
+                close = find_matching_brace(umma_body, match.end() - 1)
+            except SourceStructureError:
+                continue
+            if close > loop_open:
+                errors.append(
+                    "the runtime outer iteration loop must not be nested inside an "
+                    f"'{label}' conditional; it must be executed uniformly by the whole cluster"
+                )
+
+    leader_headers = list(LEADER_BLOCK_HEADER.finditer(umma_body, loop_body_start, loop_body_end))
+    if len(leader_headers) != 1:
+        errors.append(
+            "the runtime outer iteration loop must contain exactly one "
+            f"'if (is_leader) {{ ... }}' block, found {len(leader_headers)}"
+        )
+        return errors
+    leader_open = leader_headers[0].end() - 1
+    try:
+        leader_close = find_matching_brace(umma_body, leader_open)
+    except SourceStructureError as exc:
+        errors.append(f"cannot validate the per-iteration leader block: {exc}")
+        return errors
+    leader_span = (leader_open + 1, leader_close)
+
+    # ---- MMA/commit dominance (task section 4; mutations 6-7) ------------
+    # issue_one_umma_2sm legitimately appears at TWO call sites in the
+    # canonical source (the enable-input-d=false UMMA 0, then the
+    # #pragma-unrolled UMMA 1..DEPTH-1 loop), both inside the same
+    # rank-0-nested-in-leader block; commit_umma_2sm_multicast appears at
+    # exactly one. The dominance requirement is therefore "every call site
+    # (whatever its count) lies inside that single block", not "exactly
+    # one call site" -- an extra call ANYWHERE outside that block is what
+    # must be rejected (mutations 6-7).
+    all_issue = list(re.finditer(r"\bissue_one_umma_2sm\s*\(", umma_body))
+    all_commit = list(re.finditer(r"\bcommit_umma_2sm_multicast\s*\(", umma_body))
+    if not all_issue:
+        errors.append("umma_2sm_body must contain at least one issue_one_umma_2sm(...) call site")
+    if len(all_commit) != 1:
+        errors.append(
+            f"umma_2sm_body must contain exactly one commit_umma_2sm_multicast(...) call "
+            f"site, found {len(all_commit)}"
+        )
+
+    rank0_span: tuple[int, int] | None = None
     mask_ok = False
-    for match in rank0_matches:
+    for match in RANK0_BLOCK_HEADER.finditer(umma_body, leader_span[0], leader_span[1]):
         try:
-            close = find_matching_brace(leader_body, match.end() - 1)
+            close = find_matching_brace(umma_body, match.end() - 1)
         except SourceStructureError:
             continue
-        scoped = leader_body[match.end():close]
-        if "issue_one_umma_2sm" in scoped and "commit_umma_2sm_multicast" in scoped:
-            issue_in_rank0 = True
-            if re.search(r"commit_umma_2sm_multicast\s*\(\s*mbar_addr\s*,\s*/\*[^*]*\*/\s*0x0003u\s*\)", scoped) or \
-               re.search(r"commit_umma_2sm_multicast\s*\([^;]*0x0003u?\b", scoped, re.DOTALL):
+        span = (match.end(), close)
+        if any(_span_contains(span, m.start()) for m in all_issue) and \
+           any(_span_contains(span, m.start()) for m in all_commit):
+            rank0_span = span
+            if re.search(r"commit_umma_2sm_multicast\s*\([^;]*0x0003u?\b", umma_body[span[0]:span[1]], re.DOTALL):
                 mask_ok = True
-    if not issue_in_rank0:
+            break
+    if rank0_span is None:
         errors.append(
-            "issue_one_umma_2sm and commit_umma_2sm_multicast must both be issued from a single "
-            "'if (cta_rank == 0)' block nested inside the leader-only region"
+            "issue_one_umma_2sm and commit_umma_2sm_multicast must both be issued from a "
+            "single 'if (cta_rank == 0) { ... }' block nested inside the per-iteration "
+            "'if (is_leader)' block"
         )
-    if not mask_ok:
-        errors.append("commit_umma_2sm_multicast must be called with the exact literal CTA mask 0x0003")
+    else:
+        if not mask_ok:
+            errors.append("commit_umma_2sm_multicast must be called with the exact literal CTA mask 0x0003")
+        if any(not _span_contains(rank0_span, m.start()) for m in all_issue):
+            errors.append(
+                "issue_one_umma_2sm must be confined to the rank-0-nested-in-leader block; "
+                "no additional issue call site is permitted"
+            )
+        if any(not _span_contains(rank0_span, m.start()) for m in all_commit):
+            errors.append(
+                "commit_umma_2sm_multicast must be confined to the rank-0-nested-in-leader "
+                "block; no additional commit call site is permitted"
+            )
 
-    # The wait must be present in the leader body but OUTSIDE every
-    # 'if (cta_rank == 0)' block (i.e. at the leader_body's own top level).
-    stripped_of_rank0_blocks = leader_body
-    for match in reversed(rank0_matches):
-        try:
-            close = find_matching_brace(leader_body, match.end() - 1)
-        except SourceStructureError:
-            continue
-        stripped_of_rank0_blocks = (
-            stripped_of_rank0_blocks[:match.start()] + stripped_of_rank0_blocks[close + 1:]
-        )
-    if "mbarrier_try_wait_parity" not in stripped_of_rank0_blocks:
+    # ---- Wait must remain reachable in both CTA ranks (mutation 14) ------
+    wait_matches = list(re.finditer(r"\bmbarrier_try_wait_parity\s*\(", umma_body))
+    leader_waits = [m for m in wait_matches if _span_contains(leader_span, m.start())]
+    if not leader_waits:
         errors.append(
-            "the mbarrier completion wait must not be enclosed in a cta_rank == 0 condition"
+            "the mbarrier completion wait must be present inside the per-iteration "
+            "'if (is_leader)' block"
+        )
+    elif rank0_span is not None and any(_span_contains(rank0_span, m.start()) for m in leader_waits):
+        errors.append(
+            "the mbarrier completion wait must not be enclosed in a cta_rank == 0 condition "
+            "(CTA rank 1's leader must wait too)"
         )
 
-    # The TMEM readback loop (after the leader block) must not be re-guarded
-    # by cta_rank == 0 anywhere between the leader block and the end of the
-    # function.
-    after_leader = umma_body[umma_body.find(leader_body) + len(leader_body):]
-    readback_rank0_guard = re.compile(
-        r"\bif\s*\(\s*cta_rank\s*==\s*0\s*\)\s*\{[^{}]*tcgen05_ld_32x32b_x32", re.DOTALL
-    )
-    if readback_rank0_guard.search(after_leader):
-        errors.append("the TMEM readback loop must not be enclosed in a cta_rank == 0 condition")
-    if "tcgen05_ld_32x32b_x32" not in after_leader:
-        errors.append("the TMEM readback loop must be present after the timed region")
+    # ---- Neither may live inside is_leader (mutation 13) -----------------
+    for pattern, label in (
+        (SYNCTHREADS_PATTERN, "__syncthreads()"),
+        (CLUSTER_ARRIVE_PATTERN, "barrier_cluster_arrive()"),
+        (CLUSTER_WAIT_PATTERN, "barrier_cluster_wait()"),
+    ):
+        if pattern.search(umma_body, leader_span[0], leader_span[1]):
+            errors.append(
+                f"{label} must not be issued from inside the per-iteration 'if (is_leader)' "
+                "block; it must be reachable by every thread"
+            )
+
+    # ---- CTA sync, then full cluster rendezvous, in order, inside the ----
+    # ---- loop body, after the leader block (mutations 9, 10, 11, 12). ----
+    sync_match = SYNCTHREADS_PATTERN.search(umma_body, leader_close + 1, loop_body_end)
+    if not sync_match:
+        errors.append(
+            "the runtime outer iteration loop must contain a __syncthreads() call, after the "
+            "per-iteration leader block, inside every outer iteration -- publishing the "
+            "successful local wait to the whole CTA"
+        )
+        return errors
+    arrive_match = CLUSTER_ARRIVE_PATTERN.search(umma_body, sync_match.end(), loop_body_end)
+    if not arrive_match:
+        errors.append(
+            "the runtime outer iteration loop must contain a barrier_cluster_arrive() call, "
+            "after the post-wait __syncthreads(), inside every outer iteration"
+        )
+        return errors
+    cluster_wait_match = CLUSTER_WAIT_PATTERN.search(umma_body, arrive_match.end(), loop_body_end)
+    if not cluster_wait_match:
+        errors.append(
+            "the runtime outer iteration loop must contain a barrier_cluster_wait() call, "
+            "after barrier_cluster_arrive(), inside every outer iteration"
+        )
+        return errors
+
+    # ---- Readback, after the loop, must remain reachable by both ranks. --
+    after_loop_start = loop_body_end + 1
+    readback_match = re.search(r"\btcgen05_ld_32x32b_x32\s*\(", umma_body[after_loop_start:])
+    if not readback_match:
+        errors.append("the TMEM readback loop must be present after the runtime outer iteration loop")
+    else:
+        readback_pos = after_loop_start + readback_match.start()
+        for match in RANK0_BLOCK_HEADER.finditer(umma_body, after_loop_start):
+            try:
+                close = find_matching_brace(umma_body, match.end() - 1)
+            except SourceStructureError:
+                continue
+            if _span_contains((match.end(), close), readback_pos):
+                errors.append("the TMEM readback loop must not be enclosed in a cta_rank == 0 condition")
+                break
+
     return errors
 
 
@@ -690,7 +1039,7 @@ def check_timing_routing(code_only: str) -> list[str]:
         )
 
     timed_guard_pattern = re.compile(
-        r"\bif\s*\(\s*cta_rank\s*==\s*0\s*&&\s*timing_mode\s*==\s*TimingMode::kTimed\s*\)\s*\{",
+        r"\bif\s*\(\s*is_leader\s*&&\s*cta_rank\s*==\s*0\s*&&\s*timing_mode\s*==\s*TimingMode::kTimed\s*\)\s*\{",
         re.DOTALL,
     )
     timed_guard_matches = list(timed_guard_pattern.finditer(umma_body))
@@ -698,7 +1047,8 @@ def check_timing_routing(code_only: str) -> list[str]:
     if len(timed_guard_matches) != 2:
         errors.append(
             f"umma_2sm_body contains {len(timed_guard_matches)} exact "
-            "'cta_rank == 0 && timing_mode == TimingMode::kTimed' guard(s); expected exactly two"
+            "'is_leader && cta_rank == 0 && timing_mode == TimingMode::kTimed' guard(s); "
+            "expected exactly two"
         )
     for match in timed_guard_matches:
         try:
@@ -714,7 +1064,7 @@ def check_timing_routing(code_only: str) -> list[str]:
         ]
         if len(containing_scopes) != 1:
             errors.append(
-                "a %clock64 read is outside an exact 'cta_rank == 0 && "
+                "a %clock64 read is outside an exact 'is_leader && cta_rank == 0 && "
                 "timing_mode == TimingMode::kTimed' lexical scope"
             )
 
@@ -804,26 +1154,50 @@ def check_timing_routing(code_only: str) -> list[str]:
 
 def check_source(source_text: str) -> list[str]:
     """Full source-level contract: comment/literal-aware forbidden/required
-    PTX text, per-rank mapping, collective TMEM lifecycle, rank-0-only
-    issue, cluster-sync-before-dealloc, and timing-mode routing. Fails
-    closed (non-empty list) if the lexical scan itself cannot be trusted.
+    PTX text (as genuine asm evidence), exact geometry, the
+    mbarrier-initialization fence and its ordering, per-rank mapping,
+    collective TMEM lifecycle, the per-phase CTA-pair handshake and
+    MMA/commit dominance, cluster-sync-before-dealloc, and timing-mode
+    routing. Fails closed (non-empty list) if the lexical scan itself
+    cannot be trusted.
+
+    Two decoy-resistant views are derived from the comment-stripped,
+    literal-preserving ``code_only`` text (see module docstring):
+    ``masked`` blanks out every string/char literal's CONTENTS (so a
+    required/forbidden C++ identifier or attribute can never be satisfied by
+    a decoy string) and ``asm_spans`` locates the genuine string-literal
+    operand of every real asm/asm volatile(...) statement (so a required PTX
+    mnemonic can never be satisfied by a comment or an ordinary, non-asm
+    string literal). Checks that legitimately need to see PTX text inside an
+    asm operand (e.g. %clock64) still use ``code_only`` directly.
     """
     try:
         code_only = strip_comments_preserving_literals(source_text)
     except SourceScanError as exc:
         return [f"cannot safely scan source: {exc}"]
 
+    masked = mask_string_and_char_literals(code_only)
+    asm_spans = find_asm_string_operand_spans(code_only)
+
     errors: list[str] = []
     for pattern, description in FORBIDDEN_SOURCE_PATTERNS:
         if pattern.search(code_only):
             errors.append(f"source contains forbidden pattern: {description}")
-    for pattern, description in REQUIRED_SOURCE_PATTERNS:
-        if not pattern.search(code_only):
+    for pattern, description in REQUIRED_ASM_EVIDENCE_PATTERNS:
+        if not pattern_has_asm_evidence(pattern, code_only, asm_spans):
+            errors.append(
+                "source is missing required text as real asm evidence (a comment or an "
+                f"ordinary, non-asm string literal does not count): {description}"
+            )
+    for pattern, description in REQUIRED_IDENTIFIER_PATTERNS:
+        if not pattern.search(masked):
             errors.append(f"source is missing required text: {description}")
+    errors.extend(check_exact_geometry(masked))
     errors.extend(check_launch_guard_ordering(code_only))
     errors.extend(check_rank_mapping(code_only))
     errors.extend(check_collective_tmem_lifecycle(code_only))
-    errors.extend(check_rank0_only_issue(code_only))
+    errors.extend(check_mbarrier_init_fence(masked))
+    errors.extend(check_iteration_structure(masked))
     errors.extend(check_cluster_sync_before_dealloc(code_only))
     errors.extend(check_timing_routing(code_only))
     return errors
@@ -1164,6 +1538,9 @@ def synthetic_elf(omit_cluster_attrs: set[tuple[int, int]] | None = None,
 # ---------------------------------------------------------------------------
 def golden_source_snippet(**overrides: str) -> str:
     fields = {
+        # ---- PTX-mnemonic text: wrapped in a real asm volatile("...") by
+        # ---- the template below, so it only counts as evidence when it is
+        # ---- genuinely an asm operand (never a bare/comment/string decoy).
         "wait_ld_text": "tcgen05.wait::ld.sync.aligned;",
         "fence_text": "tcgen05.fence::after_thread_sync;",
         "mma_text": "tcgen05.mma.cta_group::2.kind::f16 [x], a, b, i, p;",
@@ -1174,11 +1551,24 @@ def golden_source_snippet(**overrides: str) -> str:
         "alloc_text": "tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [x], y;",
         "dealloc_text": "tcgen05.dealloc.cta_group::2.sync.aligned.b32 x, y;",
         "relinquish_text": "tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;",
+        # ---- geometry / identifiers: rendered as bare (real) code. --------
+        "geometry_consts": (
+            "constexpr int kThreadsPerCta = 128;\n"
+            "constexpr int kClusterCtas = 2;\n"
+            "constexpr int kGridBlocks = 2;\n"
+        ),
         "cluster_dims_text": "__global__ __cluster_dims__(2, 1, 1) __launch_bounds__(128) void k() {}",
         "ctarank_text": "cuda::ptx::get_sreg_cluster_ctarank();",
         "nctarank_text": "cuda::ptx::get_sreg_cluster_nctarank();",
         "mask_text": "0x0003u",
         "extra_forbidden_line": "",
+        "fence_helper_def": (
+            "void fence_mbarrier_init_release_cluster() { "
+            "cuda::ptx::fence_mbarrier_init(cuda::ptx::sem_release, cuda::ptx::scope_cluster); }"
+        ),
+        "fence_helper_call": "fence_mbarrier_init_release_cluster();",
+        "mbarrier_init_call": "cuda::ptx::mbarrier_init(&mbar, 1u);",
+        "fence_proxy_call": "cuda::ptx::fence_proxy_async(cuda::ptx::space_cluster);",
         "launch_predicate": (
             "return gridDim.x == kExpectedGridDim && gridDim.y == 1 && gridDim.z == 1 && "
             "blockDim.x == kExpectedBlockDimX && blockDim.y == 1 && blockDim.z == 1 && "
@@ -1206,11 +1596,25 @@ def golden_source_snippet(**overrides: str) -> str:
         ),
         "alloc_call": "if (warp_id == 0) { tcgen05_alloc_2sm(x, N); }",
         "dealloc_call": "if (warp_id == 0) { tcgen05_dealloc_2sm(tmem_d, N); tcgen05_relinquish_alloc_permit_2sm(); }",
+        # ---- the per-iteration handshake structure. ------------------
+        "loop_open": "for (int64_t it = 0; it < iterations; ++it) {",
+        "loop_close": "}",
+        "leader_wrapper_open": "if (is_leader) {",
+        "leader_wrapper_close": "}",
+        "rank0_wrapper_open": "if (cta_rank == 0) {",
+        "rank0_wrapper_close": "}",
         "issue_call": (
-            "if (cta_rank == 0) { issue_one_umma_2sm(tmem_d, a_desc, b_desc, idesc, 0); "
-            "commit_umma_2sm_multicast(mbar_addr, 0x0003u); }"
+            "issue_one_umma_2sm(tmem_d, a_desc, b_desc, idesc, 0); "
+            "commit_umma_2sm_multicast(mbar_addr, 0x0003u);"
         ),
+        "extra_issue_call": "",
+        "extra_commit_call": "",
         "wait_call": "while (!cuda::ptx::mbarrier_try_wait_parity(&mbar, parity)) {}",
+        "leader_extra": "",
+        "post_wait_syncthreads": "__syncthreads();",
+        "loop_cluster_arrive": "cuda::ptx::barrier_cluster_arrive();",
+        "loop_cluster_wait": "cuda::ptx::barrier_cluster_wait();",
+        "after_loop_extra": "",
         "cluster_sync_before_dealloc": "cuda::ptx::barrier_cluster_arrive(); cuda::ptx::barrier_cluster_wait();",
         "readback_global_row": (
             "const int global_row = cta_rank * kMLocal + local_row;"
@@ -1220,18 +1624,21 @@ def golden_source_snippet(**overrides: str) -> str:
             "g_d_out[static_cast<int64_t>(global_row) * N + frag * 32 + i] = 0.0f;"
         ),
         "timing_guard_a": (
-            'if (cta_rank == 0 && timing_mode == TimingMode::kTimed) { '
+            'if (is_leader && cta_rank == 0 && timing_mode == TimingMode::kTimed) { '
             'asm volatile("mov.u64 %0, %%clock64;" : "=l"(start_clock)); }'
         ),
         "timing_guard_b": (
-            'if (cta_rank == 0 && timing_mode == TimingMode::kTimed) { '
+            'if (is_leader && cta_rank == 0 && timing_mode == TimingMode::kTimed) { '
             'asm volatile("mov.u64 %0, %%clock64;" : "=l"(end_clock)); '
             "elapsed_cycles = end_clock - start_clock; }"
         ),
         "kernel_mode_forward": (
             "umma_2sm_body<N, DEPTH>(iterations, timing_mode, g_d_out, g_elapsed_cycles, g_launch_ok);"
         ),
-        "run_once_mode_forward": "spec.kernel<<<2, 128>>>(iterations, mode, d_out_device, cycles_device, launch_ok_device);",
+        "run_once_mode_forward": (
+            "spec.kernel<<<kGridBlocks, kThreadsPerCta>>>(iterations, mode, d_out_device, "
+            "cycles_device, launch_ok_device);"
+        ),
         "untimed_call_a": "run_once(spec, iterations, TimingMode::kUntimed);",
         "untimed_call_b": "run_once(spec, kSelfTestIterations, TimingMode::kUntimed);",
         "timed_call": "run_once(spec, iterations, TimingMode::kTimed);",
@@ -1240,10 +1647,16 @@ def golden_source_snippet(**overrides: str) -> str:
         "timed_repetition_call": "run_timed_or_die(*spec, cli.iterations);",
     }
     fields.update(overrides)
+
+    def asm(text: str) -> str:
+        return f'asm volatile("{text}");' if text else ""
+
     return (
+        f"{fields['geometry_consts']}\n"
         "__device__ bool launch_contract_is_valid(uint32_t cluster_nctarank, uint32_t cluster_ctarank) {\n"
         f"    {fields['launch_predicate']}\n"
         "}\n"
+        f"__device__ {fields['fence_helper_def']}\n"
         "__device__ void umma_2sm_body(int64_t iterations, TimingMode timing_mode) {\n"
         f"    {fields['launch_guard']}\n"
         f"    {fields['accepted_path']}\n"
@@ -1251,13 +1664,32 @@ def golden_source_snippet(**overrides: str) -> str:
         f"    {fields['a_loop']}\n"
         f"    {fields['b_loop']}\n"
         "    __syncthreads();\n"
+        f"    {fields['mbarrier_init_call']}\n"
+        f"    {fields['fence_helper_call']}\n"
+        f"    {fields['fence_proxy_call']}\n"
+        "    __syncthreads();\n"
+        "    cuda::ptx::barrier_cluster_arrive();\n"
+        "    cuda::ptx::barrier_cluster_wait();\n"
         f"    {fields['alloc_call']}\n"
-        "    if (is_leader) {\n"
-        f"        {fields['timing_guard_a']}\n"
-        f"        {fields['issue_call']}\n"
-        f"        {fields['wait_call']}\n"
-        f"        {fields['timing_guard_b']}\n"
-        "    }\n"
+        "    uint64_t start_clock = 0, end_clock = 0;\n"
+        f"    {fields['timing_guard_a']}\n"
+        "    uint32_t parity = 0;\n"
+        f"    {fields['loop_open']}\n"
+        f"        {fields['leader_wrapper_open']}\n"
+        f"            {fields['rank0_wrapper_open']}\n"
+        f"                {fields['issue_call']}\n"
+        f"            {fields['rank0_wrapper_close']}\n"
+        f"            {fields['extra_issue_call']}\n"
+        f"            {fields['extra_commit_call']}\n"
+        f"            {fields['wait_call']}\n"
+        f"            {fields['leader_extra']}\n"
+        f"        {fields['leader_wrapper_close']}\n"
+        f"        {fields['post_wait_syncthreads']}\n"
+        f"        {fields['loop_cluster_arrive']}\n"
+        f"        {fields['loop_cluster_wait']}\n"
+        f"    {fields['loop_close']}\n"
+        f"    {fields['after_loop_extra']}\n"
+        f"    {fields['timing_guard_b']}\n"
         f"    {fields['readback_global_row']}\n"
         f"    {fields['readback_call']}\n"
         f"    {fields['cluster_sync_before_dealloc']}\n"
@@ -1288,13 +1720,13 @@ def golden_source_snippet(**overrides: str) -> str:
         f"        {fields['timed_repetition_call']}\n"
         "    }\n"
         "}\n"
-        f"{fields['wait_ld_text']}\n"
-        f"{fields['fence_text']}\n"
-        f"{fields['mma_text']}\n"
-        f"{fields['commit_text']}\n"
-        f"{fields['alloc_text']}\n"
-        f"{fields['dealloc_text']}\n"
-        f"{fields['relinquish_text']}\n"
+        f"{asm(fields['wait_ld_text'])}\n"
+        f"{asm(fields['fence_text'])}\n"
+        f"{asm(fields['mma_text'])}\n"
+        f"{asm(fields['commit_text'])}\n"
+        f"{asm(fields['alloc_text'])}\n"
+        f"{asm(fields['dealloc_text'])}\n"
+        f"{asm(fields['relinquish_text'])}\n"
         f"{fields['cluster_dims_text']}\n"
         f"{fields['ctarank_text']}\n"
         f"{fields['nctarank_text']}\n"
@@ -1530,31 +1962,34 @@ def run_self_test() -> int:
             "cuda::ptx::get_sreg_cluster_nctarank",
         ),
         (
-            "source check rejects a missing barrier_cluster_arrive",
+            "source check rejects a missing barrier_cluster_arrive before deallocation",
             golden_source_snippet(cluster_sync_before_dealloc="cuda::ptx::barrier_cluster_wait();"),
-            "cuda::ptx::barrier_cluster_arrive",
+            "barrier_cluster_arrive()/barrier_cluster_wait() pair must appear",
         ),
         (
-            "source check rejects a missing barrier_cluster_wait",
+            "source check rejects a missing barrier_cluster_wait before deallocation",
             golden_source_snippet(cluster_sync_before_dealloc="cuda::ptx::barrier_cluster_arrive();"),
-            "cuda::ptx::barrier_cluster_wait",
+            "barrier_cluster_arrive()/barrier_cluster_wait() pair must appear",
         ),
         (
             "source check rejects a missing exact multicast mask 0x0003",
-            golden_source_snippet(mask_text="", issue_call=(
-                "if (cta_rank == 0) { issue_one_umma_2sm(tmem_d, a_desc, b_desc, idesc, 0); "
-                "commit_umma_2sm_multicast(mbar_addr, 0x0007u); }"
-            )),
+            golden_source_snippet(
+                mask_text="",
+                issue_call=(
+                    "issue_one_umma_2sm(tmem_d, a_desc, b_desc, idesc, 0); "
+                    "commit_umma_2sm_multicast(mbar_addr, 0x0007u);"
+                ),
+            ),
             "the exact multicast CTA mask 0x0003",
         ),
         (
             "source check rejects required PTX text present only in a // comment",
-            golden_source_snippet(wait_ld_text="// tcgen05.wait::ld.sync.aligned"),
+            golden_source_snippet(wait_ld_text="", extra_forbidden_line="// tcgen05.wait::ld.sync.aligned"),
             "tcgen05.wait::ld.sync.aligned",
         ),
         (
             "source check rejects required PTX text present only in a /* */ comment",
-            golden_source_snippet(fence_text="/* tcgen05.fence::after_thread_sync */"),
+            golden_source_snippet(fence_text="", extra_forbidden_line="/* tcgen05.fence::after_thread_sync */"),
             "tcgen05.fence::after_thread_sync",
         ),
         (
@@ -1629,22 +2064,8 @@ def run_self_test() -> int:
         ),
         (
             "source check rejects an MMA/commit issue not confined to cta_rank == 0",
-            golden_source_snippet(
-                issue_call="issue_one_umma_2sm(tmem_d, a_desc, b_desc, idesc, 0); commit_umma_2sm_multicast(mbar_addr, 0x0003u);"
-            ),
-            "must both be issued from a single 'if (cta_rank == 0)' block",
-        ),
-        (
-            "source check rejects a wait enclosed in cta_rank == 0",
-            golden_source_snippet(
-                issue_call=(
-                    "if (cta_rank == 0) { issue_one_umma_2sm(tmem_d, a_desc, b_desc, idesc, 0); "
-                    "commit_umma_2sm_multicast(mbar_addr, 0x0003u); "
-                    "while (!cuda::ptx::mbarrier_try_wait_parity(&mbar, parity)) {} }"
-                ),
-                wait_call="",
-            ),
-            "mbarrier completion wait must not be enclosed in a cta_rank == 0 condition",
+            golden_source_snippet(rank0_wrapper_open="", rank0_wrapper_close=""),
+            "must both be issued from a single 'if (cta_rank == 0) { ... }' block",
         ),
         (
             "source check rejects a TMEM load address offset by cta_rank",
@@ -1680,7 +2101,17 @@ def run_self_test() -> int:
             "source check rejects a timed guard missing the cta_rank == 0 conjunct",
             golden_source_snippet(
                 timing_guard_a=(
-                    'if (timing_mode == TimingMode::kTimed) { '
+                    'if (is_leader && timing_mode == TimingMode::kTimed) { '
+                    'asm volatile("mov.u64 %0, %%clock64;" : "=l"(start_clock)); }'
+                ),
+            ),
+            "guard(s); expected exactly two",
+        ),
+        (
+            "source check rejects a timed guard missing the is_leader conjunct",
+            golden_source_snippet(
+                timing_guard_a=(
+                    'if (cta_rank == 0 && timing_mode == TimingMode::kTimed) { '
                     'asm volatile("mov.u64 %0, %%clock64;" : "=l"(start_clock)); }'
                 ),
             ),
@@ -1706,6 +2137,145 @@ def run_self_test() -> int:
             'const char* s = "this string never closes;\n',
             "cannot safely scan",
         ),
+        (
+            "the mbarrier-init fence helper must genuinely call the official wrapper",
+            golden_source_snippet(fence_helper_def="void fence_mbarrier_init_release_cluster() { /* no-op */ }"),
+            "must call cuda::ptx::fence_mbarrier_init",
+        ),
+        (
+            "source check rejects a missing fence_mbarrier_init_release_cluster() helper definition",
+            golden_source_snippet(fence_helper_def=""),
+            "invalid mbarrier-init fence helper",
+        ),
+        (
+            "the mbarrier-init fence call must be ordered after mbarrier_init, not before",
+            golden_source_snippet(
+                mbarrier_init_call="",
+                fence_helper_call="fence_mbarrier_init_release_cluster(); cuda::ptx::mbarrier_init(&mbar, 1u);",
+            ),
+            "must be called after mbarrier_init(&mbar, ...)",
+        ),
+
+        # ---- Task section 5: fourteen independent adversarial mutations. -
+        # ---- Each isolates exactly one defect; every one must be rejected
+        # ---- for the intended reason (mutation 5 is folded in above,
+        # ---- immediately after the "missing tcgen05.wait::ld" case, since
+        # ---- it is a variant of the same required-PTX-evidence family). --
+        (
+            "mutation 1/14: changes kGridBlocks from 2 to 3",
+            golden_source_snippet(geometry_consts=(
+                "constexpr int kThreadsPerCta = 128;\n"
+                "constexpr int kClusterCtas = 2;\n"
+                "constexpr int kGridBlocks = 3;\n"
+            )),
+            "constexpr int kGridBlocks = 2;",
+        ),
+        (
+            "mutation 2/14: changes kThreadsPerCta from 128 to 64",
+            golden_source_snippet(geometry_consts=(
+                "constexpr int kThreadsPerCta = 64;\n"
+                "constexpr int kClusterCtas = 2;\n"
+                "constexpr int kGridBlocks = 2;\n"
+            )),
+            "constexpr int kThreadsPerCta = 128;",
+        ),
+        (
+            "mutation 3/14: changes kClusterCtas from 2 to 4",
+            golden_source_snippet(geometry_consts=(
+                "constexpr int kThreadsPerCta = 128;\n"
+                "constexpr int kClusterCtas = 4;\n"
+                "constexpr int kGridBlocks = 2;\n"
+            )),
+            "constexpr int kClusterCtas = 2;",
+        ),
+        (
+            "mutation 4/14: changes __cluster_dims__(2,1,1) to another value",
+            golden_source_snippet(
+                cluster_dims_text="__global__ __cluster_dims__(4, 1, 1) __launch_bounds__(128) void k() {}"
+            ),
+            "__cluster_dims__(2, 1, 1)",
+        ),
+        (
+            "mutation 5/14: removes the executable tcgen05.wait::ld while leaving the mnemonic in a normal string",
+            golden_source_snippet(
+                wait_ld_text="",
+                extra_forbidden_line='const char* decoy = "tcgen05.wait::ld.sync.aligned";',
+            ),
+            "tcgen05.wait::ld.sync.aligned",
+        ),
+        (
+            "mutation 6/14: adds an extra UMMA issue outside the rank-0 condition",
+            golden_source_snippet(extra_issue_call="issue_one_umma_2sm(tmem_d, a_desc, b_desc, idesc, 1);"),
+            "issue_one_umma_2sm must be confined to the rank-0-nested-in-leader block",
+        ),
+        (
+            "mutation 7/14: adds an extra commit outside the rank-0 condition",
+            golden_source_snippet(extra_commit_call="commit_umma_2sm_multicast(mbar_addr, 0x0003u);"),
+            "commit_umma_2sm_multicast must be confined to the rank-0-nested-in-leader block",
+        ),
+        (
+            "mutation 8a/14: removes fence.mbarrier_init.release.cluster's call, leaving a comment decoy",
+            golden_source_snippet(fence_helper_call="// fence_mbarrier_init_release_cluster();"),
+            "must call fence_mbarrier_init_release_cluster() exactly once, found 0",
+        ),
+        (
+            "mutation 8b/14: removes fence.mbarrier_init.release.cluster's call, leaving a string decoy",
+            golden_source_snippet(
+                fence_helper_call='const char* decoy = "fence_mbarrier_init_release_cluster();";'
+            ),
+            "must call fence_mbarrier_init_release_cluster() exactly once, found 0",
+        ),
+        (
+            "mutation 9/14: removes the CTA-wide synchronization after the local mbarrier wait",
+            golden_source_snippet(post_wait_syncthreads=""),
+            "must contain a __syncthreads() call, after the per-iteration leader block",
+        ),
+        (
+            "mutation 10/14: removes the per-phase cluster arrive",
+            golden_source_snippet(loop_cluster_arrive=""),
+            "must contain a barrier_cluster_arrive() call, after the post-wait __syncthreads()",
+        ),
+        (
+            "mutation 11/14: removes the per-phase cluster wait",
+            golden_source_snippet(loop_cluster_wait=""),
+            "must contain a barrier_cluster_wait() call, after barrier_cluster_arrive()",
+        ),
+        (
+            "mutation 12/14: moves the cluster rendezvous outside the runtime iteration loop",
+            golden_source_snippet(
+                post_wait_syncthreads="",
+                loop_cluster_arrive="",
+                loop_cluster_wait="",
+                after_loop_extra=(
+                    "__syncthreads(); cuda::ptx::barrier_cluster_arrive(); cuda::ptx::barrier_cluster_wait();"
+                ),
+            ),
+            "must contain a __syncthreads() call, after the per-iteration leader block",
+        ),
+        (
+            "mutation 13/14: places the cluster rendezvous inside is_leader",
+            golden_source_snippet(
+                post_wait_syncthreads="",
+                loop_cluster_arrive="",
+                loop_cluster_wait="",
+                leader_extra=(
+                    "__syncthreads(); cuda::ptx::barrier_cluster_arrive(); cuda::ptx::barrier_cluster_wait();"
+                ),
+            ),
+            "must not be issued from inside the per-iteration 'if (is_leader)' block",
+        ),
+        (
+            "mutation 14/14: places the mbarrier wait inside cta_rank == 0",
+            golden_source_snippet(
+                issue_call=(
+                    "issue_one_umma_2sm(tmem_d, a_desc, b_desc, idesc, 0); "
+                    "commit_umma_2sm_multicast(mbar_addr, 0x0003u); "
+                    "while (!cuda::ptx::mbarrier_try_wait_parity(&mbar, parity)) {}"
+                ),
+                wait_call="",
+            ),
+            "the mbarrier completion wait must not be enclosed in a cta_rank == 0 condition",
+        ),
     ]
     for name, source_text, expected_error in source_cases:
         errors = check_source(source_text)
@@ -1727,6 +2297,10 @@ def run_self_test() -> int:
         (
             "mandatory source validation: a missing canonical source fails closed (non-empty errors)",
             bool(validate_source_file(Path("/nonexistent-path-should-never-exist/umma_2sm.cu"))),
+        ),
+        (
+            "the repaired canonical source (src/compute/umma_2sm.cu) is accepted with zero errors",
+            validate_source_file(resolve_default_source_path()) == [],
         ),
     ]
     for name, ok in mandatory_validation_cases:

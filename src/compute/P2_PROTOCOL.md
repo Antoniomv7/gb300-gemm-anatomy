@@ -27,12 +27,13 @@ estimated from documentation.
 AGENTS.md caps experiment 2 at 24 configurations: 1-SM (M=128) and 2-SM
 (M=256), each with N in {64,128,256} and depth in {4,16,64,256} -- 2 x 3 x 4
 = 24. P2.1 implements exactly the 1-SM half (12 of the 24); the 2-SM half is
-P2.2's unimplemented scope.
+P2.2's scope, implemented in `src/compute/umma_2sm.cu` (independent audit
+and GB300 verification pending; see `src/compute/P2_2_PROTOCOL.md`).
 
 | cta_group | M | N | depth | Unit |
 |-----------|---|---|-------|------|
 | ::1 | 128 | {64,128,256} | {4,16,64,256} | P2.1 (this document, 12 configs) |
-| ::2 | 256 | {64,128,256} | {4,16,64,256} | P2.2 (unimplemented, 12 configs) |
+| ::2 | 256 | {64,128,256} | {4,16,64,256} | P2.2 (implemented, 12 configs; see P2_2_PROTOCOL.md) |
 
 ## 4. The exact twelve P2.1 configurations
 
@@ -554,9 +555,11 @@ BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
   not wall-clock time, not corrected for clock throttling/boost state, and
   not a throughput or saturation claim. No TFLOP/s conversion exists in
   this unit (P2.4 work).
-* P2.2 (2-SM), P2.3 (joint sweep), and P2.4 (profiling/ceiling) remain
-  entirely unimplemented; nothing in this document or in `PLAN.md`'s P2.1
-  row claims otherwise.
+* P2.2 (2-SM) is implemented (`src/compute/umma_2sm.cu`; see
+  `src/compute/P2_2_PROTOCOL.md`), with independent audit and GB300
+  verification pending. P2.3 (joint sweep) and P2.4 (profiling/ceiling)
+  remain entirely unimplemented. Nothing in this document or in `PLAN.md`'s
+  P2.1 row claims otherwise about P2.1's own closed scope.
 
 ## 18. Status
 
@@ -585,7 +588,9 @@ routing checks described in sections 16-17:
 * GB300 verification: **passed**.
 * Publishable result: **none**. Every CSV row P2.1 can ever emit carries
   `publishable=false` unconditionally.
-* P2.2, P2.3, P2.4: **not implemented**.
+* P2.2: **implemented** (`src/compute/umma_2sm.cu`; independent audit and
+  GB300 verification pending -- see `src/compute/P2_2_PROTOCOL.md`).
+  P2.3, P2.4: **not implemented**.
 
 ## 19. References
 
