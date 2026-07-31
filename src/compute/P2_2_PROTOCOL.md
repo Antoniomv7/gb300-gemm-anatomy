@@ -687,10 +687,11 @@ Summary of what is proved for every one of the twelve symbols:
     and its own body genuinely calls the official
     `cuda::ptx::fence_mbarrier_init(cuda::ptx::sem_release,
     cuda::ptx::scope_cluster)` wrapper; `umma_2sm_body` calls this helper
-    exactly once, program-ordered after `mbarrier_init(&mbar, ...)` and
-    before the first cluster barrier that publishes CTA-local
-    initialization to the pair; a separate, real `fence_proxy_async` call
-    is also present.
+    exactly once as a direct, unconditionally reachable statement in the
+    same `if (tid == 0)` initialization block, program-ordered immediately
+    after `mbarrier_init(&mbar, ...)` and before the separate, real
+    `fence_proxy_async` call and the first cluster barrier that publishes
+    CTA-local initialization to the pair.
 18. (source check, repair) the per-phase CTA-pair handshake (section 10.1):
     the runtime outer iteration loop (`for (int64_t it = 0; it <
     iterations; ++it)`) is executed uniformly by the whole cluster -- never
@@ -699,16 +700,24 @@ Summary of what is proved for every one of the twelve symbols:
     per-iteration `if (is_leader)` block; and, inside that same loop body,
     after the leader block, `__syncthreads()`, then
     `barrier_cluster_arrive()`, then `barrier_cluster_wait()`, appear in
-    that exact order.
+    that exact order as direct statements reachable by every thread in both
+    CTA ranks. The local wait and its single `parity ^= 1u` phase advance
+    must likewise be direct statements reachable by both CTA leaders, never
+    hidden in an additional rank condition.
+19. (source check, re-audit repair) the live TMEM load-completion route: the
+    unique `tcgen05_wait_ld()` helper contains real inline-PTX evidence, and
+    the canonical `kFragments = N / 32` readback loop contains exactly one
+    direct `tcgen05_ld_32x32b_x32(...)` call followed by exactly one live
+    `tcgen05_wait_ld()` call before the loaded registers are written.
 
-`scripts/check_umma_2sm_sass.py --self-test` exercises all of the above (88
+`scripts/check_umma_2sm_sass.py --self-test` exercises all of the above (93
 cases total): 23 SASS-contract cases (missing/extra/duplicate symbol,
 missing/incorrect-depth/non-uniformly-spaced burst, missing commit/wait/
 alloc/dealloc, non-`.2CTA` fallback forms for MMA/commit/alloc, incorrect
 `LDTM.x32` count, missing cluster-barrier evidence in two distinct forms,
 every forbidden whole-binary instruction), 4 ELF-attribute cases (accept,
 missing attribute, missing section, wrong `EIATTR_CTA_PER_CLUSTER` value),
-58 source-level positive and negative cases (every required/forbidden
+63 source-level positive and negative cases (every required/forbidden
 pattern individually, comment- and ordinary-non-asm-string-literal-only
 placement of required PTX text -- so a decoy never counts as evidence --
 launch-guard structure and both ranks' status writes, A/B rank-dependence in
@@ -719,7 +728,11 @@ separation in both directions, cluster-sync-before-dealloc, every timing-
 route defect, both lexical-scan failure modes, exact-geometry regressions,
 mbarrier-init-fence presence/body-content/ordering defects including
 comment and string decoys, and every independent per-phase-handshake
-mutation from the fourteen listed in task section 5), and 3 mandatory-
+mutation from the fourteen listed in task section 5, plus five independent
+follow-up regressions covering an unused live TMEM-wait helper, a second
+rank-0 condition around the local wait, rank-0-only CTA/cluster rendezvous,
+a missing parity phase advance, and a conditionally unreachable
+mbarrier-init fence), and 3 mandatory-
 source-path-resolution cases (including that the repaired canonical source
 itself is accepted with zero errors).
 
@@ -799,7 +812,16 @@ BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
   comment/string-decoy-resistant source checker with 88 self-test cases
   including fourteen independent adversarial mutations of the handshake and
   geometry (section 14), and the corrected documentation here and in the
-  files above. This repair round's own remediation is GPU-free and has
+  files above.
+* A follow-up independent audit of commit
+  `b78695848bb73e46aa4f6f53cab155cc3375fea9` confirmed the canonical CUDA
+  synchronization repair but found five remaining fail-open checker paths:
+  it could accept removal of the live `tcgen05_wait_ld()` call, a second
+  rank-0 condition around the local wait, a rank-0-only per-phase
+  rendezvous, removal of the parity phase advance, and an unreachable
+  mbarrier-init fence call. The 93-case checker described in section 14
+  repairs those five paths with direct-scope, reachability, sequence, and
+  live-call checks. This checker-only remediation is GPU-free and has
   **not** itself been independently audited.
 * P2.2 has **not** been independently audited (a static self-check, however
   thorough, is not an audit -- AGENTS.md, `PLAN.md`). This includes the

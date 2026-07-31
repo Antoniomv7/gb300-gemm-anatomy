@@ -495,6 +495,9 @@ MAIN_DEFINITION = re.compile(
 FENCE_MBARRIER_INIT_DEFINITION = re.compile(
     r"\bvoid\s+fence_mbarrier_init_release_cluster\s*\(\s*\)\s*\{", re.DOTALL
 )
+TCGEN05_WAIT_LD_DEFINITION = re.compile(
+    r"\bvoid\s+tcgen05_wait_ld\s*\(\s*\)\s*\{", re.DOTALL
+)
 
 # Per-phase CTA-pair handshake structure (task sections 3-4).
 ITERATION_LOOP_HEADER = re.compile(
@@ -503,13 +506,49 @@ ITERATION_LOOP_HEADER = re.compile(
 )
 LEADER_BLOCK_HEADER = re.compile(r"\bif\s*\(\s*is_leader\s*\)\s*\{", re.DOTALL)
 RANK0_BLOCK_HEADER = re.compile(r"\bif\s*\(\s*cta_rank\s*==\s*0\s*\)\s*\{", re.DOTALL)
-SYNCTHREADS_PATTERN = re.compile(r"__syncthreads\s*\(\s*\)")
-CLUSTER_ARRIVE_PATTERN = re.compile(r"barrier_cluster_arrive\s*\(\s*\)")
-CLUSTER_WAIT_PATTERN = re.compile(r"barrier_cluster_wait\s*\(\s*\)")
+TID0_BLOCK_HEADER = re.compile(r"\bif\s*\(\s*tid\s*==\s*0\s*\)\s*\{", re.DOTALL)
+FRAGMENT_LOOP_HEADER = re.compile(
+    r"\bfor\s*\(\s*int\s+frag\s*=\s*0\s*;\s*frag\s*<\s*kFragments\s*;\s*\+\+frag\s*\)\s*\{",
+    re.DOTALL,
+)
+WAIT_LOOP_HEADER = re.compile(
+    r"\bwhile\s*\(\s*!\s*(?:cuda::ptx::)?mbarrier_try_wait_parity\s*"
+    r"\([^;{}]*\)\s*\)\s*\{",
+    re.DOTALL,
+)
+SYNCTHREADS_PATTERN = re.compile(r"__syncthreads\s*\(\s*\)\s*;")
+CLUSTER_ARRIVE_PATTERN = re.compile(
+    r"(?:\bcuda::ptx::)?\bbarrier_cluster_arrive\s*\(\s*\)\s*;"
+)
+CLUSTER_WAIT_PATTERN = re.compile(
+    r"(?:\bcuda::ptx::)?\bbarrier_cluster_wait\s*\(\s*\)\s*;"
+)
+PARITY_ADVANCE_PATTERN = re.compile(r"\bparity\s*\^=\s*1u?\s*;")
 
 
 def _span_contains(span: tuple[int, int], pos: int) -> bool:
     return span[0] <= pos < span[1]
+
+
+def brace_depth_within(code_only: str, scope_start: int, position: int) -> int:
+    """Return the braced nesting depth at ``position`` within a known body.
+
+    Callers pass the comment-stripped, string-masked view, so braces in
+    comments or literals cannot affect the result.  A required operation at
+    depth zero is a direct statement of the selected body; a positive depth
+    proves that an additional braced conditional/loop can gate it.
+    """
+    if not (0 <= scope_start <= position <= len(code_only)):
+        raise SourceStructureError("internal source-check error: invalid brace-depth range")
+    depth = 0
+    for char in code_only[scope_start:position]:
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth < 0:
+                raise SourceStructureError("unexpected closing brace while computing scope depth")
+    return depth
 
 
 def check_launch_guard_ordering(code_only: str) -> list[str]:
@@ -763,7 +802,9 @@ def check_mbarrier_init_fence(masked: str) -> list[str]:
         errors.append(f"invalid mbarrier-init fence ordering check: {exc}")
         return errors
 
-    fence_calls = list(re.finditer(r"\bfence_mbarrier_init_release_cluster\s*\(\s*\)", umma_body))
+    fence_calls = list(
+        re.finditer(r"\bfence_mbarrier_init_release_cluster\s*\(\s*\)\s*;", umma_body)
+    )
     if len(fence_calls) != 1:
         errors.append(
             "umma_2sm_body must call fence_mbarrier_init_release_cluster() exactly once, "
@@ -771,24 +812,99 @@ def check_mbarrier_init_fence(masked: str) -> list[str]:
         )
         return errors
 
-    mbarrier_init_match = re.search(r"\bmbarrier_init\s*\(\s*&mbar\b", umma_body)
-    if not mbarrier_init_match:
-        errors.append("umma_2sm_body must call mbarrier_init(&mbar, ...)")
+    mbarrier_init_calls = list(
+        re.finditer(r"\bmbarrier_init\s*\(\s*&mbar\b[^;]*\)\s*;", umma_body)
+    )
+    if len(mbarrier_init_calls) != 1:
+        errors.append(
+            "umma_2sm_body must call mbarrier_init(&mbar, ...) exactly once, "
+            f"found {len(mbarrier_init_calls)}"
+        )
         return errors
+    mbarrier_init_match = mbarrier_init_calls[0]
+
+    proxy_calls = list(
+        re.finditer(r"(?:\bcuda::ptx::)?\bfence_proxy_async\s*\([^;]*\)\s*;", umma_body)
+    )
+    if len(proxy_calls) != 1:
+        errors.append(
+            "umma_2sm_body must separately call fence_proxy_async(...) exactly once "
+            f"(the async-proxy fence), found {len(proxy_calls)}"
+        )
+        return errors
+    proxy_match = proxy_calls[0]
 
     arrive_match = CLUSTER_ARRIVE_PATTERN.search(umma_body)
     if not arrive_match:
         errors.append("umma_2sm_body must call barrier_cluster_arrive() at least once")
         return errors
 
-    if not (mbarrier_init_match.start() < fence_calls[0].start() < arrive_match.start()):
+    fence_match = fence_calls[0]
+    if not (
+        mbarrier_init_match.start()
+        < fence_match.start()
+        < proxy_match.start()
+        < arrive_match.start()
+    ):
         errors.append(
             "fence_mbarrier_init_release_cluster() must be called after mbarrier_init(&mbar, ...) "
-            "and before the first cluster barrier that publishes CTA-local initialization to the pair"
+            "and before the separate fence_proxy_async(...) and first cluster barrier that publish "
+            "CTA-local initialization to the pair"
         )
 
-    if not re.search(r"\bfence_proxy_async\s*\(", umma_body):
-        errors.append("umma_2sm_body must separately call fence_proxy_async(...) (the async-proxy fence)")
+    # Presence and ordering are insufficient: ``if (false) { fence(); }``
+    # is textually ordered but unreachable.  Identify the unique tid==0
+    # initialization block containing mbarrier_init and require init, both
+    # fences, and no intervening executable syntax to form one direct
+    # statement sequence in that block.
+    init_blocks: list[tuple[int, int]] = []
+    for header in TID0_BLOCK_HEADER.finditer(umma_body):
+        try:
+            close = find_matching_brace(umma_body, header.end() - 1)
+        except SourceStructureError:
+            continue
+        span = (header.end(), close)
+        if _span_contains(span, mbarrier_init_match.start()):
+            init_blocks.append(span)
+    if len(init_blocks) != 1:
+        errors.append(
+            "mbarrier_init(&mbar, ...), fence_mbarrier_init_release_cluster(), and "
+            "fence_proxy_async(...) must share one 'if (tid == 0)' initialization block"
+        )
+        return errors
+
+    init_span = init_blocks[0]
+    required_in_init = (
+        (mbarrier_init_match, "mbarrier_init(&mbar, ...)"),
+        (fence_match, "fence_mbarrier_init_release_cluster()"),
+        (proxy_match, "fence_proxy_async(...)"),
+    )
+    for match, label in required_in_init:
+        if not _span_contains(init_span, match.start()):
+            errors.append(
+                f"{label} must be a direct, unconditionally reachable statement in the "
+                "same 'if (tid == 0)' initialization block"
+            )
+            continue
+        try:
+            depth = brace_depth_within(umma_body, init_span[0], match.start())
+        except SourceStructureError as exc:
+            errors.append(f"cannot validate mbarrier initialization reachability: {exc}")
+            continue
+        if depth != 0:
+            errors.append(
+                f"{label} must be a direct, unconditionally reachable statement in the "
+                "'if (tid == 0)' initialization block; an additional braced condition "
+                "must not gate it"
+            )
+
+    if umma_body[mbarrier_init_match.end():fence_match.start()].strip() or \
+       umma_body[fence_match.end():proxy_match.start()].strip():
+        errors.append(
+            "mbarrier_init(&mbar, ...), fence_mbarrier_init_release_cluster(), and "
+            "fence_proxy_async(...) must be one direct statement sequence with no "
+            "intervening conditional or executable statement"
+        )
 
     return errors
 
@@ -919,18 +1035,106 @@ def check_iteration_structure(masked: str) -> list[str]:
             )
 
     # ---- Wait must remain reachable in both CTA ranks (mutation 14) ------
+    wait_loop_close: int | None = None
     wait_matches = list(re.finditer(r"\bmbarrier_try_wait_parity\s*\(", umma_body))
+    if len(wait_matches) != 1:
+        errors.append(
+            "umma_2sm_body must contain exactly one mbarrier_try_wait_parity(...) call "
+            f"site, found {len(wait_matches)}"
+        )
     leader_waits = [m for m in wait_matches if _span_contains(leader_span, m.start())]
     if not leader_waits:
         errors.append(
             "the mbarrier completion wait must be present inside the per-iteration "
             "'if (is_leader)' block"
         )
-    elif rank0_span is not None and any(_span_contains(rank0_span, m.start()) for m in leader_waits):
-        errors.append(
-            "the mbarrier completion wait must not be enclosed in a cta_rank == 0 condition "
-            "(CTA rank 1's leader must wait too)"
+    else:
+        wait_match = leader_waits[0]
+        for rank0_header in RANK0_BLOCK_HEADER.finditer(
+            umma_body, leader_span[0], leader_span[1]
+        ):
+            try:
+                rank0_close = find_matching_brace(umma_body, rank0_header.end() - 1)
+            except SourceStructureError:
+                continue
+            if _span_contains((rank0_header.end(), rank0_close), wait_match.start()):
+                errors.append(
+                    "the mbarrier completion wait must not be enclosed in a cta_rank == 0 "
+                    "condition (CTA rank 1's leader must wait too)"
+                )
+                break
+        try:
+            wait_depth = brace_depth_within(umma_body, leader_span[0], wait_match.start())
+        except SourceStructureError as exc:
+            errors.append(f"cannot validate mbarrier-wait reachability: {exc}")
+        else:
+            if wait_depth != 0:
+                errors.append(
+                    "the mbarrier completion wait must be directly reachable by both CTA "
+                    "leaders; no additional braced conditional may enclose it"
+                )
+
+        wait_loop_headers = list(
+            WAIT_LOOP_HEADER.finditer(umma_body, leader_span[0], leader_span[1])
         )
+        if len(wait_loop_headers) != 1:
+            errors.append(
+                "the leader block must contain exactly one braced while-loop around "
+                f"mbarrier_try_wait_parity(...), found {len(wait_loop_headers)}"
+            )
+        else:
+            wait_loop_header = wait_loop_headers[0]
+            try:
+                wait_loop_close = find_matching_brace(
+                    umma_body, wait_loop_header.end() - 1
+                )
+            except SourceStructureError as exc:
+                errors.append(f"cannot validate the mbarrier wait loop: {exc}")
+            if rank0_span is not None and \
+               umma_body[rank0_span[1] + 1:wait_loop_header.start()].strip():
+                errors.append(
+                    "the both-CTA mbarrier wait loop must directly follow the rank-0 issue "
+                    "block; no additional conditional or executable statement may gate it"
+                )
+
+    # ``mbarrier_try_wait_parity`` only follows successive primary phases
+    # when the expected parity advances once after every successful wait.
+    # Require the advance as a direct statement of the same leader block,
+    # after the wait, so a decoy or conditionally executed update cannot
+    # satisfy the gate.
+    parity_advances = list(PARITY_ADVANCE_PATTERN.finditer(umma_body))
+    if len(parity_advances) != 1:
+        errors.append(
+            "umma_2sm_body must advance mbarrier parity exactly once per iteration with "
+            f"'parity ^= 1u;' after the successful wait, found {len(parity_advances)}"
+        )
+    else:
+        parity_match = parity_advances[0]
+        if not _span_contains(leader_span, parity_match.start()):
+            errors.append(
+                "'parity ^= 1u;' must be inside the per-iteration 'if (is_leader)' block"
+            )
+        else:
+            try:
+                parity_depth = brace_depth_within(
+                    umma_body, leader_span[0], parity_match.start()
+                )
+            except SourceStructureError as exc:
+                errors.append(f"cannot validate mbarrier parity reachability: {exc}")
+            else:
+                if parity_depth != 0:
+                    errors.append(
+                        "'parity ^= 1u;' must be a direct, unconditionally reachable statement "
+                        "of the leader block after the successful wait"
+                    )
+        if leader_waits and parity_match.start() <= leader_waits[0].start():
+            errors.append("'parity ^= 1u;' must occur after mbarrier_try_wait_parity succeeds")
+        if wait_loop_close is not None and \
+           umma_body[wait_loop_close + 1:parity_match.start()].strip():
+            errors.append(
+                "'parity ^= 1u;' must directly follow the successful mbarrier wait loop; "
+                "no additional conditional or executable statement may gate it"
+            )
 
     # ---- Neither may live inside is_leader (mutation 13) -----------------
     for pattern, label in (
@@ -954,6 +1158,21 @@ def check_iteration_structure(masked: str) -> list[str]:
             "successful local wait to the whole CTA"
         )
         return errors
+    if umma_body[leader_close + 1:sync_match.start()].strip():
+        errors.append(
+            "the post-wait __syncthreads() must directly follow the leader block; no "
+            "additional conditional or executable statement may gate it"
+        )
+    try:
+        sync_depth = brace_depth_within(umma_body, loop_body_start, sync_match.start())
+    except SourceStructureError as exc:
+        errors.append(f"cannot validate post-wait CTA synchronization reachability: {exc}")
+    else:
+        if sync_depth != 0:
+            errors.append(
+                "the post-wait __syncthreads() must be a direct statement of the runtime "
+                "outer iteration loop, reachable by every thread in both CTA ranks"
+            )
     arrive_match = CLUSTER_ARRIVE_PATTERN.search(umma_body, sync_match.end(), loop_body_end)
     if not arrive_match:
         errors.append(
@@ -961,6 +1180,21 @@ def check_iteration_structure(masked: str) -> list[str]:
             "after the post-wait __syncthreads(), inside every outer iteration"
         )
         return errors
+    if umma_body[sync_match.end():arrive_match.start()].strip():
+        errors.append(
+            "barrier_cluster_arrive() must directly follow the post-wait __syncthreads(); "
+            "no additional conditional or executable statement may gate it"
+        )
+    try:
+        arrive_depth = brace_depth_within(umma_body, loop_body_start, arrive_match.start())
+    except SourceStructureError as exc:
+        errors.append(f"cannot validate per-phase cluster-arrive reachability: {exc}")
+    else:
+        if arrive_depth != 0:
+            errors.append(
+                "the per-phase barrier_cluster_arrive() must be a direct statement of the "
+                "runtime outer iteration loop, reachable by every thread in both CTA ranks"
+            )
     cluster_wait_match = CLUSTER_WAIT_PATTERN.search(umma_body, arrive_match.end(), loop_body_end)
     if not cluster_wait_match:
         errors.append(
@@ -968,6 +1202,23 @@ def check_iteration_structure(masked: str) -> list[str]:
             "after barrier_cluster_arrive(), inside every outer iteration"
         )
         return errors
+    if umma_body[arrive_match.end():cluster_wait_match.start()].strip():
+        errors.append(
+            "barrier_cluster_wait() must directly follow barrier_cluster_arrive(); no "
+            "additional conditional or executable statement may gate it"
+        )
+    try:
+        cluster_wait_depth = brace_depth_within(
+            umma_body, loop_body_start, cluster_wait_match.start()
+        )
+    except SourceStructureError as exc:
+        errors.append(f"cannot validate per-phase cluster-wait reachability: {exc}")
+    else:
+        if cluster_wait_depth != 0:
+            errors.append(
+                "the per-phase barrier_cluster_wait() must be a direct statement of the "
+                "runtime outer iteration loop, reachable by every thread in both CTA ranks"
+            )
 
     # ---- Readback, after the loop, must remain reachable by both ranks. --
     after_loop_start = loop_body_end + 1
@@ -984,6 +1235,115 @@ def check_iteration_structure(masked: str) -> list[str]:
             if _span_contains((match.end(), close), readback_pos):
                 errors.append("the TMEM readback loop must not be enclosed in a cta_rank == 0 condition")
                 break
+
+    return errors
+
+
+def check_tmem_load_completion(code_only: str, masked: str) -> list[str]:
+    """Prove every compile-time TMEM fragment performs load -> wait -> use.
+
+    The PTX mnemonic alone is insufficient because an unused helper still
+    compiles as source evidence while the live readback path can omit its
+    call.  Require the mnemonic in the unique helper's real asm operand and
+    require exactly one live helper call, directly after the single load in
+    the canonical ``N/32`` fragment loop and before the first global-output
+    use of the loaded registers.
+    """
+    errors: list[str] = []
+    wait_ptx_pattern = re.compile(r"tcgen05\.wait::ld\.sync\.aligned")
+
+    try:
+        wait_helper_body, _, _ = extract_single_function_body(
+            code_only, TCGEN05_WAIT_LD_DEFINITION, "tcgen05_wait_ld"
+        )
+    except SourceStructureError as exc:
+        return [f"invalid tcgen05.wait::ld helper: {exc}"]
+    helper_asm_spans = find_asm_string_operand_spans(wait_helper_body)
+    if not pattern_has_asm_evidence(wait_ptx_pattern, wait_helper_body, helper_asm_spans):
+        errors.append(
+            "tcgen05_wait_ld() must contain tcgen05.wait::ld.sync.aligned as real asm evidence"
+        )
+
+    try:
+        umma_body, _, _ = extract_single_function_body(
+            masked, UMMA_BODY_DEFINITION, "umma_2sm_body"
+        )
+    except SourceStructureError as exc:
+        errors.append(f"invalid TMEM-load completion check: {exc}")
+        return errors
+
+    fragment_count = re.search(
+        r"\bconstexpr\s+int\s+kFragments\s*=\s*N\s*/\s*32\s*;", umma_body
+    )
+    if not fragment_count:
+        errors.append("TMEM readback must derive exactly kFragments = N / 32")
+
+    fragment_headers = list(FRAGMENT_LOOP_HEADER.finditer(umma_body))
+    if len(fragment_headers) != 1:
+        errors.append(
+            "umma_2sm_body must contain exactly one 'for (int frag = 0; "
+            f"frag < kFragments; ++frag)' TMEM readback loop, found {len(fragment_headers)}"
+        )
+        return errors
+    fragment_open = fragment_headers[0].end() - 1
+    try:
+        fragment_close = find_matching_brace(umma_body, fragment_open)
+    except SourceStructureError as exc:
+        errors.append(f"cannot validate the TMEM fragment loop: {exc}")
+        return errors
+    fragment_span = (fragment_open + 1, fragment_close)
+
+    all_loads = list(re.finditer(r"\btcgen05_ld_32x32b_x32\s*\([^;]*\)\s*;", umma_body))
+    all_wait_calls = list(re.finditer(r"\btcgen05_wait_ld\s*\(\s*\)\s*;", umma_body))
+    if len(all_loads) != 1:
+        errors.append(
+            "umma_2sm_body must contain exactly one tcgen05_ld_32x32b_x32(...) call "
+            f"site in the N/32 fragment loop, found {len(all_loads)}"
+        )
+    if len(all_wait_calls) != 1:
+        errors.append(
+            "umma_2sm_body must call tcgen05_wait_ld() exactly once after the fragment "
+            f"load, found {len(all_wait_calls)}"
+        )
+    if len(all_loads) != 1 or len(all_wait_calls) != 1:
+        return errors
+
+    load_match = all_loads[0]
+    wait_match = all_wait_calls[0]
+    if not _span_contains(fragment_span, load_match.start()):
+        errors.append("tcgen05_ld_32x32b_x32(...) must execute inside the N/32 fragment loop")
+    if not _span_contains(fragment_span, wait_match.start()):
+        errors.append("tcgen05_wait_ld() must execute inside the N/32 fragment loop")
+    if wait_match.start() <= load_match.end():
+        errors.append("tcgen05_wait_ld() must execute after tcgen05_ld_32x32b_x32(...)")
+    elif umma_body[load_match.end():wait_match.start()].strip():
+        errors.append(
+            "tcgen05_wait_ld() must directly follow tcgen05_ld_32x32b_x32(...); no "
+            "additional conditional or executable statement may gate it"
+        )
+
+    for match, label in (
+        (load_match, "tcgen05_ld_32x32b_x32(...)"),
+        (wait_match, "tcgen05_wait_ld()"),
+    ):
+        try:
+            depth = brace_depth_within(umma_body, fragment_span[0], match.start())
+        except SourceStructureError as exc:
+            errors.append(f"cannot validate {label} reachability: {exc}")
+        else:
+            if depth != 0:
+                errors.append(
+                    f"{label} must be a direct, unconditionally reachable statement of the "
+                    "N/32 fragment loop"
+                )
+
+    first_output_use = re.compile(r"\bg_d_out\s*\[").search(
+        umma_body, load_match.end(), fragment_span[1]
+    )
+    if not first_output_use:
+        errors.append("the N/32 fragment loop must write the loaded registers to g_d_out")
+    elif wait_match.start() >= first_output_use.start():
+        errors.append("tcgen05_wait_ld() must execute before the loaded registers are written")
 
     return errors
 
@@ -1198,6 +1558,7 @@ def check_source(source_text: str) -> list[str]:
     errors.extend(check_collective_tmem_lifecycle(code_only))
     errors.extend(check_mbarrier_init_fence(masked))
     errors.extend(check_iteration_structure(masked))
+    errors.extend(check_tmem_load_completion(code_only, masked))
     errors.extend(check_cluster_sync_before_dealloc(code_only))
     errors.extend(check_timing_routing(code_only))
     return errors
@@ -1610,6 +1971,7 @@ def golden_source_snippet(**overrides: str) -> str:
         "extra_issue_call": "",
         "extra_commit_call": "",
         "wait_call": "while (!cuda::ptx::mbarrier_try_wait_parity(&mbar, parity)) {}",
+        "parity_advance": "parity ^= 1u;",
         "leader_extra": "",
         "post_wait_syncthreads": "__syncthreads();",
         "loop_cluster_arrive": "cuda::ptx::barrier_cluster_arrive();",
@@ -1619,8 +1981,11 @@ def golden_source_snippet(**overrides: str) -> str:
         "readback_global_row": (
             "const int global_row = cta_rank * kMLocal + local_row;"
         ),
-        "readback_call": (
-            "tcgen05_ld_32x32b_x32(make_tmem_load_address(tmem_d, warp_id, frag), regs); "
+        "readback_load_call": (
+            "tcgen05_ld_32x32b_x32(make_tmem_load_address(tmem_d, warp_id, frag), regs);"
+        ),
+        "readback_wait_call": "tcgen05_wait_ld();",
+        "readback_store_call": (
             "g_d_out[static_cast<int64_t>(global_row) * N + frag * 32 + i] = 0.0f;"
         ),
         "timing_guard_a": (
@@ -1656,6 +2021,7 @@ def golden_source_snippet(**overrides: str) -> str:
         "__device__ bool launch_contract_is_valid(uint32_t cluster_nctarank, uint32_t cluster_ctarank) {\n"
         f"    {fields['launch_predicate']}\n"
         "}\n"
+        f"__device__ void tcgen05_wait_ld() {{ {asm(fields['wait_ld_text'])} }}\n"
         f"__device__ {fields['fence_helper_def']}\n"
         "__device__ void umma_2sm_body(int64_t iterations, TimingMode timing_mode) {\n"
         f"    {fields['launch_guard']}\n"
@@ -1664,9 +2030,11 @@ def golden_source_snippet(**overrides: str) -> str:
         f"    {fields['a_loop']}\n"
         f"    {fields['b_loop']}\n"
         "    __syncthreads();\n"
-        f"    {fields['mbarrier_init_call']}\n"
-        f"    {fields['fence_helper_call']}\n"
-        f"    {fields['fence_proxy_call']}\n"
+        "    if (tid == 0) {\n"
+        f"        {fields['mbarrier_init_call']}\n"
+        f"        {fields['fence_helper_call']}\n"
+        f"        {fields['fence_proxy_call']}\n"
+        "    }\n"
         "    __syncthreads();\n"
         "    cuda::ptx::barrier_cluster_arrive();\n"
         "    cuda::ptx::barrier_cluster_wait();\n"
@@ -1682,6 +2050,7 @@ def golden_source_snippet(**overrides: str) -> str:
         f"            {fields['extra_issue_call']}\n"
         f"            {fields['extra_commit_call']}\n"
         f"            {fields['wait_call']}\n"
+        f"            {fields['parity_advance']}\n"
         f"            {fields['leader_extra']}\n"
         f"        {fields['leader_wrapper_close']}\n"
         f"        {fields['post_wait_syncthreads']}\n"
@@ -1691,7 +2060,12 @@ def golden_source_snippet(**overrides: str) -> str:
         f"    {fields['after_loop_extra']}\n"
         f"    {fields['timing_guard_b']}\n"
         f"    {fields['readback_global_row']}\n"
-        f"    {fields['readback_call']}\n"
+        "    constexpr int kFragments = N / 32;\n"
+        "    for (int frag = 0; frag < kFragments; ++frag) {\n"
+        f"        {fields['readback_load_call']}\n"
+        f"        {fields['readback_wait_call']}\n"
+        f"        {fields['readback_store_call']}\n"
+        "    }\n"
         f"    {fields['cluster_sync_before_dealloc']}\n"
         f"    {fields['dealloc_call']}\n"
         "}\n"
@@ -1720,7 +2094,6 @@ def golden_source_snippet(**overrides: str) -> str:
         f"        {fields['timed_repetition_call']}\n"
         "    }\n"
         "}\n"
-        f"{asm(fields['wait_ld_text'])}\n"
         f"{asm(fields['fence_text'])}\n"
         f"{asm(fields['mma_text'])}\n"
         f"{asm(fields['commit_text'])}\n"
@@ -2070,9 +2443,9 @@ def run_self_test() -> int:
         (
             "source check rejects a TMEM load address offset by cta_rank",
             golden_source_snippet(
-                readback_call=(
-                    "tcgen05_ld_32x32b_x32(make_tmem_load_address(tmem_d, warp_id, frag) + cta_rank * kMLocal, regs); "
-                    "g_d_out[static_cast<int64_t>(global_row) * N + frag * 32 + i] = 0.0f;"
+                readback_load_call=(
+                    "tcgen05_ld_32x32b_x32(make_tmem_load_address(tmem_d, warp_id, frag) "
+                    "+ cta_rank * kMLocal, regs);"
                 )
             ),
             "TMEM load address must not be offset by cta_rank",
@@ -2080,8 +2453,7 @@ def run_self_test() -> int:
         (
             "source check rejects D readback written by local_row instead of global_row",
             golden_source_snippet(
-                readback_call=(
-                    "tcgen05_ld_32x32b_x32(make_tmem_load_address(tmem_d, warp_id, frag), regs); "
+                readback_store_call=(
                     "g_d_out[static_cast<int64_t>(local_row) * N + frag * 32 + i] = 0.0f;"
                 )
             ),
@@ -2275,6 +2647,47 @@ def run_self_test() -> int:
                 wait_call="",
             ),
             "the mbarrier completion wait must not be enclosed in a cta_rank == 0 condition",
+        ),
+
+        # ---- Independent re-audit regressions found after the original --
+        # ---- 88-case repair.  Each reproduces one source mutation that ---
+        # ---- the old checker incorrectly accepted with zero errors. ------
+        (
+            "re-audit regression: removes the live tcgen05_wait_ld() call but keeps its PTX helper",
+            golden_source_snippet(readback_wait_call=""),
+            "must call tcgen05_wait_ld() exactly once after the fragment load",
+        ),
+        (
+            "re-audit regression: wraps both-CTA mbarrier wait in a second cta_rank == 0 condition",
+            golden_source_snippet(
+                wait_call=(
+                    "if (cta_rank == 0) { "
+                    "while (!cuda::ptx::mbarrier_try_wait_parity(&mbar, parity)) {} }"
+                )
+            ),
+            "the mbarrier completion wait must not be enclosed in a cta_rank == 0 condition",
+        ),
+        (
+            "re-audit regression: wraps the per-phase CTA/cluster rendezvous in cta_rank == 0",
+            golden_source_snippet(
+                post_wait_syncthreads="if (cta_rank == 0) { __syncthreads();",
+                loop_cluster_wait="cuda::ptx::barrier_cluster_wait(); }",
+            ),
+            "post-wait __syncthreads() must be a direct statement of the runtime outer iteration loop",
+        ),
+        (
+            "re-audit regression: removes the mbarrier parity phase advance",
+            golden_source_snippet(parity_advance=""),
+            "must advance mbarrier parity exactly once per iteration",
+        ),
+        (
+            "re-audit regression: makes the mbarrier-init fence call unreachable",
+            golden_source_snippet(
+                fence_helper_call=(
+                    "if (false) { fence_mbarrier_init_release_cluster(); }"
+                )
+            ),
+            "must be a direct, unconditionally reachable statement",
         ),
     ]
     for name, source_text, expected_error in source_cases:
