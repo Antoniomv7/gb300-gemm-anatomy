@@ -225,7 +225,10 @@ remains entirely unimplemented.
 
 ## Phase 3 — CuTe DSL GEMM versus cuBLASLt (3–9 August 2026)
 
-Gate: Phase 2 gate passed.
+Gate: Phase 2 gate remains pending. P2.1 and P2.2 are audited and verified on
+GB300, but P2.3 still needs an independent audit and GB300 verification, and
+P2.4 remains unimplemented. Phase 3 cannot begin until all four P2 units are
+implemented, audited, and verified.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|

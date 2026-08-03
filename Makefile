@@ -1040,7 +1040,12 @@ compute-umma-2sm-smoke: compute-umma-2sm-sass
 # GPU-free build/SASS target above; they still touch no GPU). compute-umma-
 # sweep-smoke is the only P2.3 target that executes on GPU; it requires an
 # explicit BLACKWELL_GPU_INDEX and reuses scripts/run_container.sh
-# exclusively via the runner. No P2.3 target invokes Nsight Compute or
+# exclusively via the runner. compute-umma-sweep-smoke has no Make
+# prerequisites of its own (audit repair): the runner already performs its
+# own build/SASS gate internally (Step 3-4), so listing
+# compute-umma-1sm-sass/compute-umma-2sm-sass as prerequisites here would let
+# Make build and compile inside Docker before the recipe's own
+# BLACKWELL_GPU_INDEX check ever ran. No P2.3 target invokes Nsight Compute or
 # computes TFLOP/s, an empirical ceiling, 1-SM/2-SM speedup, scaling
 # efficiency, or saturation; that remains explicit P2.4 work. P2.3 reuses
 # the audited P2.1/P2.2 binaries and their existing CLIs completely
@@ -1061,9 +1066,12 @@ compute-umma-sweep-check: compute-umma-1sm-sass compute-umma-2sm-sass
 	@grep -Fq 'P2.3 | Sweep (≤24 configurations) | YES | NO | NO |' PLAN.md
 	@grep -Fq 'P2.3 = YES / NO / NO' $(EXP02_PROTOCOL)
 	@! grep -rnF 'Phase 2 is closed' PLAN.md README.md $(EXP02_PROTOCOL)
+	@echo "== P2.3 repair: PLAN.md cannot claim the Phase 2 gate has passed =="
+	@! grep -F 'Gate: Phase 2 gate passed.' PLAN.md
+	@grep -Fq 'Gate: Phase 2 gate remains pending.' PLAN.md
 	@echo "compute-umma-sweep-check: OK"
 
-compute-umma-sweep-smoke: compute-umma-1sm-sass compute-umma-2sm-sass
+compute-umma-sweep-smoke:
 	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
 		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
 		echo "       Example: BLACKWELL_GPU_INDEX=3 make compute-umma-sweep-smoke"; \

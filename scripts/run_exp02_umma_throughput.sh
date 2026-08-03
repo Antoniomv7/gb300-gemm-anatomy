@@ -68,8 +68,13 @@ Options:
                                  Forwarded verbatim to both binaries.
   --warmup-iterations N            Required for a campaign, in [0, 1000000].
                                  Forwarded verbatim to both binaries.
-  --repetitions N                  Required for a campaign, in [1, 1000000].
-                                 Forwarded verbatim to both binaries.
+  --repetitions N                  Required for a campaign, in [2, 1000000].
+                                 Forwarded verbatim to both binaries. Real
+                                 campaigns require at least two repetitions
+                                 so summary.csv's sample standard deviation
+                                 and coefficient of variation are never
+                                 silently reported as zero for a single
+                                 observation.
 
 --help, --print-plan, and --self-test are mutually exclusive with each other
 and with every campaign option, and each may be given at most once. Every
@@ -117,6 +122,27 @@ validate_range() {
     fi
 }
 
+# require_regular_nonsymlink_artifact ABS_PATH LABEL: succeeds only if
+# ABS_PATH exists as a regular, non-symlink file. Checks -L (lstat; true for
+# a symlink regardless of whether its target exists or is itself valid)
+# BEFORE -f (which follows symlinks), so a symlinked "binary" or SASS
+# evidence file is refused outright rather than silently accepted via a
+# test -f that resolved through it (audit repair). LABEL is a
+# repository-relative name used only for the diagnostic message, so a
+# rejection never prints this host's absolute repository path.
+require_regular_nonsymlink_artifact() {
+    local abs_path="$1" label="$2"
+    if [ -L "${abs_path}" ]; then
+        echo "run_exp02_umma_throughput: ERROR: ${label} is a symlink, refusing" >&2
+        return 1
+    fi
+    if [ ! -f "${abs_path}" ]; then
+        echo "run_exp02_umma_throughput: ERROR: ${label} missing or not a regular file" >&2
+        return 1
+    fi
+    return 0
+}
+
 # _check_rejected_cli LABEL ARGS...: recursively invokes this same script
 # with ARGS and asserts it exits 2 (a CLI-rejection path only) without
 # touching Docker, nvidia-smi, or results/raw/. Used exclusively by the
@@ -156,6 +182,31 @@ run_self_test() {
         failures=$((failures + 1))
     fi
 
+    local symlink_test_dir
+    symlink_test_dir="$(mktemp -d)"
+    : >"${symlink_test_dir}/real_target"
+    ln -s "${symlink_test_dir}/real_target" "${symlink_test_dir}/symlinked_binary"
+    if require_regular_nonsymlink_artifact "${symlink_test_dir}/symlinked_binary" "test artifact" 2>/dev/null; then
+        echo "run_exp02_umma_throughput: self-test: FAIL: a symlinked execution artifact was NOT rejected before any external launcher could run" >&2
+        failures=$((failures + 1))
+    else
+        echo "run_exp02_umma_throughput: self-test: PASS: a symlinked execution artifact is rejected before any external launcher could run" >&2
+    fi
+    : >"${symlink_test_dir}/real_regular_file"
+    if require_regular_nonsymlink_artifact "${symlink_test_dir}/real_regular_file" "test artifact"; then
+        echo "run_exp02_umma_throughput: self-test: PASS: a genuine regular, non-symlink file is accepted" >&2
+    else
+        echo "run_exp02_umma_throughput: self-test: FAIL: a genuine regular, non-symlink file was rejected" >&2
+        failures=$((failures + 1))
+    fi
+    if require_regular_nonsymlink_artifact "${symlink_test_dir}/does_not_exist" "test artifact" 2>/dev/null; then
+        echo "run_exp02_umma_throughput: self-test: FAIL: a missing artifact was NOT rejected" >&2
+        failures=$((failures + 1))
+    else
+        echo "run_exp02_umma_throughput: self-test: PASS: a missing artifact is rejected" >&2
+    fi
+    rm -rf "${symlink_test_dir}"
+
     echo "run_exp02_umma_throughput: self-test: delegating to the Python aggregator's synthetic test suite" >&2
     if python3 "${AGGREGATOR_HOST}" --self-test; then
         echo "run_exp02_umma_throughput: self-test: PASS: aggregate_exp02_umma_throughput.py --self-test" >&2
@@ -182,7 +233,7 @@ run_self_test() {
     _check_rejected_cli "unknown flag" --run-kind smoke --iterations 1 --warmup-iterations 0 \
         --repetitions 1 --bogus-flag || failures=$((failures + 1))
     _check_rejected_cli "'--campaign-id a..b'" --campaign-id a..b \
-        --run-kind smoke --iterations 1 --warmup-iterations 0 --repetitions 1 || failures=$((failures + 1))
+        --run-kind smoke --iterations 1 --warmup-iterations 0 --repetitions 2 || failures=$((failures + 1))
     _check_rejected_cli "--iterations below range" --run-kind smoke \
         --iterations 0 --warmup-iterations 0 --repetitions 1 || failures=$((failures + 1))
     _check_rejected_cli "--iterations above range" --run-kind smoke \
@@ -191,6 +242,8 @@ run_self_test() {
         --iterations 1 --warmup-iterations -1 --repetitions 1 || failures=$((failures + 1))
     _check_rejected_cli "--repetitions below range" --run-kind smoke \
         --iterations 1 --warmup-iterations 0 --repetitions 0 || failures=$((failures + 1))
+    _check_rejected_cli "--repetitions=1 (below the 2-repetition minimum)" --run-kind smoke \
+        --iterations 1 --warmup-iterations 0 --repetitions 1 || failures=$((failures + 1))
     _check_rejected_cli "missing --run-kind" --iterations 1 --warmup-iterations 0 --repetitions 1 \
         || failures=$((failures + 1))
     _check_rejected_cli "missing --iterations" --run-kind smoke --warmup-iterations 0 --repetitions 1 \
@@ -300,7 +353,12 @@ esac
 # far inside the int64 range for every one of the 24 frozen configurations.
 validate_range "--iterations" "${ITERATIONS}" 1 1000000
 validate_range "--warmup-iterations" "${WARMUP_ITERATIONS}" 0 1000000
-validate_range "--repetitions" "${REPETITIONS}" 1 1000000
+# Real campaigns require repetitions >= 2 (audit repair): summary.csv's
+# sample standard deviation and coefficient of variation are only
+# statistically meaningful with at least two observations, and must never be
+# silently reported as zero for a single sample. Matches
+# aggregate_exp02_umma_throughput.py's REPETITIONS_MIN.
+validate_range "--repetitions" "${REPETITIONS}" 2 1000000
 
 if [ "${HAS_CAMPAIGN_ID}" -eq 1 ]; then
     [[ "${CAMPAIGN_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
@@ -360,18 +418,43 @@ trap 'on_signal TERM' TERM
 trap on_exit EXIT
 
 write_manifest_status() {
-    local status="$1" failure_stage="${2:-}" failure_exit_code="${3:-}"
+    local status="$1" failure_stage="${2:-}" failure_exit_code="${3:-}" failure_log_rel="${4:-}"
     local merge_file
     merge_file="$(mktemp "${CAMPAIGN_DIR}/manifest_merge.XXXXXX")"
     if [ -n "${failure_stage}" ]; then
-        printf '{"failure_stage": "%s", "failure_exit_code": %s}\n' \
-            "${failure_stage}" "${failure_exit_code:-null}" >| "${merge_file}"
+        if [ -n "${failure_log_rel}" ]; then
+            printf '{"failure_stage": "%s", "failure_exit_code": %s, "failure_detail": ["%s"]}\n' \
+                "${failure_stage}" "${failure_exit_code:-null}" "${failure_log_rel}" >| "${merge_file}"
+        else
+            printf '{"failure_stage": "%s", "failure_exit_code": %s}\n' \
+                "${failure_stage}" "${failure_exit_code:-null}" >| "${merge_file}"
+        fi
     else
         printf '{}' >| "${merge_file}"
     fi
     python3 "${AGGREGATOR_HOST}" manifest-write --campaign-dir "${CAMPAIGN_REL}" \
         --status "${status}" --merge-json "${merge_file}" >/dev/null
     rm -f "${merge_file}"
+}
+
+# write_self_test_outcomes UMMA_1SM_OUTCOME UMMA_2SM_OUTCOME: records both
+# methods' self-test outcome together (the manifest schema always requires
+# both keys). Used to record PENDING/STARTED immediately before a self-test
+# runs and PASS/FAIL/NOT_RUN immediately after, so the manifest is always
+# truthful about what has actually happened, including for an interrupted
+# run (audit repair -- see aggregate_exp02_umma_throughput.py's
+# SELF_TEST_TRANSITIONS for the enforced per-method lifecycle).
+write_self_test_outcomes() {
+    local umma_1sm_outcome="$1" umma_2sm_outcome="$2"
+    local merge_file
+    merge_file="$(mktemp "${CAMPAIGN_DIR}/manifest_merge.XXXXXX")"
+    printf '{"self_test_outcomes": {"umma_1sm": "%s", "umma_2sm": "%s"}}\n' \
+        "${umma_1sm_outcome}" "${umma_2sm_outcome}" >| "${merge_file}"
+    python3 "${AGGREGATOR_HOST}" manifest-write --campaign-dir "${CAMPAIGN_REL}" \
+        --status IN_PROGRESS --merge-json "${merge_file}" >/dev/null
+    local rc=$?
+    rm -f "${merge_file}"
+    return "${rc}"
 }
 
 write_manifest_progress() {
@@ -388,7 +471,7 @@ write_manifest_progress() {
     return "${rc}"
 }
 
-echo "run_exp02_umma_throughput: campaign ${CAMPAIGN_ID} IN_PROGRESS at ${CAMPAIGN_DIR}" >&2
+echo "run_exp02_umma_throughput: campaign ${CAMPAIGN_ID} IN_PROGRESS at ${CAMPAIGN_REL}" >&2
 
 # Step 3-4: existing GPU-free compilation and SASS gates (P2.1/P2.2, both
 # unmodified by P2.3); require the resulting artifacts.
@@ -398,43 +481,59 @@ if ! ( cd "${REPO_ROOT}" && make compute-umma-1sm-sass compute-umma-2sm-sass ); 
     echo "run_exp02_umma_throughput: ERROR: GPU-free compilation/SASS gate failed" >&2
     exit 1
 fi
+# Symlink-safe (audit repair): require every execution artifact to be a
+# regular, non-symlink file before the first scripts/run_container.sh
+# invocation below (the self-tests). A plain `test -f` would follow a
+# symlink and accept it; require_regular_nonsymlink_artifact rejects it
+# outright via -L (lstat) first.
 for artifact in build/compute/umma_1sm build/compute/umma_1sm.sass build/compute/umma_2sm build/compute/umma_2sm.sass; do
-    if [ ! -f "${REPO_ROOT}/${artifact}" ]; then
-        write_manifest_status FAILED "missing_artifact" 1
+    if ! require_regular_nonsymlink_artifact "${REPO_ROOT}/${artifact}" "${artifact}"; then
+        write_manifest_status FAILED "invalid_artifact" 1
         CAMPAIGN_OUTCOME=FAILED
-        echo "run_exp02_umma_throughput: ERROR: expected artifact missing: ${artifact}" >&2
         exit 1
     fi
 done
 
 # Step 5-6: both full binary self-tests, independently and sequentially,
-# through the launcher. Continue only if both pass.
+# through the launcher. Continue only if both pass. Each method's outcome is
+# recorded in the manifest immediately -- STARTED right before it runs, then
+# PASS/FAIL right after -- so an interrupted or failed self-test is never
+# later reported as passed, and a method that never runs because its
+# sibling failed first is truthfully recorded as NOT_RUN rather than
+# omitted or invented (audit repair).
+SELF_TEST_UMMA_1SM_LOG_REL="${CAMPAIGN_REL}/logs/self_test_umma_1sm.stderr.log"
+SELF_TEST_UMMA_2SM_LOG_REL="${CAMPAIGN_REL}/logs/self_test_umma_2sm.stderr.log"
+
+if ! write_self_test_outcomes STARTED PENDING; then
+    write_manifest_status FAILED "self_test_outcome_record" 1
+    CAMPAIGN_OUTCOME=FAILED
+    echo "run_exp02_umma_throughput: ERROR: could not record umma_1sm self-test start" >&2
+    exit 1
+fi
 if ! "${RUN_CONTAINER}" build/compute/umma_1sm --self-test \
         >"${CAMPAIGN_DIR}/logs/self_test_umma_1sm.launcher.log" \
         2>"${CAMPAIGN_DIR}/logs/self_test_umma_1sm.stderr.log"; then
-    write_manifest_status FAILED "self_test_umma_1sm" 1
+    write_self_test_outcomes FAIL NOT_RUN || true
+    write_manifest_status FAILED "self_test_umma_1sm" 1 "${SELF_TEST_UMMA_1SM_LOG_REL}"
     CAMPAIGN_OUTCOME=FAILED
-    echo "run_exp02_umma_throughput: ERROR: umma_1sm --self-test failed; see ${CAMPAIGN_DIR}/logs/self_test_umma_1sm.*.log" >&2
+    echo "run_exp02_umma_throughput: ERROR: umma_1sm --self-test failed; see ${SELF_TEST_UMMA_1SM_LOG_REL%.stderr.log}.*.log" >&2
     exit 1
 fi
 SELF_TEST_UMMA_1SM=PASS
+write_self_test_outcomes PASS PENDING
 
+write_self_test_outcomes PASS STARTED
 if ! "${RUN_CONTAINER}" build/compute/umma_2sm --self-test \
         >"${CAMPAIGN_DIR}/logs/self_test_umma_2sm.launcher.log" \
         2>"${CAMPAIGN_DIR}/logs/self_test_umma_2sm.stderr.log"; then
-    write_manifest_status FAILED "self_test_umma_2sm" 1
+    write_self_test_outcomes PASS FAIL
+    write_manifest_status FAILED "self_test_umma_2sm" 1 "${SELF_TEST_UMMA_2SM_LOG_REL}"
     CAMPAIGN_OUTCOME=FAILED
-    echo "run_exp02_umma_throughput: ERROR: umma_2sm --self-test failed; see ${CAMPAIGN_DIR}/logs/self_test_umma_2sm.*.log" >&2
+    echo "run_exp02_umma_throughput: ERROR: umma_2sm --self-test failed; see ${SELF_TEST_UMMA_2SM_LOG_REL%.stderr.log}.*.log" >&2
     exit 1
 fi
 SELF_TEST_UMMA_2SM=PASS
-
-SELFTEST_MERGE_FILE="$(mktemp "${CAMPAIGN_DIR}/manifest_merge.XXXXXX")"
-printf '{"self_test_outcomes": {"umma_1sm": "%s", "umma_2sm": "%s"}}\n' \
-    "${SELF_TEST_UMMA_1SM}" "${SELF_TEST_UMMA_2SM}" >| "${SELFTEST_MERGE_FILE}"
-python3 "${AGGREGATOR_HOST}" manifest-write --campaign-dir "${CAMPAIGN_REL}" \
-    --status IN_PROGRESS --merge-json "${SELFTEST_MERGE_FILE}" >/dev/null
-rm -f "${SELFTEST_MERGE_FILE}"
+write_self_test_outcomes PASS PASS
 echo "run_exp02_umma_throughput: both full self-tests PASS; starting the 24-configuration sweep" >&2
 
 # Step 7-10: the 24 deterministic configurations, one GPU process at a time
@@ -450,15 +549,17 @@ while IFS=$'\t' read -r p_index p_pair p_method p_cta p_m p_n p_k p_depth p_bina
 
     launcher_log="${CAMPAIGN_DIR}/logs/${p_case_name}.launcher.log"
     stderr_log="${CAMPAIGN_DIR}/logs/${p_case_name}.stderr.log"
+    launcher_log_rel="${CAMPAIGN_REL}/logs/${p_case_name}.launcher.log"
+    stderr_log_rel="${CAMPAIGN_REL}/logs/${p_case_name}.stderr.log"
 
     echo "run_exp02_umma_throughput: [${p_index}/23] ${p_case_name} (pair ${p_pair}, ${p_method})" >&2
     if ! "${RUN_CONTAINER}" python3 "${AGGREGATOR_IN_CONTAINER}" capture \
             --campaign-dir "${CAMPAIGN_REL}" --out "cases/${p_case_name}.csv" -- \
             "${p_binary}" "${bench_args[@]}" \
             >"${launcher_log}" 2>"${stderr_log}"; then
-        write_manifest_status FAILED "capture_${p_case_name}" 1
+        write_manifest_status FAILED "capture_${p_case_name}" 1 "${stderr_log_rel}"
         CAMPAIGN_OUTCOME=FAILED
-        echo "run_exp02_umma_throughput: ERROR: capture failed at index ${p_index} (${p_case_name}); see ${launcher_log} / ${stderr_log}" >&2
+        echo "run_exp02_umma_throughput: ERROR: capture failed at index ${p_index} (${p_case_name}); see ${launcher_log_rel} / ${stderr_log_rel}" >&2
         exit 1
     fi
 
@@ -466,9 +567,9 @@ while IFS=$'\t' read -r p_index p_pair p_method p_cta p_m p_n p_k p_depth p_bina
         --run-kind "${RUN_KIND}" --iterations "${ITERATIONS}" --warmup-iterations "${WARMUP_ITERATIONS}"
         --repetitions "${REPETITIONS}" --git-commit "${GIT_COMMIT}")
     if ! python3 "${AGGREGATOR_HOST}" "${validate_args[@]}" 2>>"${stderr_log}"; then
-        write_manifest_status FAILED "validate_${p_case_name}" 1
+        write_manifest_status FAILED "validate_${p_case_name}" 1 "${stderr_log_rel}"
         CAMPAIGN_OUTCOME=FAILED
-        echo "run_exp02_umma_throughput: ERROR: validation failed at index ${p_index} (${p_case_name}); see ${stderr_log}" >&2
+        echo "run_exp02_umma_throughput: ERROR: validation failed at index ${p_index} (${p_case_name}); see ${stderr_log_rel}" >&2
         exit 1
     fi
 
@@ -499,6 +600,6 @@ if ! python3 "${AGGREGATOR_HOST}" "${finalize_args[@]}"; then
 fi
 
 CAMPAIGN_OUTCOME=COMPLETE
-echo "run_exp02_umma_throughput: campaign ${CAMPAIGN_ID} COMPLETE at ${CAMPAIGN_DIR}" >&2
+echo "run_exp02_umma_throughput: campaign ${CAMPAIGN_ID} COMPLETE at ${CAMPAIGN_REL}" >&2
 echo "run_exp02_umma_throughput: functional/descriptive output only; not a publishable performance result (P2.4 owns interpretation)" >&2
 exit 0

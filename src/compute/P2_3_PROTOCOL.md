@@ -131,9 +131,15 @@ scripts/run_exp02_umma_throughput.sh \
   `YYYYMMDDTHHMMSSZ`); when given it must match
   `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` and must not contain `..`.
 * `--iterations` in `[1, 1000000]`, `--warmup-iterations` in
-  `[0, 1000000]`, `--repetitions` in `[1, 1000000]` -- forwarded verbatim to
-  both binaries' own identically-named flags. These bounds are chosen so
-  that every existing signed 64-bit FLOP/UMMA formula
+  `[0, 1000000]`, `--repetitions` in `[2, 1000000]` (audit repair: real P2.3
+  campaigns require at least two repetitions per configuration, since
+  `summary.csv`'s sample standard deviation and coefficient of variation are
+  only statistically meaningful with two or more observations and must
+  never be silently reported as zero for a single sample; `--repetitions 1`
+  is rejected as a CLI/precondition error before any Docker, GPU, or
+  raw-results access) -- forwarded verbatim to both binaries' own
+  identically-named flags. The iterations/warmup-iterations bounds are
+  chosen so that every existing signed 64-bit FLOP/UMMA formula
   (`flops_per_umma = 2*M*N*K`, `total_umma = depth*iterations`,
   `total_flops = flops_per_umma*total_umma`) stays far inside the int64
   range for every one of the 24 frozen configurations -- proved by
@@ -386,6 +392,62 @@ infrastructure only; its cycle values are not publishable results. No
 * No TFLOP/s, empirical ceiling, 1-SM/2-SM speedup, scaling efficiency,
   saturation, winning configuration, or Nsight Compute result exists
   anywhere in this repository; P2.4 remains entirely unimplemented.
+
+### 8.1 First independent audit and GPU-free repair (evidence integrity and truthfulness)
+
+A first independent GPU-free audit of the initial implementation (commit
+`bbd6371eb1c40357e60eb843acfabea3f00e1366`) found eight defects, all in
+evidence integrity and campaign truthfulness rather than in the frozen
+24-case matrix, the P2.1/P2.2 binaries, or either SASS checker (none of
+which this repair touches):
+
+1. **Malformed CSV quoting.** `read_case_rows()`/`validate_execution_order_file()`
+   parsed campaign CSVs with Python's lenient (non-strict) `csv.reader`,
+   which can silently reinterpret broken or unterminated quoting instead of
+   rejecting it.
+2. **Unenforced `cases/` inventory.** `scan_case_directory()` silently
+   skipped any regular file whose name did not end in `.csv`
+   (`.partial`/`.invalid` salvage evidence, `notes.txt`, hidden files, ...)
+   instead of rejecting it, contrary to its own docstring.
+3. **Symlinked execution artifacts.** The runner's pre-self-test artifact
+   check used `test -f`, which follows symlinks, so a symlinked binary or
+   SASS evidence file could pass before the first `scripts/run_container.sh`
+   invocation.
+4. **Untruthful self-test outcomes.** `self_test_outcomes` was written to
+   the manifest only after *both* device self-tests passed; a failing or
+   never-run self-test left the manifest with no outcome recorded at all.
+5. **Absolute host paths.** Validation-error strings (built from absolute
+   `Path` objects) could reach `failure_detail` and campaign logs verbatim,
+   including this host's absolute repository path.
+6. **`make compute-umma-sweep-smoke` prerequisite ordering.** Listing
+   `compute-umma-1sm-sass compute-umma-2sm-sass` as Make prerequisites ran
+   Docker/compilation/SASS checks before the recipe's own
+   `BLACKWELL_GPU_INDEX` check.
+7. **Repetitions floor.** `--repetitions 1` was accepted, under which
+   `summary.csv`'s sample standard deviation and coefficient of variation
+   are silently reported as `0.000000` rather than being statistically
+   meaningless.
+8. **`PLAN.md` presentation.** The Phase 3 heading stated "Gate: Phase 2
+   gate passed." while P2.3 was unaudited/unverified and P2.4 was
+   unimplemented.
+
+All eight were remediated GPU-free, each with new adversarial self-test
+coverage: strict-mode `csv.Error` regressions for both the case-CSV and
+`execution_order.csv` readers; unexpected-`cases/`-entry regressions for
+`notes.txt`, a `.partial` file, and a subdirectory, alongside the
+pre-existing symlinked-case-file regression; a GPU-free synthetic proof that
+a symlinked execution artifact is rejected before any external launcher
+runs; manifest-lifecycle regressions for a first-method self-test failure, a
+second-method failure, and both methods passing, using an explicit
+PENDING/STARTED/PASS/FAIL/NOT_RUN per-method transition table
+(`SELF_TEST_TRANSITIONS`) in place of the previous whole-dict immutability
+rule; a synthetic-absolute-repository-path regression proving the redacted
+root never reaches the manifest, `failure_detail`, or P2.3-generated logs;
+and a `--repetitions 1`/`requested.repetitions=1` rejection regression at
+both the runner CLI and the manifest-validation layer. No CUDA kernel, SASS
+checker, or element of the frozen 24-case matrix changed. This repair does
+not itself constitute an audit: P2.3 remains independently unaudited and
+unverified on GB300, and P2.4 remains entirely unimplemented.
 
 ## 9. Status
 

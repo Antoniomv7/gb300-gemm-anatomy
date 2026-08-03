@@ -60,8 +60,10 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import csv
 import hashlib
+import io
 import itertools
 import json
 import math
@@ -186,10 +188,13 @@ INT64_MAX = 2**63 - 1
 # Docker/GPU/raw-results access, and re-validated in the manifest contract
 # below. Chosen so every existing signed-64-bit FLOP/UMMA formula (see
 # check_int64_safety()) stays far inside the int64 range for every one of the
-# 24 frozen configurations.
+# 24 frozen configurations. REPETITIONS_MIN=2 (audit repair): summary.csv's
+# sample standard deviation and coefficient of variation are only
+# statistically meaningful with at least two observations; a real P2.3
+# campaign must never be able to request repetitions=1.
 ITERATIONS_MIN, ITERATIONS_MAX = 1, 1_000_000
 WARMUP_ITERATIONS_MIN, WARMUP_ITERATIONS_MAX = 0, 1_000_000
-REPETITIONS_MIN, REPETITIONS_MAX = 1, 1_000_000
+REPETITIONS_MIN, REPETITIONS_MAX = 2, 1_000_000
 
 TERMINAL_STATUSES = frozenset({"COMPLETE", "FAILED", "INTERRUPTED"})
 ALLOWED_TRANSITIONS: dict[str | None, frozenset[str]] = {
@@ -665,6 +670,38 @@ def _is_sha256_hex(value: object) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Private-path redaction (audit repair): generated manifests, failure
+# details, and P2.3-generated logs must never store this host's absolute
+# repository path or user-specific prefix (AGENTS.md: never store home paths
+# or unrelated host metadata in logs, results, or committed files). Only the
+# exact literal REPO_ROOT prefix is ever replaced -- this is applied solely
+# to diagnostic/error text, never to CSV or manifest scientific data.
+# ---------------------------------------------------------------------------
+_REPO_ROOT_STR = str(REPO_ROOT)
+
+
+def _redact_repo_root(text: str) -> str:
+    """Replaces a literal occurrence of the canonical absolute repository
+    root with a stable repository-relative representation. A no-op unless
+    the exact REPO_ROOT string is present."""
+    if not text or _REPO_ROOT_STR not in text:
+        return text
+    return text.replace(_REPO_ROOT_STR + os.sep, "").replace(_REPO_ROOT_STR, ".")
+
+
+def _redact_failure_detail(errors: list[str]) -> list[str]:
+    return [_redact_repo_root(error) for error in errors]
+
+
+def _eprint(message: str) -> None:
+    """print(..., file=sys.stderr), with the absolute repository root
+    redacted first. Used by every subcommand's diagnostic output, since the
+    runner redirects several subcommands' stderr directly into
+    results/raw/.../logs/*.log."""
+    print(_redact_repo_root(message), file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Strict, centralized per-field validation contract.
 #
 # FIELD_VALIDATORS maps every one of the 37 CSV_HEADER columns to a callable
@@ -1044,13 +1081,18 @@ assert set(FIELD_VALIDATORS) == set(CSV_HEADER), (
 
 
 def read_case_rows(path: Path) -> tuple[list[list[str]], list[str]]:
-    """Reads the raw CSV with csv.reader (never cut/awk/line-splitting).
-    Returns (all_rows_including_header, errors). On a structural error the
-    row list may be incomplete."""
+    """Reads the raw CSV with csv.reader in strict mode (never cut/awk/
+    line-splitting). Strict mode (audit repair) makes broken or unterminated
+    quoting a hard csv.Error instead of a silently lenient reinterpretation,
+    so malformed CSV syntax can never be misparsed into something that
+    happens to still pass the exact-header/column-count/semantic checks
+    below. _open_regular_nofollow already opens with newline="" (required
+    for correct csv module behavior). Returns (all_rows_including_header,
+    errors). On a structural error the row list may be incomplete."""
     try:
         with _open_regular_nofollow(path, binary=False) as handle:
-            rows = list(csv.reader(handle))
-    except (OSError, UnsafePathError, UnicodeError) as exc:
+            rows = list(csv.reader(handle, strict=True))
+    except (OSError, UnsafePathError, UnicodeError, csv.Error) as exc:
         return [], [f"{path}: unable to read: {exc}"]
     if not rows:
         return [], [f"{path}: file is empty (no header)"]
@@ -1159,9 +1201,16 @@ def scan_case_directory(cases_dir: Path, plan: list[dict]) -> tuple[dict[int, Pa
     """Scans cases_dir for files matching the canonical NN_method_nN_dD.csv
     naming convention, cross-checks the parsed filename against the plan,
     and returns (index -> path for exactly the 24 expected indices, errors).
-    Anything not matching the canonical pattern (including .partial/.invalid
-    evidence), or not present, is reported rather than silently ignored or
-    aggregated."""
+    Every directory entry is inspected via lstat (never following a
+    symlink); the cases/ directory must contain exactly the 24 expected
+    filenames, each a regular non-symlink file. Anything else -- a
+    non-canonical .csv name, a non-.csv regular file (.partial/.invalid
+    salvage evidence, notes.txt, a hidden file, ...), a subdirectory, a
+    FIFO, or a symlink (dangling or not) at any expected or unexpected
+    filename -- is reported as an error, never silently ignored or
+    aggregated (audit repair: a non-.csv entry was previously skipped with a
+    bare `continue`, so a stray file such as cases/notes.txt could sit next
+    to a complete 24-case set without ever being flagged)."""
     errors: list[str] = []
     by_index = plan_by_index(plan)
     found: dict[int, Path] = {}
@@ -1186,7 +1235,8 @@ def scan_case_directory(cases_dir: Path, plan: list[dict]) -> tuple[dict[int, Pa
             errors.append(f"{path}: is not a regular file; refusing")
             continue
         if path.suffix != ".csv":
-            continue  # .partial / .invalid / anything else is never aggregated
+            errors.append(f"{path}: unexpected entry in cases/ (not a canonical case CSV); refusing")
+            continue
         match = CASE_NAME_RE.match(path.stem)
         if not match:
             errors.append(f"{path}: does not match the canonical case-name pattern; unexpected file")
@@ -1271,8 +1321,8 @@ def validate_execution_order_file(path: Path, plan: list[dict]) -> list[str]:
 
     try:
         with _open_regular_nofollow(path, binary=False) as handle:
-            rows = list(csv.reader(handle))
-    except (OSError, UnsafePathError, UnicodeError) as exc:
+            rows = list(csv.reader(handle, strict=True))
+    except (OSError, UnsafePathError, UnicodeError, csv.Error) as exc:
         return [f"{path}: unable to read: {exc}"]
     if not rows:
         return [f"{path}: empty file"]
@@ -1363,7 +1413,15 @@ SUMMARY_HEADER = [
 
 
 def _sample_stdev(values: list[float]) -> float:
-    return statistics.stdev(values) if len(values) > 1 else 0.0
+    """Sample standard deviation. Raises rather than silently reporting 0.0
+    for a single observation (audit repair): with REPETITIONS_MIN=2 enforced
+    upstream (CLI, requested-parameter, and manifest validation), a
+    real, validated case's rows must never number fewer than two, so
+    reaching this branch indicates an upstream validation gap, not a
+    legitimate single-sample statistic."""
+    if len(values) < 2:
+        raise ValueError(f"sample standard deviation requires at least 2 observations, got {len(values)}")
+    return statistics.stdev(values)
 
 
 def _numeric_stats(values: list[float]) -> dict[str, float]:
@@ -1564,13 +1622,59 @@ def _validate_requested(requested: object) -> None:
             raise ManifestTransitionError(f"manifest requested.{key} must be an integer in [{lo},{hi}]")
 
 
+SELF_TEST_OUTCOME_STATES = frozenset({"PENDING", "STARTED", "PASS", "FAIL", "NOT_RUN"})
+
+# Per-method self-test outcome lifecycle (audit repair). PENDING is the
+# initial value for a method that has not started yet (recorded together
+# with its sibling's STARTED, so both keys always exist -- the manifest
+# schema requires exactly {"umma_1sm", "umma_2sm"} at all times). STARTED is
+# recorded immediately before that method's device self-test runs, so an
+# interrupted running self-test is never later reported as PASS. NOT_RUN is
+# reserved for a method whose sibling failed first, so it never runs at all
+# -- an invented PASS/FAIL is never recorded for it. PASS/FAIL/NOT_RUN are
+# terminal: once recorded for a method, that method's outcome can never
+# change again (enforced in merge_manifest via _check_self_test_transition).
+SELF_TEST_TRANSITIONS: dict[str | None, frozenset[str]] = {
+    # None (no outcome recorded yet) may go straight to any state, including
+    # a terminal one -- this lets a manifest be initialized directly with a
+    # known-final outcome (e.g. a synthetic test fixture, or -- in the real
+    # runner -- a value that was already PASS by the time this exact key was
+    # first written). What matters is what happens *after* a value is
+    # recorded, not what the very first recorded value is allowed to be.
+    None: frozenset({"PENDING", "STARTED", "PASS", "FAIL", "NOT_RUN"}),
+    "PENDING": frozenset({"STARTED", "NOT_RUN"}),
+    "STARTED": frozenset({"PASS", "FAIL"}),
+    "PASS": frozenset(),
+    "FAIL": frozenset(),
+    "NOT_RUN": frozenset(),
+}
+
+
 def _validate_self_test_outcomes(value: object, *, require_pass: bool) -> None:
     if not isinstance(value, dict) or set(value) != {"umma_1sm", "umma_2sm"}:
         raise ManifestTransitionError("manifest self_test_outcomes must contain exactly umma_1sm and umma_2sm")
-    allowed = {"PASS"} if require_pass else {"PASS", "FAIL"}
+    allowed = {"PASS"} if require_pass else SELF_TEST_OUTCOME_STATES
     for method in METHODS:
         if value[method] not in allowed:
             raise ManifestTransitionError(f"manifest self_test_outcomes.{method}={value[method]!r} must be one of {sorted(allowed)}")
+
+
+def _check_self_test_transition(old_outcomes: object, new_outcomes: dict) -> None:
+    """Enforces the per-method SELF_TEST_TRANSITIONS lifecycle above instead
+    of the blanket "the whole dict can never change" rule this replaces:
+    PENDING/STARTED may still advance, but PASS/FAIL/NOT_RUN are terminal
+    per method. A method re-recorded with its already-current value (e.g. a
+    retried manifest-write) is always accepted."""
+    old = old_outcomes if isinstance(old_outcomes, dict) else {}
+    for method in METHODS:
+        old_value = old.get(method)
+        new_value = new_outcomes.get(method)
+        if old_value == new_value:
+            continue
+        if new_value not in SELF_TEST_TRANSITIONS.get(old_value, frozenset()):
+            raise ManifestTransitionError(
+                f"manifest self_test_outcomes.{method}: illegal transition {old_value!r} -> {new_value!r}"
+            )
 
 
 def _validate_versions_dict(value: object) -> None:
@@ -1772,9 +1876,8 @@ def merge_manifest(campaign_dir: Path, updates: dict, status: str, *, allow_comp
     for key in ("configuration_count_completed", "sample_count_completed"):
         if key in manifest and key in updates and updates[key] < manifest[key]:
             raise ManifestTransitionError(f"manifest counter {key!r} cannot decrease")
-    if "self_test_outcomes" in manifest and "self_test_outcomes" in updates:
-        if updates["self_test_outcomes"] != manifest["self_test_outcomes"]:
-            raise ManifestTransitionError("manifest self_test_outcomes cannot change after being recorded")
+    if "self_test_outcomes" in updates:
+        _check_self_test_transition(manifest.get("self_test_outcomes"), updates["self_test_outcomes"])
     manifest.update(updates)
     manifest["schema_version"] = MANIFEST_SCHEMA_VERSION
     manifest["experiment_id"] = EXPERIMENT_ID
@@ -1872,7 +1975,7 @@ def cmd_init_campaign(args: argparse.Namespace) -> int:
             git_commit=args.git_commit, gpu_index=args.gpu_index, started_at_utc=args.started_at_utc,
         )
     except (UnsafePathError, ManifestTransitionError, ValueError) as exc:
-        print(f"aggregate_exp02_umma_throughput: init-campaign: ERROR: {exc}", file=sys.stderr)
+        _eprint(f"aggregate_exp02_umma_throughput: init-campaign: ERROR: {exc}")
         return 2
     print(str(campaign_dir.relative_to(REPO_ROOT)))
     return 0
@@ -1887,37 +1990,35 @@ def _do_capture(
     try:
         out_path = resolve_capture_out_path(campaign_dir, out_rel)
     except UnsafePathError as exc:
-        print(f"aggregate_exp02_umma_throughput: capture: ERROR: {exc}", file=sys.stderr)
+        _eprint(f"aggregate_exp02_umma_throughput: capture: ERROR: {exc}")
         return 2
 
     if binary_argv and binary_argv[0] == "--":
         binary_argv = binary_argv[1:]  # argparse.REMAINDER keeps a literal '--' marker
     if not binary_argv:
-        print("aggregate_exp02_umma_throughput: capture: ERROR: no binary command given after '--'", file=sys.stderr)
+        _eprint("aggregate_exp02_umma_throughput: capture: ERROR: no binary command given after '--'")
         return 2
     if binary_argv[0] not in ALLOWED_BINARIES:
-        print(
+        _eprint(
             f"aggregate_exp02_umma_throughput: capture: ERROR: binary must be exactly one of "
-            f"{sorted(ALLOWED_BINARIES)}, got {binary_argv[0]!r}",
-            file=sys.stderr,
+            f"{sorted(ALLOWED_BINARIES)}, got {binary_argv[0]!r}"
         )
         return 2
     artifact_paths = DEFAULT_CAPTURE_ARTIFACTS if artifact_paths is None else artifact_paths
     artifact_path = artifact_paths.get(binary_argv[0])
     if artifact_path is None:
-        print(
-            f"aggregate_exp02_umma_throughput: capture: ERROR: no verified artifact path supplied for {binary_argv[0]!r}",
-            file=sys.stderr,
+        _eprint(
+            f"aggregate_exp02_umma_throughput: capture: ERROR: no verified artifact path supplied for {binary_argv[0]!r}"
         )
         return 2
     artifact_err = _verify_artifact(artifact_path)
     if artifact_err:
-        print(f"aggregate_exp02_umma_throughput: capture: ERROR: {artifact_err}", file=sys.stderr)
+        _eprint(f"aggregate_exp02_umma_throughput: capture: ERROR: {artifact_err}")
         return 2
 
     tmp_path = out_path.with_name(out_path.name + ".tmp")
     if os.path.lexists(tmp_path):
-        print(f"aggregate_exp02_umma_throughput: capture: ERROR: stale temporary file already exists: {tmp_path}", file=sys.stderr)
+        _eprint(f"aggregate_exp02_umma_throughput: capture: ERROR: stale temporary file already exists: {tmp_path}")
         return 2
 
     def salvage(is_signal: bool) -> None:
@@ -1933,46 +2034,46 @@ def _do_capture(
                 failed_path = out_path.with_name(out_path.name + suffix + numbered)
                 try:
                     _publish_no_clobber(tmp_path, failed_path)
-                    print(f"aggregate_exp02_umma_throughput: capture: preserved evidence as {failed_path.name}", file=sys.stderr)
+                    _eprint(f"aggregate_exp02_umma_throughput: capture: preserved evidence as {failed_path.name}")
                     return
                 except UnsafePathError:
                     if os.path.lexists(tmp_path):
                         continue
                     return
-            print("aggregate_exp02_umma_throughput: capture: ERROR: could not find a free failure-evidence name", file=sys.stderr)
+            _eprint("aggregate_exp02_umma_throughput: capture: ERROR: could not find a free failure-evidence name")
         else:
             if os.path.lexists(tmp_path):
                 _safe_unlink_owned(tmp_path)
 
-    print(f"aggregate_exp02_umma_throughput: capture: running {binary_argv!r} -> {out_path.name}", file=sys.stderr)
+    _eprint(f"aggregate_exp02_umma_throughput: capture: running {binary_argv!r} -> {out_path.name}")
     try:
         csv_out = _open_exclusive(tmp_path, binary=True)
     except UnsafePathError as exc:
-        print(f"aggregate_exp02_umma_throughput: capture: ERROR: cannot create owned temporary: {exc}", file=sys.stderr)
+        _eprint(f"aggregate_exp02_umma_throughput: capture: ERROR: cannot create owned temporary: {exc}")
         return 2
     try:
         with csv_out:
             result = subprocess.run(binary_argv, stdout=csv_out, stderr=None)
     except OSError as exc:
-        print(f"aggregate_exp02_umma_throughput: capture: ERROR: unable to launch binary: {exc}", file=sys.stderr)
+        _eprint(f"aggregate_exp02_umma_throughput: capture: ERROR: unable to launch binary: {exc}")
         salvage(is_signal=False)
         return 1
 
     if result.returncode == 0:
         if not os.path.lexists(tmp_path) or os.lstat(tmp_path).st_size == 0:
-            print("aggregate_exp02_umma_throughput: capture: ERROR: binary exited 0 but produced no stdout", file=sys.stderr)
+            _eprint("aggregate_exp02_umma_throughput: capture: ERROR: binary exited 0 but produced no stdout")
             salvage(is_signal=False)
             return 1
         try:
             _publish_no_clobber(tmp_path, out_path)
         except UnsafePathError as exc:
-            print(f"aggregate_exp02_umma_throughput: capture: ERROR: {exc}", file=sys.stderr)
+            _eprint(f"aggregate_exp02_umma_throughput: capture: ERROR: {exc}")
             salvage(is_signal=False)
             return 1
-        print(f"aggregate_exp02_umma_throughput: capture: OK: wrote {out_path}", file=sys.stderr)
+        _eprint(f"aggregate_exp02_umma_throughput: capture: OK: wrote {out_path}")
         return 0
 
-    print(f"aggregate_exp02_umma_throughput: capture: ERROR: binary exited {result.returncode}", file=sys.stderr)
+    _eprint(f"aggregate_exp02_umma_throughput: capture: ERROR: binary exited {result.returncode}")
     salvage(is_signal=result.returncode < 0)
     return 1
 
@@ -1981,7 +2082,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
     try:
         campaign_dir = resolve_campaign_dir(args.campaign_dir)
     except UnsafePathError as exc:
-        print(f"aggregate_exp02_umma_throughput: capture: ERROR: {exc}", file=sys.stderr)
+        _eprint(f"aggregate_exp02_umma_throughput: capture: ERROR: {exc}")
         return 2
     return _do_capture(campaign_dir, args.out, list(args.binary_args))
 
@@ -1993,17 +2094,16 @@ def cmd_validate_case(args: argparse.Namespace) -> int:
     plan = build_plan()
     entry = plan_by_index(plan).get(args.index)
     if entry is None:
-        print(
+        _eprint(
             f"aggregate_exp02_umma_throughput: validate-case: ERROR: index {args.index} "
-            f"is not in 0..{EXPECTED_CONFIGURATION_COUNT - 1}",
-            file=sys.stderr,
+            f"is not in 0..{EXPECTED_CONFIGURATION_COUNT - 1}"
         )
         return 2
 
     try:
         campaign_dir = resolve_campaign_dir(args.campaign_dir)
     except UnsafePathError as exc:
-        print(f"aggregate_exp02_umma_throughput: validate-case: ERROR: {exc}", file=sys.stderr)
+        _eprint(f"aggregate_exp02_umma_throughput: validate-case: ERROR: {exc}")
         return 2
 
     case_path = campaign_dir / "cases" / f"{entry['case_name']}.csv"
@@ -2013,11 +2113,11 @@ def cmd_validate_case(args: argparse.Namespace) -> int:
     )
     _, errors = validate_case_file(case_path, expect)
     if errors:
-        print(f"aggregate_exp02_umma_throughput: validate-case: FAIL: {case_path}", file=sys.stderr)
+        _eprint(f"aggregate_exp02_umma_throughput: validate-case: FAIL: {case_path}")
         for error in errors:
-            print(f"aggregate_exp02_umma_throughput: validate-case:   - {error}", file=sys.stderr)
+            _eprint(f"aggregate_exp02_umma_throughput: validate-case:   - {error}")
         return 1
-    print(f"aggregate_exp02_umma_throughput: validate-case: OK: {case_path}", file=sys.stderr)
+    _eprint(f"aggregate_exp02_umma_throughput: validate-case: OK: {case_path}")
     return 0
 
 
@@ -2102,7 +2202,16 @@ def _do_finalize(
         try:
             manifest = load_manifest(campaign_dir)
             if manifest.get("status") in (None, "IN_PROGRESS"):
-                merge_manifest(campaign_dir, {"failure_stage": stage, "failure_detail": errors[:50]}, status="FAILED")
+                # Audit repair: redact the absolute repository root from
+                # every error string before it is persisted, so a
+                # validation failure (which routinely embeds absolute
+                # campaign/case paths built from REPO_ROOT) never stores
+                # this host's absolute path in the manifest.
+                merge_manifest(
+                    campaign_dir,
+                    {"failure_stage": stage, "failure_detail": _redact_failure_detail(errors[:50])},
+                    status="FAILED",
+                )
         except (ManifestTransitionError, UnsafePathError):
             pass
         return False, errors
@@ -2257,16 +2366,16 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     try:
         campaign_dir = resolve_campaign_dir(args.campaign_dir)
     except UnsafePathError as exc:
-        print(f"aggregate_exp02_umma_throughput: finalize: ERROR: {exc}", file=sys.stderr)
+        _eprint(f"aggregate_exp02_umma_throughput: finalize: ERROR: {exc}")
         return 2
 
     success, errors = _do_finalize(campaign_dir, args)
     if not success:
-        print("aggregate_exp02_umma_throughput: finalize: ERROR:", file=sys.stderr)
+        _eprint("aggregate_exp02_umma_throughput: finalize: ERROR:")
         for error in errors:
-            print(f"aggregate_exp02_umma_throughput: finalize:   - {error}", file=sys.stderr)
+            _eprint(f"aggregate_exp02_umma_throughput: finalize:   - {error}")
         return 1
-    print(f"aggregate_exp02_umma_throughput: finalize: OK: campaign {args.campaign_id} COMPLETE", file=sys.stderr)
+    _eprint(f"aggregate_exp02_umma_throughput: finalize: OK: campaign {args.campaign_id} COMPLETE")
     return 0
 
 
@@ -2277,7 +2386,7 @@ def cmd_manifest_write(args: argparse.Namespace) -> int:
     try:
         campaign_dir = resolve_campaign_dir(args.campaign_dir)
     except UnsafePathError as exc:
-        print(f"aggregate_exp02_umma_throughput: manifest-write: ERROR: {exc}", file=sys.stderr)
+        _eprint(f"aggregate_exp02_umma_throughput: manifest-write: ERROR: {exc}")
         return 2
 
     updates: dict = {}
@@ -2286,18 +2395,18 @@ def cmd_manifest_write(args: argparse.Namespace) -> int:
         try:
             updates = json.loads(merge_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            print(f"aggregate_exp02_umma_throughput: manifest-write: ERROR: cannot read --merge-json: {exc}", file=sys.stderr)
+            _eprint(f"aggregate_exp02_umma_throughput: manifest-write: ERROR: cannot read --merge-json: {exc}")
             return 2
         if not isinstance(updates, dict):
-            print("aggregate_exp02_umma_throughput: manifest-write: ERROR: --merge-json must contain a JSON object", file=sys.stderr)
+            _eprint("aggregate_exp02_umma_throughput: manifest-write: ERROR: --merge-json must contain a JSON object")
             return 2
 
     try:
         merge_manifest(campaign_dir, updates, status=args.status)
     except ManifestTransitionError as exc:
-        print(f"aggregate_exp02_umma_throughput: manifest-write: ERROR: {exc}", file=sys.stderr)
+        _eprint(f"aggregate_exp02_umma_throughput: manifest-write: ERROR: {exc}")
         return 1
-    print(f"aggregate_exp02_umma_throughput: manifest-write: OK: status={args.status}", file=sys.stderr)
+    _eprint(f"aggregate_exp02_umma_throughput: manifest-write: OK: status={args.status}")
     return 0
 
 
@@ -2308,9 +2417,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
     plan = build_plan()
     errors = check_plan_contract(plan)
     if errors:
-        print("aggregate_exp02_umma_throughput: plan: ERROR: plan contract violated:", file=sys.stderr)
+        _eprint("aggregate_exp02_umma_throughput: plan: ERROR: plan contract violated:")
         for error in errors:
-            print(f"aggregate_exp02_umma_throughput: plan:   - {error}", file=sys.stderr)
+            _eprint(f"aggregate_exp02_umma_throughput: plan:   - {error}")
         return 1
     if args.format == "json":
         print(json.dumps(plan, indent=2))
@@ -2442,7 +2551,7 @@ def _build_valid_campaign(
     return plan
 
 
-def _prepare_test_finalize_campaign(parent: Path, campaign_id: str, *, repetitions: int = 1) -> tuple[Path, argparse.Namespace]:
+def _prepare_test_finalize_campaign(parent: Path, campaign_id: str, *, repetitions: int = 2) -> tuple[Path, argparse.Namespace]:
     """Create a complete synthetic pre-finalization fixture under parent.
 
     It includes all 24 case files, execution_order.csv, an initialized
@@ -2551,6 +2660,42 @@ def run_self_test() -> int:
             _write_case_csv(path, rows)
             _, errors = validate_case_file(path, _expect_for(entry, repetitions=3))
             rec.check(f"valid synthetic {label} CSV passes validation", not errors, detail=str(errors))
+
+        # --- malformed/unterminated CSV quoting (audit repair: strict mode) ------
+        # A quoted field immediately followed by unescaped trailing text before
+        # the next delimiter (e.g. `"a" b,c`) is the canonical strict-mode
+        # csv.Error trigger: Python's default (non-strict) csv.reader silently
+        # reinterprets it instead of rejecting it, which is exactly the audit
+        # finding this regression reproduces and closes.
+        malformed_path = tmp_path / "malformed_quoting.csv"
+        malformed_path.write_text(
+            ",".join(CSV_HEADER) + "\n" + '"' + entry_1sm["case_name"] + '" trailing,x,x\n', encoding="utf-8",
+        )
+        rows_bad, read_errors_bad = read_case_rows(malformed_path)
+        rec.check(
+            "a case CSV with malformed/unterminated quoting is rejected by strict csv.reader, never silently misparsed",
+            bool(read_errors_bad) and not rows_bad,
+            detail=str(read_errors_bad),
+        )
+        _, ve_errors_bad = validate_case_file(malformed_path, _expect_for(entry_1sm, repetitions=1))
+        rec.check(
+            "validate_case_file rejects the same malformed-quoting case CSV",
+            bool(ve_errors_bad),
+            detail=str(ve_errors_bad),
+        )
+
+        malformed_eo_path = tmp_path / "malformed_eo_execution_order.csv"
+        malformed_eo_path.write_text(
+            ",".join(EXECUTION_ORDER_HEADER) + "\n"
+            + '"0" bogus,1,umma_1sm,1,128,64,16,4,build/compute/umma_1sm,cases/x.csv\n',
+            encoding="utf-8",
+        )
+        eo_malformed_errors = validate_execution_order_file(malformed_eo_path, plan)
+        rec.check(
+            "execution_order.csv with malformed/unterminated quoting is rejected by strict csv.reader",
+            bool(eo_malformed_errors),
+            detail=str(eo_malformed_errors),
+        )
 
         # --- structural failures: header/order/row-count/sample-index ------
         bad_header_path = tmp_path / "bad_header.csv"
@@ -2675,6 +2820,12 @@ def run_self_test() -> int:
         _, errs_d = scan_case_directory(dup_dir, plan_full)
         rec.check("scan_case_directory rejects a duplicate index", any("duplicate configuration for index 0" in e for e in errs_d), detail=str(errs_d))
 
+        # audit repair: an unexpected entry in cases/ must be rejected, never
+        # silently ignored, regardless of its extension or type -- a stray
+        # notes.txt, a .partial salvage-evidence file, or a subdirectory must
+        # each independently prevent scan_case_directory from returning a
+        # clean 24-case set (and therefore prevent finalize from reaching
+        # COMPLETE).
         unexpected_dir = tmp_path / "scan_unexpected"
         unexpected_dir.mkdir()
         for e in plan_full:
@@ -2683,9 +2834,38 @@ def run_self_test() -> int:
         (unexpected_dir / "notes.txt").write_text("ignored\n")
         _, errs_u = scan_case_directory(unexpected_dir, plan_full)
         rec.check(
-            "scan_case_directory rejects an unexpected .csv file but ignores non-.csv files",
-            any("does not match the canonical case-name pattern" in e for e in errs_u) and not any("notes.txt" in e for e in errs_u),
+            "scan_case_directory rejects an unexpected .csv file with a non-canonical name",
+            any("does not match the canonical case-name pattern" in e for e in errs_u),
             detail=str(errs_u),
+        )
+        rec.check(
+            "scan_case_directory rejects an unexpected non-.csv file (cases/notes.txt), never silently ignoring it",
+            any("notes.txt" in e for e in errs_u),
+            detail=str(errs_u),
+        )
+
+        partial_dir = tmp_path / "scan_partial"
+        partial_dir.mkdir()
+        for e in plan_full:
+            _write_case_csv(partial_dir / f"{e['case_name']}.csv", [_default_row(e, 0, repetitions=1)])
+        (partial_dir / f"{plan_full[0]['case_name']}.csv.partial").write_text("salvaged garbage\n")
+        _, errs_p = scan_case_directory(partial_dir, plan_full)
+        rec.check(
+            "scan_case_directory rejects an unexpected .partial salvage-evidence file, never silently ignoring it",
+            any(".partial" in e for e in errs_p),
+            detail=str(errs_p),
+        )
+
+        subdir_dir = tmp_path / "scan_subdir"
+        subdir_dir.mkdir()
+        for e in plan_full:
+            _write_case_csv(subdir_dir / f"{e['case_name']}.csv", [_default_row(e, 0, repetitions=1)])
+        (subdir_dir / "unexpected_subdir").mkdir()
+        _, errs_sd = scan_case_directory(subdir_dir, plan_full)
+        rec.check(
+            "scan_case_directory rejects an unexpected subdirectory in cases/, never silently ignoring it",
+            any("unexpected_subdir" in e for e in errs_sd),
+            detail=str(errs_sd),
         )
 
         symlink_dir = tmp_path / "scan_symlink"
@@ -2775,6 +2955,120 @@ def run_self_test() -> int:
         write_summary(cases_for_agg, summary_path_2)
         rec.check("summary.csv generation is deterministic", summary_path.read_bytes() == summary_path_2.read_bytes())
 
+        # --- summary statistics must be mathematically valid (audit repair) ------
+        try:
+            _numeric_stats([1000.0])
+            single_sample_stats_rejected = False
+        except ValueError:
+            single_sample_stats_rejected = True
+        rec.check(
+            "_numeric_stats/_sample_stdev refuse to silently report zero stdev/CV for a single observation",
+            single_sample_stats_rejected,
+        )
+        two_sample_stats = _numeric_stats([1000.0, 1002.0])
+        rec.check(
+            "_numeric_stats computes a real, non-zero sample stdev for two or more observations",
+            two_sample_stats["stdev"] > 0.0,
+            detail=str(two_sample_stats),
+        )
+
+        repetitions_floor_campaign = tmp_path / "repetitions_floor_campaign"
+        repetitions_floor_campaign.mkdir()
+        try:
+            merge_manifest(
+                repetitions_floor_campaign,
+                {
+                    "campaign_id": "repetitions_floor_campaign", "run_kind": "smoke",
+                    "started_at_utc": "20260803T000000Z",
+                    "configuration_count_expected": EXPECTED_CONFIGURATION_COUNT, "configuration_count_completed": 0,
+                    "sample_count_expected": EXPECTED_CONFIGURATION_COUNT, "sample_count_completed": 0,
+                    "requested": {
+                        "run_kind": "smoke", "iterations": 20, "warmup_iterations": 5,
+                        "repetitions": 1, "campaign_id": "repetitions_floor_campaign",
+                    },
+                    "selected_gpu_index": 0, "git_commit": "a" * 40, "git_dirty": False,
+                },
+                status="IN_PROGRESS",
+            )
+            repetitions_floor_rejected = False
+        except ManifestTransitionError:
+            repetitions_floor_rejected = True
+        rec.check(
+            "manifest requested.repetitions=1 is rejected before a campaign can be initialized (REPETITIONS_MIN=2)",
+            repetitions_floor_rejected,
+        )
+
+        # --- private-path redaction (audit repair): a synthetic absolute
+        # repository path must never survive into the manifest, failure
+        # detail, or any P2.3-generated diagnostic/log text. ----------------
+        synthetic_abs_case_path = (
+            f"{REPO_ROOT}/results/raw/exp02_umma_throughput/FAKE_CAMPAIGN/cases/00_umma_1sm_n64_d4.csv"
+        )
+        synthetic_relative_suffix = "results/raw/exp02_umma_throughput/FAKE_CAMPAIGN/cases/00_umma_1sm_n64_d4.csv"
+
+        redacted_single = _redact_repo_root(f"{synthetic_abs_case_path}: some validation error")
+        rec.check(
+            "_redact_repo_root removes the absolute repository root from a synthetic absolute repository path",
+            str(REPO_ROOT) not in redacted_single and synthetic_relative_suffix in redacted_single,
+            detail=redacted_single,
+        )
+
+        redacted_list = _redact_failure_detail(
+            [f"{synthetic_abs_case_path}: another error", "an already-relative message"]
+        )
+        rec.check(
+            "_redact_failure_detail (used by _do_finalize before persisting failure_detail) redacts every list entry",
+            all(str(REPO_ROOT) not in e for e in redacted_list) and redacted_list[1] == "an already-relative message",
+            detail=str(redacted_list),
+        )
+
+        eprint_buf = io.StringIO()
+        with contextlib.redirect_stderr(eprint_buf):
+            _eprint(f"aggregate_exp02_umma_throughput: test: synthetic {synthetic_abs_case_path}")
+        eprint_logged = eprint_buf.getvalue()
+        rec.check(
+            "_eprint (used by every P2.3 subcommand whose stderr the runner redirects into logs/*.log) "
+            "never leaks the absolute repository root",
+            str(REPO_ROOT) not in eprint_logged and synthetic_relative_suffix in eprint_logged,
+            detail=eprint_logged,
+        )
+
+        # End-to-end proof through the real _do_finalize code path (never
+        # writing under the real results/raw/ tree -- only a read-only
+        # existence probe of one deliberately nonexistent path beneath it):
+        redaction_probe_root = tmp_path / "redaction_probe_root"
+        redaction_probe_root.mkdir()
+        redaction_probe_campaign, redaction_probe_args = _prepare_test_finalize_campaign(
+            redaction_probe_root, "redaction_probe", repetitions=2,
+        )
+        redaction_probe_sass1 = tmp_path / "redaction_probe.sass"
+        redaction_probe_sass1.write_bytes(b"x")
+        redaction_probe_bin2 = tmp_path / "redaction_probe_bin2"
+        redaction_probe_bin2.write_bytes(b"x")
+        redaction_probe_sass2 = tmp_path / "redaction_probe2.sass"
+        redaction_probe_sass2.write_bytes(b"x")
+        redaction_probe_artifacts = {
+            "umma_1sm_bin": REPO_ROOT / "results" / "raw" / "exp02_umma_throughput" / "DOES_NOT_EXIST_PROBE_FOR_SELFTEST",
+            "umma_1sm_sass": redaction_probe_sass1,
+            "umma_2sm_bin": redaction_probe_bin2,
+            "umma_2sm_sass": redaction_probe_sass2,
+        }
+        success_redact, errors_redact = _do_finalize(
+            redaction_probe_campaign, redaction_probe_args, artifact_paths=redaction_probe_artifacts,
+        )
+        rec.check(
+            "finalize fails closed against a missing artifact referenced by a real absolute path under REPO_ROOT",
+            not success_redact and any(str(REPO_ROOT) in e for e in errors_redact),
+            detail=str(errors_redact),
+        )
+        redaction_probe_manifest = load_manifest(redaction_probe_campaign)
+        persisted_detail = redaction_probe_manifest.get("failure_detail") or []
+        rec.check(
+            "that real finalize failure never persists the absolute repository root into the manifest's failure_detail",
+            redaction_probe_manifest.get("status") == "FAILED" and all(str(REPO_ROOT) not in d for d in persisted_detail),
+            detail=str(persisted_detail),
+        )
+
         # --- manifest state machine ---------------------------------------------
         manifest_campaign = tmp_path / "manifest_campaign"
         manifest_campaign.mkdir()
@@ -2835,6 +3129,97 @@ def run_self_test() -> int:
             self_test_immutable_ok = True
         rec.check("self_test_outcomes cannot change once recorded", self_test_immutable_ok)
 
+        # --- self-test outcome truthfulness (audit repair): first-method
+        # failure, second-method failure, both-pass, an interrupted running
+        # self-test, and illegal per-method transitions. Mirrors exactly the
+        # write sequence scripts/run_exp02_umma_throughput.sh now performs.
+        def _init_self_test_campaign(campaign_id: str) -> Path:
+            campaign_dir = tmp_path / campaign_id
+            campaign_dir.mkdir()
+            merge_manifest(
+                campaign_dir,
+                {
+                    "campaign_id": campaign_id, "run_kind": "smoke", "started_at_utc": "20260803T000000Z",
+                    "configuration_count_expected": EXPECTED_CONFIGURATION_COUNT, "configuration_count_completed": 0,
+                    "sample_count_expected": EXPECTED_CONFIGURATION_COUNT * 2, "sample_count_completed": 0,
+                    "requested": {
+                        "run_kind": "smoke", "iterations": 20, "warmup_iterations": 5,
+                        "repetitions": 2, "campaign_id": campaign_id,
+                    },
+                    "selected_gpu_index": 0, "git_commit": "a" * 40, "git_dirty": False,
+                },
+                status="IN_PROGRESS",
+            )
+            return campaign_dir
+
+        first_fail_campaign = _init_self_test_campaign("self_test_first_fail")
+        merge_manifest(first_fail_campaign, {"self_test_outcomes": {"umma_1sm": "STARTED", "umma_2sm": "PENDING"}}, status="IN_PROGRESS")
+        merge_manifest(first_fail_campaign, {"self_test_outcomes": {"umma_1sm": "FAIL", "umma_2sm": "NOT_RUN"}}, status="FAILED")
+        first_fail_manifest = load_manifest(first_fail_campaign)
+        rec.check(
+            "first-method self-test failure is recorded truthfully (FAIL), and the never-run sibling is NOT_RUN, never invented",
+            first_fail_manifest["self_test_outcomes"] == {"umma_1sm": "FAIL", "umma_2sm": "NOT_RUN"}
+            and first_fail_manifest["status"] == "FAILED",
+            detail=str(first_fail_manifest.get("self_test_outcomes")),
+        )
+        try:
+            _validate_self_test_outcomes(first_fail_manifest["self_test_outcomes"], require_pass=True)
+            first_fail_complete_rejected = False
+        except ManifestTransitionError:
+            first_fail_complete_rejected = True
+        rec.check("a first-method self-test failure can never satisfy the COMPLETE self-test contract", first_fail_complete_rejected)
+
+        second_fail_campaign = _init_self_test_campaign("self_test_second_fail")
+        merge_manifest(second_fail_campaign, {"self_test_outcomes": {"umma_1sm": "STARTED", "umma_2sm": "PENDING"}}, status="IN_PROGRESS")
+        merge_manifest(second_fail_campaign, {"self_test_outcomes": {"umma_1sm": "PASS", "umma_2sm": "PENDING"}}, status="IN_PROGRESS")
+        merge_manifest(second_fail_campaign, {"self_test_outcomes": {"umma_1sm": "PASS", "umma_2sm": "STARTED"}}, status="IN_PROGRESS")
+        merge_manifest(second_fail_campaign, {"self_test_outcomes": {"umma_1sm": "PASS", "umma_2sm": "FAIL"}}, status="FAILED")
+        second_fail_manifest = load_manifest(second_fail_campaign)
+        rec.check(
+            "second-method self-test failure is recorded truthfully after the first genuinely passed",
+            second_fail_manifest["self_test_outcomes"] == {"umma_1sm": "PASS", "umma_2sm": "FAIL"}
+            and second_fail_manifest["status"] == "FAILED",
+            detail=str(second_fail_manifest.get("self_test_outcomes")),
+        )
+
+        both_pass_campaign = _init_self_test_campaign("self_test_both_pass")
+        merge_manifest(both_pass_campaign, {"self_test_outcomes": {"umma_1sm": "STARTED", "umma_2sm": "PENDING"}}, status="IN_PROGRESS")
+        merge_manifest(both_pass_campaign, {"self_test_outcomes": {"umma_1sm": "PASS", "umma_2sm": "PENDING"}}, status="IN_PROGRESS")
+        merge_manifest(both_pass_campaign, {"self_test_outcomes": {"umma_1sm": "PASS", "umma_2sm": "STARTED"}}, status="IN_PROGRESS")
+        merge_manifest(both_pass_campaign, {"self_test_outcomes": {"umma_1sm": "PASS", "umma_2sm": "PASS"}}, status="IN_PROGRESS")
+        both_pass_manifest = load_manifest(both_pass_campaign)
+        rec.check(
+            "both self-tests genuinely passing is recorded truthfully",
+            both_pass_manifest["self_test_outcomes"] == {"umma_1sm": "PASS", "umma_2sm": "PASS"},
+            detail=str(both_pass_manifest.get("self_test_outcomes")),
+        )
+        try:
+            _validate_self_test_outcomes(both_pass_manifest["self_test_outcomes"], require_pass=True)
+            both_pass_complete_ok = True
+        except ManifestTransitionError:
+            both_pass_complete_ok = False
+        rec.check("a campaign with both self-tests genuinely PASS satisfies the COMPLETE self-test contract", both_pass_complete_ok)
+
+        interrupted_campaign = _init_self_test_campaign("self_test_interrupted")
+        merge_manifest(interrupted_campaign, {"self_test_outcomes": {"umma_1sm": "STARTED", "umma_2sm": "PENDING"}}, status="IN_PROGRESS")
+        merge_manifest(interrupted_campaign, {}, status="INTERRUPTED")
+        interrupted_manifest = load_manifest(interrupted_campaign)
+        rec.check(
+            "an interrupted running self-test remains STARTED, never silently reported as PASS",
+            interrupted_manifest["self_test_outcomes"]["umma_1sm"] == "STARTED"
+            and interrupted_manifest["status"] == "INTERRUPTED",
+            detail=str(interrupted_manifest.get("self_test_outcomes")),
+        )
+
+        illegal_transition_campaign = _init_self_test_campaign("self_test_illegal_transition")
+        merge_manifest(illegal_transition_campaign, {"self_test_outcomes": {"umma_1sm": "FAIL", "umma_2sm": "NOT_RUN"}}, status="IN_PROGRESS")
+        try:
+            merge_manifest(illegal_transition_campaign, {"self_test_outcomes": {"umma_1sm": "FAIL", "umma_2sm": "STARTED"}}, status="IN_PROGRESS")
+            not_run_resurrection_rejected = False
+        except ManifestTransitionError:
+            not_run_resurrection_rejected = True
+        rec.check("a method recorded NOT_RUN can never later be reported as STARTED/PASS/FAIL", not_run_resurrection_rejected)
+
         terminal_campaign = tmp_path / "terminal_campaign"
         terminal_campaign.mkdir()
         merge_manifest(
@@ -2842,8 +3227,8 @@ def run_self_test() -> int:
             {
                 "campaign_id": "terminal_campaign", "run_kind": "smoke", "started_at_utc": "20260803T000000Z",
                 "configuration_count_expected": EXPECTED_CONFIGURATION_COUNT, "configuration_count_completed": 0,
-                "sample_count_expected": EXPECTED_CONFIGURATION_COUNT, "sample_count_completed": 0,
-                "requested": {"run_kind": "smoke", "iterations": 20, "warmup_iterations": 5, "repetitions": 1, "campaign_id": "terminal_campaign"},
+                "sample_count_expected": EXPECTED_CONFIGURATION_COUNT * 2, "sample_count_completed": 0,
+                "requested": {"run_kind": "smoke", "iterations": 20, "warmup_iterations": 5, "repetitions": 2, "campaign_id": "terminal_campaign"},
                 "selected_gpu_index": 0, "git_commit": "a" * 40, "git_dirty": False,
             },
             status="IN_PROGRESS",
@@ -2962,7 +3347,7 @@ def run_self_test() -> int:
 
         fin_bad_root = tmp_path / "finalize_bad_root"
         fin_bad_root.mkdir()
-        fin_bad_campaign, fin_bad_args = _prepare_test_finalize_campaign(fin_bad_root, "finalize_bad", repetitions=1)
+        fin_bad_campaign, fin_bad_args = _prepare_test_finalize_campaign(fin_bad_root, "finalize_bad", repetitions=2)
         success_bad, errors_bad = _do_finalize(fin_bad_campaign, fin_bad_args, artifact_paths={}, versions_path=fake_versions)
         rec.check("finalize fails closed when required artifacts are misconfigured/missing", not success_bad and bool(errors_bad))
         bad_manifest = load_manifest(fin_bad_campaign)
@@ -2970,7 +3355,7 @@ def run_self_test() -> int:
 
         mismatch_root = tmp_path / "finalize_mismatch_root"
         mismatch_root.mkdir()
-        mismatch_campaign, mismatch_args = _prepare_test_finalize_campaign(mismatch_root, "finalize_mismatch", repetitions=1)
+        mismatch_campaign, mismatch_args = _prepare_test_finalize_campaign(mismatch_root, "finalize_mismatch", repetitions=2)
         mismatch_args.repetitions = 999
         success_mm, errors_mm = _do_finalize(mismatch_campaign, mismatch_args, artifact_paths=real_artifacts, versions_path=fake_versions)
         rec.check(
