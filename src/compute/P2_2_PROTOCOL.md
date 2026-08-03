@@ -28,7 +28,7 @@ sweep infrastructure).
 |------|-------|--------------------------|
 | P2.1 | 1-SM UMMA: single CTA, `cta_group::1`, M=128, N in {64,128,256}, depth in {4,16,64,256}, 12 configurations. | **Implemented, independently audited, and functionally verified on GB300** (see `src/compute/P2_PROTOCOL.md`). |
 | P2.2 | 2-SM UMMA: CTA pair, `cta_group::2`, M=256, cluster of 2 CTAs, 12 configurations. | **Implemented, independently audited, and functionally verified on GB300** at commit `637b6a7e2efbe77b1c9c5d3dfc7ece527f522bba` on 31 July 2026. |
-| P2.3 | Joint 1-SM/2-SM sweep infrastructure, at most 24 configurations (AGENTS.md ceiling). | **Implemented; independently audited: no; verified on GB300: no.** See `src/compute/P2_3_PROTOCOL.md`. Reuses the P2.1/P2.2 binaries above unmodified; introduces no new CUDA kernel. |
+| P2.3 | Joint 1-SM/2-SM sweep infrastructure, at most 24 configurations (AGENTS.md ceiling). | **Implemented, independently audited, and functionally verified on GB300** at commit `7a7cc2ab83197376720f030ba2e990092c3ada40` on 3 August 2026. See `src/compute/P2_3_PROTOCOL.md`. Reuses the P2.1/P2.2 binaries above unmodified; introduces no new CUDA kernel. |
 | P2.4 | Profiling and empirical ceiling: Nsight Compute, TFLOP/s and saturation analysis. | **Not implemented.** No profiling script, no TFLOP/s conversion, no saturation claim exists. `elapsed_cycles` in the P2.2 CSV is a raw `%clock64` delta, never converted to seconds or FLOP/s here. |
 
 Together with P2.1, P2.2 completes AGENTS.md's full 24-configuration Phase 2
@@ -914,8 +914,9 @@ BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
   by the publicly available PTX ISA text; section 8 documents the safe,
   strictly-sufficient choice made under this ambiguity (cluster-scoped
   `fence.proxy.async`).
-* P2.3 (joint sweep infrastructure) is implemented but not yet
-  independently audited or GB300-verified (see
+* P2.3 (joint sweep infrastructure) is implemented, independently audited,
+  and functionally verified on GB300 at commit
+  `7a7cc2ab83197376720f030ba2e990092c3ada40` (see
   `src/compute/P2_3_PROTOCOL.md`); P2.4 (profiling/ceiling) remains entirely
   unimplemented; nothing in this document or in `PLAN.md`'s P2.2 row claims
   otherwise.
@@ -930,8 +931,9 @@ BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
   2026 with zero mismatches.
 * Publishable result: **none**. Every CSV row P2.2 can ever emit carries
   `publishable=false` unconditionally.
-* P2.3: **implemented** (see `src/compute/P2_3_PROTOCOL.md`); independently
-  audited: **no**; verified on GB300: **no**.
+* P2.3: **implemented, independently audited, and functionally verified on
+  GB300** at commit `7a7cc2ab83197376720f030ba2e990092c3ada40` (see
+  `src/compute/P2_3_PROTOCOL.md`).
 * P2.4: **not implemented**.
 
 Machine-readable project status:

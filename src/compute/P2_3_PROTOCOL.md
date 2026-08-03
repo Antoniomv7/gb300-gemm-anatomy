@@ -38,7 +38,7 @@ between two configurations, a ranking, or a saturation classification.
 |------|-------|--------------------------|
 | P2.1 | 1-SM UMMA: single CTA, `cta_group::1`, M=128. | **Implemented, independently audited, and functionally verified on GB300** (see `src/compute/P2_PROTOCOL.md`). Unmodified by P2.3. |
 | P2.2 | 2-SM UMMA: CTA pair, `cta_group::2`, M=256. | **Implemented, independently audited, and functionally verified on GB300** (see `src/compute/P2_2_PROTOCOL.md`). Unmodified by P2.3. |
-| P2.3 | Joint 1-SM/2-SM sweep infrastructure, exactly 24 configurations. | **Implemented in this document.** Independently audited: **no**. Verified on GB300: **no**. |
+| P2.3 | Joint 1-SM/2-SM sweep infrastructure, exactly 24 configurations. | **Implemented, independently audited, and functionally verified on GB300.** |
 | P2.4 | Profiling and empirical ceiling: Nsight Compute, TFLOP/s and saturation analysis. | **Not implemented.** No profiling script, no TFLOP/s conversion, no saturation claim exists anywhere in this repository. |
 
 ## 2. The frozen 24-case matrix and its execution order
@@ -363,7 +363,9 @@ make compute-umma-sweep-plan
 make compute-umma-sweep-check
 ```
 
-GB300 functional-verification commands (not yet executed; see section 8):
+GB300 functional-verification commands (executed successfully on 3 August
+2026 against Git commit `7a7cc2ab83197376720f030ba2e990092c3ada40`; see
+section 8.3):
 
 ```bash
 BLACKWELL_GPU_INDEX=<physical-index> make preflight
@@ -378,9 +380,9 @@ infrastructure only; its cycle values are not publishable results. No
 
 ## 8. Limitations and current status
 
-* P2.3 is **implemented**. It has not yet been independently audited and
-  has not yet been exercised on GB300 hardware; both remain explicitly
-  pending.
+* P2.3 is **implemented, independently audited, and functionally verified on
+  GB300**. Section 8.3 records the exact implementation commit and campaign
+  identifiers.
 * `elapsed_cycles`, `cycles_per_umma`, and `flops_per_cycle` are exactly the
   raw, unconverted quantities P2.1/P2.2 already produce (see
   `src/compute/P2_PROTOCOL.md` section 17 and
@@ -469,15 +471,40 @@ The same focused repair initializes both manifest self-test outcomes as
 ran, and records the launcher's real nonzero status in `failure_exit_code`
 instead of the previous constant `1`. No kernel, SASS checker, plan entry,
 performance calculation, or P2.4 analysis changed. These repairs still
-require independent audit and GB300 verification.
+required independent audit and GB300 verification at that point.
+
+### 8.3 Independent audit and GB300 functional verification
+
+The final implementation at Git commit
+`7a7cc2ab83197376720f030ba2e990092c3ada40` passed the independent audit.
+The cluster reran the pinned `sm_103a` build and both real-cubin SASS gates,
+all 127 synthetic aggregator regressions, the runner's CLI and artifact
+self-tests, and the complete `make compute-umma-sweep-check` target; every
+gate passed.
+
+Functional verification then ran on 3 August 2026 on physical GPU index 4,
+an NVIDIA B300 SXM6 AC with UUID
+`GPU-4ae7e013-1aac-31d8-8b8e-c27530f1c6ed`. Fresh preflight campaign
+`20260803T141347Z` reported `OVERALL=PASS`. Both complete device self-tests
+passed sequentially, after which smoke campaign `20260803T141410Z`
+executed and validated the frozen 24-invocation order with
+`iterations=20`, `warmup_iterations=5`, and `repetitions=3`; the finalizer
+revalidated the complete evidence set and recorded `status=COMPLETE`, and
+the Make target returned `smoke_rc=0`.
+
+This closes P2.3 as audited and GB300-verified infrastructure. It does not
+create a publishable performance result: every row remains
+`publishable=false`, and no cycle value from the smoke campaign is cited as
+a Tensor Core ceiling, speedup, scaling, or saturation result. Those tasks
+remain exclusively in P2.4, which is still unimplemented.
 
 ## 9. Status
 
 ```text
-P2.3 = YES / NO / NO
+P2.3 = YES / YES / YES
 ```
 
-That is: Implemented = **YES**; Independently audited = **NO**; Verified on
-GB300 = **NO**. P2.1 and P2.2 remain `YES / YES / YES`, unchanged and
+That is: Implemented = **YES**; Independently audited = **YES**; Verified on
+GB300 = **YES**. P2.1 and P2.2 remain `YES / YES / YES`, unchanged and
 unaltered by this document. P2.4 remains `NO / NO / NO`. Phase 2 is **not**
 closed.

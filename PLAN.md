@@ -150,15 +150,14 @@ campaigns remain Phase 4 work.
 ## Phase 2 — BF16 UMMA throughput (27 July–2 August 2026)
 
 Entry condition for Phase 2: the Phase 1 gate must pass. Current status:
-Phase 1 gate passed; Phase 2 may begin. P2.1 and P2.2 are closed. P2.3
-(joint sweep infrastructure) is implemented; independent audit and GB300
-verification are pending. P2.4 remains unimplemented.
+Phase 1 gate passed; P2.1, P2.2, and P2.3 are closed. P2.4 remains
+unimplemented, so the Phase 2 gate has not yet passed.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
 | P2.1 | 1-SM UMMA | YES | YES | YES |
 | P2.2 | 2-SM UMMA | YES | YES | YES |
-| P2.3 | Sweep (≤24 configurations) | YES | NO | NO |
+| P2.3 | Sweep (≤24 configurations) | YES | YES | YES |
 | P2.4 | Profiling and empirical ceiling | NO | NO | NO |
 
 P2.1 at Git commit
@@ -219,16 +218,21 @@ empirical ceiling, no 1-SM/2-SM speedup, no scaling efficiency, no
 saturation, no winning configuration, no Nsight Compute). See
 `src/compute/P2_3_PROTOCOL.md` for the full frozen contract. P2.3 introduces
 no new CUDA kernel and does not modify `src/compute/umma_1sm.cu`,
-`src/compute/umma_2sm.cu`, or either SASS checker. Independent audit and
-GB300 verification are both pending. P2.4 (profiling and empirical ceiling)
-remains entirely unimplemented.
+`src/compute/umma_2sm.cu`, or either SASS checker. The final implementation
+at Git commit `7a7cc2ab83197376720f030ba2e990092c3ada40` passed the
+independent audit and was functionally verified on a physical NVIDIA B300
+on 3 August 2026. Preflight campaign `20260803T141347Z` reported
+`OVERALL=PASS`; both complete device self-tests passed; and smoke campaign
+`20260803T141410Z` executed and validated the exact 24-invocation plan before
+reaching `status=COMPLETE`. All evidence remained `publishable=false`; this
+was infrastructure verification, not a performance result. P2.4 (profiling
+and empirical ceiling) remains entirely unimplemented.
 
 ## Phase 3 — CuTe DSL GEMM versus cuBLASLt (3–9 August 2026)
 
-Gate: Phase 2 gate remains pending. P2.1 and P2.2 are audited and verified on
-GB300, but P2.3 still needs an independent audit and GB300 verification, and
-P2.4 remains unimplemented. Phase 3 cannot begin until all four P2 units are
-implemented, audited, and verified.
+Gate: Phase 2 gate remains pending. P2.1, P2.2, and P2.3 are audited and
+verified on GB300, but P2.4 remains unimplemented. Phase 3 cannot begin until
+all four P2 units are implemented, audited, and verified.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|

@@ -17,7 +17,7 @@ BF16 UMMA) — implemented, independently audited, and functionally verified
 on GB300; publishable results: NONE`. `P2.2 (2-SM BF16 UMMA) — implemented;
 independently audited: YES; verified on GB300: YES; publishable results:
 NONE`. `P2.3 (joint 1-SM/2-SM UMMA sweep infrastructure) — implemented;
-independently audited: NO; verified on GB300: NO; publishable results:
+independently audited: YES; verified on GB300: YES; publishable results:
 NONE`.**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
@@ -238,8 +238,15 @@ per-configuration statistics in `summary.csv` (mean/median/sample
 stdev/coefficient of variation for `elapsed_cycles`, `cycles_per_umma`, and
 `flops_per_cycle` -- no TFLOP/s, no empirical ceiling, no 1-SM/2-SM speedup,
 no scaling efficiency, no saturation, no Nsight Compute). See
-`src/compute/P2_3_PROTOCOL.md` for the full frozen contract. P2.3 has not
-yet been independently audited and has not yet been verified on GB300.
+`src/compute/P2_3_PROTOCOL.md` for the full frozen contract. The final
+implementation at Git commit `7a7cc2ab83197376720f030ba2e990092c3ada40`
+passed the independent audit and was functionally verified on a physical
+NVIDIA B300 on 3 August 2026. Fresh preflight campaign `20260803T141347Z`
+reported `OVERALL=PASS`; both complete device self-tests passed; and smoke
+campaign `20260803T141410Z` validated all 24 frozen invocations before
+reaching `status=COMPLETE`. This closes P2.3 as infrastructure only: every
+row remains `publishable=false`, and the smoke cycle values are not
+experimental performance results.
 P2.4 (profiling and empirical ceiling) remains entirely **not implemented**.
 
 ## Research question
@@ -382,7 +389,8 @@ successful NCU cases; it closes the Phase 1 technical gate but remains
 underway: P2.1 is implemented, independently audited, and functionally
 verified on GB300; P2.2 is likewise implemented, independently audited, and
 functionally verified on GB300; P2.3 (joint sweep infrastructure) is
-implemented but not yet independently audited or GB300-verified; P2.4 and
+implemented, independently audited, and functionally verified on GB300;
+P2.4 and
 experiment 3 remain unimplemented. The repository still contains no
 publishable bandwidth, throughput, GEMM-performance, or cuBLASLt-comparison
 result. The pinned
