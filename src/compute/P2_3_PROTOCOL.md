@@ -220,8 +220,11 @@ manifest key is allowlisted with an exact required Python type
 (`ALLOWED_MANIFEST_KEYS`); `campaign_id`, `run_kind`, `started_at_utc`,
 `configuration_count_expected`, `sample_count_expected`, `requested`,
 `selected_gpu_index`, `git_commit`, and `git_dirty` are immutable once set;
-`configuration_count_completed`/`sample_count_completed` can never decrease;
-`self_test_outcomes` can never change once recorded. The manifest contains
+`configuration_count_completed`/`sample_count_completed` can never decrease.
+`self_test_outcomes` starts as `PENDING` for both methods and follows the
+per-method legal transitions `PENDING -> STARTED -> PASS/FAIL`, with
+`PENDING -> NOT_RUN` only when the sibling fails first; terminal outcomes
+cannot change. The manifest contains
 only experiment-relevant, secret-free metadata: schema/experiment
 identifiers, campaign ID, status, `publishable=false` (unconditional), the
 frozen plan/configuration count (24), completed configuration/sample
@@ -310,14 +313,15 @@ against one single reference row (the very first row of the very first
 case), not merely each case's own first row, so a field that drifts only in
 a later repetition is still caught.
 
-`scan_case_directory()` additionally rejects: malformed CSV quoting/field
-counts, missing columns, duplicate rows (duplicate `sample_index`), NaN/Inf
-numeric fields, every wrong formula above, mismatched provenance, an
-unexpected `.csv` file whose name does not match the canonical
-`NN_method_nN_dD.csv` pattern or whose encoded method/N/depth disagrees with
-the frozen plan's own index, a duplicate index across two differently-named
-files, and any symlinked case file. Non-`.csv` artifacts (e.g. a
-salvaged `.invalid`/`.partial` capture failure) are never aggregated.
+`scan_case_directory()` requires the literal set of 24 filenames generated
+by `build_plan()` and referenced by `execution_order.csv`; it does not parse
+names back into integers. A spelling such as `n064` therefore cannot stand
+in for canonical `n64`. It also rejects malformed CSV quoting/field counts,
+missing columns, duplicate rows (duplicate `sample_index`), NaN/Inf numeric
+fields, every wrong formula above, mismatched provenance, symlinked case
+files, and every extra directory entry regardless of name, extension, or
+type. Non-`.csv` artifacts such as salvaged `.invalid`/`.partial` capture
+evidence prevent completion and are never aggregated.
 
 ## 6. Aggregated artifacts
 
@@ -448,6 +452,24 @@ both the runner CLI and the manifest-validation layer. No CUDA kernel, SASS
 checker, or element of the frozen 24-case matrix changed. This repair does
 not itself constitute an audit: P2.3 remains independently unaudited and
 unverified on GB300, and P2.4 remains entirely unimplemented.
+
+### 8.2 Focused re-audit repair (canonical identity and failure telemetry)
+
+A focused re-audit of the first repair (commit
+`6bea37cc7641f1de813ffe74806ce7dfdec0f1c5`) found that filenames were still
+parsed semantically: replacing canonical `00_umma_1sm_n64_d4.csv` with
+`00_umma_1sm_n064_d4.csv` could satisfy the configuration checks even though
+`execution_order.csv` referenced a missing path. The finalizer now compares
+the literal filename inventory with the canonical plan and has both a
+direct scan regression and an end-to-end regression proving that this
+campaign becomes `FAILED`, never `COMPLETE`.
+
+The same focused repair initializes both manifest self-test outcomes as
+`PENDING`, so failures before device self-tests truthfully show that neither
+ran, and records the launcher's real nonzero status in `failure_exit_code`
+instead of the previous constant `1`. No kernel, SASS checker, plan entry,
+performance calculation, or P2.4 analysis changed. These repairs still
+require independent audit and GB300 verification.
 
 ## 9. Status
 

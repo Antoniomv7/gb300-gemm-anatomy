@@ -510,29 +510,33 @@ if ! write_self_test_outcomes STARTED PENDING; then
     echo "run_exp02_umma_throughput: ERROR: could not record umma_1sm self-test start" >&2
     exit 1
 fi
-if ! "${RUN_CONTAINER}" build/compute/umma_1sm --self-test \
+if "${RUN_CONTAINER}" build/compute/umma_1sm --self-test \
         >"${CAMPAIGN_DIR}/logs/self_test_umma_1sm.launcher.log" \
         2>"${CAMPAIGN_DIR}/logs/self_test_umma_1sm.stderr.log"; then
+    SELF_TEST_UMMA_1SM=PASS
+else
+    SELF_TEST_UMMA_1SM_RC=$?
     write_self_test_outcomes FAIL NOT_RUN || true
-    write_manifest_status FAILED "self_test_umma_1sm" 1 "${SELF_TEST_UMMA_1SM_LOG_REL}"
+    write_manifest_status FAILED "self_test_umma_1sm" "${SELF_TEST_UMMA_1SM_RC}" "${SELF_TEST_UMMA_1SM_LOG_REL}"
     CAMPAIGN_OUTCOME=FAILED
     echo "run_exp02_umma_throughput: ERROR: umma_1sm --self-test failed; see ${SELF_TEST_UMMA_1SM_LOG_REL%.stderr.log}.*.log" >&2
     exit 1
 fi
-SELF_TEST_UMMA_1SM=PASS
 write_self_test_outcomes PASS PENDING
 
 write_self_test_outcomes PASS STARTED
-if ! "${RUN_CONTAINER}" build/compute/umma_2sm --self-test \
+if "${RUN_CONTAINER}" build/compute/umma_2sm --self-test \
         >"${CAMPAIGN_DIR}/logs/self_test_umma_2sm.launcher.log" \
         2>"${CAMPAIGN_DIR}/logs/self_test_umma_2sm.stderr.log"; then
+    SELF_TEST_UMMA_2SM=PASS
+else
+    SELF_TEST_UMMA_2SM_RC=$?
     write_self_test_outcomes PASS FAIL
-    write_manifest_status FAILED "self_test_umma_2sm" 1 "${SELF_TEST_UMMA_2SM_LOG_REL}"
+    write_manifest_status FAILED "self_test_umma_2sm" "${SELF_TEST_UMMA_2SM_RC}" "${SELF_TEST_UMMA_2SM_LOG_REL}"
     CAMPAIGN_OUTCOME=FAILED
     echo "run_exp02_umma_throughput: ERROR: umma_2sm --self-test failed; see ${SELF_TEST_UMMA_2SM_LOG_REL%.stderr.log}.*.log" >&2
     exit 1
 fi
-SELF_TEST_UMMA_2SM=PASS
 write_self_test_outcomes PASS PASS
 echo "run_exp02_umma_throughput: both full self-tests PASS; starting the 24-configuration sweep" >&2
 
