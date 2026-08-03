@@ -16,6 +16,8 @@ pilot executed: YES; NCU/HBM validation: six of six predefined cases
 BF16 UMMA) — implemented, independently audited, and functionally verified
 on GB300; publishable results: NONE`. `P2.2 (2-SM BF16 UMMA) — implemented;
 independently audited: YES; verified on GB300: YES; publishable results:
+NONE`. `P2.3 (joint 1-SM/2-SM UMMA sweep infrastructure) — implemented;
+independently audited: NO; verified on GB300: NO; publishable results:
 NONE`.**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
@@ -161,7 +163,7 @@ renders the exact `ok`/`REVIEW` value and adds a regression test; it changes
 no sample, statistic, profiler evidence, HBM classification, kernel, or GPU
 path. No P1.4 result is publishable yet.
 
-## Phase 2 status: P2.1 (1-SM BF16 UMMA), P2.2 (2-SM BF16 UMMA)
+## Phase 2 status: P2.1 (1-SM BF16 UMMA), P2.2 (2-SM BF16 UMMA), P2.3 (joint sweep)
 
 P2.1, the 1-SM arm of the "BF16 UMMA throughput" experiment
 (`src/compute/umma_1sm.cu`), is implemented: twelve `tcgen05.mma.
@@ -220,8 +222,25 @@ preflight campaign `20260731T115848Z` passed, the device self-test reported
 `correctness=OK`, `mismatches=0`, the expected commit, and
 `git_dirty=false`. These are functional checks only; every CSV row remains
 unconditionally `publishable=false`, and no throughput or 1-SM/2-SM scaling
-result is claimed. P2.3 (joint sweep) and P2.4 (profiling and empirical
-ceiling) are **not implemented**.
+result is claimed.
+
+P2.3, the joint 1-SM/2-SM sweep infrastructure
+(`scripts/run_exp02_umma_throughput.sh`,
+`scripts/aggregate_exp02_umma_throughput.py`), is implemented: a
+deterministic 24-invocation runner (12 logical `(N, depth)` pairs x
+`umma_1sm`/`umma_2sm`, alternating which method runs first per pair),
+reusing the audited P2.1/P2.2 binaries and command-line interfaces
+completely unmodified, strict validation of every field of every repetition
+of both binaries' raw 37-column CSV, symlink-safe centralized campaign
+initialization, no-clobber publication of every result/log/evidence file,
+lossless consolidation into `combined_samples.csv`, and purely descriptive
+per-configuration statistics in `summary.csv` (mean/median/sample
+stdev/coefficient of variation for `elapsed_cycles`, `cycles_per_umma`, and
+`flops_per_cycle` -- no TFLOP/s, no empirical ceiling, no 1-SM/2-SM speedup,
+no scaling efficiency, no saturation, no Nsight Compute). See
+`src/compute/P2_3_PROTOCOL.md` for the full frozen contract. P2.3 has not
+yet been independently audited and has not yet been verified on GB300.
+P2.4 (profiling and empirical ceiling) remains entirely **not implemented**.
 
 ## Research question
 
@@ -362,8 +381,10 @@ successful NCU cases; it closes the Phase 1 technical gate but remains
 `publishable: false` pending later final campaigns. Experiment 2 is
 underway: P2.1 is implemented, independently audited, and functionally
 verified on GB300; P2.2 is likewise implemented, independently audited, and
-functionally verified on GB300; P2.3–P2.4 and experiment 3 remain
-unimplemented. The repository still contains no publishable bandwidth,
-throughput, GEMM-performance, or cuBLASLt-comparison result. The pinned
+functionally verified on GB300; P2.3 (joint sweep infrastructure) is
+implemented but not yet independently audited or GB300-verified; P2.4 and
+experiment 3 remain unimplemented. The repository still contains no
+publishable bandwidth, throughput, GEMM-performance, or cuBLASLt-comparison
+result. The pinned
 CUDA 13.1 container contract remains unchanged. See `PLAN.md` for the
 remaining schedule and `AGENTS.md` for the mandatory shared-cluster rules.

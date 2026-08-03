@@ -8,7 +8,8 @@
 # memory-paths-p14-analyze, compute-umma-1sm-build, compute-umma-1sm-sass,
 # compute-umma-1sm-check, compute-umma-1sm-self-test, compute-umma-1sm-smoke,
 # compute-umma-2sm-build, compute-umma-2sm-sass, compute-umma-2sm-check,
-# compute-umma-2sm-self-test, compute-umma-2sm-smoke.
+# compute-umma-2sm-self-test, compute-umma-2sm-smoke, compute-umma-sweep-plan,
+# compute-umma-sweep-check, compute-umma-sweep-smoke.
 # No target selects a GPU automatically, elevates privileges, or exceeds two
 # build jobs.
 
@@ -73,6 +74,10 @@ COMPUTE_UMMA_2SM_PROTOCOL := src/compute/P2_2_PROTOCOL.md
 # required and reproducibly verified for umma_2sm.cu as well.
 COMPUTE_UMMA_2SM_ARCH_FLAGS := -arch=compute_$(patsubst sm_%,%,$(CUDA_ARCH)) -code=$(CUDA_ARCH)
 
+EXP02_RUNNER := scripts/run_exp02_umma_throughput.sh
+EXP02_AGGREGATOR := scripts/aggregate_exp02_umma_throughput.py
+EXP02_PROTOCOL := src/compute/P2_3_PROTOCOL.md
+
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
 	Dockerfile Makefile \
@@ -85,7 +90,8 @@ REQUIRED_FILES := \
 	$(EXP01_P14_RUNNER) $(EXP01_P14_ANALYZER) $(EXP01_P14_SAFE_CAPTURE) $(EXP01_P14_NCU_BRIDGE) \
 	$(EXP01_P14_PROTOCOL) \
 	$(COMPUTE_UMMA_1SM_SRC) $(COMPUTE_UMMA_1SM_CHECKER) $(COMPUTE_UMMA_1SM_PROTOCOL) \
-	$(COMPUTE_UMMA_2SM_SRC) $(COMPUTE_UMMA_2SM_CHECKER) $(COMPUTE_UMMA_2SM_PROTOCOL)
+	$(COMPUTE_UMMA_2SM_SRC) $(COMPUTE_UMMA_2SM_CHECKER) $(COMPUTE_UMMA_2SM_PROTOCOL) \
+	$(EXP02_RUNNER) $(EXP02_AGGREGATOR) $(EXP02_PROTOCOL)
 
 .DEFAULT_GOAL := help
 .PHONY: help check-static build-image check-env preflight \
@@ -97,7 +103,8 @@ REQUIRED_FILES := \
 	compute-umma-1sm-build compute-umma-1sm-sass compute-umma-1sm-check \
 	compute-umma-1sm-self-test compute-umma-1sm-smoke \
 	compute-umma-2sm-build compute-umma-2sm-sass compute-umma-2sm-check \
-	compute-umma-2sm-self-test compute-umma-2sm-smoke
+	compute-umma-2sm-self-test compute-umma-2sm-smoke \
+	compute-umma-sweep-plan compute-umma-sweep-check compute-umma-sweep-smoke
 
 help:
 	@echo "gb300-gemm-anatomy — Phase 0 + P1.1 (LDGSTS) + P1.2 (TMA) + P1.3 (sweep) targets"
@@ -171,7 +178,8 @@ help:
 	@echo "     src/compute/P2_PROTOCOL.md; implemented, independently audited,"
 	@echo "     functionally verified on GB300, no publishable result;"
 	@echo "     P2.2 implemented; independently audited; GB300 verification passed."
-	@echo "     P2.3 and P2.4 not implemented. No publishable P2.2 result exists.) --"
+	@echo "     P2.3 implemented; not yet audited; not yet GB300-verified. P2.4 not"
+	@echo "     implemented. No publishable P2.2/P2.3 result exists.) --"
 	@echo "  GPU-free build/SASS/check (no GPU, no network):"
 	@echo "  make compute-umma-1sm-build    Compile the twelve P2.1 specializations. No GPU."
 	@echo "  make compute-umma-1sm-sass     Disassemble and verify the real cubin: exactly"
@@ -207,6 +215,25 @@ help:
 	@echo "                                   publishable numbers)."
 	@echo "  make compute-umma-2sm-smoke      Self-test, then one short run_kind=smoke"
 	@echo "                                   measurement (NOT a final result)."
+	@echo ""
+	@echo "  -- P2.3 joint 1-SM/2-SM BF16 UMMA sweep infrastructure (exp02_umma_throughput;"
+	@echo "     see src/compute/P2_3_PROTOCOL.md; implemented; not yet independently"
+	@echo "     audited; not yet verified on GB300. Reuses the audited P2.1/P2.2 binaries"
+	@echo "     and CLIs unmodified; introduces no new CUDA kernel; no Nsight Compute) --"
+	@echo "  GPU-free P2.3 planning/checking (no GPU, no Docker, no network):"
+	@echo "  make compute-umma-sweep-plan   Print the deterministic 24-invocation plan."
+	@echo "  make compute-umma-sweep-check  Shell/Python syntax, executable bits, GPU-free"
+	@echo "                                 synthetic tests, exact 24-way plan validation,"
+	@echo "                                 plus the existing P2.1/P2.2 build/SASS gates."
+	@echo "  GPU-executing 24-way functional smoke (uses the compute-umma-1sm-sass/"
+	@echo "  compute-umma-2sm-sass gates above, then both binaries' full self-tests, then"
+	@echo "  all 24 smoke configurations; requires BLACKWELL_GPU_INDEX; never selects a"
+	@echo "  GPU automatically):"
+	@echo "  make compute-umma-sweep-smoke  run_kind=smoke only; functional verification,"
+	@echo "                                 NOT a publishable performance result."
+	@echo "  P2.3 never runs Nsight Compute and never computes TFLOP/s, an empirical"
+	@echo "  ceiling, 1-SM/2-SM speedup, scaling efficiency, or saturation; P2.4 (not yet"
+	@echo "  implemented) owns that interpretation."
 	@echo ""
 	@echo "Pinned contract (VERSIONS.env): CUDA $(CUDA_VERSION), CUTLASS $(CUTLASS_VERSION),"
 	@echo "arch $(CUDA_ARCH), max build jobs $(MAX_BUILD_JOBS)."
@@ -468,6 +495,39 @@ check-static:
 	@echo "== P2.2 repair (audit round 1): per-phase CTA-pair handshake cannot silently regress =="
 	@grep -Fq 'is_leader && cta_rank == 0 && timing_mode == TimingMode::kTimed' $(COMPUTE_UMMA_2SM_SRC)
 	@test "$$(grep -coE 'if \(is_leader && cta_rank == 0 && timing_mode == TimingMode::kTimed\)' $(COMPUTE_UMMA_2SM_SRC))" -eq 2
+	@echo "== P2.3 required files present, executable, and syntactically valid =="
+	@test -x $(EXP02_RUNNER)
+	@test -x $(EXP02_AGGREGATOR)
+	bash -n $(EXP02_RUNNER)
+	python3 -m py_compile $(EXP02_AGGREGATOR)
+	@rm -rf scripts/__pycache__
+	@echo "== P2.3 GPU-free synthetic tests (self-test) =="
+	python3 $(EXP02_AGGREGATOR) --self-test
+	@echo "== P2.3 exact 24-way plan validation =="
+	@test "$$(python3 $(EXP02_AGGREGATOR) plan --format lines | wc -l | tr -d ' ')" -eq 24
+	@echo "== P2.3 forbidden patterns absent from the new scripts =="
+	@pat='--gpus[ =]+all|NVIDIA_VISIBLE_DEVICES=all|--privileged|--pid[ =]+host|docker\.sock|--cap-add|SYS_ADMIN|set -x'; \
+	pat="$$pat|\bs""udo\b|\$$\(np""roc\)|\bncu\b|nvidia-smi[^|]*(-pm|--persistence-mode|-lgc|--lock-gpu-clocks|-pl|--power-limit)"; \
+	! grep -nE -- "$$pat" $(EXP02_RUNNER) $(EXP02_AGGREGATOR)
+	@echo "== P2.3 runner uses the audited launcher and never selects a GPU automatically =="
+	@grep -Fq 'run_container.sh' $(EXP02_RUNNER)
+	@grep -Fq 'BLACKWELL_GPU_INDEX' $(EXP02_RUNNER)
+	@echo "== P2.3 runner reuses the audited P2.1/P2.2 binaries unmodified (no new kernel) =="
+	@grep -Fq 'build/compute/umma_1sm' $(EXP02_RUNNER)
+	@grep -Fq 'build/compute/umma_2sm' $(EXP02_RUNNER)
+	@grep -Fq 'compute-umma-1sm-sass compute-umma-2sm-sass' $(EXP02_RUNNER)
+	@echo "== P2.3 runner records progress after every validated case =="
+	@grep -Fq 'write_manifest_progress' $(EXP02_RUNNER)
+	@grep -Fq 'configurations_completed=$$((p_index + 1))' $(EXP02_RUNNER)
+	@grep -Fq 'samples_completed=$$((configurations_completed * REPETITIONS))' $(EXP02_RUNNER)
+	@echo "== P2.3 raw campaign output is git-ignored (shared results/raw/ rule) =="
+	@grep -Fq 'results/raw/' .gitignore
+	@echo "== truthful P2.3 status assertions =="
+	@grep -Fq 'P2.3 | Sweep (≤24 configurations) | YES | NO | NO |' PLAN.md
+	@grep -Fq 'P2.3 = YES / NO / NO' $(EXP02_PROTOCOL)
+	@! grep -rnF 'Phase 2 is closed' PLAN.md README.md $(EXP02_PROTOCOL)
+	@! grep -rnF 'P2.3 (joint sweep) has not been started' PLAN.md README.md
+	@! grep -F 'No runner, no campaign, no sweep script exists.' $(COMPUTE_UMMA_1SM_PROTOCOL) $(COMPUTE_UMMA_2SM_PROTOCOL)
 	@echo "check-static: OK"
 
 build-image:
@@ -968,4 +1028,53 @@ compute-umma-2sm-smoke: compute-umma-2sm-sass
 	@echo "The run_kind=smoke output above is a functional smoke check only. It is NOT a"
 	@echo "final experimental result, is not a TFLOP/s or saturation claim, and must not"
 	@echo "be cited as a performance number."
+	@echo "=============================================================================="
+
+# --- P2.3: joint 1-SM/2-SM BF16 UMMA sweep infrastructure (exp02_umma_throughput) -
+# compute-umma-sweep-plan and compute-umma-sweep-check never touch a GPU or
+# Docker themselves: they only exercise scripts/run_exp02_umma_throughput.sh's
+# and scripts/aggregate_exp02_umma_throughput.py's own GPU-free CLI paths and
+# synthetic self-tests, plus the existing compute-umma-1sm-sass/
+# compute-umma-2sm-sass build/SASS gates (which do run inside the pinned,
+# network-less, unprivileged image, same secure pattern as every other
+# GPU-free build/SASS target above; they still touch no GPU). compute-umma-
+# sweep-smoke is the only P2.3 target that executes on GPU; it requires an
+# explicit BLACKWELL_GPU_INDEX and reuses scripts/run_container.sh
+# exclusively via the runner. No P2.3 target invokes Nsight Compute or
+# computes TFLOP/s, an empirical ceiling, 1-SM/2-SM speedup, scaling
+# efficiency, or saturation; that remains explicit P2.4 work. P2.3 reuses
+# the audited P2.1/P2.2 binaries and their existing CLIs completely
+# unmodified and introduces no new CUDA kernel.
+
+compute-umma-sweep-plan:
+	$(EXP02_RUNNER) --print-plan
+
+compute-umma-sweep-check: compute-umma-1sm-sass compute-umma-2sm-sass
+	bash -n $(EXP02_RUNNER)
+	@test -x $(EXP02_RUNNER)
+	@test -x $(EXP02_AGGREGATOR)
+	python3 -m py_compile $(EXP02_AGGREGATOR)
+	@rm -rf scripts/__pycache__
+	python3 $(EXP02_AGGREGATOR) --self-test
+	@test "$$(python3 $(EXP02_AGGREGATOR) plan --format lines | wc -l | tr -d ' ')" -eq 24
+	$(EXP02_RUNNER) --self-test
+	@grep -Fq 'P2.3 | Sweep (≤24 configurations) | YES | NO | NO |' PLAN.md
+	@grep -Fq 'P2.3 = YES / NO / NO' $(EXP02_PROTOCOL)
+	@! grep -rnF 'Phase 2 is closed' PLAN.md README.md $(EXP02_PROTOCOL)
+	@echo "compute-umma-sweep-check: OK"
+
+compute-umma-sweep-smoke: compute-umma-1sm-sass compute-umma-2sm-sass
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make compute-umma-sweep-smoke"; \
+		echo "       This project never selects a GPU automatically."; \
+		exit 2; \
+	fi
+	@echo "== compute-umma-sweep-smoke: both binaries' self-tests, then all 24 smoke configurations =="
+	$(EXP02_RUNNER) --run-kind smoke --iterations 20 --warmup-iterations 5 --repetitions 3
+	@echo "=============================================================================="
+	@echo "The run_kind=smoke output above is functional verification of the P2.3 sweep"
+	@echo "infrastructure only. It is NOT a final experimental result, computes no"
+	@echo "TFLOP/s, empirical ceiling, 1-SM/2-SM speedup, scaling efficiency, or"
+	@echo "saturation, and must not be cited as a performance number."
 	@echo "=============================================================================="

@@ -150,14 +150,15 @@ campaigns remain Phase 4 work.
 ## Phase 2 — BF16 UMMA throughput (27 July–2 August 2026)
 
 Entry condition for Phase 2: the Phase 1 gate must pass. Current status:
-Phase 1 gate passed; Phase 2 may begin. P2.1 and P2.2 are closed. P2.3 and
-P2.4 remain unimplemented.
+Phase 1 gate passed; Phase 2 may begin. P2.1 and P2.2 are closed. P2.3
+(joint sweep infrastructure) is implemented; independent audit and GB300
+verification are pending. P2.4 remains unimplemented.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
 | P2.1 | 1-SM UMMA | YES | YES | YES |
 | P2.2 | 2-SM UMMA | YES | YES | YES |
-| P2.3 | Sweep (≤24 configurations) | NO | NO | NO |
+| P2.3 | Sweep (≤24 configurations) | YES | NO | NO |
 | P2.4 | Profiling and empirical ceiling | NO | NO | NO |
 
 P2.1 at Git commit
@@ -200,8 +201,27 @@ infrastructure only. No publishable result exists or is claimed; every CSV
 row remains `publishable=false`, and no throughput, ceiling, or 1-SM/2-SM
 scaling claim is made before P2.3-P2.4. See
 `src/compute/P2_2_PROTOCOL.md` for the full audit and validation history.
-P2.3 (joint sweep) and P2.4 (profiling and empirical ceiling) remain entirely
-unimplemented.
+
+P2.3 (joint 1-SM/2-SM sweep infrastructure,
+`scripts/run_exp02_umma_throughput.sh`,
+`scripts/aggregate_exp02_umma_throughput.py`) is implemented: a deterministic
+24-invocation runner (12 logical `(N, depth)` pairs x `umma_1sm`/`umma_2sm`,
+alternating which method runs first per pair), reusing the already-audited
+P2.1/P2.2 binaries and their existing command-line interfaces completely
+unmodified, strict validation of every field of every repetition of both
+binaries' raw 37-column CSV, symlink-safe centralized campaign
+initialization, no-clobber publication of every result/log/evidence file, a
+fail-closed manifest state machine, lossless consolidation into
+`combined_samples.csv`, and purely descriptive per-configuration statistics
+in `summary.csv` (mean/median/sample stdev/coefficient of variation for
+`elapsed_cycles`, `cycles_per_umma`, and `flops_per_cycle` -- no TFLOP/s, no
+empirical ceiling, no 1-SM/2-SM speedup, no scaling efficiency, no
+saturation, no winning configuration, no Nsight Compute). See
+`src/compute/P2_3_PROTOCOL.md` for the full frozen contract. P2.3 introduces
+no new CUDA kernel and does not modify `src/compute/umma_1sm.cu`,
+`src/compute/umma_2sm.cu`, or either SASS checker. Independent audit and
+GB300 verification are both pending. P2.4 (profiling and empirical ceiling)
+remains entirely unimplemented.
 
 ## Phase 3 — CuTe DSL GEMM versus cuBLASLt (3–9 August 2026)
 

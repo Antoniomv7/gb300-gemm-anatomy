@@ -19,7 +19,7 @@ estimated from documentation.
 |------|-------|--------------------------|
 | P2.1 | 1-SM UMMA: single CTA, `cta_group::1`, M=128, N in {64,128,256}, depth in {4,16,64,256}, 12 configurations. | **Implemented, independently audited, and functionally verified on GB300.** |
 | P2.2 | 2-SM UMMA: CTA pair, `cta_group::2`, M=256, cluster of 2 CTAs. | **Implemented, independently audited, and functionally verified on GB300** at commit `637b6a7e2efbe77b1c9c5d3dfc7ece527f522bba`. This P2.1 document's own closed scope and evidence (sections 4-20 below) remain unchanged and describe only the `cta_group::1` arm. See `src/compute/P2_2_PROTOCOL.md` for the complete, independently frozen P2.2 contract and closure evidence. |
-| P2.3 | Joint 1-SM/2-SM sweep infrastructure, at most 24 configurations (AGENTS.md ceiling). | **Not implemented.** No runner, no campaign, no sweep script exists. |
+| P2.3 | Joint 1-SM/2-SM sweep infrastructure, at most 24 configurations (AGENTS.md ceiling). | **Implemented; independently audited: no; verified on GB300: no.** See `src/compute/P2_3_PROTOCOL.md`. Reuses the P2.1/P2.2 binaries above unmodified; introduces no new CUDA kernel. |
 | P2.4 | Profiling and empirical ceiling: Nsight Compute, TFLOP/s and saturation analysis. | **Not implemented.** No profiling script, no TFLOP/s conversion, no saturation claim exists. `elapsed_cycles` in the P2.1 CSV is a raw `%clock64` delta, never converted to seconds or FLOP/s here. |
 
 ## 3. Complete future Phase 2 matrix (24 configurations, for provenance only)
@@ -558,9 +558,11 @@ BLACKWELL_GPU_INDEX=<physical-index> scripts/run_container.sh \
   this unit (P2.4 work).
 * P2.2 (2-SM) is implemented, independently audited, and functionally
   verified on GB300 at commit `637b6a7e2efbe77b1c9c5d3dfc7ece527f522bba`
-  (see `src/compute/P2_2_PROTOCOL.md`). P2.3 (joint sweep) and P2.4
-  (profiling/ceiling) remain entirely unimplemented. Nothing in this
-  document or in `PLAN.md`'s P2.1 row changes P2.1's own closed scope.
+  (see `src/compute/P2_2_PROTOCOL.md`). P2.3 (joint sweep infrastructure) is
+  implemented but not yet independently audited or GB300-verified (see
+  `src/compute/P2_3_PROTOCOL.md`); P2.4 (profiling/ceiling) remains entirely
+  unimplemented. Nothing in this document or in `PLAN.md`'s P2.1 row changes
+  P2.1's own closed scope.
 
 ## 18. Status
 
@@ -592,7 +594,9 @@ routing checks described in sections 16-17:
 * P2.2: **implemented and closed** (`src/compute/umma_2sm.cu`; independent
   audit and GB300 functional verification passed at commit `637b6a7` -- see
   `src/compute/P2_2_PROTOCOL.md`).
-  P2.3, P2.4: **not implemented**.
+* P2.3: **implemented** (see `src/compute/P2_3_PROTOCOL.md`); independently
+  audited: **no**; verified on GB300: **no**.
+* P2.4: **not implemented**.
 
 ## 19. References
 
