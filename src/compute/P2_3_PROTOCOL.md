@@ -39,7 +39,7 @@ between two configurations, a ranking, or a saturation classification.
 | P2.1 | 1-SM UMMA: single CTA, `cta_group::1`, M=128. | **Implemented, independently audited, and functionally verified on GB300** (see `src/compute/P2_PROTOCOL.md`). Unmodified by P2.3. |
 | P2.2 | 2-SM UMMA: CTA pair, `cta_group::2`, M=256. | **Implemented, independently audited, and functionally verified on GB300** (see `src/compute/P2_2_PROTOCOL.md`). Unmodified by P2.3. |
 | P2.3 | Joint 1-SM/2-SM sweep infrastructure, exactly 24 configurations. | **Implemented, independently audited, and functionally verified on GB300.** |
-| P2.4 | Profiling and empirical ceiling: Nsight Compute, TFLOP/s and saturation analysis. | **Not implemented.** No profiling script, no TFLOP/s conversion, no saturation claim exists anywhere in this repository. |
+| P2.4 | Profiling and empirical ceiling: Nsight Compute, TFLOP/s and saturation analysis. | **Implemented; independently audited: NO; verified on GB300: NO.** See `src/compute/P2_4_PROTOCOL.md`. |
 
 ## 2. The frozen 24-case matrix and its execution order
 
@@ -396,8 +396,11 @@ infrastructure only; its cycle values are not publishable results. No
   `max_abs_error=0` contract already guarantees; P2.3 only orchestrates and
   validates the already-audited evidence.
 * No TFLOP/s, empirical ceiling, 1-SM/2-SM speedup, scaling efficiency,
-  saturation, winning configuration, or Nsight Compute result exists
-  anywhere in this repository; P2.4 remains entirely unimplemented.
+  saturation, or winning configuration exists anywhere in this repository
+  yet. P2.4 (Nsight Compute profiling and this interpretation) is
+  implemented (see `src/compute/P2_4_PROTOCOL.md`) but not yet
+  independently audited or verified on GB300, and no P2.4 campaign has been
+  executed.
 
 ### 8.1 First independent audit and GPU-free repair (evidence integrity and truthfulness)
 
@@ -496,7 +499,9 @@ This closes P2.3 as audited and GB300-verified infrastructure. It does not
 create a publishable performance result: every row remains
 `publishable=false`, and no cycle value from the smoke campaign is cited as
 a Tensor Core ceiling, speedup, scaling, or saturation result. Those tasks
-remain exclusively in P2.4, which is still unimplemented.
+remain exclusively in P2.4, which is now implemented (see
+`src/compute/P2_4_PROTOCOL.md`) but not yet independently audited or
+verified on GB300.
 
 ## 9. Status
 
@@ -506,5 +511,6 @@ P2.3 = YES / YES / YES
 
 That is: Implemented = **YES**; Independently audited = **YES**; Verified on
 GB300 = **YES**. P2.1 and P2.2 remain `YES / YES / YES`, unchanged and
-unaltered by this document. P2.4 remains `NO / NO / NO`. Phase 2 is **not**
-closed.
+unaltered by this document. P2.4 is `YES / NO / NO`: implemented, pending
+independent audit, pending GB300 verification (see
+`src/compute/P2_4_PROTOCOL.md`). Phase 2 is **not** closed.

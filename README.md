@@ -18,7 +18,9 @@ on GB300; publishable results: NONE`. `P2.2 (2-SM BF16 UMMA) — implemented;
 independently audited: YES; verified on GB300: YES; publishable results:
 NONE`. `P2.3 (joint 1-SM/2-SM UMMA sweep infrastructure) — implemented;
 independently audited: YES; verified on GB300: YES; publishable results:
-NONE`.**
+NONE`. `P2.4 (profiling and empirical BF16 UMMA per-SM ceiling) —
+implemented; independently audited: NO; verified on GB300: NO; campaign
+executed: NO; empirical ceiling measured: NO; publishable results: NONE`.**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -247,7 +249,30 @@ campaign `20260803T141410Z` validated all 24 frozen invocations before
 reaching `status=COMPLETE`. This closes P2.3 as infrastructure only: every
 row remains `publishable=false`, and the smoke cycle values are not
 experimental performance results.
-P2.4 (profiling and empirical ceiling) remains entirely **not implemented**.
+
+P2.4, profiling and the empirical BF16 UMMA per-SM ceiling
+(`scripts/run_exp02_umma_throughput_p24.sh`,
+`scripts/analyze_exp02_umma_throughput_p24.py`,
+`scripts/p24_safe_capture.py`, `scripts/p24_ncu_bridge.py`), is implemented:
+a reproducible layer around the unmodified P2.3 infrastructure that drives
+one frozen 24-configuration `run_kind=benchmark` pilot through the
+unmodified P2.3 runner, profiles the identical 24 configurations with
+Nsight Compute (an exact kernel-symbol filter with `--launch-skip 1
+--launch-count 1`, profiling only the second, timed launch; clock-control-
+disabled, non-defaulting profiler controls), and computes deterministic
+statistics, clock-calibrated TFLOP/s, 1-SM/2-SM speedup and scaling
+efficiency (never clamped), candidate depth saturation per `(method, N)`
+group, and an empirical per-SM ceiling candidate selected in
+clock-independent FLOP/cycle-per-SM space before any clock conversion. If
+the mandatory SM-clock metric cannot be trusted for any of the 24 profiled
+configurations, the campaign becomes `INCONCLUSIVE` and no TFLOP/s or
+completed empirical-ceiling claim is emitted anywhere. See
+`src/compute/P2_4_PROTOCOL.md` for the complete frozen contract. P2.4
+introduces no new CUDA kernel and modifies no P2.1/P2.2/P2.3 file. This
+implementation has not yet been independently audited or verified on GB300:
+no P2.4 campaign has been executed, no NCU profiling has run, and no
+empirical ceiling has been measured. Every artifact remains
+`publishable: false` unconditionally.
 
 ## Research question
 
@@ -390,8 +415,9 @@ underway: P2.1 is implemented, independently audited, and functionally
 verified on GB300; P2.2 is likewise implemented, independently audited, and
 functionally verified on GB300; P2.3 (joint sweep infrastructure) is
 implemented, independently audited, and functionally verified on GB300;
-P2.4 and
-experiment 3 remain unimplemented. The repository still contains no
+P2.4 (profiling and empirical ceiling) is implemented but not yet
+independently audited or verified on GB300, so the Phase 2 gate has not yet
+passed; experiment 3 remains unimplemented. The repository still contains no
 publishable bandwidth, throughput, GEMM-performance, or cuBLASLt-comparison
 result. The pinned
 CUDA 13.1 container contract remains unchanged. See `PLAN.md` for the

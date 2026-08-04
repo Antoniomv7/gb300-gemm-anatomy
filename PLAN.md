@@ -150,15 +150,16 @@ campaigns remain Phase 4 work.
 ## Phase 2 — BF16 UMMA throughput (27 July–2 August 2026)
 
 Entry condition for Phase 2: the Phase 1 gate must pass. Current status:
-Phase 1 gate passed; P2.1, P2.2, and P2.3 are closed. P2.4 remains
-unimplemented, so the Phase 2 gate has not yet passed.
+Phase 1 gate passed; P2.1, P2.2, and P2.3 are closed. P2.4 is implemented
+but not yet independently audited or verified on GB300, so the Phase 2 gate
+has not yet passed.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
 | P2.1 | 1-SM UMMA | YES | YES | YES |
 | P2.2 | 2-SM UMMA | YES | YES | YES |
 | P2.3 | Sweep (≤24 configurations) | YES | YES | YES |
-| P2.4 | Profiling and empirical ceiling | NO | NO | NO |
+| P2.4 | Profiling and empirical ceiling | YES | NO | NO |
 
 P2.1 at Git commit
 `1004666db7a2eef1ec499c60740cafc1e2f41328` passed an independent audit
@@ -225,14 +226,47 @@ on 3 August 2026. Preflight campaign `20260803T141347Z` reported
 `OVERALL=PASS`; both complete device self-tests passed; and smoke campaign
 `20260803T141410Z` executed and validated the exact 24-invocation plan before
 reaching `status=COMPLETE`. All evidence remained `publishable=false`; this
-was infrastructure verification, not a performance result. P2.4 (profiling
-and empirical ceiling) remains entirely unimplemented.
+was infrastructure verification, not a performance result.
+
+P2.4 (profiling and empirical ceiling,
+`scripts/run_exp02_umma_throughput_p24.sh`,
+`scripts/analyze_exp02_umma_throughput_p24.py`,
+`scripts/p24_safe_capture.py`, `scripts/p24_ncu_bridge.py`) is implemented: a
+reproducible layer around the unmodified, already-audited P2.3 infrastructure
+that drives one frozen 24-configuration `run_kind=benchmark` pilot
+(iterations=1000, warmup_iterations=10, repetitions=30) through the
+unmodified P2.3 runner, profiles the same 24 configurations with Nsight
+Compute (an exact kernel-symbol filter, `--launch-skip 1 --launch-count 1`
+to profile only the second, timed launch, and clock-control-disabled,
+non-defaulting profiler controls), and computes deterministic statistics
+(count/mean/median/sample stdev/CV/min/max, a 95% bootstrap CI for the
+median, and Tukey-IQR diagnostics) for `elapsed_cycles`, `cycles_per_umma`,
+`flops_per_cycle`, and `flops_per_cycle_per_sm` over all 30 retained
+repetitions of all 24 configurations, 1-SM/2-SM speedup and scaling
+efficiency (never clamped), candidate depth saturation per `(method, N)`
+group, and an empirical per-SM BF16 Tensor Core ceiling candidate selected
+in clock-independent FLOP/cycle-per-SM space and only then converted with
+that same configuration's own matching NCU SM-clock measurement. If the
+mandatory `sm__cycles_elapsed.avg.per_second` metric cannot be trusted
+(unavailable, ambiguous, malformed, non-finite, non-positive, or an unknown
+unit) for any of the 24 profiled configurations, the campaign's terminal
+state is `INCONCLUSIVE` rather than `ANALYZED` and no TFLOP/s or completed
+empirical-ceiling claim is ever emitted; every other clock-independent
+statistic and artifact is still produced. See `src/compute/P2_4_PROTOCOL.md`
+for the complete frozen contract. P2.4 introduces no new CUDA kernel and
+does not modify `src/compute/umma_1sm.cu`, `src/compute/umma_2sm.cu`, either
+SASS checker, or any P2.3 file. This implementation has not yet been
+independently audited, and no P2.4 campaign has been executed on GB300: no
+pilot has run, no NCU profiling has run, and no empirical ceiling has been
+measured. Every artifact this module can ever produce carries
+`publishable: false` unconditionally.
 
 ## Phase 3 — CuTe DSL GEMM versus cuBLASLt (3–9 August 2026)
 
 Gate: Phase 2 gate remains pending. P2.1, P2.2, and P2.3 are audited and
-verified on GB300, but P2.4 remains unimplemented. Phase 3 cannot begin until
-all four P2 units are implemented, audited, and verified.
+verified on GB300; P2.4 is implemented but not yet independently audited or
+verified on GB300. Phase 3 cannot begin until all four P2 units are
+implemented, audited, and verified.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|

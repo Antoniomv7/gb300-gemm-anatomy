@@ -1,0 +1,4138 @@
+#!/usr/bin/env python3
+"""P2.4 profiling, clock-calibrated TFLOP/s, scaling, saturation, and
+empirical BF16 Tensor Core per-SM ceiling candidate for exp02_umma_throughput.
+
+This module never touches CUDA, Docker, ``nvidia-smi``, either UMMA binary,
+the P2.3 runner/aggregator's own files, or the network. It builds a
+reproducible layer around the already-audited, unmodified P2.3 infrastructure
+(``scripts/run_exp02_umma_throughput.sh``,
+``scripts/aggregate_exp02_umma_throughput.py``, imported here as ``p23``):
+the frozen 24-configuration pilot is driven by P2.3's own runner unmodified;
+this module only validates P2.3's resulting campaign, profiles the same 24
+configurations with Nsight Compute, and computes deterministic statistics,
+1-SM/2-SM scaling, candidate depth saturation, and an empirical per-SM
+BF16 Tensor Core ceiling candidate. See ``src/compute/P2_4_PROTOCOL.md`` for
+the complete frozen contract.
+
+P2.4 does not add or modify a CUDA kernel, does not change either UMMA
+binary or SASS checker, and does not change the P2.3 plan, order, runner,
+aggregator, or CSV schema. Every artifact this module can ever produce
+carries ``publishable: false`` unconditionally. P2.4 produces a reviewed
+pilot and an empirical ceiling *candidate*, never a final campaign; if the
+mandatory SM-clock metric cannot be trusted for every one of the 24 profiled
+configurations, the whole campaign is recorded ``INCONCLUSIVE`` and no
+TFLOP/s or completed empirical-ceiling claim is ever emitted.
+
+Subcommands:
+  plan                              Print the frozen 24-case profile plan
+                                     (identical configurations/order to
+                                     P2.3's own plan, plus each case's exact
+                                     kernel symbol).
+  init-campaign                     Symlink-safe P2.4 campaign creation.
+  validate-preflight                Validate a preflight summary.json.
+  record-pilot                      Validate a COMPLETE P2.3 benchmark
+                                     campaign (run with the frozen pilot
+                                     parameters) as this campaign's pilot
+                                     input.
+  discover-metrics                  Resolve the mandatory SM-clock metric
+                                     and the diagnostic tensor-pipe metrics;
+                                     start the profiling phase.
+  validate-profile-preconditions    GPU-free check that a fresh profiling
+                                     preflight matches the recorded pilot
+                                     preflight.
+  validate-profile-case             Validate one captured NCU profile case
+                                     and record its result.
+  finalize-profile                  Re-validate and close the 24-case
+                                     profile set (state COMPLETE).
+  analyze                           Generate analysis/* from a COMPLETE
+                                     campaign; state ANALYZED or
+                                     INCONCLUSIVE.
+  manifest-write                    Merge FAILED/INTERRUPTED failure
+                                     telemetry (never a completing state).
+  --self-test                       GPU-free synthetic/adversarial tests (no
+                                     CUDA, no Docker, no nvidia-smi, no
+                                     network, no real subprocess). Runs
+                                     entirely under a TemporaryDirectory with
+                                     this module's and p23's REPO_ROOT
+                                     patched to it; never touches
+                                     results/raw/.
+
+Exit codes: 0 on success (including --self-test passing); 1 on a validation,
+aggregation, or evidence-integrity failure; 2 on a usage/precondition error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import math
+import os
+import random
+import re
+import stat
+import statistics
+import sys
+import tempfile
+from datetime import datetime as _datetime
+from datetime import timezone as _timezone
+from pathlib import Path
+from typing import Callable
+from unittest import mock
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import aggregate_exp02_umma_throughput as p23  # noqa: E402
+
+REPO_ROOT = SCRIPT_DIR.parent
+
+# ---------------------------------------------------------------------------
+# Frozen P2.4 constants (src/compute/P2_4_PROTOCOL.md is the human-readable
+# mirror of every constant below; keep them in lockstep).
+# ---------------------------------------------------------------------------
+P24_SCHEMA_VERSION = "1"
+P24_EXPERIMENT_ID = "exp02_umma_throughput_p24"
+
+FROZEN_PILOT_PARAMS = {
+    "run_kind": "benchmark",
+    "iterations": 1000,
+    "warmup_iterations": 10,
+    "repetitions": 30,
+}
+
+FROZEN_PROFILE_PARAMS = {
+    "run_kind": "benchmark",
+    "iterations": 1000,
+    "warmup_iterations": 0,
+    "repetitions": 1,
+}
+
+MANDATORY_SM_CLOCK_METRIC = "sm__cycles_elapsed.avg.per_second"
+EXPECTED_SM_CLOCK_UNIT = "cycle/nsecond"
+DIAGNOSTIC_METRICS = (
+    "gpu__time_duration.sum",
+    "device__attribute_multiprocessor_count",
+    "sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_elapsed",
+    "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed",
+    "sm__inst_executed_pipe_tensor.sum",
+    "smsp__inst_executed_pipe_tensor.sum",
+)
+CANDIDATE_METRICS = (MANDATORY_SM_CLOCK_METRIC,) + DIAGNOSTIC_METRICS
+
+BOOTSTRAP_SEED = 20260804
+BOOTSTRAP_RESAMPLES = 10000
+BOOTSTRAP_LO_PERCENTILE = 0.025
+BOOTSTRAP_HI_PERCENTILE = 0.975
+
+CV_STABILITY_REVIEW_PERCENT = 5.0
+SATURATION_FRACTION_OF_MAX = 0.95
+
+STAT_METRIC_NAMES = ("elapsed_cycles", "cycles_per_umma", "flops_per_cycle", "flops_per_cycle_per_sm")
+DEPTH_VALUES = (4, 16, 64, 256)
+
+RAW_ROOT_PARTS_P24 = ("results", "raw", "exp02_umma_throughput_p24")
+RAW_ROOT_REL_P24 = Path(*RAW_ROOT_PARTS_P24)
+
+P24_CAMPAIGN_ID_RE = re.compile(r"^\d{8}T\d{6}Z$")
+P24_TIMESTAMP_RE = p23.MANIFEST_TIMESTAMP_RE  # YYYYMMDDTHHMMSSZ, reused as-is
+NOW_ARG_RE = p23.TIMESTAMP_UTC_RE  # YYYY-MM-DDTHH:MM:SSZ, reused as-is
+
+PROFILE_PLAN_HEADER = [
+    "index", "pair_index", "method", "cta_group", "m", "n", "k", "depth",
+    "binary", "case_name", "kernel_symbol",
+]
+
+ALLOWED_P24_STATES = frozenset({
+    "PILOT_IN_PROGRESS", "PILOT_COMPLETE", "PROFILE_IN_PROGRESS",
+    "COMPLETE", "ANALYZED", "INCONCLUSIVE", "FAILED", "INTERRUPTED",
+})
+P24_TERMINAL_STATES = frozenset({"ANALYZED", "INCONCLUSIVE", "FAILED", "INTERRUPTED"})
+
+EXPECTED_PROFILE_CASE_COUNT = p23.EXPECTED_CONFIGURATION_COUNT  # 24; the *same* configurations as P2.3
+
+ALLOWED_P24_TRANSITIONS: dict[str | None, frozenset[str]] = {
+    None: frozenset({"PILOT_IN_PROGRESS"}),
+    "PILOT_IN_PROGRESS": frozenset({"PILOT_COMPLETE", "FAILED", "INTERRUPTED"}),
+    "PILOT_COMPLETE": frozenset({"PROFILE_IN_PROGRESS", "FAILED", "INTERRUPTED"}),
+    "PROFILE_IN_PROGRESS": frozenset({"PROFILE_IN_PROGRESS", "COMPLETE", "FAILED", "INTERRUPTED"}),
+    # analyze() picks exactly one of these two terminal outcomes; COMPLETE has
+    # no FAILED/INTERRUPTED edge because analysis is a pure, retriable
+    # function of already-validated evidence (mirrors P1.4's COMPLETE ->
+    # ANALYZED-only design; see src/compute/P2_4_PROTOCOL.md section 8).
+    "COMPLETE": frozenset({"ANALYZED", "INCONCLUSIVE"}),
+    "ANALYZED": frozenset(),
+    "INCONCLUSIVE": frozenset(),
+    "FAILED": frozenset(),
+    "INTERRUPTED": frozenset(),
+}
+
+ALLOWED_P24_MANIFEST_KEYS: dict[str, object] = {
+    "schema_version": str,
+    "experiment_id": str,
+    "campaign_id": str,
+    "state": str,
+    "publishable": bool,
+    "started_at_utc": str,
+    "pilot_completed_at_utc": str,
+    "profile_started_at_utc": str,
+    "profile_completed_at_utc": str,
+    "analysis_completed_at_utc": str,
+    "frozen_protocol": dict,
+    "profile_plan_sha256": str,
+    "pilot_campaign_reference": dict,
+    "preflight_reference_pilot": dict,
+    "preflight_reference_profile": dict,
+    "provenance": dict,
+    "resolved_ncu_metrics": dict,
+    "profile_order": list,
+    "profile_count_completed": int,
+    "case_results": dict,
+    "artifact_sha256": dict,
+    "inconclusive_reason": list,
+    "failure_stage": str,
+    "failure_detail": list,
+}
+
+CASE_ARTIFACT_HASH_FIELDS: tuple[str, ...] = (
+    "application_csv_sha256",
+    "metrics_csv_sha256",
+    "ncu_rep_sha256",
+)
+
+ANALYSIS_ARTIFACT_RELATIVE_PATHS: tuple[str, ...] = (
+    "analysis/configuration_statistics.csv",
+    "analysis/scaling.csv",
+    "analysis/saturation.csv",
+    "analysis/profile_validation.csv",
+    "analysis/empirical_ceiling.json",
+    "analysis/report.md",
+    "analysis/throughput.svg",
+    "analysis/scaling_efficiency.svg",
+    "analysis/saturation.svg",
+    "analysis/analysis_manifest.json",
+)
+
+
+# ---------------------------------------------------------------------------
+# Frozen 24-case profile plan: the *same* configurations as P2.3's own
+# build_plan(), in the *same* canonical order -- never reimplemented, never
+# reordered. Adds only the exact kernel symbol each case must be profiled
+# under (src/compute/P2_PROTOCOL.md section 4 / P2_2_PROTOCOL.md section 3).
+# ---------------------------------------------------------------------------
+def _kernel_symbol(method: str, m: int, n: int, depth: int) -> str:
+    tag = "1sm" if method == "umma_1sm" else "2sm"
+    return f"umma_{tag}_m{m}n{n}k16_d{depth}"
+
+
+def build_profile_plan() -> list[dict]:
+    plan = []
+    for entry in p23.build_plan():
+        item = dict(entry)
+        item["kernel_symbol"] = _kernel_symbol(entry["method"], entry["m"], entry["n"], entry["depth"])
+        plan.append(item)
+    return plan
+
+
+def check_profile_plan_contract(plan: list[dict]) -> list[str]:
+    """Independently re-derives every property build_profile_plan() must
+    guarantee, so a future edit cannot silently diverge from P2.3's own
+    frozen 24-case matrix without failing --self-test."""
+    errors: list[str] = []
+    p23_plan = p23.build_plan()
+    p23_errors = p23.check_plan_contract(p23_plan)
+    if p23_errors:
+        errors.append(f"underlying P2.3 plan contract violated: {p23_errors}")
+    if len(plan) != EXPECTED_PROFILE_CASE_COUNT:
+        errors.append(f"profile plan has {len(plan)} case(s), expected {EXPECTED_PROFILE_CASE_COUNT}")
+    for entry, p23_entry in zip(plan, p23_plan):
+        for field in ("index", "pair_index", "method", "cta_group", "m", "n", "k", "depth", "binary", "case_name"):
+            if entry.get(field) != p23_entry.get(field):
+                errors.append(
+                    f"profile plan entry index {entry.get('index')} field {field}={entry.get(field)!r} "
+                    f"!= P2.3 plan's {p23_entry.get(field)!r} (P2.4 must reuse P2.3's plan unmodified)"
+                )
+        expected_symbol = _kernel_symbol(p23_entry["method"], p23_entry["m"], p23_entry["n"], p23_entry["depth"])
+        if entry.get("kernel_symbol") != expected_symbol:
+            errors.append(
+                f"profile plan entry index {entry.get('index')} kernel_symbol="
+                f"{entry.get('kernel_symbol')!r} != expected {expected_symbol!r}"
+            )
+    symbols = [e["kernel_symbol"] for e in plan]
+    if len(set(symbols)) != len(symbols):
+        errors.append("duplicate kernel_symbol values in profile plan")
+    return errors
+
+
+def format_plan_text(plan: list[dict]) -> str:
+    lines = [
+        "index  pair  method     cta_group  m    n    k   depth  case_name                  kernel_symbol",
+    ]
+    for entry in plan:
+        lines.append(
+            f"{entry['index']:>5d}  {entry['pair_index']:>4d}  {entry['method']:<9s}  "
+            f"{entry['cta_group']:>9d}  {entry['m']:>3d}  {entry['n']:>3d}  {entry['k']:>3d}  "
+            f"{entry['depth']:>5d}  {entry['case_name']:<26s}  {entry['kernel_symbol']}"
+        )
+    lines.append(f"total profile cases: {len(plan)}")
+    return "\n".join(lines) + "\n"
+
+
+def format_plan_lines(plan: list[dict]) -> str:
+    return "".join(
+        f"{e['index']}\t{e['method']}\t{e['n']}\t{e['depth']}\t{e['cta_group']}\t"
+        f"{e['kernel_symbol']}\t{e['case_name']}\n"
+        for e in plan
+    )
+
+
+# ---------------------------------------------------------------------------
+# Preflight validation. Structurally identical contract to P1.4's own
+# (src/memory/P1_4_PROTOCOL.md section 7): reused here field-for-field since
+# scripts/preflight.sh's summary.json schema is a single, project-wide
+# contract, not specific to any one experiment.
+# ---------------------------------------------------------------------------
+def load_preflight_json(path: Path) -> tuple[dict | None, list[str]]:
+    try:
+        with p23._open_regular_nofollow(path, binary=False) as handle:
+            text = handle.read()
+    except (OSError, p23.UnsafePathError, UnicodeError) as exc:
+        return None, [f"{path}: {exc}"]
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return None, [f"{path}: invalid JSON: {exc}"]
+    if not isinstance(doc, dict):
+        return None, [f"{path}: root is not a JSON object"]
+    return doc, []
+
+
+def parse_now_arg(value: str) -> _datetime:
+    if not NOW_ARG_RE.fullmatch(value):
+        raise ValueError(f"--now={value!r} is not in YYYY-MM-DDTHH:MM:SSZ form")
+    return _datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_timezone.utc)
+
+
+def validate_preflight_fields(doc: dict, *, expected_git_commit: str, now_utc: _datetime) -> tuple[list[str], dict]:
+    errors: list[str] = []
+    snapshot: dict = {}
+
+    if doc.get("overall_status") != "PASS":
+        errors.append(f"overall_status={doc.get('overall_status')!r} != 'PASS'")
+    if doc.get("git_dirty") is not False:
+        errors.append(f"git_dirty={doc.get('git_dirty')!r} != false")
+
+    commit = doc.get("git_commit")
+    if not isinstance(commit, str) or not p23.GIT_COMMIT_RE.fullmatch(commit):
+        errors.append(f"git_commit={commit!r} is not a 40-character lowercase hex commit")
+    elif commit != expected_git_commit:
+        errors.append(f"git_commit={commit!r} != expected clean HEAD {expected_git_commit!r}")
+    else:
+        snapshot["git_commit"] = commit
+
+    gpu = doc.get("gpu")
+    if not isinstance(gpu, dict):
+        errors.append("gpu field is missing or not an object")
+        gpu = {}
+    for key in ("logical_index", "name", "uuid", "driver_version", "compute_cap", "memory_total"):
+        if not gpu.get(key):
+            errors.append(f"gpu.{key} is missing or empty")
+    uuid = gpu.get("uuid")
+    if uuid is not None and not p23.GPU_UUID_RE.fullmatch(uuid):
+        errors.append(f"gpu.uuid={uuid!r} is not a canonical GPU-xxxxxxxx-... UUID")
+    if gpu.get("compute_cap") != "10.3":
+        errors.append(f"gpu.compute_cap={gpu.get('compute_cap')!r} != '10.3'")
+    snapshot["gpu_uuid"] = gpu.get("uuid")
+    snapshot["gpu_name"] = gpu.get("name")
+    snapshot["gpu_driver_version"] = gpu.get("driver_version")
+    snapshot["gpu_compute_cap"] = gpu.get("compute_cap")
+
+    checks = doc.get("checks")
+    check_status: dict[str, object] = {}
+    if isinstance(checks, list):
+        for entry in checks:
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                check_status[entry["name"]] = entry.get("status")
+    else:
+        errors.append("checks field is missing or not a list")
+    if check_status.get("gpu_visibility") != "PASS":
+        errors.append(f"checks.gpu_visibility={check_status.get('gpu_visibility')!r} != 'PASS'")
+    if check_status.get("ncu_profile") != "PASS":
+        errors.append(f"checks.ncu_profile={check_status.get('ncu_profile')!r} != 'PASS'")
+
+    ts = doc.get("timestamp_utc")
+    if not isinstance(ts, str) or not P24_TIMESTAMP_RE.fullmatch(ts):
+        errors.append(f"timestamp_utc={ts!r} is not YYYYMMDDTHHMMSSZ")
+    else:
+        try:
+            ts_dt = _datetime.strptime(ts, "%Y%m%dT%H%M%SZ").replace(tzinfo=_timezone.utc)
+        except ValueError:
+            errors.append(f"timestamp_utc={ts!r} is not a real calendar UTC timestamp")
+        else:
+            age_seconds = (now_utc - ts_dt).total_seconds()
+            if age_seconds < 0:
+                errors.append(f"timestamp_utc={ts!r} is in the future relative to now={now_utc.isoformat()}")
+            elif age_seconds > 24 * 3600:
+                errors.append(
+                    f"timestamp_utc={ts!r} is more than 24h old "
+                    f"(age={age_seconds / 3600.0:.2f}h relative to now={now_utc.isoformat()})"
+                )
+            else:
+                snapshot["timestamp_utc"] = ts
+
+    return errors, snapshot
+
+
+def validate_preflight_file(path: Path, *, expected_git_commit: str, now_utc: _datetime) -> tuple[list[str], dict]:
+    doc, errors = load_preflight_json(path)
+    if errors:
+        return errors, {}
+    field_errors, snapshot = validate_preflight_fields(doc, expected_git_commit=expected_git_commit, now_utc=now_utc)
+    if field_errors:
+        return field_errors, snapshot
+    try:
+        snapshot["sha256"] = p23.sha256_of(path)
+    except p23.UnsafePathError as exc:
+        return [str(exc)], snapshot
+    snapshot["path"] = str(path)
+    return [], snapshot
+
+
+PREFLIGHT_PROVENANCE_FIELDS = ("git_commit", "gpu_uuid", "gpu_name", "gpu_compute_cap", "gpu_driver_version")
+
+
+def compare_preflight_provenance(pilot_snapshot: dict, profile_snapshot: dict) -> list[str]:
+    errors: list[str] = []
+    for field in PREFLIGHT_PROVENANCE_FIELDS:
+        pilot_value = pilot_snapshot.get(field)
+        profile_value = profile_snapshot.get(field)
+        if pilot_value != profile_value:
+            errors.append(
+                f"profile preflight {field}={profile_value!r} != pilot preflight {field}={pilot_value!r} "
+                f"(the pilot and profiling phases of one campaign must run on the identical GPU/driver/commit)"
+            )
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# P2.4 campaign-ID validation and symlink-safe raw-tree primitives. Reuses
+# p23's generic lstat-based path-safety helpers.
+# ---------------------------------------------------------------------------
+def validate_p24_campaign_id(campaign_id: str) -> None:
+    p23.validate_campaign_id(campaign_id)
+    if not P24_CAMPAIGN_ID_RE.fullmatch(campaign_id):
+        raise p23.UnsafePathError(
+            f"P2_4_CAMPAIGN_ID={campaign_id!r} must be an explicit canonical UTC timestamp YYYYMMDDTHHMMSSZ"
+        )
+    try:
+        _datetime.strptime(campaign_id, "%Y%m%dT%H%M%SZ")
+    except ValueError as exc:
+        raise p23.UnsafePathError(f"P2_4_CAMPAIGN_ID={campaign_id!r} is not a real calendar UTC timestamp") from exc
+
+
+def create_p24_campaign_dir(campaign_id: str) -> Path:
+    validate_p24_campaign_id(campaign_id)
+    current = REPO_ROOT
+    for part in RAW_ROOT_PARTS_P24:
+        current = current / part
+        p23._mkdir_component(current, must_not_exist=False, root=REPO_ROOT)
+    campaign_dir = current / campaign_id
+    p23._mkdir_component(campaign_dir, must_not_exist=True, root=REPO_ROOT)
+    for sub in ("profiles", "analysis", "logs", "manifest"):
+        p23._mkdir_component(campaign_dir / sub, must_not_exist=False, root=REPO_ROOT)
+    return campaign_dir
+
+
+def resolve_p24_campaign_dir(campaign_dir_rel: str) -> Path:
+    if os.path.isabs(campaign_dir_rel):
+        raise p23.UnsafePathError(f"--campaign-dir must be relative, got absolute path {campaign_dir_rel!r}")
+    parts = Path(campaign_dir_rel).parts
+    if any(".." in part for part in parts):
+        raise p23.UnsafePathError(f"--campaign-dir must not contain '..': {campaign_dir_rel!r}")
+    if len(parts) != len(RAW_ROOT_PARTS_P24) + 1 or tuple(parts[: len(RAW_ROOT_PARTS_P24)]) != RAW_ROOT_PARTS_P24:
+        raise p23.UnsafePathError(
+            f"--campaign-dir must be exactly {'/'.join(RAW_ROOT_PARTS_P24)}/<campaign_id>, got {campaign_dir_rel!r}"
+        )
+    validate_p24_campaign_id(parts[-1])
+
+    current = REPO_ROOT
+    for part in parts:
+        current = current / part
+        p23._reject_if_symlink_or_wrong_type(current, expect_dir=True)
+        if not os.path.lexists(current):
+            raise p23.UnsafePathError(f"{current}: does not exist")
+    p23._confirm_contained(current, REPO_ROOT)
+    for subdir_name in ("profiles", "analysis", "logs", "manifest"):
+        subdir = current / subdir_name
+        p23._reject_if_symlink_or_wrong_type(subdir, expect_dir=True)
+        if not os.path.lexists(subdir):
+            raise p23.UnsafePathError(f"{subdir}: required campaign directory does not exist")
+        p23._confirm_contained(subdir, current)
+    return current
+
+
+def resolve_p23_campaign_dir_arg(campaign_dir_rel: str) -> Path:
+    return p23.resolve_campaign_dir(campaign_dir_rel)
+
+
+# ---------------------------------------------------------------------------
+# profile_plan.csv: written once at init, re-validated at finalize-profile
+# time. Mirrors P2.3's own execution_order.csv discipline exactly.
+# ---------------------------------------------------------------------------
+def _profile_plan_row(entry: dict) -> list[str]:
+    return [
+        str(entry["index"]), str(entry["pair_index"]), entry["method"], str(entry["cta_group"]),
+        str(entry["m"]), str(entry["n"]), str(entry["k"]), str(entry["depth"]), entry["binary"],
+        entry["case_name"], entry["kernel_symbol"],
+    ]
+
+
+def write_profile_plan(campaign_dir: Path, plan: list[dict]) -> Path:
+    out_path = campaign_dir / "profile_plan.csv"
+    if os.path.lexists(out_path):
+        raise p23.UnsafePathError(f"{out_path}: already exists, refusing to overwrite")
+    tmp_path = campaign_dir / "profile_plan.csv.tmp"
+    if os.path.lexists(tmp_path):
+        raise p23.UnsafePathError(f"{tmp_path}: stale temporary file already exists")
+    try:
+        with p23._open_exclusive(tmp_path, binary=False, newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(PROFILE_PLAN_HEADER)
+            for entry in plan:
+                writer.writerow(_profile_plan_row(entry))
+    except Exception:
+        if os.path.lexists(tmp_path):
+            p23._safe_unlink_owned(tmp_path)
+        raise
+    try:
+        p23._publish_no_clobber(tmp_path, out_path)
+    except p23.UnsafePathError:
+        if os.path.lexists(tmp_path):
+            p23._safe_unlink_owned(tmp_path)
+        raise
+    return out_path
+
+
+def validate_profile_plan_file(path: Path, plan: list[dict]) -> list[str]:
+    if os.path.lexists(path):
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode):
+            return [f"{path}: is a symlink; refusing"]
+    else:
+        return [f"{path}: does not exist"]
+    try:
+        with p23._open_regular_nofollow(path, binary=False) as handle:
+            rows = list(csv.reader(handle))
+    except (OSError, p23.UnsafePathError, UnicodeError) as exc:
+        return [f"{path}: unable to read: {exc}"]
+    if not rows:
+        return [f"{path}: empty file"]
+    header, data_rows = rows[0], rows[1:]
+    if header != PROFILE_PLAN_HEADER:
+        return [f"{path}: header mismatch: {header!r}"]
+    if len(data_rows) != len(plan):
+        return [f"{path}: has {len(data_rows)} row(s), expected {len(plan)}"]
+    errors: list[str] = []
+    for i, (row, entry) in enumerate(zip(data_rows, plan)):
+        expected_row = _profile_plan_row(entry)
+        if row != expected_row:
+            errors.append(f"{path}: row {i} = {row!r} != expected {expected_row!r}")
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# Manifest: allowlisted keys/types, field classification, exact per-
+# transition mutation matrix, state-shape validation, timestamp chronology,
+# append-only hash chain. Mirrors src/memory/P1_4_PROTOCOL.md section 8's
+# design exactly, extended with one new terminal state (INCONCLUSIVE) for
+# the case where the mandatory SM-clock metric cannot be trusted.
+# ---------------------------------------------------------------------------
+def _expected_complete_artifact_sha256(manifest: dict) -> tuple[dict[str, str], list[str]]:
+    expected: dict[str, str] = {}
+    errors: list[str] = []
+
+    def _record(output_key: str, value: object, source: str) -> None:
+        if not isinstance(value, str) or not p23._is_sha256_hex(value):
+            errors.append(
+                f"{source} must be a canonical 64-hex SHA-256 before artifact_sha256[{output_key!r}] "
+                f"can be derived; got {value!r}"
+            )
+            return
+        expected[output_key] = value
+
+    _record("profile_plan.csv", manifest.get("profile_plan_sha256"), "profile_plan_sha256")
+
+    pilot_ref = manifest.get("pilot_campaign_reference")
+    if not isinstance(pilot_ref, dict):
+        errors.append("pilot_campaign_reference must be an object for terminal artifact validation")
+    else:
+        for source_key, output_key in (
+            ("manifest_sha256", "pilot_manifest_sha256"),
+            ("combined_samples_sha256", "pilot_combined_samples_sha256"),
+            ("summary_sha256", "pilot_summary_sha256"),
+        ):
+            _record(output_key, pilot_ref.get(source_key), f"pilot_campaign_reference.{source_key}")
+
+    for ref_name in ("preflight_reference_pilot", "preflight_reference_profile"):
+        ref = manifest.get(ref_name)
+        if not isinstance(ref, dict):
+            errors.append(f"{ref_name} must be an object for terminal artifact validation")
+            continue
+        _record(ref_name, ref.get("sha256"), f"{ref_name}.sha256")
+
+    case_results = manifest.get("case_results")
+    if not isinstance(case_results, dict):
+        errors.append("case_results must be an object for terminal artifact validation")
+    else:
+        for entry in build_profile_plan():
+            case_name = entry["case_name"]
+            result = case_results.get(case_name)
+            if not isinstance(result, dict):
+                errors.append(f"case_results.{case_name} must be an object for terminal artifact validation")
+                continue
+            for field in CASE_ARTIFACT_HASH_FIELDS:
+                _record(f"{case_name}.{field}", result.get(field), f"case_results.{case_name}.{field}")
+
+    return expected, errors
+
+
+def validate_terminal_manifest_content(manifest: dict) -> list[str]:
+    state = manifest.get("state")
+    if state not in ("COMPLETE", "ANALYZED", "INCONCLUSIVE"):
+        return []
+
+    errors: list[str] = []
+    expected_plan = build_profile_plan()
+    if manifest.get("profile_order") != expected_plan:
+        errors.append("profile_order is not exactly the frozen 24-case plan in its canonical order")
+
+    expected_base, source_errors = _expected_complete_artifact_sha256(manifest)
+    errors.extend(source_errors)
+
+    actual = manifest.get("artifact_sha256")
+    if not isinstance(actual, dict):
+        return errors + ["artifact_sha256 must be an object in COMPLETE/ANALYZED/INCONCLUSIVE"]
+
+    expected_keys = set(expected_base)
+    if state in ("ANALYZED", "INCONCLUSIVE"):
+        expected_keys.update(ANALYSIS_ARTIFACT_RELATIVE_PATHS)
+    actual_keys = set(actual)
+    missing = sorted(expected_keys - actual_keys)
+    unexpected = sorted(actual_keys - expected_keys)
+    if missing:
+        errors.append(f"artifact_sha256 is missing canonical key(s): {missing}")
+    if unexpected:
+        errors.append(f"artifact_sha256 contains unexpected key(s): {unexpected}")
+
+    for key, expected_hash in expected_base.items():
+        if key in actual and actual[key] != expected_hash:
+            errors.append(
+                f"artifact_sha256[{key!r}]={actual[key]!r} does not equal its canonical recorded "
+                f"evidence hash {expected_hash!r}"
+            )
+    if state in ("ANALYZED", "INCONCLUSIVE"):
+        for key in ANALYSIS_ARTIFACT_RELATIVE_PATHS:
+            value = actual.get(key)
+            if key in actual and (not isinstance(value, str) or not p23._is_sha256_hex(value)):
+                errors.append(f"artifact_sha256[{key!r}] must be a canonical 64-hex SHA-256; got {value!r}")
+
+    if state == "INCONCLUSIVE":
+        reason = manifest.get("inconclusive_reason")
+        if not isinstance(reason, list) or not reason or not all(isinstance(item, str) for item in reason):
+            errors.append("INCONCLUSIVE manifest must carry a non-empty inconclusive_reason list[str]")
+
+    return errors
+
+
+def _validate_p24_manifest_updates(updates: dict) -> None:
+    unknown = set(updates) - set(ALLOWED_P24_MANIFEST_KEYS)
+    if unknown:
+        raise p23.ManifestTransitionError(f"unknown P2.4 manifest field(s): {sorted(unknown)}")
+    for key, value in updates.items():
+        expected_type = ALLOWED_P24_MANIFEST_KEYS[key]
+        if not p23._manifest_type_matches(value, expected_type):
+            raise p23.ManifestTransitionError(
+                f"P2.4 manifest field {key!r} has invalid type {type(value).__name__}, expected {expected_type}"
+            )
+
+
+def _validate_p24_manifest_document(manifest: dict, *, require_initialized: bool = False) -> None:
+    _validate_p24_manifest_updates(manifest)
+    if not manifest:
+        if require_initialized:
+            raise p23.ManifestTransitionError("P2.4 manifest is empty")
+        return
+
+    state = manifest.get("state")
+    if state not in ALLOWED_P24_STATES:
+        raise p23.ManifestTransitionError(f"P2.4 manifest state={state!r} is invalid")
+    if "schema_version" in manifest and manifest["schema_version"] != P24_SCHEMA_VERSION:
+        raise p23.ManifestTransitionError("P2.4 manifest schema_version is invalid")
+    if "experiment_id" in manifest and manifest["experiment_id"] != P24_EXPERIMENT_ID:
+        raise p23.ManifestTransitionError("P2.4 manifest experiment_id is invalid")
+    if "publishable" in manifest and manifest["publishable"] is not False:
+        raise p23.ManifestTransitionError("P2.4 manifest publishable must be false")
+    if "campaign_id" in manifest:
+        try:
+            validate_p24_campaign_id(manifest["campaign_id"])
+        except p23.UnsafePathError as exc:
+            raise p23.ManifestTransitionError(f"P2.4 manifest campaign_id is invalid: {exc}") from exc
+    if "started_at_utc" in manifest:
+        p23._validate_compact_timestamp(manifest["started_at_utc"], "started_at_utc")
+    for key in ("pilot_completed_at_utc", "profile_started_at_utc", "profile_completed_at_utc", "analysis_completed_at_utc"):
+        if key in manifest:
+            p23._validate_compact_timestamp(manifest[key], key)
+    if "profile_count_completed" in manifest and not (0 <= manifest["profile_count_completed"] <= EXPECTED_PROFILE_CASE_COUNT):
+        raise p23.ManifestTransitionError(
+            f"P2.4 manifest profile_count_completed must be in [0, {EXPECTED_PROFILE_CASE_COUNT}]"
+        )
+    if "failure_stage" in manifest and not manifest["failure_stage"]:
+        raise p23.ManifestTransitionError("P2.4 manifest failure_stage must be non-empty when present")
+    if "failure_detail" in manifest and not all(isinstance(item, str) for item in manifest["failure_detail"]):
+        raise p23.ManifestTransitionError("P2.4 manifest failure_detail must be a list of strings")
+    if "inconclusive_reason" in manifest and not all(isinstance(item, str) for item in manifest["inconclusive_reason"]):
+        raise p23.ManifestTransitionError("P2.4 manifest inconclusive_reason must be a list of strings")
+
+    required_by_state = {
+        "PILOT_IN_PROGRESS": {
+            "schema_version", "experiment_id", "campaign_id", "state", "publishable",
+            "started_at_utc", "frozen_protocol", "profile_plan_sha256",
+        },
+        "PILOT_COMPLETE": {
+            "pilot_completed_at_utc", "pilot_campaign_reference", "preflight_reference_pilot", "provenance",
+        },
+        "PROFILE_IN_PROGRESS": {"profile_started_at_utc", "resolved_ncu_metrics", "preflight_reference_profile"},
+        "COMPLETE": {
+            "profile_completed_at_utc", "profile_order", "profile_count_completed",
+            "case_results", "artifact_sha256",
+        },
+    }
+    if state in required_by_state:
+        gate_order = list(required_by_state)
+        needed: set[str] = set()
+        for gate_state in gate_order[: gate_order.index(state) + 1]:
+            needed |= required_by_state[gate_state]
+        missing = needed - set(manifest)
+        if missing:
+            raise p23.ManifestTransitionError(f"P2.4 manifest in state {state!r} missing required field(s): {sorted(missing)}")
+    elif state in ("ANALYZED", "INCONCLUSIVE"):
+        needed = set()
+        for gate_state in required_by_state.values():
+            needed |= gate_state
+        needed.add("analysis_completed_at_utc")
+        if state == "INCONCLUSIVE":
+            needed.add("inconclusive_reason")
+        missing = needed - set(manifest)
+        if missing:
+            raise p23.ManifestTransitionError(f"P2.4 manifest in state {state!r} missing required field(s): {sorted(missing)}")
+
+    if state in ("COMPLETE", "ANALYZED", "INCONCLUSIVE") and manifest.get("profile_count_completed") != EXPECTED_PROFILE_CASE_COUNT:
+        raise p23.ManifestTransitionError(
+            f"P2.4 manifest state={state} requires profile_count_completed={EXPECTED_PROFILE_CASE_COUNT}, "
+            f"got {manifest.get('profile_count_completed')!r}"
+        )
+    failure_keys = {"failure_stage", "failure_detail"}
+    present_failure_keys = failure_keys & set(manifest)
+    if state in ("FAILED", "INTERRUPTED"):
+        missing_failure_keys = failure_keys - set(manifest)
+        if missing_failure_keys:
+            raise p23.ManifestTransitionError(
+                f"P2.4 manifest state={state!r} missing failure telemetry field(s): {sorted(missing_failure_keys)}"
+            )
+    elif present_failure_keys:
+        raise p23.ManifestTransitionError(
+            f"P2.4 manifest state={state!r} cannot contain failure telemetry field(s): {sorted(present_failure_keys)}"
+        )
+    if state != "INCONCLUSIVE" and "inconclusive_reason" in manifest:
+        raise p23.ManifestTransitionError(f"P2.4 manifest state={state!r} cannot contain inconclusive_reason")
+
+    terminal_errors = validate_terminal_manifest_content(manifest)
+    if terminal_errors:
+        raise p23.ManifestTransitionError(f"P2.4 manifest state={state!r} has non-canonical terminal content: {terminal_errors}")
+
+
+# --- Field classification (documented in src/compute/P2_4_PROTOCOL.md) -----
+P24_FIELD_IMMUTABLE = frozenset({
+    "schema_version", "experiment_id", "campaign_id", "publishable", "frozen_protocol", "profile_plan_sha256",
+})
+P24_FIELD_ALLOWED_TIMESTAMP = frozenset({
+    "started_at_utc", "pilot_completed_at_utc", "profile_started_at_utc",
+    "profile_completed_at_utc", "analysis_completed_at_utc",
+})
+P24_FIELD_SET_ONCE = frozenset({
+    "pilot_campaign_reference", "preflight_reference_pilot", "provenance",
+    "preflight_reference_profile", "resolved_ncu_metrics", "profile_order",
+})
+P24_FIELD_STATE_DERIVED = frozenset({"state", "profile_count_completed"})
+P24_FIELD_APPEND_ONLY = frozenset({"case_results", "artifact_sha256"})
+P24_FIELD_FAILURE = frozenset({"failure_stage", "failure_detail"})
+P24_FIELD_INCONCLUSIVE = frozenset({"inconclusive_reason"})
+
+_P24_FIELD_CLASSIFICATION_UNION = (
+    P24_FIELD_IMMUTABLE | P24_FIELD_ALLOWED_TIMESTAMP | P24_FIELD_SET_ONCE
+    | P24_FIELD_STATE_DERIVED | P24_FIELD_APPEND_ONLY | P24_FIELD_FAILURE | P24_FIELD_INCONCLUSIVE
+)
+assert _P24_FIELD_CLASSIFICATION_UNION == frozenset(ALLOWED_P24_MANIFEST_KEYS), (
+    "every P2.4 manifest field must be classified into exactly one P24_FIELD_* category: "
+    f"missing={frozenset(ALLOWED_P24_MANIFEST_KEYS) - _P24_FIELD_CLASSIFICATION_UNION!r} "
+    f"extra={_P24_FIELD_CLASSIFICATION_UNION - frozenset(ALLOWED_P24_MANIFEST_KEYS)!r}"
+)
+
+P24_EXACT_TRANSITION_MUTATIONS: dict[tuple[str, str], frozenset[str]] = {
+    ("PILOT_IN_PROGRESS", "PILOT_COMPLETE"): frozenset({
+        "pilot_completed_at_utc", "pilot_campaign_reference", "preflight_reference_pilot", "provenance",
+    }),
+    ("PILOT_COMPLETE", "PROFILE_IN_PROGRESS"): frozenset({
+        "profile_started_at_utc", "resolved_ncu_metrics", "preflight_reference_profile",
+    }),
+    ("PROFILE_IN_PROGRESS", "PROFILE_IN_PROGRESS"): frozenset({"case_results", "profile_count_completed"}),
+    ("PROFILE_IN_PROGRESS", "COMPLETE"): frozenset({"profile_completed_at_utc", "profile_order", "artifact_sha256"}),
+    ("COMPLETE", "ANALYZED"): frozenset({"analysis_completed_at_utc", "artifact_sha256"}),
+    ("COMPLETE", "INCONCLUSIVE"): frozenset({"analysis_completed_at_utc", "artifact_sha256", "inconclusive_reason"}),
+}
+
+# State-availability matrix: which fields a revision in a given state may
+# ever carry (Task-4-style, src/memory/P1_4_PROTOCOL.md section 8). ANALYZED
+# and INCONCLUSIVE are both direct, mutually exclusive children of COMPLETE
+# (never chained to each other), so _p24_cumulative_allowed_fields handles
+# them as a special case rather than a strict linear walk.
+P24_STATE_ORDER: tuple[str, ...] = ("PILOT_IN_PROGRESS", "PILOT_COMPLETE", "PROFILE_IN_PROGRESS", "COMPLETE")
+
+P24_FIELDS_INTRODUCED_BY_STATE: dict[str, frozenset[str]] = {
+    "PILOT_IN_PROGRESS": frozenset({
+        "schema_version", "experiment_id", "campaign_id", "state", "publishable",
+        "started_at_utc", "frozen_protocol", "profile_plan_sha256",
+    }),
+    "PILOT_COMPLETE": frozenset({
+        "pilot_completed_at_utc", "pilot_campaign_reference", "preflight_reference_pilot", "provenance",
+    }),
+    "PROFILE_IN_PROGRESS": frozenset({
+        "profile_started_at_utc", "resolved_ncu_metrics", "preflight_reference_profile",
+        "case_results", "profile_count_completed",
+    }),
+    "COMPLETE": frozenset({"profile_completed_at_utc", "profile_order", "artifact_sha256"}),
+    "ANALYZED": frozenset({"analysis_completed_at_utc"}),
+    "INCONCLUSIVE": frozenset({"analysis_completed_at_utc", "inconclusive_reason"}),
+}
+P24_FAILURE_ONLY_FIELDS = frozenset({"failure_stage", "failure_detail"})
+
+_P24_FIELD_INTRODUCTION_UNION = frozenset().union(*P24_FIELDS_INTRODUCED_BY_STATE.values()) | P24_FAILURE_ONLY_FIELDS
+assert _P24_FIELD_INTRODUCTION_UNION == frozenset(ALLOWED_P24_MANIFEST_KEYS), (
+    "every P2.4 manifest field must be bound to a legal state-availability bucket (or the failure-only "
+    "exception) -- an unbound field must never be able to appear at an arbitrary state unnoticed: "
+    f"missing={frozenset(ALLOWED_P24_MANIFEST_KEYS) - _P24_FIELD_INTRODUCTION_UNION!r} "
+    f"extra={_P24_FIELD_INTRODUCTION_UNION - frozenset(ALLOWED_P24_MANIFEST_KEYS)!r}"
+)
+
+
+def _p24_cumulative_allowed_fields(state: str) -> frozenset[str]:
+    if state in ("FAILED", "INTERRUPTED"):
+        cumulative: frozenset[str] = frozenset()
+        for s in P24_STATE_ORDER:
+            cumulative = cumulative | P24_FIELDS_INTRODUCED_BY_STATE[s]
+        return cumulative | P24_FAILURE_ONLY_FIELDS
+    if state in ("ANALYZED", "INCONCLUSIVE"):
+        cumulative = frozenset()
+        for s in P24_STATE_ORDER:
+            cumulative = cumulative | P24_FIELDS_INTRODUCED_BY_STATE[s]
+        return cumulative | P24_FIELDS_INTRODUCED_BY_STATE[state]
+    cumulative = frozenset()
+    for s in P24_STATE_ORDER:
+        cumulative = cumulative | P24_FIELDS_INTRODUCED_BY_STATE[s]
+        if s == state:
+            return cumulative
+    raise AssertionError(f"unreachable: state {state!r} is not in P24_STATE_ORDER or the failure states")
+
+
+def validate_manifest_state_shape(current: dict, expected_campaign_id: str) -> list[str]:
+    """Validates ONE manifest revision's shape in isolation from any other
+    revision: which fields may legally be present given its own declared
+    state, with no knowledge of history. Presence is tested by key
+    membership, never truthiness -- an unexpected `null` must never behave
+    like an absent field."""
+    errors: list[str] = []
+    state = current.get("state")
+    if state not in ALLOWED_P24_STATES:
+        return [f"state={state!r} is not a recognized P2.4 state"]
+
+    if current.get("campaign_id") != expected_campaign_id:
+        errors.append(
+            f"campaign_id={current.get('campaign_id')!r} != campaign directory basename {expected_campaign_id!r}"
+        )
+
+    allowed = _p24_cumulative_allowed_fields(state)
+    for key in ALLOWED_P24_MANIFEST_KEYS:
+        if key in current and key not in allowed:
+            errors.append(
+                f"{key} is present but state={state!r} has not yet reached the state that may introduce it"
+            )
+
+    case_results_present = "case_results" in current
+    count_present = "profile_count_completed" in current
+    if case_results_present != count_present:
+        errors.append(
+            f"profile_count_completed present={count_present} but case_results present={case_results_present} "
+            f"(the two fields must always appear together)"
+        )
+
+    case_results = current.get("case_results")
+    if isinstance(case_results, dict):
+        frozen_order = [entry["case_name"] for entry in build_profile_plan()]
+        actual_order = list(case_results)
+        if actual_order != frozen_order[: len(actual_order)]:
+            errors.append(
+                f"case_results key order {actual_order!r} is not an exact ordered prefix of the frozen "
+                f"24-case order (checked as an ordered list, never a set)"
+            )
+        if count_present and current["profile_count_completed"] != len(case_results):
+            errors.append(
+                f"profile_count_completed={current.get('profile_count_completed')!r} != "
+                f"len(case_results)={len(case_results)}"
+            )
+
+    return errors
+
+
+def validate_manifest_revision_transition(previous: dict | None, current: dict, expected_campaign_id: str) -> list[str]:
+    """Validates one manifest revision (previous=None: revision 0 in
+    isolation) or one adjacent revision-to-revision transition. Never trusts
+    campaign_id recorded inside a revision by itself."""
+    errors: list[str] = []
+
+    if current.get("campaign_id") != expected_campaign_id:
+        errors.append(f"campaign_id={current.get('campaign_id')!r} != campaign directory basename {expected_campaign_id!r}")
+    if current.get("publishable") is not False:
+        errors.append(f"publishable={current.get('publishable')!r} != False (must always be false)")
+
+    curr_state = current.get("state")
+    curr_failure_stage = current.get("failure_stage")
+    if curr_failure_stage is not None and curr_state not in ("FAILED", "INTERRUPTED"):
+        errors.append(f"failure_stage={curr_failure_stage!r} is set but state={curr_state!r} is neither FAILED nor INTERRUPTED")
+    if current.get("analysis_completed_at_utc") is not None and curr_state not in ("ANALYZED", "INCONCLUSIVE"):
+        errors.append(f"analysis_completed_at_utc is set but state={curr_state!r} is neither ANALYZED nor INCONCLUSIVE")
+    if current.get("inconclusive_reason") is not None and curr_state != "INCONCLUSIVE":
+        errors.append(f"inconclusive_reason is set but state={curr_state!r} != 'INCONCLUSIVE'")
+    curr_artifact_sha256 = current.get("artifact_sha256")
+    if isinstance(curr_artifact_sha256, dict):
+        for name in curr_artifact_sha256:
+            if name.startswith("analysis/") and curr_state not in ("ANALYZED", "INCONCLUSIVE"):
+                errors.append(
+                    f"artifact_sha256 contains analysis artifact {name!r} but state={curr_state!r} is "
+                    f"neither ANALYZED nor INCONCLUSIVE"
+                )
+
+    if previous is None:
+        prev_state = None
+    else:
+        for field in P24_FIELD_IMMUTABLE:
+            if field in previous and previous.get(field) != current.get(field):
+                errors.append(f"{field} is immutable but changed: {previous.get(field)!r} -> {current.get(field)!r}")
+        for field in P24_FIELD_ALLOWED_TIMESTAMP | P24_FIELD_SET_ONCE:
+            prev_value = previous.get(field)
+            curr_value = current.get(field)
+            if prev_value is not None and curr_value != prev_value:
+                errors.append(f"{field} is set-once but changed: {prev_value!r} -> {curr_value!r}")
+            if field in previous and prev_value is not None and field not in current:
+                errors.append(f"{field} was present in the previous revision but is now absent")
+
+        prev_artifacts = previous.get("artifact_sha256")
+        prev_artifacts = prev_artifacts if isinstance(prev_artifacts, dict) else {}
+        curr_artifacts = curr_artifact_sha256 if isinstance(curr_artifact_sha256, dict) else {}
+        for name, prev_hash in prev_artifacts.items():
+            if name not in curr_artifacts:
+                errors.append(f"artifact_sha256.{name} was deleted")
+            elif curr_artifacts[name] != prev_hash:
+                errors.append(f"artifact_sha256.{name} changed after being recorded: {prev_hash!r} -> {curr_artifacts[name]!r}")
+
+        prev_cases = previous.get("case_results")
+        prev_cases = prev_cases if isinstance(prev_cases, dict) else {}
+        curr_cases = current.get("case_results")
+        curr_cases = curr_cases if isinstance(curr_cases, dict) else {}
+        for case_name, prev_value in prev_cases.items():
+            if case_name not in curr_cases:
+                errors.append(f"case_results.{case_name} was deleted")
+            elif curr_cases[case_name] != prev_value:
+                errors.append(f"case_results.{case_name} was modified after being recorded (append-only)")
+        frozen_order = [entry["case_name"] for entry in build_profile_plan()]
+
+        def _frozen_prefix_len(names: set) -> int | None:
+            for k in range(len(frozen_order) + 1):
+                if names == set(frozen_order[:k]):
+                    return k
+            return None
+
+        prev_k = _frozen_prefix_len(set(prev_cases))
+        curr_k = _frozen_prefix_len(set(curr_cases))
+        if prev_k is None:
+            errors.append(f"case_results in the previous revision is not a frozen-order prefix: {sorted(prev_cases)}")
+        elif curr_k is None:
+            errors.append(f"case_results gained an entry out of frozen order: now contains {sorted(curr_cases)}")
+        elif curr_k < prev_k:
+            errors.append(f"case_results shrank from {prev_k} to {curr_k} entrie(s)")
+
+        prev_count = previous.get("profile_count_completed")
+        curr_count = current.get("profile_count_completed")
+        if isinstance(prev_count, int) and isinstance(curr_count, int) and curr_count < prev_count:
+            errors.append(f"profile_count_completed regressed: {prev_count} -> {curr_count}")
+
+        prev_state_for_loop = previous.get("state")
+        curr_state_for_loop = current.get("state")
+        if (
+            prev_state_for_loop == "PROFILE_IN_PROGRESS" and curr_state_for_loop == "PROFILE_IN_PROGRESS"
+            and prev_k is not None and curr_k is not None and curr_k != prev_k + 1
+        ):
+            errors.append(
+                f"a PROFILE_IN_PROGRESS -> PROFILE_IN_PROGRESS revision must append exactly one new case "
+                f"result; case_results went from {prev_k} to {curr_k} entrie(s)"
+            )
+
+        prev_state = previous.get("state")
+        allowed_next_states = ALLOWED_P24_TRANSITIONS.get(prev_state, frozenset())
+        if curr_state not in allowed_next_states:
+            errors.append(
+                f"illegal state transition: {prev_state!r} -> {curr_state!r} "
+                f"(allowed next state(s): {sorted(allowed_next_states)!r})"
+            )
+        else:
+            changed_content_fields = {
+                key
+                for key in set(previous) | set(current)
+                if key != "state"
+                and ((key in previous) != (key in current) or (key in previous and key in current and previous[key] != current[key]))
+            }
+            if curr_state in ("FAILED", "INTERRUPTED"):
+                expected_changed_fields = P24_FIELD_FAILURE
+            else:
+                expected_changed_fields = P24_EXACT_TRANSITION_MUTATIONS.get((prev_state, curr_state))
+            if expected_changed_fields is not None and changed_content_fields != expected_changed_fields:
+                missing_changes = sorted(expected_changed_fields - changed_content_fields)
+                unexpected_changes = sorted(changed_content_fields - expected_changed_fields)
+                errors.append(
+                    f"exact transition mutation matrix violation for {prev_state!r} -> {curr_state!r}: "
+                    f"changed content fields {sorted(changed_content_fields)!r}, expected exactly "
+                    f"{sorted(expected_changed_fields)!r}; missing changes={missing_changes!r}; "
+                    f"unexpected changes={unexpected_changes!r}"
+                )
+
+    return errors
+
+
+P24_LIFECYCLE_TIMESTAMP_ORDER: tuple[str, ...] = (
+    "started_at_utc", "pilot_completed_at_utc", "profile_started_at_utc",
+    "profile_completed_at_utc", "analysis_completed_at_utc",
+)
+
+
+def validate_manifest_timestamp_chronology(current: dict) -> list[str]:
+    errors: list[str] = []
+    parsed: list[tuple[str, _datetime]] = []
+    for field in P24_LIFECYCLE_TIMESTAMP_ORDER:
+        value = current.get(field)
+        if not isinstance(value, str):
+            continue
+        try:
+            p23._validate_compact_timestamp(value, field)
+            parsed.append((field, _datetime.strptime(value, "%Y%m%dT%H%M%SZ")))
+        except p23.ManifestTransitionError:
+            continue
+    for (earlier_field, earlier_dt), (later_field, later_dt) in zip(parsed, parsed[1:]):
+        if later_dt < earlier_dt:
+            errors.append(
+                f"{later_field}={current[later_field]!r} precedes {earlier_field}={current[earlier_field]!r} "
+                f"(lifecycle timestamps must be nondecreasing: {' <= '.join(P24_LIFECYCLE_TIMESTAMP_ORDER)})"
+            )
+    return errors
+
+
+MANIFEST_REVISION_RE = re.compile(r"^(\d{6})\.json$")
+MANIFEST_REVISION_TMP_NAME = ".manifest_revision.tmp"
+MANIFEST_REVISION_KEYS = ("manifest_revision", "previous_manifest_sha256")
+
+
+def _p24_manifest_dir(campaign_dir: Path) -> Path:
+    return campaign_dir / "manifest"
+
+
+def _manifest_revision_path(campaign_dir: Path, revision: int) -> Path:
+    return _p24_manifest_dir(campaign_dir) / f"{revision:06d}.json"
+
+
+# ---------------------------------------------------------------------------
+# Descriptor-anchored directory/file resolution, duplicated in miniature
+# rather than imported from scripts/p24_safe_capture.py (which itself
+# imports this module for the frozen plan/raw-root constants -- importing
+# back would be circular). Mirrors P1.4's identical design choice.
+# ---------------------------------------------------------------------------
+def _open_dir_nofollow_p24(name: str, *, dir_fd: int | None) -> int:
+    flags = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        return os.open(name, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise p23.UnsafePathError(f"{name}: cannot open as a non-symlink directory: {exc}") from exc
+
+
+def _open_dir_component_chain(*parts: str) -> int:
+    fd = _open_dir_nofollow_p24(str(REPO_ROOT), dir_fd=None)
+    try:
+        for part in parts:
+            next_fd = _open_dir_nofollow_p24(part, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _open_profiles_fd_anchored(campaign_dir: Path) -> int:
+    campaign_parts = campaign_dir.relative_to(REPO_ROOT).parts
+    return _open_dir_component_chain(*campaign_parts, "profiles")
+
+
+def _open_case_evidence_fds(profiles_fd: int, case_name: str) -> dict[str, int]:
+    case_fd = None
+    try:
+        case_fd = _open_dir_nofollow_p24(case_name, dir_fd=profiles_fd)
+    except p23.UnsafePathError as exc:
+        raise p23.UnsafePathError(f"profiles/{case_name}: {exc}") from exc
+    fds: dict[str, int] = {"_case_dir": case_fd}
+    try:
+        for label, filename in (
+            ("application_csv", f"{case_name}.application.csv"),
+            ("metrics_csv", f"{case_name}.metrics_raw.csv"),
+            ("ncu_rep", f"{case_name}_report.ncu-rep"),
+        ):
+            file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+            try:
+                fd = os.open(filename, file_flags, dir_fd=case_fd)
+            except OSError as exc:
+                raise p23.UnsafePathError(f"profiles/{case_name}/{filename}: cannot open: {exc}") from exc
+            try:
+                st = os.fstat(fd)
+            except OSError:
+                os.close(fd)
+                raise
+            if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
+                os.close(fd)
+                raise p23.UnsafePathError(f"profiles/{case_name}/{filename}: not a non-empty regular file")
+            fds[label] = fd
+    except Exception:
+        for fd in fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+    return fds
+
+
+def _sha256_of_fd(fd: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(fd, 1 << 20)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_csv_rows_from_fd(fd: int) -> list[list[str]]:
+    os.lseek(fd, 0, os.SEEK_SET)
+    dup_fd = os.dup(fd)
+    with os.fdopen(dup_fd, "r", encoding="utf-8", newline="") as handle:
+        return list(csv.reader(handle))
+
+
+# ---------------------------------------------------------------------------
+# Append-only, hash-chained manifest revision log.
+# ---------------------------------------------------------------------------
+def load_p24_manifest_chain(campaign_dir: Path) -> tuple[dict, int]:
+    manifest_dir = _p24_manifest_dir(campaign_dir)
+    if not os.path.lexists(manifest_dir):
+        return {}, -1
+
+    try:
+        campaign_parts = campaign_dir.relative_to(REPO_ROOT).parts
+        manifest_fd = _open_dir_component_chain(*campaign_parts, "manifest")
+    except p23.UnsafePathError as exc:
+        raise p23.ManifestTransitionError(str(exc)) from exc
+    try:
+        try:
+            names = sorted(os.listdir(manifest_fd))
+        except OSError as exc:
+            raise p23.ManifestTransitionError(f"{manifest_dir}: cannot list revisions: {exc}") from exc
+        revision_names = [n for n in names if MANIFEST_REVISION_RE.fullmatch(n)]
+        other_names = [n for n in names if n not in revision_names and n != MANIFEST_REVISION_TMP_NAME]
+        if other_names:
+            raise p23.ManifestTransitionError(f"{manifest_dir}: unexpected entries in manifest revision directory: {sorted(other_names)}")
+        if not revision_names:
+            return {}, -1
+        expected_names = [f"{i:06d}.json" for i in range(len(revision_names))]
+        if revision_names != expected_names:
+            raise p23.ManifestTransitionError(
+                f"{manifest_dir}: manifest revisions are not exactly contiguous 000000..{len(revision_names) - 1:06d}.json: "
+                f"found {revision_names!r}"
+            )
+
+        expected_campaign_id = campaign_dir.name
+        previous_hash: str | None = None
+        previous_content: dict | None = None
+        current_content: dict = {}
+        for i, name in enumerate(expected_names):
+            path = manifest_dir / name  # diagnostic text only; never reopened by this path
+            try:
+                st = os.stat(name, dir_fd=manifest_fd, follow_symlinks=False)
+                if stat.S_ISLNK(st.st_mode):
+                    raise p23.UnsafePathError(f"{path}: is a symlink; refusing")
+                if not stat.S_ISREG(st.st_mode):
+                    raise p23.UnsafePathError(f"{path}: is not a regular file")
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=manifest_fd)
+                try:
+                    fst = os.fstat(fd)
+                    if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(fst.st_mode):
+                        raise p23.UnsafePathError(f"{path}: changed identity while being opened")
+                    raw = b"".join(iter(lambda: os.read(fd, 1 << 20), b""))
+                finally:
+                    os.close(fd)
+            except (OSError, p23.UnsafePathError) as exc:
+                raise p23.ManifestTransitionError(f"{path}: cannot load manifest revision: {exc}") from exc
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeError as exc:
+                raise p23.ManifestTransitionError(f"{path}: cannot load manifest revision: {exc}") from exc
+            try:
+                doc = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise p23.ManifestTransitionError(f"{path}: invalid JSON: {exc}") from exc
+            if not isinstance(doc, dict):
+                raise p23.ManifestTransitionError(f"{path}: revision root is not a JSON object")
+            if doc.get("manifest_revision") != i:
+                raise p23.ManifestTransitionError(f"{path}: manifest_revision={doc.get('manifest_revision')!r} != expected {i}")
+            expected_previous_hash = None if i == 0 else previous_hash
+            if doc.get("previous_manifest_sha256") != expected_previous_hash:
+                raise p23.ManifestTransitionError(
+                    f"{path}: previous_manifest_sha256={doc.get('previous_manifest_sha256')!r} != expected "
+                    f"{expected_previous_hash!r} (hash chain broken or tampered)"
+                )
+            content = {k: v for k, v in doc.items() if k not in MANIFEST_REVISION_KEYS}
+            try:
+                _validate_p24_manifest_document(content)
+            except p23.ManifestTransitionError as exc:
+                raise p23.ManifestTransitionError(f"{path}: {exc}") from exc
+            shape_errors = validate_manifest_state_shape(content, expected_campaign_id)
+            if shape_errors:
+                raise p23.ManifestTransitionError(f"{path}: manifest state-shape validation failed: {shape_errors}")
+            transition_errors = validate_manifest_revision_transition(previous_content, content, expected_campaign_id)
+            if transition_errors:
+                raise p23.ManifestTransitionError(f"{path}: semantic transition validation failed: {transition_errors}")
+            chronology_errors = validate_manifest_timestamp_chronology(content)
+            if chronology_errors:
+                raise p23.ManifestTransitionError(f"{path}: manifest timestamp chronology validation failed: {chronology_errors}")
+            previous_content = content
+            current_content = content
+            previous_hash = hashlib.sha256(raw).hexdigest()
+
+        return current_content, len(expected_names) - 1
+    finally:
+        os.close(manifest_fd)
+
+
+def write_next_p24_manifest_revision(campaign_dir: Path, manifest_content: dict) -> dict:
+    manifest_dir = _p24_manifest_dir(campaign_dir)
+    p23._mkdir_component(manifest_dir, must_not_exist=False, root=REPO_ROOT)
+    current, current_revision = load_p24_manifest_chain(campaign_dir)
+    new_revision = current_revision + 1
+    previous_hash = None
+    if current_revision >= 0:
+        previous_hash = p23.sha256_of(_manifest_revision_path(campaign_dir, current_revision))
+
+    doc = dict(manifest_content)
+    doc["manifest_revision"] = new_revision
+    doc["previous_manifest_sha256"] = previous_hash
+    text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
+
+    tmp_path = manifest_dir / MANIFEST_REVISION_TMP_NAME
+    if os.path.lexists(tmp_path):
+        raise p23.UnsafePathError(f"{tmp_path}: stale manifest-revision temporary already exists")
+
+    shape_errors = validate_manifest_state_shape(manifest_content, campaign_dir.name)
+    if shape_errors:
+        raise p23.ManifestTransitionError(f"refusing to write a manifest revision with an invalid shape: {shape_errors}")
+    transition_errors = validate_manifest_revision_transition(
+        current if current_revision >= 0 else None, manifest_content, campaign_dir.name,
+    )
+    if transition_errors:
+        raise p23.ManifestTransitionError(f"refusing to write a non-compliant manifest revision: {transition_errors}")
+    chronology_errors = validate_manifest_timestamp_chronology(manifest_content)
+    if chronology_errors:
+        raise p23.ManifestTransitionError(f"refusing to write a manifest revision with invalid timestamp chronology: {chronology_errors}")
+
+    final_path = _manifest_revision_path(campaign_dir, new_revision)
+    try:
+        with p23._open_exclusive(tmp_path, binary=False) as handle:
+            handle.write(text)
+    except Exception:
+        if os.path.lexists(tmp_path):
+            p23._safe_unlink_owned(tmp_path)
+        raise
+    try:
+        p23._publish_no_clobber(tmp_path, final_path)
+    except p23.UnsafePathError:
+        if os.path.lexists(tmp_path):
+            p23._safe_unlink_owned(tmp_path)
+        raise
+    return manifest_content
+
+
+def p24_merge_manifest(campaign_dir: Path, updates: dict, state: str) -> dict:
+    _validate_p24_manifest_updates(updates)
+    manifest, _revision = load_p24_manifest_chain(campaign_dir)
+    _validate_p24_manifest_document(manifest)
+    current_state = manifest.get("state")
+    allowed = ALLOWED_P24_TRANSITIONS.get(current_state, frozenset())
+    if state not in allowed:
+        raise p23.ManifestTransitionError(f"invalid P2.4 manifest state transition: {current_state!r} -> {state!r}")
+    immutable_after_init = {"campaign_id", "started_at_utc", "frozen_protocol"}
+    for key in immutable_after_init & set(manifest) & set(updates):
+        if updates[key] != manifest[key]:
+            raise p23.ManifestTransitionError(f"P2.4 manifest field {key!r} is immutable after initialization")
+    if "profile_count_completed" in manifest and "profile_count_completed" in updates:
+        if updates["profile_count_completed"] < manifest["profile_count_completed"]:
+            raise p23.ManifestTransitionError("P2.4 manifest profile_count_completed cannot decrease")
+    manifest.update(updates)
+    manifest["schema_version"] = P24_SCHEMA_VERSION
+    manifest["experiment_id"] = P24_EXPERIMENT_ID
+    manifest["state"] = state
+    manifest["publishable"] = False
+    _validate_p24_manifest_document(manifest, require_initialized=True)
+    write_next_p24_manifest_revision(campaign_dir, manifest)
+    return manifest
+
+
+# ---------------------------------------------------------------------------
+# Statistics: percentile/IQR helpers, deterministic bootstrap, per-config
+# descriptive statistics, 1-SM/2-SM scaling, candidate depth saturation, and
+# empirical per-SM ceiling selection. Python standard library only. See
+# src/compute/P2_4_PROTOCOL.md section 6 for the frozen formulas.
+# ---------------------------------------------------------------------------
+def _reject_non_finite(values: list[float], *, label: str) -> None:
+    for v in values:
+        if not math.isfinite(v):
+            raise ValueError(f"{label}: non-finite value {v!r} is rejected, never silently dropped")
+
+
+def _percentile_linear(sorted_values: list[float], p: float) -> float:
+    n = len(sorted_values)
+    if n == 1:
+        return sorted_values[0]
+    idx = p * (n - 1)
+    lo = math.floor(idx)
+    hi = math.ceil(idx)
+    if lo == hi:
+        return sorted_values[int(idx)]
+    frac = idx - lo
+    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * frac
+
+
+def iqr_bounds(values: list[float]) -> tuple[float, float, int]:
+    sorted_values = sorted(values)
+    q1 = _percentile_linear(sorted_values, 0.25)
+    q3 = _percentile_linear(sorted_values, 0.75)
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    flagged = sum(1 for v in values if v < lower or v > upper)
+    return lower, upper, flagged
+
+
+def _sample_stdev(values: list[float]) -> float:
+    if len(values) < 2:
+        raise ValueError(f"sample standard deviation requires at least 2 observations, got {len(values)}")
+    return statistics.stdev(values)
+
+
+def bootstrap_indices_median_ci(
+    values: list[float], rng: random.Random, *, resamples: int = BOOTSTRAP_RESAMPLES,
+) -> tuple[float, float]:
+    n = len(values)
+    medians = []
+    for _ in range(resamples):
+        resample = [values[rng.randrange(n)] for _ in range(n)]
+        medians.append(statistics.median(resample))
+    medians.sort()
+    lo_idx = max(int(BOOTSTRAP_LO_PERCENTILE * resamples) - 1, 0)
+    hi_idx = min(int(BOOTSTRAP_HI_PERCENTILE * resamples) - 1, resamples - 1)
+    return medians[lo_idx], medians[hi_idx]
+
+
+def bootstrap_indices_ratio_ci(
+    values_a: list[float], values_b: list[float], rng: random.Random, *, resamples: int = BOOTSTRAP_RESAMPLES,
+) -> tuple[float, float]:
+    """95% bootstrap CI for median(values_b) / median(values_a), resampling
+    both inputs independently each iteration. The two configurations execute
+    sequentially, never concurrently; these are never called "paired
+    samples" anywhere in generated output."""
+    n_a, n_b = len(values_a), len(values_b)
+    ratios = []
+    for _ in range(resamples):
+        resample_a = [values_a[rng.randrange(n_a)] for _ in range(n_a)]
+        resample_b = [values_b[rng.randrange(n_b)] for _ in range(n_b)]
+        median_a = statistics.median(resample_a)
+        if median_a == 0:
+            continue
+        ratios.append(statistics.median(resample_b) / median_a)
+    if not ratios:
+        raise ValueError("bootstrap ratio CI: every resample had a zero-median denominator")
+    ratios.sort()
+    lo_idx = max(int(BOOTSTRAP_LO_PERCENTILE * len(ratios)) - 1, 0)
+    hi_idx = min(int(BOOTSTRAP_HI_PERCENTILE * len(ratios)) - 1, len(ratios) - 1)
+    return ratios[lo_idx], ratios[hi_idx]
+
+
+def compute_metric_stats(values: list[float]) -> dict:
+    _reject_non_finite(values, label="metric sample")
+    mean = statistics.mean(values)
+    median = statistics.median(values)
+    stdev = _sample_stdev(values)
+    cv_percent = (100.0 * stdev / mean) if mean != 0 else 0.0
+    lower_fence, upper_fence, flagged = iqr_bounds(values)
+    return {
+        "count": len(values),
+        "mean": mean,
+        "median": median,
+        "stdev": stdev,
+        "cv_percent": cv_percent,
+        "min": min(values),
+        "max": max(values),
+        "iqr_lower_fence": lower_fence,
+        "iqr_upper_fence": upper_fence,
+        "iqr_flagged_count": flagged,
+    }
+
+
+def _read_combined_samples(path: Path) -> dict[tuple[str, int, int], dict[str, list[float] | int]]:
+    """Reads P2.3's combined_samples.csv: 30 retained repetitions x 24
+    configurations. Derives flops_per_cycle_per_sm = flops_per_cycle /
+    cta_group per sample (never per already-aggregated statistic)."""
+    samples: dict[tuple[str, int, int], dict[str, list[float] | int]] = {}
+    with p23._open_regular_nofollow(path, binary=False) as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            method = row["method"]
+            n = int(row["n"])
+            depth = int(row["depth"])
+            cta_group = int(row["cta_group"])
+            key = (method, n, depth)
+            entry = samples.setdefault(key, {name: [] for name in STAT_METRIC_NAMES})
+            entry["cta_group"] = cta_group
+            elapsed_cycles = float(row["elapsed_cycles"])
+            cycles_per_umma = float(row["cycles_per_umma"])
+            flops_per_cycle = float(row["flops_per_cycle"])
+            entry["elapsed_cycles"].append(elapsed_cycles)
+            entry["cycles_per_umma"].append(cycles_per_umma)
+            entry["flops_per_cycle"].append(flops_per_cycle)
+            entry["flops_per_cycle_per_sm"].append(flops_per_cycle / cta_group)
+    return samples
+
+
+def compute_all_config_stats(
+    samples_by_config: dict[tuple[str, int, int], dict], rng: random.Random,
+) -> dict[tuple[str, int, int], dict]:
+    """Computes descriptive stats + bootstrap median CI for all 24 configs
+    and all 4 metrics, in one fixed order -- (n, depth, method) for configs,
+    then STAT_METRIC_NAMES order for metrics within each config -- so that,
+    given the same input samples, the shared rng's draw sequence (and
+    therefore every output) is bit-identical on any machine, every time."""
+    results: dict[tuple[str, int, int], dict] = {}
+    ordered_keys = sorted(samples_by_config, key=lambda k: (k[1], k[2], k[0]))
+    for key in ordered_keys:
+        entry = samples_by_config[key]
+        config_result: dict = {"cta_group": entry["cta_group"]}
+        for metric_name in STAT_METRIC_NAMES:
+            values = entry[metric_name]
+            stats = compute_metric_stats(values)
+            stats["median_ci_low"], stats["median_ci_high"] = bootstrap_indices_median_ci(values, rng)
+            if metric_name == "flops_per_cycle":
+                stats["stability_review"] = stats["cv_percent"] > CV_STABILITY_REVIEW_PERCENT
+            config_result[metric_name] = stats
+        results[key] = config_result
+    return results
+
+
+def compute_scaling(
+    samples_by_config: dict[tuple[str, int, int], dict],
+    stats_by_config: dict[tuple[str, int, int], dict],
+    rng: random.Random,
+) -> list[dict]:
+    """Per (N, depth) pair, in ascending (N, depth) order: 2-SM-over-1-SM
+    speedup and scaling efficiency of median flops_per_cycle, with an
+    independently-resampled 95% bootstrap CI. Never clamped."""
+    rows = []
+    pairs = sorted({(n, depth) for (_method, n, depth) in samples_by_config})
+    for n, depth in pairs:
+        values_1sm = samples_by_config[("umma_1sm", n, depth)]["flops_per_cycle"]
+        values_2sm = samples_by_config[("umma_2sm", n, depth)]["flops_per_cycle"]
+        median_1sm = stats_by_config[("umma_1sm", n, depth)]["flops_per_cycle"]["median"]
+        median_2sm = stats_by_config[("umma_2sm", n, depth)]["flops_per_cycle"]["median"]
+        speedup = median_2sm / median_1sm
+        scaling_efficiency = speedup / 2.0
+        scaling_efficiency_percent = 100.0 * scaling_efficiency
+        ci_low, ci_high = bootstrap_indices_ratio_ci(values_1sm, values_2sm, rng)
+        rows.append({
+            "n": n,
+            "depth": depth,
+            "median_flops_per_cycle_1sm": median_1sm,
+            "median_flops_per_cycle_2sm": median_2sm,
+            "speedup_2sm_over_1sm": speedup,
+            "speedup_ci_low": ci_low,
+            "speedup_ci_high": ci_high,
+            "scaling_efficiency": scaling_efficiency,
+            "scaling_efficiency_percent": scaling_efficiency_percent,
+            "surprising_value_flag": not (0.0 <= scaling_efficiency_percent <= 100.0),
+        })
+    return rows
+
+
+def _ci_overlaps(lo_a: float, hi_a: float, lo_b: float, hi_b: float) -> bool:
+    return lo_a <= hi_b and lo_b <= hi_a
+
+
+def compute_saturation(stats_by_config: dict[tuple[str, int, int], dict]) -> list[dict]:
+    """Per (method, N) group, in ascending (method, N) order: the earliest
+    (smallest) tested depth whose median flops_per_cycle is >= 95% of the
+    group's observed maximum median AND whose bootstrap CI overlaps the
+    maximum's own CI. The maximum-median entry is always a valid fallback."""
+    rows = []
+    groups = sorted({(method, n) for (method, n, _depth) in stats_by_config})
+    for method, n in groups:
+        medians = {d: stats_by_config[(method, n, d)]["flops_per_cycle"]["median"] for d in DEPTH_VALUES}
+        max_median = max(medians.values())
+        max_depth = min(d for d in DEPTH_VALUES if medians[d] == max_median)
+        max_ci = (
+            stats_by_config[(method, n, max_depth)]["flops_per_cycle"]["median_ci_low"],
+            stats_by_config[(method, n, max_depth)]["flops_per_cycle"]["median_ci_high"],
+        )
+        earliest = max_depth
+        for d in sorted(DEPTH_VALUES):
+            if medians[d] < SATURATION_FRACTION_OF_MAX * max_median:
+                continue
+            candidate_ci = (
+                stats_by_config[(method, n, d)]["flops_per_cycle"]["median_ci_low"],
+                stats_by_config[(method, n, d)]["flops_per_cycle"]["median_ci_high"],
+            )
+            if _ci_overlaps(*candidate_ci, *max_ci):
+                earliest = d
+                break
+        rows.append({
+            "method": method,
+            "n": n,
+            "depth_4_median_flops_per_cycle": medians[4],
+            "depth_16_median_flops_per_cycle": medians[16],
+            "depth_64_median_flops_per_cycle": medians[64],
+            "depth_256_median_flops_per_cycle": medians[256],
+            "max_median_flops_per_cycle": max_median,
+            "earliest_tested_candidate_saturation_depth": earliest,
+        })
+    return rows
+
+
+def select_ceiling(stats_by_config: dict[tuple[str, int, int], dict]) -> dict[str, tuple[str, int, int]]:
+    """Selects the ceiling candidate configuration(s) in clock-independent
+    FLOP/cycle-per-SM space only -- never using a clock measurement. Ties
+    resolve to the first configuration in (n, depth, method) sorted order
+    (Python's max() keeps the first-seen maximal element)."""
+    ordered_keys = sorted(stats_by_config, key=lambda k: (k[1], k[2], k[0]))
+
+    def _best(keys: list[tuple[str, int, int]]) -> tuple[str, int, int]:
+        return max(keys, key=lambda k: stats_by_config[k]["flops_per_cycle_per_sm"]["median"])
+
+    best_1sm = _best([k for k in ordered_keys if k[0] == "umma_1sm"])
+    best_2sm = _best([k for k in ordered_keys if k[0] == "umma_2sm"])
+    overall = _best(ordered_keys)
+    return {"best_1sm": best_1sm, "best_2sm": best_2sm, "empirical_per_sm_ceiling_candidate": overall}
+
+
+# ---------------------------------------------------------------------------
+# NCU metric name resolution (discovery). Unlike P1.4's resolve_ncu_metrics,
+# no candidate here -- mandatory or diagnostic -- ever raises on ambiguity:
+# an ambiguous or missing mandatory SM-clock metric is instead recorded and
+# later drives the whole campaign to INCONCLUSIVE at analyze() time (never
+# guessed, never silently downgraded to a diagnostic-only omission); an
+# ambiguous or missing *diagnostic* metric is recorded and reported
+# explicitly, exactly as src/compute/P2_4_PROTOCOL.md requires, and never
+# blocks the campaign at all.
+# ---------------------------------------------------------------------------
+def canonical_candidate_metric_name(metric_name: str) -> str | None:
+    if metric_name in CANDIDATE_METRICS:
+        return metric_name
+    matches = [candidate for candidate in CANDIDATE_METRICS if metric_name.endswith(f".{candidate}")]
+    return matches[0] if len(matches) == 1 else None
+
+
+def parse_metric_discovery_log(path: Path) -> set[str]:
+    try:
+        with p23._open_regular_nofollow(path, binary=False) as handle:
+            text = handle.read()
+    except (OSError, p23.UnsafePathError, UnicodeError) as exc:
+        raise ValueError(f"{path}: unable to read: {exc}") from exc
+    names: set[str] = set()
+    for line in text.splitlines():
+        fields = line.split(maxsplit=1)
+        if not fields:
+            continue
+        token = fields[0]
+        if "__" in token:
+            names.add(token)
+    return names
+
+
+def resolve_ncu_metrics_p24(discovered: set[str]) -> dict:
+    per_metric: dict[str, dict] = {}
+    for candidate in CANDIDATE_METRICS:
+        matches = sorted(name for name in discovered if canonical_candidate_metric_name(name) == candidate)
+        if candidate in matches:
+            per_metric[candidate] = {"status": "resolved", "resolved_name": candidate, "ambiguous_candidates": []}
+        elif len(matches) == 1:
+            per_metric[candidate] = {"status": "resolved", "resolved_name": matches[0], "ambiguous_candidates": []}
+        elif len(matches) > 1:
+            per_metric[candidate] = {"status": "ambiguous", "resolved_name": None, "ambiguous_candidates": matches}
+        else:
+            per_metric[candidate] = {"status": "missing", "resolved_name": None, "ambiguous_candidates": []}
+    return {
+        "requested": list(CANDIDATE_METRICS),
+        "per_metric": per_metric,
+        "sm_clock_metric_resolved": per_metric[MANDATORY_SM_CLOCK_METRIC]["status"] == "resolved",
+    }
+
+
+def resolved_metric_names_for_ncu(resolved: dict) -> list[str]:
+    """The exact --metrics argument: every candidate whose name resolved,
+    mandatory first then diagnostics in their frozen order."""
+    return [
+        resolved["per_metric"][candidate]["resolved_name"]
+        for candidate in CANDIDATE_METRICS
+        if resolved["per_metric"][candidate]["status"] == "resolved"
+    ]
+
+
+# ---------------------------------------------------------------------------
+# NCU raw-CSV metrics parsing. Same wide-table shape as P1.4's own (ID,
+# Kernel Name, then one column per collected metric; one unit row; exactly
+# one profiled launch row, since --launch-skip 1 --launch-count 1 collects
+# exactly one). The mandatory SM-clock candidate is validated strictly
+# (present, finite, strictly positive, exact expected unit); diagnostic
+# candidates are recorded best-effort with no unit enforcement, since their
+# exact availability or naming may differ on GB300.
+# ---------------------------------------------------------------------------
+class NcuCsvParseError(ValueError):
+    pass
+
+
+REQUIRED_NCU_CSV_COLUMNS = ("ID", "Kernel Name")
+
+
+def _parse_ncu_raw_csv_rows(rows_raw: list[list[str]], *, label: str) -> dict:
+    if not rows_raw:
+        raise NcuCsvParseError(f"{label}: empty file (no header)")
+    header = rows_raw[0]
+    if not header:
+        raise NcuCsvParseError(f"{label}: empty header row")
+    if len(header) != len(set(header)):
+        duplicates = sorted({h for h in header if header.count(h) > 1})
+        raise NcuCsvParseError(f"{label}: duplicate header column name(s): {duplicates}")
+    missing_columns = [c for c in REQUIRED_NCU_CSV_COLUMNS if c not in header]
+    if missing_columns:
+        raise NcuCsvParseError(f"{label}: missing required column(s) {missing_columns} in header {header!r}")
+    col_index = {name: header.index(name) for name in REQUIRED_NCU_CSV_COLUMNS}
+
+    if len(rows_raw) < 2:
+        raise NcuCsvParseError(f"{label}: missing metric-unit row")
+    unit_row = rows_raw[1]
+    if len(unit_row) != len(header):
+        raise NcuCsvParseError(f"{label}: line 2 (metric units): expected {len(header)} field(s), got {len(unit_row)}")
+
+    data_rows = rows_raw[2:]
+    if len(data_rows) != 1:
+        raise NcuCsvParseError(
+            f"{label}: found {len(data_rows)} profiled launch row(s), expected exactly 1 "
+            f"(--launch-skip 1 --launch-count 1 should guarantee this)"
+        )
+    data_row = data_rows[0]
+    if len(data_row) != len(header):
+        raise NcuCsvParseError(f"{label}: line 3 (profiled launch): expected {len(header)} field(s), got {len(data_row)}")
+
+    launch_id = data_row[col_index["ID"]].strip()
+    kernel_name = data_row[col_index["Kernel Name"]].strip()
+    if not launch_id:
+        raise NcuCsvParseError(f"{label}: line 3: empty launch ID")
+    if not kernel_name:
+        raise NcuCsvParseError(f"{label}: line 3: empty kernel name")
+
+    metrics: dict[str, float] = {}
+    units: dict[str, str] = {}
+    candidate_metric_names: dict[str, str] = {}
+    for column_index, metric_name_raw in enumerate(header):
+        metric_name = metric_name_raw.strip()
+        canonical_metric_name = canonical_candidate_metric_name(metric_name)
+        if canonical_metric_name is None:
+            continue
+        if canonical_metric_name in candidate_metric_names:
+            previous = candidate_metric_names[canonical_metric_name]
+            raise NcuCsvParseError(
+                f"{label}: candidate metric {canonical_metric_name!r} is represented by more than one "
+                f"column ({previous!r}, {metric_name!r}); refusing an ambiguous canonical/qualified mapping"
+            )
+        metric_unit = unit_row[column_index].strip()
+        raw_value = data_row[column_index].strip()
+        if not raw_value:
+            # A diagnostic counter this GB300 build does not populate is
+            # recorded as unavailable rather than treated as zero.
+            candidate_metric_names[canonical_metric_name] = metric_name
+            units[metric_name] = metric_unit
+            continue
+        try:
+            value = float(raw_value)
+        except ValueError as exc:
+            raise NcuCsvParseError(f"{label}: line 3: metric {metric_name!r} value {raw_value!r} is not a number") from exc
+        metrics[metric_name] = value
+        units[metric_name] = metric_unit
+        candidate_metric_names[canonical_metric_name] = metric_name
+
+    return {
+        "metrics": metrics,
+        "units": units,
+        "candidate_metric_names": candidate_metric_names,
+        "kernel_name": kernel_name,
+        "launch_id": launch_id,
+        "launch_count": 1,
+    }
+
+
+def parse_ncu_raw_csv(path: Path) -> dict:
+    try:
+        with p23._open_regular_nofollow(path, binary=False) as handle:
+            rows_raw = list(csv.reader(handle))
+    except (OSError, p23.UnsafePathError, UnicodeError) as exc:
+        raise NcuCsvParseError(f"{path}: unable to read: {exc}") from exc
+    return _parse_ncu_raw_csv_rows(rows_raw, label=str(path))
+
+
+def evaluate_sm_clock(
+    *, sm_clock_metric_resolved: bool, actual_column_name: str | None, parsed_metrics: dict,
+) -> dict:
+    """Strict, fail-closed evaluation of the mandatory SM-clock metric for
+    one profiled case. Never guesses or rescales a unit. Returns a dict with
+    sm_clock_valid (bool), sm_clock_issue (str, empty iff valid),
+    sm_clock_raw_value, sm_clock_unit, sm_clock_hz (all None unless the
+    metric parsed to a real value, regardless of validity)."""
+    result = {
+        "sm_clock_valid": False, "sm_clock_issue": "", "sm_clock_raw_value": None,
+        "sm_clock_unit": None, "sm_clock_hz": None,
+    }
+    if not sm_clock_metric_resolved or actual_column_name is None:
+        result["sm_clock_issue"] = "metric_unavailable_at_discovery"
+        return result
+    if actual_column_name not in parsed_metrics["metrics"]:
+        result["sm_clock_issue"] = "missing_from_case_evidence"
+        result["sm_clock_unit"] = parsed_metrics["units"].get(actual_column_name)
+        return result
+    value = parsed_metrics["metrics"][actual_column_name]
+    unit = parsed_metrics["units"].get(actual_column_name, "")
+    result["sm_clock_raw_value"] = value
+    result["sm_clock_unit"] = unit
+    if not math.isfinite(value):
+        result["sm_clock_issue"] = "non_finite"
+        return result
+    if value <= 0:
+        result["sm_clock_issue"] = "non_positive"
+        return result
+    if unit.strip().lower() != EXPECTED_SM_CLOCK_UNIT.strip().lower():
+        result["sm_clock_issue"] = f"unknown_unit:{unit}"
+        return result
+    result["sm_clock_valid"] = True
+    result["sm_clock_hz"] = value * 1e9
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Canonical case-result reconstruction. Mirrors P1.4's reconstruct_case_result
+# design (src/memory/P1_4_PROTOCOL.md section 8): one pure-data core, used by
+# both a path-based entry point (validate-profile-case's one-shot validation
+# of freshly-produced evidence) and a descriptor-anchored entry point (the
+# evidence-integrity gate, which keeps every relevant fd open for the whole
+# check).
+# ---------------------------------------------------------------------------
+def p24_validate_case_rows(rows: list[list[str]], expect: dict, *, label: str) -> tuple[list[dict[str, str]], list[str]]:
+    """Validates the already-audited P2.1/P2.2 37-column application CSV
+    (reused unmodified via p23.CSV_HEADER/p23.FIELD_VALIDATORS) against
+    already-parsed rows, so the descriptor-anchored evidence layer can
+    validate bytes from an already-open fd without reopening a pathname."""
+    errors: list[str] = []
+    if not rows:
+        return [], [f"{label}: empty file (no header)"]
+    header, data_rows_raw = rows[0], rows[1:]
+    if header != p23.CSV_HEADER:
+        return [], [f"{label}: header mismatch (wrong or reordered CSV header): {header!r}"]
+
+    parsed_rows: list[dict[str, str]] = []
+    for line_no, row in enumerate(data_rows_raw, start=2):
+        if len(row) == 0:
+            errors.append(f"{label}: line {line_no}: blank row")
+            continue
+        if row == p23.CSV_HEADER:
+            errors.append(f"{label}: line {line_no}: repeated header row")
+            continue
+        if len(row) != len(p23.CSV_HEADER):
+            errors.append(f"{label}: line {line_no}: expected {len(p23.CSV_HEADER)} fields, got {len(row)}")
+            continue
+        parsed_rows.append(dict(zip(p23.CSV_HEADER, row)))
+    if errors:
+        return parsed_rows, errors
+
+    repetitions = expect["repetitions"]
+    if len(parsed_rows) != repetitions:
+        errors.append(f"{label}: has {len(parsed_rows)} data row(s), expected exactly repetitions={repetitions}")
+        return parsed_rows, errors
+
+    for row_num, row in enumerate(parsed_rows):
+        ctx = f"{label}: data row {row_num} (line {row_num + 2})"
+        for field in p23.CSV_HEADER:
+            p23.FIELD_VALIDATORS[field](row, expect, errors, ctx)
+
+    return parsed_rows, errors
+
+
+def _reconstruct_case_result_core(
+    *, entry: dict, application_rows: list[list[str]], metrics_rows: list[list[str]],
+    application_label: str, metrics_label: str,
+    application_hash: str, metrics_hash: str, ncu_rep_hash: str,
+    resolved_ncu_metrics: dict, git_commit: str,
+) -> tuple[dict | None, list[str]]:
+    errors: list[str] = []
+    method = entry["method"]
+    info = p23.METHOD_INFO[method]
+    expect = {
+        "method": method, "cta_group": info["cta_group"], "m": info["m"], "grid_blocks": info["grid_blocks"],
+        "n": entry["n"], "depth": entry["depth"],
+        "run_kind": FROZEN_PROFILE_PARAMS["run_kind"], "iterations": FROZEN_PROFILE_PARAMS["iterations"],
+        "warmup_iterations": FROZEN_PROFILE_PARAMS["warmup_iterations"], "repetitions": FROZEN_PROFILE_PARAMS["repetitions"],
+        "git_commit": git_commit,
+    }
+    app_rows, app_errors = p24_validate_case_rows(application_rows, expect, label=application_label)
+    errors.extend(app_errors)
+    app_row = app_rows[0] if (app_rows and not app_errors) else None
+
+    parsed_metrics = None
+    try:
+        parsed_metrics = _parse_ncu_raw_csv_rows(metrics_rows, label=metrics_label)
+    except NcuCsvParseError as exc:
+        errors.append(str(exc))
+
+    if parsed_metrics is not None and parsed_metrics["kernel_name"] != entry["kernel_symbol"]:
+        errors.append(
+            f"metrics CSV kernel name {parsed_metrics['kernel_name']!r} != expected exact function name "
+            f"{entry['kernel_symbol']!r} (no substring/regex matching is permitted)"
+        )
+
+    if errors:
+        return None, errors
+
+    per_metric = resolved_ncu_metrics.get("per_metric", {})
+    sm_clock_entry = per_metric.get(MANDATORY_SM_CLOCK_METRIC, {})
+    sm_clock_actual_name = None
+    if sm_clock_entry.get("status") == "resolved":
+        candidate_name = sm_clock_entry.get("resolved_name")
+        canonical = canonical_candidate_metric_name(candidate_name) if candidate_name else None
+        sm_clock_actual_name = parsed_metrics["candidate_metric_names"].get(canonical) if canonical else None
+    sm_clock = evaluate_sm_clock(
+        sm_clock_metric_resolved=resolved_ncu_metrics.get("sm_clock_metric_resolved", False),
+        actual_column_name=sm_clock_actual_name, parsed_metrics=parsed_metrics,
+    )
+
+    diagnostic_values: dict[str, float] = {}
+    diagnostic_units: dict[str, str] = {}
+    for candidate in DIAGNOSTIC_METRICS:
+        candidate_entry = per_metric.get(candidate, {})
+        if candidate_entry.get("status") != "resolved":
+            continue
+        canonical = canonical_candidate_metric_name(candidate_entry.get("resolved_name") or "")
+        actual_name = parsed_metrics["candidate_metric_names"].get(canonical) if canonical else None
+        if actual_name and actual_name in parsed_metrics["metrics"]:
+            diagnostic_values[candidate] = parsed_metrics["metrics"][actual_name]
+            diagnostic_units[candidate] = parsed_metrics["units"].get(actual_name, "")
+
+    case_result = {
+        "case_name": entry["case_name"],
+        "method": method,
+        "n": entry["n"],
+        "depth": entry["depth"],
+        "cta_group": info["cta_group"],
+        "kernel_symbol": entry["kernel_symbol"],
+        "launch_id": parsed_metrics["launch_id"],
+        "application_elapsed_cycles": int(app_row["elapsed_cycles"]),
+        "application_cycles_per_umma": float(app_row["cycles_per_umma"]),
+        "application_flops_per_cycle": float(app_row["flops_per_cycle"]),
+        "application_flops_per_cycle_per_sm": float(app_row["flops_per_cycle"]) / info["cta_group"],
+        "application_total_flops": int(app_row["total_flops"]),
+        "application_total_umma": int(app_row["total_umma"]),
+        "sm_clock_valid": sm_clock["sm_clock_valid"],
+        "sm_clock_issue": sm_clock["sm_clock_issue"],
+        "sm_clock_raw_value": sm_clock["sm_clock_raw_value"],
+        "sm_clock_unit": sm_clock["sm_clock_unit"],
+        "sm_clock_hz": sm_clock["sm_clock_hz"],
+        "diagnostic_metric_values": diagnostic_values,
+        "diagnostic_metric_units": diagnostic_units,
+        "application_csv_sha256": application_hash,
+        "metrics_csv_sha256": metrics_hash,
+        "ncu_rep_sha256": ncu_rep_hash,
+    }
+    return case_result, []
+
+
+def reconstruct_case_result(
+    *, entry: dict, application_csv: Path, metrics_csv: Path, ncu_rep: Path,
+    resolved_ncu_metrics: dict, git_commit: str,
+) -> tuple[dict | None, list[str]]:
+    ncu_rep_err = p23._verify_artifact(ncu_rep)
+    if ncu_rep_err:
+        return None, [ncu_rep_err]
+    try:
+        with p23._open_regular_nofollow(application_csv, binary=False) as handle:
+            application_rows = list(csv.reader(handle))
+    except (OSError, p23.UnsafePathError, UnicodeError) as exc:
+        return None, [f"{application_csv}: unable to read: {exc}"]
+    try:
+        with p23._open_regular_nofollow(metrics_csv, binary=False) as handle:
+            metrics_rows = list(csv.reader(handle))
+    except (OSError, p23.UnsafePathError, UnicodeError) as exc:
+        return None, [f"{metrics_csv}: unable to read: {exc}"]
+    try:
+        application_hash = p23.sha256_of(application_csv)
+        metrics_hash = p23.sha256_of(metrics_csv)
+        ncu_rep_hash = p23.sha256_of(ncu_rep)
+    except p23.UnsafePathError as exc:
+        return None, [str(exc)]
+    return _reconstruct_case_result_core(
+        entry=entry, application_rows=application_rows, metrics_rows=metrics_rows,
+        application_label=str(application_csv), metrics_label=str(metrics_csv),
+        application_hash=application_hash, metrics_hash=metrics_hash, ncu_rep_hash=ncu_rep_hash,
+        resolved_ncu_metrics=resolved_ncu_metrics, git_commit=git_commit,
+    )
+
+
+def _reconstruct_case_result_from_fds(
+    *, entry: dict, case_name: str, fds: dict[str, int], resolved_ncu_metrics: dict, git_commit: str,
+) -> tuple[dict | None, list[str]]:
+    application_rows = _read_csv_rows_from_fd(fds["application_csv"])
+    metrics_rows = _read_csv_rows_from_fd(fds["metrics_csv"])
+    application_hash = _sha256_of_fd(fds["application_csv"])
+    metrics_hash = _sha256_of_fd(fds["metrics_csv"])
+    ncu_rep_hash = _sha256_of_fd(fds["ncu_rep"])
+    return _reconstruct_case_result_core(
+        entry=entry, application_rows=application_rows, metrics_rows=metrics_rows,
+        application_label=f"profiles/{case_name}/{case_name}.application.csv",
+        metrics_label=f"profiles/{case_name}/{case_name}.metrics_raw.csv",
+        application_hash=application_hash, metrics_hash=metrics_hash, ncu_rep_hash=ncu_rep_hash,
+        resolved_ncu_metrics=resolved_ncu_metrics, git_commit=git_commit,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Strict recursive case-result comparison and the central evidence-integrity
+# gate. Mirrors src/memory/P1_4_PROTOCOL.md section 8 exactly: exact key
+# sets first (missing vs. unexpected reported as distinct conditions), exact
+# list length/order, exact scalar type (type(x) is type(y), so True is
+# never accepted in place of canonical 1), exact value, NaN/infinity
+# rejected outright on either side.
+# ---------------------------------------------------------------------------
+def _strict_compare_values(path: str, recorded: object, canonical: object, errors: list[str]) -> None:
+    if isinstance(canonical, dict) or isinstance(recorded, dict):
+        if not isinstance(canonical, dict) or not isinstance(recorded, dict):
+            errors.append(f"{path}: recorded is {type(recorded).__name__} ({recorded!r}), reconstructed is {type(canonical).__name__} ({canonical!r})")
+            return
+        recorded_keys, canonical_keys = set(recorded), set(canonical)
+        missing = sorted(canonical_keys - recorded_keys)
+        unexpected = sorted(recorded_keys - canonical_keys)
+        if missing:
+            errors.append(f"{path}: missing key(s) {missing} (present in reconstructed evidence, absent from the recorded manifest)")
+        if unexpected:
+            errors.append(f"{path}: unexpected key(s) {unexpected} (present in the recorded manifest, absent from reconstructed evidence)")
+        for key in sorted(recorded_keys & canonical_keys):
+            _strict_compare_values(f"{path}.{key}", recorded[key], canonical[key], errors)
+        return
+
+    if isinstance(canonical, list) or isinstance(recorded, list):
+        if not isinstance(canonical, list) or not isinstance(recorded, list):
+            errors.append(f"{path}: recorded is {type(recorded).__name__} ({recorded!r}), reconstructed is {type(canonical).__name__} ({canonical!r})")
+            return
+        if len(recorded) != len(canonical):
+            errors.append(f"{path}: recorded has {len(recorded)} entry(ies), reconstructed has {len(canonical)} (exact list length/order is required)")
+            return
+        for i, (r_item, c_item) in enumerate(zip(recorded, canonical)):
+            _strict_compare_values(f"{path}[{i}]", r_item, c_item, errors)
+        return
+
+    if recorded is None or canonical is None:
+        if recorded is not canonical:
+            errors.append(f"{path}: recorded={recorded!r} != reconstructed={canonical!r}")
+        return
+    if type(recorded) is not type(canonical):
+        errors.append(f"{path}: type mismatch: recorded is {type(recorded).__name__} ({recorded!r}), reconstructed is {type(canonical).__name__} ({canonical!r})")
+        return
+    if isinstance(canonical, float):
+        if not math.isfinite(canonical) or not math.isfinite(recorded):
+            errors.append(f"{path}: NaN/infinite value rejected outright: recorded={recorded!r} reconstructed={canonical!r}")
+            return
+    if recorded != canonical:
+        suffix = "tampered or corrupted since it was first validated" if path.endswith("_sha256") else "recomputed fresh from disk"
+        errors.append(f"{path}: recorded {recorded!r} != reconstructed {canonical!r} ({suffix})")
+
+
+def _list_and_check_profiles_inventory(profiles_fd: int, expected_names: set[str]) -> list[str]:
+    errors: list[str] = []
+    try:
+        actual_names = set(os.listdir(profiles_fd))
+    except OSError as exc:
+        return [f"profiles/: cannot list directory: {exc}"]
+    for extra in sorted(actual_names - expected_names):
+        errors.append(f"profiles/{extra}: unplanned entry not present in profile_plan.csv")
+    for missing in sorted(expected_names - actual_names):
+        errors.append(f"profiles/{missing}: missing canonical case directory")
+    for name in sorted(actual_names & expected_names):
+        try:
+            st = os.stat(name, dir_fd=profiles_fd, follow_symlinks=False)
+        except OSError as exc:
+            errors.append(f"profiles/{name}: cannot stat: {exc}")
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            errors.append(f"profiles/{name}: is a symlink; refusing")
+        elif not stat.S_ISDIR(st.st_mode):
+            errors.append(f"profiles/{name}: is not a directory")
+    return errors
+
+
+def _recheck_inode_identity(campaign_fd: int, profiles_fd: int, case_fds: dict[str, int]) -> list[str]:
+    errors: list[str] = []
+    try:
+        fresh_profiles = os.stat("profiles", dir_fd=campaign_fd, follow_symlinks=False)
+        held_profiles = os.fstat(profiles_fd)
+    except OSError as exc:
+        return [f"profiles/: cannot re-check identity before terminal publication: {exc}"]
+    if stat.S_ISLNK(fresh_profiles.st_mode) or (fresh_profiles.st_dev, fresh_profiles.st_ino) != (held_profiles.st_dev, held_profiles.st_ino):
+        errors.append("profiles/: name-to-inode binding changed during validation; failing closed rather than trust a name whose target moved")
+        return errors
+    for case_name, case_fd in sorted(case_fds.items()):
+        try:
+            fresh_case = os.stat(case_name, dir_fd=profiles_fd, follow_symlinks=False)
+            held_case = os.fstat(case_fd)
+        except OSError as exc:
+            errors.append(f"profiles/{case_name}: cannot re-check identity before terminal publication: {exc}")
+            continue
+        if stat.S_ISLNK(fresh_case.st_mode) or (fresh_case.st_dev, fresh_case.st_ino) != (held_case.st_dev, held_case.st_ino):
+            errors.append(f"profiles/{case_name}: name-to-inode binding changed during validation; failing closed")
+    return errors
+
+
+def _verify_hash(label: str, path: Path, expected_sha256: object, errors: list[str]) -> str | None:
+    if not isinstance(expected_sha256, str) or not p23._is_sha256_hex(expected_sha256):
+        errors.append(f"{label}: no valid recorded SHA-256 to verify against (got {expected_sha256!r})")
+        return None
+    try:
+        actual = p23.sha256_of(path)
+    except p23.UnsafePathError as exc:
+        errors.append(f"{label}: {exc}")
+        return None
+    if actual != expected_sha256:
+        errors.append(f"{label}: {path} SHA-256 {actual} != recorded {expected_sha256} (tampered or corrupted since it was first validated)")
+        return None
+    return actual
+
+
+def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> tuple[list[str], dict | None]:
+    """Re-verified before COMPLETE and before publishing ANALYZED/
+    INCONCLUSIVE. Returns (errors, verified_snapshot); snapshot is None
+    whenever errors is non-empty. Never mutates the manifest or campaign."""
+    errors: list[str] = []
+    snapshot: dict = {}
+
+    pilot_ref = manifest.get("pilot_campaign_reference")
+    if not isinstance(pilot_ref, dict) or "path" not in pilot_ref:
+        return ["pilot_campaign_reference is missing or incomplete; cannot verify pilot evidence"], None
+    try:
+        p23_campaign_dir = resolve_p23_campaign_dir_arg(pilot_ref["path"])
+    except p23.UnsafePathError as exc:
+        return [f"pilot_campaign_reference.path: {exc}"], None
+
+    snapshot["pilot_manifest_sha256"] = _verify_hash("P2.3 manifest.json", p23_campaign_dir / "manifest.json", pilot_ref.get("manifest_sha256"), errors)
+    snapshot["pilot_combined_samples_sha256"] = _verify_hash("P2.3 combined_samples.csv", p23_campaign_dir / "combined_samples.csv", pilot_ref.get("combined_samples_sha256"), errors)
+    snapshot["pilot_summary_sha256"] = _verify_hash("P2.3 summary.csv", p23_campaign_dir / "summary.csv", pilot_ref.get("summary_sha256"), errors)
+
+    preflight_pilot = manifest.get("preflight_reference_pilot", {})
+    if isinstance(preflight_pilot, dict) and preflight_pilot.get("path"):
+        snapshot["preflight_reference_pilot_sha256"] = _verify_hash("pilot preflight summary", Path(preflight_pilot["path"]), preflight_pilot.get("sha256"), errors)
+    else:
+        errors.append("preflight_reference_pilot is missing or incomplete")
+
+    preflight_profile = manifest.get("preflight_reference_profile", {})
+    if isinstance(preflight_profile, dict) and preflight_profile.get("path"):
+        snapshot["preflight_reference_profile_sha256"] = _verify_hash("profile preflight summary", Path(preflight_profile["path"]), preflight_profile.get("sha256"), errors)
+    else:
+        errors.append("preflight_reference_profile is missing or incomplete")
+
+    snapshot["profile_plan_sha256"] = _verify_hash("P2.4 profile_plan.csv", campaign_dir / "profile_plan.csv", manifest.get("profile_plan_sha256"), errors)
+
+    plan = build_profile_plan()
+    plan_errors = check_profile_plan_contract(plan)
+    if plan_errors:
+        return errors + [f"internal profile plan contract violation: {plan_errors}"], None
+
+    case_results = manifest.get("case_results")
+    if not isinstance(case_results, dict):
+        return errors + ["case_results is missing or not an object"], None
+
+    resolved_ncu_metrics = manifest.get("resolved_ncu_metrics")
+    if not isinstance(resolved_ncu_metrics, dict):
+        resolved_ncu_metrics = {}
+
+    expected_names = {entry["case_name"] for entry in plan}
+    snapshot_case_results: dict[str, dict] = {}
+
+    try:
+        campaign_parts = campaign_dir.relative_to(REPO_ROOT).parts
+        campaign_fd = _open_dir_component_chain(*campaign_parts)
+    except p23.UnsafePathError as exc:
+        return errors + [f"campaign directory: {exc}"], None
+    try:
+        try:
+            profiles_fd = _open_dir_nofollow_p24("profiles", dir_fd=campaign_fd)
+        except p23.UnsafePathError as exc:
+            return errors + [f"profiles/: {exc}"], None
+        try:
+            inventory_errors = _list_and_check_profiles_inventory(profiles_fd, expected_names)
+            if inventory_errors:
+                return errors + inventory_errors, None
+
+            found_case_names = set(case_results)
+            for missing in sorted(expected_names - found_case_names):
+                errors.append(f"profile case {missing} is missing from case_results")
+            for extra in sorted(found_case_names - expected_names):
+                errors.append(f"case_results contains unexpected case {extra}")
+
+            case_fds: dict[str, int] = {}
+            try:
+                for entry in plan:
+                    case_name = entry["case_name"]
+                    recorded = case_results.get(case_name)
+                    if recorded is None:
+                        continue
+                    if not isinstance(recorded, dict):
+                        errors.append(f"{case_name}: recorded case_results entry is not an object")
+                        continue
+                    try:
+                        evidence_fds = _open_case_evidence_fds(profiles_fd, case_name)
+                    except p23.UnsafePathError as exc:
+                        errors.append(f"{case_name}: {exc}")
+                        continue
+                    case_fds[case_name] = evidence_fds["_case_dir"]
+
+                    reconstructed, case_errors = _reconstruct_case_result_from_fds(
+                        entry=entry, case_name=case_name, fds=evidence_fds,
+                        resolved_ncu_metrics=resolved_ncu_metrics, git_commit=manifest.get("provenance", {}).get("git_commit"),
+                    )
+                    for label in ("application_csv", "metrics_csv", "ncu_rep"):
+                        os.close(evidence_fds[label])
+                    if reconstructed is None:
+                        errors.extend(f"{case_name}: {e}" for e in case_errors)
+                        continue
+
+                    _strict_compare_values(case_name, recorded, reconstructed, errors)
+                    snapshot_case_results[case_name] = reconstructed
+
+                if not errors:
+                    errors.extend(_recheck_inode_identity(campaign_fd, profiles_fd, case_fds))
+            finally:
+                for fd in case_fds.values():
+                    os.close(fd)
+        finally:
+            os.close(profiles_fd)
+    finally:
+        os.close(campaign_fd)
+
+    if errors:
+        return errors, None
+    snapshot["case_results"] = snapshot_case_results
+    return errors, snapshot
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: plan
+# ---------------------------------------------------------------------------
+def cmd_plan(args: argparse.Namespace) -> int:
+    plan = build_profile_plan()
+    errors = check_profile_plan_contract(plan)
+    if errors:
+        print("analyze_exp02_umma_throughput_p24: plan: ERROR: plan contract violated:", file=sys.stderr)
+        for error in errors:
+            print(f"analyze_exp02_umma_throughput_p24: plan:   - {error}", file=sys.stderr)
+        return 1
+    if args.format == "json":
+        print(json.dumps(plan, indent=2))
+    elif args.format == "lines":
+        sys.stdout.write(format_plan_lines(plan))
+    else:
+        sys.stdout.write(format_plan_text(plan))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: init-campaign
+# ---------------------------------------------------------------------------
+def _do_init_campaign(*, campaign_id: str, started_at_utc: str) -> Path:
+    campaign_dir = create_p24_campaign_dir(campaign_id)
+    plan = build_profile_plan()
+    plan_errors = check_profile_plan_contract(plan)
+    if plan_errors:
+        raise ValueError(f"internal profile plan contract violation: {plan_errors}")
+    profile_plan_path = write_profile_plan(campaign_dir, plan)
+    profile_plan_sha256 = p23.sha256_of(profile_plan_path)
+    frozen_protocol = {
+        "pilot_params": dict(FROZEN_PILOT_PARAMS),
+        "profile_params": dict(FROZEN_PROFILE_PARAMS),
+        "profile_plan": plan,
+        "mandatory_sm_clock_metric": MANDATORY_SM_CLOCK_METRIC,
+        "expected_sm_clock_unit": EXPECTED_SM_CLOCK_UNIT,
+        "diagnostic_metrics": list(DIAGNOSTIC_METRICS),
+        "bootstrap_seed": BOOTSTRAP_SEED,
+        "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
+        "cv_stability_review_percent": CV_STABILITY_REVIEW_PERCENT,
+        "saturation_fraction_of_max": SATURATION_FRACTION_OF_MAX,
+    }
+    updates = {
+        "campaign_id": campaign_id,
+        "started_at_utc": started_at_utc,
+        "frozen_protocol": frozen_protocol,
+        "profile_plan_sha256": profile_plan_sha256,
+    }
+    p24_merge_manifest(campaign_dir, updates, state="PILOT_IN_PROGRESS")
+    return campaign_dir
+
+
+def cmd_init_campaign(args: argparse.Namespace) -> int:
+    try:
+        campaign_dir = _do_init_campaign(campaign_id=args.campaign_id, started_at_utc=args.started_at_utc)
+    except (p23.UnsafePathError, p23.ManifestTransitionError, ValueError) as exc:
+        print(f"analyze_exp02_umma_throughput_p24: init-campaign: ERROR: {exc}", file=sys.stderr)
+        return 2
+    print(str(campaign_dir.relative_to(REPO_ROOT)))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: validate-preflight
+# ---------------------------------------------------------------------------
+def cmd_validate_preflight(args: argparse.Namespace) -> int:
+    now_utc = _datetime.now(_timezone.utc)
+    if args.now is not None:
+        try:
+            now_utc = parse_now_arg(args.now)
+        except ValueError as exc:
+            print(f"analyze_exp02_umma_throughput_p24: validate-preflight: ERROR: {exc}", file=sys.stderr)
+            return 2
+    errors, snapshot = validate_preflight_file(Path(args.preflight), expected_git_commit=args.expected_git_commit, now_utc=now_utc)
+    if errors:
+        print(f"analyze_exp02_umma_throughput_p24: validate-preflight: FAIL: {args.preflight}", file=sys.stderr)
+        for error in errors:
+            print(f"analyze_exp02_umma_throughput_p24: validate-preflight:   - {error}", file=sys.stderr)
+        return 1
+    print(f"analyze_exp02_umma_throughput_p24: validate-preflight: OK: {args.preflight}", file=sys.stderr)
+    print(json.dumps(snapshot, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: record-pilot
+# ---------------------------------------------------------------------------
+def _fail_p24(campaign_dir: Path, stage: str, errors: list[str]) -> tuple[bool, list[str]]:
+    try:
+        manifest, _revision = load_p24_manifest_chain(campaign_dir)
+        current_state = manifest.get("state")
+        if current_state in ALLOWED_P24_TRANSITIONS and "FAILED" in ALLOWED_P24_TRANSITIONS[current_state]:
+            p24_merge_manifest(campaign_dir, {"failure_stage": stage, "failure_detail": errors[:50]}, state="FAILED")
+    except (p23.ManifestTransitionError, p23.UnsafePathError):
+        pass
+    return False, errors
+
+
+def _do_record_pilot(
+    *, campaign_dir: Path, p23_campaign_dir: Path, preflight_path: Path,
+    git_commit: str, completed_at_utc: str, now_utc: _datetime,
+) -> tuple[bool, list[str]]:
+    try:
+        manifest, _revision = load_p24_manifest_chain(campaign_dir)
+        _validate_p24_manifest_document(manifest, require_initialized=True)
+    except (p23.ManifestTransitionError, p23.UnsafePathError) as exc:
+        return False, [f"P2.4 manifest: {exc}"]
+    if manifest.get("state") != "PILOT_IN_PROGRESS":
+        return False, [f"P2.4 manifest state={manifest.get('state')!r} != 'PILOT_IN_PROGRESS'; cannot record a pilot"]
+
+    errors: list[str] = []
+    preflight_errors, preflight_snapshot = validate_preflight_file(preflight_path, expected_git_commit=git_commit, now_utc=now_utc)
+    errors.extend(f"preflight: {e}" for e in preflight_errors)
+
+    try:
+        p23_manifest = p23.load_manifest(p23_campaign_dir)
+        p23._validate_manifest_document(p23_manifest, require_initialized=True)
+    except (p23.ManifestTransitionError, p23.UnsafePathError) as exc:
+        return _fail_p24(campaign_dir, "pilot_p23_manifest", [f"P2.3 manifest: {exc}"])
+    if not p23_manifest:
+        return _fail_p24(campaign_dir, "pilot_p23_manifest", ["P2.3 manifest.json does not exist"])
+
+    if p23_manifest.get("status") != "COMPLETE":
+        errors.append(f"P2.3 campaign status={p23_manifest.get('status')!r} != 'COMPLETE' (only a COMPLETE P2.3 campaign can be pilot input)")
+    if p23_manifest.get("run_kind") != "benchmark":
+        errors.append(f"P2.3 campaign run_kind={p23_manifest.get('run_kind')!r} != 'benchmark' (a smoke campaign can never be pilot input)")
+    requested = p23_manifest.get("requested", {}) if isinstance(p23_manifest.get("requested"), dict) else {}
+    for key in ("iterations", "warmup_iterations", "repetitions"):
+        expected = FROZEN_PILOT_PARAMS[key]
+        if requested.get(key) != expected:
+            errors.append(f"P2.3 campaign requested.{key}={requested.get(key)!r} != frozen pilot value {expected!r}")
+    if p23_manifest.get("configuration_count_completed") != p23.EXPECTED_CONFIGURATION_COUNT:
+        errors.append(f"P2.3 campaign configuration_count_completed={p23_manifest.get('configuration_count_completed')!r} != {p23.EXPECTED_CONFIGURATION_COUNT}")
+    if p23_manifest.get("git_commit") != git_commit:
+        errors.append(f"P2.3 campaign git_commit={p23_manifest.get('git_commit')!r} != expected {git_commit!r}")
+
+    if not preflight_errors:
+        for field, snapshot_key in (("gpu_uuid", "gpu_uuid"), ("gpu_name", "gpu_name")):
+            if p23_manifest.get(field) != preflight_snapshot.get(snapshot_key):
+                errors.append(f"P2.3 campaign {field}={p23_manifest.get(field)!r} != preflight {snapshot_key}={preflight_snapshot.get(snapshot_key)!r}")
+        if p23_manifest.get("compute_capability") != preflight_snapshot.get("gpu_compute_cap"):
+            errors.append(
+                f"P2.3 campaign compute_capability={p23_manifest.get('compute_capability')!r} != "
+                f"preflight gpu.compute_cap={preflight_snapshot.get('gpu_compute_cap')!r}"
+            )
+
+    combined_hash = summary_hash = p23_manifest_hash = None
+    combined_path = p23_campaign_dir / "combined_samples.csv"
+    summary_path = p23_campaign_dir / "summary.csv"
+    p23_manifest_path = p23_campaign_dir / "manifest.json"
+    try:
+        combined_hash = p23.sha256_of(combined_path)
+        summary_hash = p23.sha256_of(summary_path)
+        p23_manifest_hash = p23.sha256_of(p23_manifest_path)
+    except p23.UnsafePathError as exc:
+        errors.append(f"artifact hashing: {exc}")
+    recorded_hashes = p23_manifest.get("aggregate_file_sha256", {})
+    if isinstance(recorded_hashes, dict):
+        if combined_hash is not None and recorded_hashes.get("combined_samples.csv") != combined_hash:
+            errors.append("combined_samples.csv on disk does not match the P2.3 manifest's recorded SHA-256")
+        if summary_hash is not None and recorded_hashes.get("summary.csv") != summary_hash:
+            errors.append("summary.csv on disk does not match the P2.3 manifest's recorded SHA-256")
+
+    if errors:
+        return _fail_p24(campaign_dir, "pilot_validation", errors)
+
+    updates = {
+        "pilot_completed_at_utc": completed_at_utc,
+        "pilot_campaign_reference": {
+            "campaign_id": p23_manifest["campaign_id"],
+            "path": str(p23_campaign_dir.relative_to(REPO_ROOT)),
+            "manifest_sha256": p23_manifest_hash,
+            "combined_samples_sha256": combined_hash,
+            "summary_sha256": summary_hash,
+        },
+        "preflight_reference_pilot": preflight_snapshot,
+        "provenance": {
+            "git_commit": git_commit,
+            "gpu_uuid": p23_manifest["gpu_uuid"],
+            "gpu_name": p23_manifest["gpu_name"],
+            "compute_capability": p23_manifest["compute_capability"],
+            "cuda_driver_version": p23_manifest["cuda_driver_version"],
+            "cuda_runtime_version": p23_manifest["cuda_runtime_version"],
+        },
+    }
+    try:
+        p24_merge_manifest(campaign_dir, updates, state="PILOT_COMPLETE")
+    except p23.ManifestTransitionError as exc:
+        return _fail_p24(campaign_dir, "pilot_manifest_transition", [str(exc)])
+    return True, []
+
+
+def cmd_record_pilot(args: argparse.Namespace) -> int:
+    try:
+        campaign_dir = resolve_p24_campaign_dir(args.campaign_dir)
+        p23_campaign_dir = resolve_p23_campaign_dir_arg(args.p23_campaign_dir)
+    except p23.UnsafePathError as exc:
+        print(f"analyze_exp02_umma_throughput_p24: record-pilot: ERROR: {exc}", file=sys.stderr)
+        return 2
+    now_utc = _datetime.now(_timezone.utc)
+    if args.now is not None:
+        try:
+            now_utc = parse_now_arg(args.now)
+        except ValueError as exc:
+            print(f"analyze_exp02_umma_throughput_p24: record-pilot: ERROR: {exc}", file=sys.stderr)
+            return 2
+    success, errors = _do_record_pilot(
+        campaign_dir=campaign_dir, p23_campaign_dir=p23_campaign_dir, preflight_path=Path(args.preflight),
+        git_commit=args.git_commit, completed_at_utc=args.completed_at_utc, now_utc=now_utc,
+    )
+    if not success:
+        print("analyze_exp02_umma_throughput_p24: record-pilot: ERROR:", file=sys.stderr)
+        for error in errors:
+            print(f"analyze_exp02_umma_throughput_p24: record-pilot:   - {error}", file=sys.stderr)
+        return 1
+    print("analyze_exp02_umma_throughput_p24: record-pilot: OK: PILOT_COMPLETE", file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: discover-metrics
+# ---------------------------------------------------------------------------
+def _do_discover_metrics(
+    *, campaign_dir: Path, discovery_log: Path, preflight_path: Path,
+    git_commit: str, started_at_utc: str, now_utc: _datetime,
+) -> tuple[bool, list[str], dict | None]:
+    try:
+        manifest, _revision = load_p24_manifest_chain(campaign_dir)
+        _validate_p24_manifest_document(manifest, require_initialized=True)
+    except (p23.ManifestTransitionError, p23.UnsafePathError) as exc:
+        return False, [f"P2.4 manifest: {exc}"], None
+    if manifest.get("state") != "PILOT_COMPLETE":
+        return False, [f"P2.4 manifest state={manifest.get('state')!r} != 'PILOT_COMPLETE'; cannot start profiling"], None
+
+    errors: list[str] = []
+    preflight_errors, preflight_snapshot = validate_preflight_file(preflight_path, expected_git_commit=git_commit, now_utc=now_utc)
+    errors.extend(f"preflight: {e}" for e in preflight_errors)
+
+    if not preflight_errors:
+        pilot_preflight_snapshot = manifest.get("preflight_reference_pilot")
+        if not isinstance(pilot_preflight_snapshot, dict):
+            errors.append("manifest preflight_reference_pilot is missing or incomplete")
+        else:
+            errors.extend(compare_preflight_provenance(pilot_preflight_snapshot, preflight_snapshot))
+
+    resolved = None
+    try:
+        discovered = parse_metric_discovery_log(discovery_log)
+        resolved = resolve_ncu_metrics_p24(discovered)
+    except ValueError as exc:
+        errors.append(str(exc))
+
+    if errors:
+        success, fail_errors = _fail_p24(campaign_dir, "profile_start", errors)
+        return success, fail_errors, None
+
+    assert resolved is not None
+    updates = {
+        "profile_started_at_utc": started_at_utc,
+        "resolved_ncu_metrics": resolved,
+        "preflight_reference_profile": preflight_snapshot,
+    }
+    try:
+        p24_merge_manifest(campaign_dir, updates, state="PROFILE_IN_PROGRESS")
+    except p23.ManifestTransitionError as exc:
+        success, fail_errors = _fail_p24(campaign_dir, "profile_start_manifest", [str(exc)])
+        return success, fail_errors, None
+    return True, [], resolved
+
+
+def cmd_discover_metrics(args: argparse.Namespace) -> int:
+    try:
+        campaign_dir = resolve_p24_campaign_dir(args.campaign_dir)
+    except p23.UnsafePathError as exc:
+        print(f"analyze_exp02_umma_throughput_p24: discover-metrics: ERROR: {exc}", file=sys.stderr)
+        return 2
+    now_utc = _datetime.now(_timezone.utc)
+    if args.now is not None:
+        try:
+            now_utc = parse_now_arg(args.now)
+        except ValueError as exc:
+            print(f"analyze_exp02_umma_throughput_p24: discover-metrics: ERROR: {exc}", file=sys.stderr)
+            return 2
+    success, errors, resolved = _do_discover_metrics(
+        campaign_dir=campaign_dir, discovery_log=Path(args.discovery_log), preflight_path=Path(args.preflight),
+        git_commit=args.git_commit, started_at_utc=args.started_at_utc, now_utc=now_utc,
+    )
+    if not success:
+        print("analyze_exp02_umma_throughput_p24: discover-metrics: ERROR:", file=sys.stderr)
+        for error in errors:
+            print(f"analyze_exp02_umma_throughput_p24: discover-metrics:   - {error}", file=sys.stderr)
+        return 1
+    if not resolved["sm_clock_metric_resolved"]:
+        print(
+            f"analyze_exp02_umma_throughput_p24: discover-metrics: WARNING: {MANDATORY_SM_CLOCK_METRIC} was not "
+            f"resolved; this campaign will become INCONCLUSIVE at analyze time",
+            file=sys.stderr,
+        )
+    print("analyze_exp02_umma_throughput_p24: discover-metrics: OK: PROFILE_IN_PROGRESS", file=sys.stderr)
+    print(",".join(resolved_metric_names_for_ncu(resolved)))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: validate-profile-preconditions
+# ---------------------------------------------------------------------------
+def _do_validate_profile_preconditions(*, campaign_dir: Path, preflight_path: Path, git_commit: str, now_utc: _datetime) -> tuple[bool, list[str]]:
+    try:
+        manifest, _revision = load_p24_manifest_chain(campaign_dir)
+        _validate_p24_manifest_document(manifest, require_initialized=True)
+    except (p23.ManifestTransitionError, p23.UnsafePathError) as exc:
+        return False, [f"P2.4 manifest: {exc}"]
+    if manifest.get("state") != "PILOT_COMPLETE":
+        return False, [f"P2.4 manifest state={manifest.get('state')!r} != 'PILOT_COMPLETE'; cannot check profiling preconditions"]
+    pilot_snapshot = manifest.get("preflight_reference_pilot")
+    if not isinstance(pilot_snapshot, dict):
+        return False, ["manifest preflight_reference_pilot is missing or incomplete"]
+
+    preflight_errors, profile_snapshot = validate_preflight_file(preflight_path, expected_git_commit=git_commit, now_utc=now_utc)
+    if preflight_errors:
+        return False, [f"preflight: {e}" for e in preflight_errors]
+
+    provenance_errors = compare_preflight_provenance(pilot_snapshot, profile_snapshot)
+    if provenance_errors:
+        return False, provenance_errors
+    return True, []
+
+
+def cmd_validate_profile_preconditions(args: argparse.Namespace) -> int:
+    try:
+        campaign_dir = resolve_p24_campaign_dir(args.campaign_dir)
+    except p23.UnsafePathError as exc:
+        print(f"analyze_exp02_umma_throughput_p24: validate-profile-preconditions: ERROR: {exc}", file=sys.stderr)
+        return 2
+    now_utc = _datetime.now(_timezone.utc)
+    if args.now is not None:
+        try:
+            now_utc = parse_now_arg(args.now)
+        except ValueError as exc:
+            print(f"analyze_exp02_umma_throughput_p24: validate-profile-preconditions: ERROR: {exc}", file=sys.stderr)
+            return 2
+    ok, errors = _do_validate_profile_preconditions(campaign_dir=campaign_dir, preflight_path=Path(args.preflight), git_commit=args.git_commit, now_utc=now_utc)
+    if not ok:
+        print("analyze_exp02_umma_throughput_p24: validate-profile-preconditions: ERROR:", file=sys.stderr)
+        for error in errors:
+            print(f"analyze_exp02_umma_throughput_p24: validate-profile-preconditions:   - {error}", file=sys.stderr)
+        return 1
+    print("analyze_exp02_umma_throughput_p24: validate-profile-preconditions: OK", file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: validate-profile-case
+# ---------------------------------------------------------------------------
+def _resolve_case_evidence_paths(campaign_dir: Path, case_name: str, errors: list[str]) -> dict[str, Path] | None:
+    profiles_dir = campaign_dir / "profiles"
+    case_dir = profiles_dir / case_name
+    try:
+        p23._reject_if_symlink_or_wrong_type(case_dir, expect_dir=True)
+        if not os.path.lexists(case_dir):
+            errors.append(f"{case_name}: profile case directory does not exist: {case_dir}")
+            return None
+        p23._confirm_contained(case_dir, profiles_dir)
+    except p23.UnsafePathError as exc:
+        errors.append(f"{case_name}: {exc}")
+        return None
+
+    paths = {
+        "application_csv": case_dir / f"{case_name}.application.csv",
+        "metrics_csv": case_dir / f"{case_name}.metrics_raw.csv",
+        "ncu_rep": case_dir / f"{case_name}_report.ncu-rep",
+    }
+    for label, path in paths.items():
+        artifact_err = p23._verify_artifact(path)
+        if artifact_err:
+            errors.append(f"{case_name}.{label}: {artifact_err}")
+            return None
+        try:
+            p23._confirm_contained(path, case_dir)
+        except p23.UnsafePathError as exc:
+            errors.append(f"{case_name}.{label}: {exc}")
+            return None
+    return paths
+
+
+def _do_validate_profile_case(*, campaign_dir: Path, index: int, git_commit: str) -> tuple[bool, list[str]]:
+    plan = build_profile_plan()
+    entry = next((e for e in plan if e["index"] == index), None)
+    if entry is None:
+        return False, [f"index {index} is not one of the frozen profile case indices 0..{EXPECTED_PROFILE_CASE_COUNT - 1}"]
+
+    try:
+        manifest, _revision = load_p24_manifest_chain(campaign_dir)
+        _validate_p24_manifest_document(manifest, require_initialized=True)
+    except (p23.ManifestTransitionError, p23.UnsafePathError) as exc:
+        return False, [f"P2.4 manifest: {exc}"]
+    if manifest.get("state") != "PROFILE_IN_PROGRESS":
+        return False, [f"P2.4 manifest state={manifest.get('state')!r} != 'PROFILE_IN_PROGRESS'"]
+
+    existing_results = manifest.get("case_results", {})
+    if entry["case_name"] in existing_results:
+        return False, [f"case {entry['case_name']} was already validated and recorded; refusing to redo it"]
+
+    path_errors: list[str] = []
+    paths = _resolve_case_evidence_paths(campaign_dir, entry["case_name"], path_errors)
+    if paths is None:
+        return False, path_errors
+
+    resolved_ncu_metrics = manifest.get("resolved_ncu_metrics", {})
+    case_result, errors = reconstruct_case_result(
+        entry=entry, application_csv=paths["application_csv"], metrics_csv=paths["metrics_csv"],
+        ncu_rep=paths["ncu_rep"], resolved_ncu_metrics=resolved_ncu_metrics, git_commit=git_commit,
+    )
+    if case_result is None:
+        return False, errors
+
+    new_results = dict(existing_results)
+    new_results[entry["case_name"]] = case_result
+    updates = {"case_results": new_results, "profile_count_completed": len(new_results)}
+    try:
+        p24_merge_manifest(campaign_dir, updates, state="PROFILE_IN_PROGRESS")
+    except p23.ManifestTransitionError as exc:
+        return False, [str(exc)]
+    return True, []
+
+
+def cmd_validate_profile_case(args: argparse.Namespace) -> int:
+    try:
+        campaign_dir = resolve_p24_campaign_dir(args.campaign_dir)
+    except p23.UnsafePathError as exc:
+        print(f"analyze_exp02_umma_throughput_p24: validate-profile-case: ERROR: {exc}", file=sys.stderr)
+        return 2
+    success, errors = _do_validate_profile_case(campaign_dir=campaign_dir, index=args.index, git_commit=args.git_commit)
+    if not success:
+        print(f"analyze_exp02_umma_throughput_p24: validate-profile-case: FAIL: index {args.index}", file=sys.stderr)
+        for error in errors:
+            print(f"analyze_exp02_umma_throughput_p24: validate-profile-case:   - {error}", file=sys.stderr)
+        return 1
+    print(f"analyze_exp02_umma_throughput_p24: validate-profile-case: OK: index {args.index}", file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: finalize-profile
+# ---------------------------------------------------------------------------
+def _do_finalize_profile(*, campaign_dir: Path, completed_at_utc: str) -> tuple[bool, list[str]]:
+    try:
+        manifest, _revision = load_p24_manifest_chain(campaign_dir)
+        _validate_p24_manifest_document(manifest, require_initialized=True)
+    except (p23.ManifestTransitionError, p23.UnsafePathError) as exc:
+        return False, [f"P2.4 manifest: {exc}"]
+    if manifest.get("state") != "PROFILE_IN_PROGRESS":
+        return False, [f"P2.4 manifest state={manifest.get('state')!r} != 'PROFILE_IN_PROGRESS'; cannot finalize"]
+
+    errors: list[str] = []
+    plan = build_profile_plan()
+    plan_errors = check_profile_plan_contract(plan)
+    if plan_errors:
+        return _fail_p24(campaign_dir, "profile_plan_contract", plan_errors)
+
+    errors.extend(validate_profile_plan_file(campaign_dir / "profile_plan.csv", plan))
+
+    case_results = manifest.get("case_results", {})
+    if not isinstance(case_results, dict):
+        errors.append("manifest case_results is not an object")
+        case_results = {}
+    expected_case_names = {entry["case_name"] for entry in plan}
+    found_case_names = set(case_results)
+    for missing in sorted(expected_case_names - found_case_names):
+        errors.append(f"profile case {missing} was never validated/recorded")
+    for extra in sorted(found_case_names - expected_case_names):
+        errors.append(f"profile case_results contains unexpected case {extra}")
+    if manifest.get("profile_count_completed") != EXPECTED_PROFILE_CASE_COUNT:
+        errors.append(f"profile_count_completed={manifest.get('profile_count_completed')!r} != {EXPECTED_PROFILE_CASE_COUNT}")
+
+    resolved_ncu_metrics = manifest.get("resolved_ncu_metrics", {})
+    if not isinstance(resolved_ncu_metrics, dict) or "sm_clock_metric_resolved" not in resolved_ncu_metrics:
+        errors.append("manifest resolved_ncu_metrics is missing or incomplete")
+
+    if errors:
+        return _fail_p24(campaign_dir, "profile_finalize", errors)
+
+    integrity_errors, verified = verify_campaign_evidence_integrity(campaign_dir, manifest)
+    if integrity_errors:
+        return _fail_p24(campaign_dir, "profile_finalize_integrity", integrity_errors)
+
+    artifact_sha256: dict[str, str] = {}
+    if verified["profile_plan_sha256"] is not None:
+        artifact_sha256["profile_plan.csv"] = verified["profile_plan_sha256"]
+    for pilot_key, snapshot_key in (
+        ("manifest_sha256", "pilot_manifest_sha256"),
+        ("combined_samples_sha256", "pilot_combined_samples_sha256"),
+        ("summary_sha256", "pilot_summary_sha256"),
+    ):
+        if verified[snapshot_key] is not None:
+            artifact_sha256[f"pilot_{pilot_key}"] = verified[snapshot_key]
+    for ref_name, snapshot_key in (
+        ("preflight_reference_pilot", "preflight_reference_pilot_sha256"),
+        ("preflight_reference_profile", "preflight_reference_profile_sha256"),
+    ):
+        if verified[snapshot_key] is not None:
+            artifact_sha256[ref_name] = verified[snapshot_key]
+    for case_name, result in verified["case_results"].items():
+        for key in CASE_ARTIFACT_HASH_FIELDS:
+            artifact_sha256[f"{case_name}.{key}"] = result[key]
+
+    updates = {"profile_completed_at_utc": completed_at_utc, "profile_order": plan, "artifact_sha256": artifact_sha256}
+    try:
+        p24_merge_manifest(campaign_dir, updates, state="COMPLETE")
+    except p23.ManifestTransitionError as exc:
+        return _fail_p24(campaign_dir, "profile_finalize_manifest", [str(exc)])
+    return True, []
+
+
+def cmd_finalize_profile(args: argparse.Namespace) -> int:
+    try:
+        campaign_dir = resolve_p24_campaign_dir(args.campaign_dir)
+    except p23.UnsafePathError as exc:
+        print(f"analyze_exp02_umma_throughput_p24: finalize-profile: ERROR: {exc}", file=sys.stderr)
+        return 2
+    success, errors = _do_finalize_profile(campaign_dir=campaign_dir, completed_at_utc=args.completed_at_utc)
+    if not success:
+        print("analyze_exp02_umma_throughput_p24: finalize-profile: ERROR:", file=sys.stderr)
+        for error in errors:
+            print(f"analyze_exp02_umma_throughput_p24: finalize-profile:   - {error}", file=sys.stderr)
+        return 1
+    print("analyze_exp02_umma_throughput_p24: finalize-profile: OK: COMPLETE", file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Deterministic SVG chart rendering. Python standard library only: plain
+# string building, escaped via xml.sax.saxutils.escape. No NumPy, pandas,
+# matplotlib, or a notebook/Docker dependency.
+# ---------------------------------------------------------------------------
+from xml.sax.saxutils import escape as _xml_escape  # noqa: E402
+
+_SERIES_COLORS = {"umma_1sm": "#1b9e77", "umma_2sm": "#d95f02"}
+_CHART_WIDTH = 720
+_CHART_HEIGHT = 460
+_MARGIN_LEFT = 76
+_MARGIN_RIGHT = 24
+_MARGIN_TOP = 48
+_MARGIN_BOTTOM = 64
+
+
+def _fmt_num(value: float) -> str:
+    return f"{value:.4g}"
+
+
+def _plot_rect(*, width: int = _CHART_WIDTH, height: int = _CHART_HEIGHT):
+    return _MARGIN_LEFT, _MARGIN_TOP, width - _MARGIN_RIGHT, height - _MARGIN_BOTTOM
+
+
+def _y_scale(y_min: float, y_max: float, plot_top: float, plot_bottom: float):
+    span = (y_max - y_min) or 1.0
+    pad = span * 0.08
+
+    def scale(y: float) -> float:
+        frac = (y - (y_min - pad)) / (span + 2 * pad)
+        return plot_bottom - frac * (plot_bottom - plot_top)
+
+    return scale, y_min - pad, y_max + pad
+
+
+def _svg_header(width: int, height: int, title: str) -> list[str]:
+    return [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
+        f'width="{width}" height="{height}" font-family="monospace" font-size="12">',
+        f'<title>{_xml_escape(title)}</title>',
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff" stroke="none"/>',
+    ]
+
+
+def _render_panel(
+    *, x0: float, y0: float, x1: float, y1: float, title: str, x_labels: list[str],
+    y_min: float, y_max: float, y_label: str, series: list[dict], hlines: tuple[tuple[float, str], ...] = (),
+) -> list[str]:
+    out: list[str] = []
+    plot_w = x1 - x0
+    plot_h = y1 - y0
+    out.append(f'<text x="{(x0 + x1) / 2:.1f}" y="{y0 - 20:.1f}" text-anchor="middle" font-weight="bold">{_xml_escape(title)}</text>')
+    scale_y, y_lo, y_hi = _y_scale(y_min, y_max, y0, y1)
+
+    n_x = max(len(x_labels), 1)
+    x_positions = [x0 + (plot_w * (i + 0.5) / n_x) for i in range(n_x)] if n_x > 0 else []
+
+    out.append(f'<rect x="{x0:.1f}" y="{y0:.1f}" width="{plot_w:.1f}" height="{plot_h:.1f}" fill="none" stroke="#333333" stroke-width="1"/>')
+
+    n_yticks = 5
+    for t in range(n_yticks + 1):
+        y_val = y_lo + (y_hi - y_lo) * t / n_yticks
+        y_px = scale_y(y_val)
+        out.append(f'<line x1="{x0:.1f}" y1="{y_px:.1f}" x2="{x1:.1f}" y2="{y_px:.1f}" stroke="#e0e0e0" stroke-width="1"/>')
+        out.append(f'<text x="{x0 - 6:.1f}" y="{y_px + 4:.1f}" text-anchor="end">{_xml_escape(_fmt_num(y_val))}</text>')
+    out.append(
+        f'<text x="{x0 - 56:.1f}" y="{(y0 + y1) / 2:.1f}" text-anchor="middle" '
+        f'transform="rotate(-90 {x0 - 56:.1f} {(y0 + y1) / 2:.1f})">{_xml_escape(y_label)}</text>'
+    )
+    for i, label in enumerate(x_labels):
+        out.append(f'<text x="{x_positions[i]:.1f}" y="{y1 + 20:.1f}" text-anchor="middle">{_xml_escape(label)}</text>')
+
+    for value, hlabel in hlines:
+        y_px = scale_y(value)
+        out.append(f'<line x1="{x0:.1f}" y1="{y_px:.1f}" x2="{x1:.1f}" y2="{y_px:.1f}" stroke="#999999" stroke-width="1.5" stroke-dasharray="6,4"/>')
+        out.append(f'<text x="{x1 - 4:.1f}" y="{y_px - 4:.1f}" text-anchor="end" fill="#666666">{_xml_escape(hlabel)}</text>')
+
+    for s in series:
+        color = s["color"]
+        point_colors = s.get("point_colors")
+        points = []
+        point_indices = []
+        for i, value in enumerate(s["values"]):
+            if value is None:
+                continue
+            px, py = x_positions[i], scale_y(value)
+            points.append((px, py))
+            point_indices.append(i)
+            ci_low = s.get("ci_low", [None] * len(s["values"]))[i]
+            ci_high = s.get("ci_high", [None] * len(s["values"]))[i]
+            if ci_low is not None and ci_high is not None:
+                py_lo, py_hi = scale_y(ci_low), scale_y(ci_high)
+                out.append(f'<line x1="{px:.1f}" y1="{py_lo:.1f}" x2="{px:.1f}" y2="{py_hi:.1f}" stroke="{color}" stroke-width="1.5"/>')
+                cap = 5
+                out.append(f'<line x1="{px - cap:.1f}" y1="{py_lo:.1f}" x2="{px + cap:.1f}" y2="{py_lo:.1f}" stroke="{color}" stroke-width="1.5"/>')
+                out.append(f'<line x1="{px - cap:.1f}" y1="{py_hi:.1f}" x2="{px + cap:.1f}" y2="{py_hi:.1f}" stroke="{color}" stroke-width="1.5"/>')
+        if len(points) >= 2 and point_colors is None:
+            path = " ".join(f"{px:.1f},{py:.1f}" for px, py in points)
+            out.append(f'<polyline points="{path}" fill="none" stroke="{color}" stroke-width="2"/>')
+        for (px, py), i in zip(points, point_indices):
+            point_color = point_colors[i] if point_colors else color
+            out.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="5" fill="{point_color}" stroke="#ffffff" stroke-width="1"/>')
+
+    legend_y = y0 + 4
+    legend_x = x1 - 90
+    for i, s in enumerate(series):
+        ly = legend_y + i * 16
+        out.append(f'<rect x="{legend_x:.1f}" y="{ly - 8:.1f}" width="12" height="12" fill="{s["color"]}"/>')
+        out.append(f'<text x="{legend_x + 16:.1f}" y="{ly + 2:.1f}">{_xml_escape(s["label"])}</text>')
+    return out
+
+
+def render_throughput_svg(stats_by_config: dict[tuple[str, int, int], dict]) -> str:
+    width, height = _CHART_WIDTH * 3 - 80, _CHART_HEIGHT
+    out = _svg_header(width, height, "FLOP/cycle (median, 95% bootstrap CI) vs depth, per N")
+    x_labels = [str(d) for d in DEPTH_VALUES]
+    all_values = [stats["flops_per_cycle"]["median"] for stats in stats_by_config.values()]
+    y_min, y_max = min(all_values), max(all_values)
+    panel_w = (width - 60) / 3
+    for panel_i, n in enumerate((64, 128, 256)):
+        x0 = 20 + panel_i * panel_w
+        x1 = x0 + panel_w
+        px0, py0, px1, py1 = x0 + _MARGIN_LEFT - 20, _MARGIN_TOP, x1 - _MARGIN_RIGHT, height - _MARGIN_BOTTOM
+        series = []
+        for method in ("umma_1sm", "umma_2sm"):
+            values, ci_low, ci_high = [], [], []
+            for depth in DEPTH_VALUES:
+                stats = stats_by_config.get((method, n, depth))
+                values.append(stats["flops_per_cycle"]["median"] if stats else None)
+                ci_low.append(stats["flops_per_cycle"]["median_ci_low"] if stats else None)
+                ci_high.append(stats["flops_per_cycle"]["median_ci_high"] if stats else None)
+            series.append({"label": method, "color": _SERIES_COLORS[method], "values": values, "ci_low": ci_low, "ci_high": ci_high})
+        out.extend(_render_panel(
+            x0=px0, y0=py0, x1=px1, y1=py1, title=f"N={n}", x_labels=x_labels, y_min=y_min, y_max=y_max,
+            y_label="flops_per_cycle (median, 95% CI)", series=series,
+        ))
+    out.append(f'<text x="12" y="{height - 8}" font-size="10" fill="#666666">Clock-independent FLOP/cycle. TFLOP/s conversion is per-configuration in report.md; never NCU kernel duration.</text>')
+    out.append("</svg>")
+    return "\n".join(out) + "\n"
+
+
+def render_scaling_efficiency_svg(scaling_rows: list[dict]) -> str:
+    width, height = _CHART_WIDTH, _CHART_HEIGHT
+    out = _svg_header(width, height, "2-SM/1-SM scaling efficiency vs (N, depth)")
+    px0, py0, px1, py1 = _plot_rect(width=width, height=height)
+    x_labels = [f"N{row['n']}d{row['depth']}" for row in scaling_rows]
+    values = [row["scaling_efficiency_percent"] for row in scaling_rows]
+    all_ci = [v for row in scaling_rows for v in (100.0 * row["speedup_ci_low"] / 2.0, 100.0 * row["speedup_ci_high"] / 2.0)]
+    y_min = min([0.0, 100.0] + values + all_ci)
+    y_max = max([100.0] + values + all_ci)
+    ci_low = [100.0 * row["speedup_ci_low"] / 2.0 for row in scaling_rows]
+    ci_high = [100.0 * row["speedup_ci_high"] / 2.0 for row in scaling_rows]
+    series = [{"label": "scaling_efficiency_percent", "color": "#7570b3", "values": values, "ci_low": ci_low, "ci_high": ci_high}]
+    out.extend(_render_panel(
+        x0=px0, y0=py0, x1=px1, y1=py1, title="scaling_efficiency_percent (median-ratio-derived, 95% CI)",
+        x_labels=x_labels, y_min=y_min, y_max=y_max, y_label="percent", series=series,
+        hlines=((100.0, "100% (ideal linear scaling)"),),
+    ))
+    out.append(f'<text x="12" y="{height - 8}" font-size="10" fill="#666666">Never clamped; values above 100% or below 0% are preserved and flagged for review, not corrected.</text>')
+    out.append("</svg>")
+    return "\n".join(out) + "\n"
+
+
+def render_saturation_svg(saturation_rows: list[dict]) -> str:
+    width, height = _CHART_WIDTH * 2 - 40, _CHART_HEIGHT
+    out = _svg_header(width, height, "FLOP/cycle vs depth per (method, N), with candidate saturation depth")
+    x_labels = [str(d) for d in DEPTH_VALUES]
+    all_values = [
+        row[f"depth_{d}_median_flops_per_cycle"] for row in saturation_rows for d in DEPTH_VALUES
+    ]
+    y_min, y_max = min(all_values), max(all_values)
+    panel_w = (width - 40) / len(saturation_rows)
+    for panel_i, row in enumerate(saturation_rows):
+        x0 = 20 + panel_i * panel_w
+        x1 = x0 + panel_w
+        px0, py0, px1, py1 = x0 + _MARGIN_LEFT - 20, _MARGIN_TOP, x1 - _MARGIN_RIGHT, height - _MARGIN_BOTTOM
+        values = [row[f"depth_{d}_median_flops_per_cycle"] for d in DEPTH_VALUES]
+        colors = ["#1b9e77" if d == row["earliest_tested_candidate_saturation_depth"] else "#999999" for d in DEPTH_VALUES]
+        series = [{
+            "label": f"{row['method']} N={row['n']}", "color": "#1b9e77", "values": values,
+            "ci_low": [None] * len(values), "ci_high": [None] * len(values), "point_colors": colors,
+        }]
+        out.extend(_render_panel(
+            x0=px0, y0=py0, x1=px1, y1=py1, title=f"{row['method']} N={row['n']}", x_labels=x_labels,
+            y_min=y_min, y_max=y_max, y_label="flops_per_cycle (median)", series=series,
+        ))
+    out.append(f'<text x="12" y="{height - 8}" font-size="10" fill="#666666">Green point = earliest_tested_candidate_saturation_depth. Limited to the four tested depths; never a universal saturation depth.</text>')
+    out.append("</svg>")
+    return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Empirical ceiling construction and report.md. clock-independent selection
+# (select_ceiling) always runs; a clock-calibrated TFLOP/s figure is
+# attached to a selected configuration only when that configuration's own
+# NCU profile has sm_clock_valid=True. If ANY of the 24 profiled
+# configurations lacks a valid SM-clock reading, the whole campaign is
+# INCONCLUSIVE and no TFLOP/s or device-equivalent figure is ever emitted
+# anywhere in analysis/* (src/compute/P2_4_PROTOCOL.md section 6).
+# ---------------------------------------------------------------------------
+def _configuration_summary(
+    key: tuple[str, int, int], stats_by_config: dict, case_results: dict[str, dict], *, campaign_may_emit_tflops: bool,
+) -> dict:
+    """campaign_may_emit_tflops gates every TFLOP/s figure on the whole
+    campaign's SM-clock validity, never only this one configuration's own
+    reading: an INCONCLUSIVE campaign must never emit a TFLOP/s or
+    completed empirical-ceiling claim for *any* configuration, even one
+    whose own profile happened to have a valid SM-clock reading."""
+    method, n, depth = key
+    entry = next(e for e in build_profile_plan() if (e["method"], e["n"], e["depth"]) == key)
+    stats = stats_by_config[key]
+    case = case_results.get(entry["case_name"], {})
+    summary = {
+        "method": method, "n": n, "depth": depth, "cta_group": stats["cta_group"],
+        "case_name": entry["case_name"], "kernel_symbol": entry["kernel_symbol"],
+        "median_flops_per_cycle": stats["flops_per_cycle"]["median"],
+        "median_flops_per_cycle_per_sm": stats["flops_per_cycle_per_sm"]["median"],
+        "sm_clock_valid": bool(case.get("sm_clock_valid")),
+        "sm_clock_hz": case.get("sm_clock_hz"),
+        "estimated_local_tflops": None,
+        "estimated_tflops_per_sm": None,
+    }
+    if campaign_may_emit_tflops and summary["sm_clock_valid"] and summary["sm_clock_hz"]:
+        estimated_local_tflops = stats["flops_per_cycle"]["median"] * case["sm_clock_hz"] / 1e12
+        summary["estimated_local_tflops"] = estimated_local_tflops
+        summary["estimated_tflops_per_sm"] = estimated_local_tflops / stats["cta_group"]
+    return summary
+
+
+def build_empirical_ceiling(
+    *, stats_by_config: dict, case_results: dict[str, dict], all_sm_clock_valid: bool, inconclusive_reason: list[str],
+) -> dict:
+    selection = select_ceiling(stats_by_config)
+    best_1sm = _configuration_summary(selection["best_1sm"], stats_by_config, case_results, campaign_may_emit_tflops=all_sm_clock_valid)
+    best_2sm = _configuration_summary(selection["best_2sm"], stats_by_config, case_results, campaign_may_emit_tflops=all_sm_clock_valid)
+    ceiling = _configuration_summary(selection["empirical_per_sm_ceiling_candidate"], stats_by_config, case_results, campaign_may_emit_tflops=all_sm_clock_valid)
+
+    multiprocessor_counts: set[float] = set()
+    for result in case_results.values():
+        value = result.get("diagnostic_metric_values", {}).get("device__attribute_multiprocessor_count")
+        if value is not None:
+            multiprocessor_counts.add(value)
+    device_extrapolation = None
+    if all_sm_clock_valid and len(multiprocessor_counts) == 1 and ceiling["estimated_tflops_per_sm"] is not None:
+        (mp_count,) = tuple(multiprocessor_counts)
+        device_extrapolation = {
+            "available": True,
+            "multiprocessor_count": mp_count,
+            "estimated_device_equivalent_tflops": ceiling["estimated_tflops_per_sm"] * mp_count,
+            "label": "extrapolation from a one-/two-SM microbenchmark, never a directly measured whole-GPU throughput",
+        }
+    else:
+        device_extrapolation = {"available": False, "reason": "no trustworthy, campaign-uniform SM-count attribute resolved, or the campaign is INCONCLUSIVE"}
+
+    return {
+        "status": "ANALYZED" if all_sm_clock_valid else "INCONCLUSIVE",
+        "inconclusive_reason": inconclusive_reason if not all_sm_clock_valid else [],
+        "best_1sm_configuration": best_1sm,
+        "best_2sm_configuration": best_2sm,
+        "empirical_per_sm_ceiling_candidate": ceiling,
+        "device_equivalent_estimate": device_extrapolation,
+        "pilot_is_not_publishable": True,
+        "notes": [
+            "ceiling selected in clock-independent FLOP/cycle-per-SM space first, then converted using that "
+            "same configuration's own matching NCU SM-frequency profile",
+            "never derived from gpu__time_duration.sum or any other NCU kernel-duration metric",
+            "a pilot result, never a final or publishable campaign",
+            "never a theoretical architectural peak, never a directly measured whole-GPU throughput",
+        ],
+    }
+
+
+def render_report_markdown(
+    *, campaign_id: str, stats_rows: list[dict], scaling_rows: list[dict], saturation_rows: list[dict],
+    profile_validation_rows: list[dict], empirical_ceiling: dict, provenance: dict,
+) -> str:
+    lines: list[str] = []
+    lines.append(f"# P2.4 profiling and empirical BF16 UMMA ceiling pilot -- campaign `{campaign_id}`")
+    lines.append("")
+    lines.append(
+        "**publishable: false.** This report is generated from a single reviewed pilot pending independent "
+        "audit and GB300 re-verification; it is not a final experimental result."
+    )
+    lines.append("")
+    lines.append("## What this is, and is not")
+    lines.append("")
+    lines.append(
+        "- One complete `run_kind=benchmark` pilot (iterations=1000, warmup_iterations=10, repetitions=30) "
+        "over the frozen 24-configuration P2.3 matrix, plus Nsight Compute profiling of the same 24 "
+        "configurations -- never 24 additional sweep configurations."
+    )
+    lines.append("- **No sample was ever removed.** All 30 retained repetitions of all 24 configurations are used in every statistic below; IQR flags are diagnostics only.")
+    lines.append("- TFLOP/s is never derived from NCU kernel duration; only from the pilot's own `%clock64`-timed `flops_per_cycle` combined with each configuration's own matching NCU SM-clock reading.")
+    lines.append("- The empirical per-SM ceiling below is a **candidate**, not a theoretical architectural peak and not a directly measured whole-device throughput.")
+    lines.append(f"- Status: **{empirical_ceiling['status']}**." + (
+        " No TFLOP/s or empirical-ceiling claim is completed anywhere in this report." if empirical_ceiling["status"] == "INCONCLUSIVE" else ""
+    ))
+    if empirical_ceiling["status"] == "INCONCLUSIVE":
+        for reason in empirical_ceiling["inconclusive_reason"]:
+            lines.append(f"  - {reason}")
+    lines.append("")
+    lines.append("## Provenance")
+    lines.append("")
+    lines.append("```text")
+    for key in ("git_commit", "gpu_uuid", "gpu_name", "compute_capability", "cuda_driver_version", "cuda_runtime_version"):
+        lines.append(f"{key}: {provenance.get(key)}")
+    lines.append("```")
+    lines.append("")
+    lines.append("## Configuration statistics (24 configurations, all 30 repetitions each)")
+    lines.append("")
+    lines.append("| method | N | depth | median flops/cycle | 95% CI | median flops/cycle/SM | CV% (flops/cycle) | stability review |")
+    lines.append("| --- | ---: | ---: | ---: | --- | ---: | ---: | --- |")
+    for row in stats_rows:
+        stability_review = row["flops_per_cycle_stability_review"]
+        if stability_review not in {"ok", "REVIEW"}:
+            raise ValueError(f"configuration-statistics stability_review must be exactly 'ok' or 'REVIEW', got {stability_review!r}")
+        lines.append(
+            f"| {row['method']} | {row['n']} | {row['depth']} | {row['flops_per_cycle_median']:.4f} | "
+            f"[{row['flops_per_cycle_median_ci_low']:.4f}, {row['flops_per_cycle_median_ci_high']:.4f}] | "
+            f"{row['flops_per_cycle_per_sm_median']:.4f} | {row['flops_per_cycle_cv_percent']:.2f} | {stability_review} |"
+        )
+    lines.append("")
+    lines.append("## 1-SM/2-SM scaling")
+    lines.append("")
+    lines.append("| N | depth | speedup (2-SM/1-SM) | 95% CI | scaling efficiency % | surprising |")
+    lines.append("| ---: | ---: | ---: | --- | ---: | --- |")
+    for row in scaling_rows:
+        lines.append(
+            f"| {row['n']} | {row['depth']} | {row['speedup_2sm_over_1sm']:.4f} | "
+            f"[{row['speedup_ci_low']:.4f}, {row['speedup_ci_high']:.4f}] | {row['scaling_efficiency_percent']:.2f} | "
+            f"{'yes' if row['surprising_value_flag'] else 'no'} |"
+        )
+    lines.append("")
+    lines.append("## Candidate depth saturation (diagnostic; four tested depths only)")
+    lines.append("")
+    lines.append("| method | N | d4 | d16 | d64 | d256 | earliest_tested_candidate_saturation_depth |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    for row in saturation_rows:
+        lines.append(
+            f"| {row['method']} | {row['n']} | {row['depth_4_median_flops_per_cycle']:.4f} | "
+            f"{row['depth_16_median_flops_per_cycle']:.4f} | {row['depth_64_median_flops_per_cycle']:.4f} | "
+            f"{row['depth_256_median_flops_per_cycle']:.4f} | {row['earliest_tested_candidate_saturation_depth']} |"
+        )
+    lines.append("")
+    lines.append("## Empirical per-SM BF16 Tensor Core ceiling candidate")
+    lines.append("")
+    lines.append("```json")
+    lines.append(json.dumps(empirical_ceiling, indent=2, sort_keys=True))
+    lines.append("```")
+    lines.append("")
+    lines.append("## Profile validation (24 NCU cases)")
+    lines.append("")
+    lines.append("| index | case | sm_clock status | sm_clock_hz |")
+    lines.append("| ---: | --- | --- | ---: |")
+    for row in profile_validation_rows:
+        hz_text = f"{row['sm_clock_hz']:.6g}" if row["sm_clock_hz"] not in (None, "") else "n/a"
+        lines.append(f"| {row['index']} | {row['case_name']} | {row['sm_clock_status']} | {hz_text} |")
+    lines.append("")
+    lines.append("## Figures")
+    lines.append("")
+    lines.append("- `throughput.svg`")
+    lines.append("- `scaling_efficiency.svg`")
+    lines.append("- `saturation.svg`")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("`publishable: false`. Pending independent review and GB300 re-verification.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: analyze
+# ---------------------------------------------------------------------------
+_STAT_FIELD_SUFFIXES = (
+    "mean", "median", "stdev", "cv_percent", "min", "max",
+    "median_ci_low", "median_ci_high", "iqr_low_bound", "iqr_high_bound", "iqr_flagged_count",
+)
+
+
+def _config_stats_columns() -> list[str]:
+    columns = ["method", "n", "depth", "cta_group", "sample_count"]
+    for metric in STAT_METRIC_NAMES:
+        for suffix in _STAT_FIELD_SUFFIXES:
+            columns.append(f"{metric}_{suffix}")
+        if metric == "flops_per_cycle":
+            columns.append("flops_per_cycle_stability_review")
+    return columns
+
+
+CONFIGURATION_STATISTICS_HEADER = _config_stats_columns()
+SCALING_HEADER = [
+    "n", "depth", "median_flops_per_cycle_1sm", "median_flops_per_cycle_2sm", "speedup_2sm_over_1sm",
+    "speedup_ci_low", "speedup_ci_high", "scaling_efficiency", "scaling_efficiency_percent", "surprising_value_flag",
+]
+SATURATION_HEADER = [
+    "method", "n", "depth_4_median_flops_per_cycle", "depth_16_median_flops_per_cycle",
+    "depth_64_median_flops_per_cycle", "depth_256_median_flops_per_cycle", "max_median_flops_per_cycle",
+    "earliest_tested_candidate_saturation_depth",
+]
+PROFILE_VALIDATION_HEADER = [
+    "index", "case_name", "method", "n", "depth", "cta_group", "kernel_symbol", "launch_id",
+    "sm_clock_status", "sm_clock_raw_value", "sm_clock_unit", "sm_clock_hz", "diagnostic_metrics_resolved_count",
+]
+
+
+def _stats_to_csv_row(key: tuple[str, int, int], config_result: dict) -> dict:
+    method, n, depth = key
+    row = {"method": method, "n": n, "depth": depth, "cta_group": config_result["cta_group"], "sample_count": config_result["elapsed_cycles"]["count"]}
+    for metric in STAT_METRIC_NAMES:
+        stats = config_result[metric]
+        for suffix in _STAT_FIELD_SUFFIXES:
+            source_key = "iqr_lower_fence" if suffix == "iqr_low_bound" else "iqr_upper_fence" if suffix == "iqr_high_bound" else suffix
+            row[f"{metric}_{suffix}"] = stats[source_key]
+        if metric == "flops_per_cycle":
+            row["flops_per_cycle_stability_review"] = "REVIEW" if stats["stability_review"] else "ok"
+    return row
+
+
+def _write_csv_no_clobber(path: Path, header: list[str], rows: list[dict]) -> None:
+    if os.path.lexists(path):
+        raise p23.UnsafePathError(f"{path}: already exists, refusing to overwrite")
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    if os.path.lexists(tmp_path):
+        raise p23.UnsafePathError(f"{tmp_path}: existing temporary; refusing to overwrite")
+    try:
+        with p23._open_exclusive(tmp_path, binary=False, newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(header)
+            for row in rows:
+                writer.writerow([row[field] for field in header])
+    except Exception:
+        if os.path.lexists(tmp_path):
+            p23._safe_unlink_owned(tmp_path)
+        raise
+    try:
+        p23._publish_no_clobber(tmp_path, path)
+    except p23.UnsafePathError:
+        if os.path.lexists(tmp_path):
+            p23._safe_unlink_owned(tmp_path)
+        raise
+
+
+def _write_text_no_clobber(path: Path, text: str) -> None:
+    if os.path.lexists(path):
+        raise p23.UnsafePathError(f"{path}: already exists, refusing to overwrite")
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    if os.path.lexists(tmp_path):
+        raise p23.UnsafePathError(f"{tmp_path}: existing temporary; refusing to overwrite")
+    try:
+        with p23._open_exclusive(tmp_path, binary=False) as handle:
+            handle.write(text)
+    except Exception:
+        if os.path.lexists(tmp_path):
+            p23._safe_unlink_owned(tmp_path)
+        raise
+    try:
+        p23._publish_no_clobber(tmp_path, path)
+    except p23.UnsafePathError:
+        if os.path.lexists(tmp_path):
+            p23._safe_unlink_owned(tmp_path)
+        raise
+
+
+def _do_analyze(
+    *, campaign_dir: Path, analyzed_at_utc: str, _test_hook_before_final_gate: Callable[[], None] | None = None,
+) -> tuple[bool, list[str]]:
+    try:
+        manifest, _revision = load_p24_manifest_chain(campaign_dir)
+        _validate_p24_manifest_document(manifest, require_initialized=True)
+    except (p23.ManifestTransitionError, p23.UnsafePathError) as exc:
+        return False, [f"P2.4 manifest: {exc}"]
+    if manifest.get("state") != "COMPLETE":
+        return False, [f"P2.4 manifest state={manifest.get('state')!r} != 'COMPLETE'; cannot analyze"]
+
+    integrity_errors, _verified_before = verify_campaign_evidence_integrity(campaign_dir, manifest)
+    if integrity_errors:
+        return False, integrity_errors
+
+    errors: list[str] = []
+    pilot_ref = manifest.get("pilot_campaign_reference", {})
+    if not isinstance(pilot_ref, dict) or "path" not in pilot_ref:
+        return False, ["manifest pilot_campaign_reference is missing or incomplete"]
+    p23_campaign_dir = REPO_ROOT / pilot_ref["path"]
+    combined_path = p23_campaign_dir / "combined_samples.csv"
+
+    samples_by_config = _read_combined_samples(combined_path)
+    plan = build_profile_plan()
+    expected_configs = {(e["method"], e["n"], e["depth"]) for e in plan}
+    for missing in sorted(expected_configs - set(samples_by_config)):
+        errors.append(f"combined_samples.csv missing configuration {missing}")
+    for key in sorted(set(samples_by_config) - expected_configs):
+        errors.append(f"combined_samples.csv has unexpected configuration {key}")
+    for key, entry in samples_by_config.items():
+        for metric in STAT_METRIC_NAMES:
+            values = entry[metric]
+            if len(values) != FROZEN_PILOT_PARAMS["repetitions"]:
+                errors.append(f"configuration {key} metric {metric} has {len(values)} sample(s), expected exactly {FROZEN_PILOT_PARAMS['repetitions']}")
+            if any(not math.isfinite(v) for v in values):
+                errors.append(f"configuration {key} has a non-finite {metric} value")
+    if errors:
+        return False, errors
+
+    rng = random.Random(BOOTSTRAP_SEED)
+    stats_by_config = compute_all_config_stats(samples_by_config, rng)
+    scaling_rows = compute_scaling(samples_by_config, stats_by_config, rng)
+    saturation_rows = compute_saturation(stats_by_config)
+
+    case_results = manifest.get("case_results", {})
+    profile_validation_rows: list[dict] = []
+    inconclusive_reason: list[str] = []
+    all_sm_clock_valid = True
+    for entry in plan:
+        result = case_results.get(entry["case_name"])
+        if result is None:
+            errors.append(f"case_results is missing entry for {entry['case_name']}")
+            continue
+        diagnostic_count = len(result.get("diagnostic_metric_values", {}))
+        sm_status = "OK" if result.get("sm_clock_valid") else (result.get("sm_clock_issue") or "UNKNOWN")
+        if not result.get("sm_clock_valid"):
+            all_sm_clock_valid = False
+            inconclusive_reason.append(f"{entry['case_name']}: sm_clock_status={sm_status}")
+        profile_validation_rows.append({
+            "index": entry["index"], "case_name": entry["case_name"], "method": entry["method"],
+            "n": entry["n"], "depth": entry["depth"], "cta_group": entry["cta_group"],
+            "kernel_symbol": entry["kernel_symbol"], "launch_id": result.get("launch_id"),
+            "sm_clock_status": sm_status, "sm_clock_raw_value": result.get("sm_clock_raw_value"),
+            "sm_clock_unit": result.get("sm_clock_unit"), "sm_clock_hz": result.get("sm_clock_hz"),
+            "diagnostic_metrics_resolved_count": diagnostic_count,
+        })
+    if errors:
+        return False, errors
+
+    stats_rows = [_stats_to_csv_row(key, stats_by_config[key]) for key in sorted(stats_by_config, key=lambda k: (k[1], k[2], k[0]))]
+
+    empirical_ceiling = build_empirical_ceiling(
+        stats_by_config=stats_by_config, case_results=case_results,
+        all_sm_clock_valid=all_sm_clock_valid, inconclusive_reason=inconclusive_reason,
+    )
+    outcome_state = "ANALYZED" if all_sm_clock_valid else "INCONCLUSIVE"
+
+    provenance = manifest.get("provenance", {})
+    analysis_dir = campaign_dir / "analysis"
+    try:
+        p23._mkdir_component(analysis_dir, must_not_exist=False, root=REPO_ROOT)
+    except p23.UnsafePathError as exc:
+        return False, [str(exc)]
+
+    outputs: list[tuple[Path, list[str], list[dict]]] = [
+        (analysis_dir / "configuration_statistics.csv", CONFIGURATION_STATISTICS_HEADER, stats_rows),
+        (analysis_dir / "scaling.csv", SCALING_HEADER, scaling_rows),
+        (analysis_dir / "saturation.csv", SATURATION_HEADER, saturation_rows),
+        (analysis_dir / "profile_validation.csv", PROFILE_VALIDATION_HEADER, profile_validation_rows),
+    ]
+    for path, _, _ in outputs:
+        for candidate in (path, path.with_suffix(path.suffix + ".tmp")):
+            if os.path.lexists(candidate):
+                return False, [f"{candidate}: existing analysis artifact; refusing to overwrite"]
+
+    report_md = render_report_markdown(
+        campaign_id=str(manifest.get("campaign_id")), stats_rows=stats_rows, scaling_rows=scaling_rows,
+        saturation_rows=saturation_rows, profile_validation_rows=profile_validation_rows,
+        empirical_ceiling=empirical_ceiling, provenance=provenance,
+    )
+    throughput_svg = render_throughput_svg(stats_by_config)
+    scaling_svg = render_scaling_efficiency_svg(scaling_rows)
+    saturation_svg = render_saturation_svg(saturation_rows)
+
+    analysis_manifest = {
+        "schema_version": P24_SCHEMA_VERSION,
+        "campaign_id": manifest.get("campaign_id"),
+        "publishable": False,
+        "status": outcome_state,
+        "provenance": provenance,
+        "resolved_ncu_metrics": manifest.get("resolved_ncu_metrics", {}),
+        "notes": [
+            "single reviewed pilot, not a final campaign",
+            "no sample was ever removed; IQR flags are diagnostics only",
+            "TFLOP/s is never derived from NCU kernel duration",
+            "empirical per-SM ceiling is a candidate, never a theoretical peak or measured whole-device throughput",
+            "publishable: false, pending independent audit and GB300 re-verification",
+        ],
+    }
+
+    file_writes: list[tuple[Path, str]] = [
+        (analysis_dir / "empirical_ceiling.json", json.dumps(empirical_ceiling, indent=2, sort_keys=True) + "\n"),
+        (analysis_dir / "report.md", report_md),
+        (analysis_dir / "throughput.svg", throughput_svg),
+        (analysis_dir / "scaling_efficiency.svg", scaling_svg),
+        (analysis_dir / "saturation.svg", saturation_svg),
+        (analysis_dir / "analysis_manifest.json", json.dumps(analysis_manifest, indent=2, sort_keys=True) + "\n"),
+    ]
+    planned_analysis_paths = tuple(path.relative_to(campaign_dir).as_posix() for path in [*(o[0] for o in outputs), *(f[0] for f in file_writes)])
+    if len(planned_analysis_paths) != len(ANALYSIS_ARTIFACT_RELATIVE_PATHS) or set(planned_analysis_paths) != set(ANALYSIS_ARTIFACT_RELATIVE_PATHS):
+        return False, [
+            f"internal analysis artifact inventory differs from the canonical terminal manifest contract: "
+            f"planned={sorted(planned_analysis_paths)!r} canonical={sorted(ANALYSIS_ARTIFACT_RELATIVE_PATHS)!r}"
+        ]
+    for path, _ in file_writes:
+        for candidate in (path, path.with_suffix(path.suffix + ".tmp")):
+            if os.path.lexists(candidate):
+                return False, [f"{candidate}: existing analysis artifact; refusing to overwrite"]
+
+    published: list[Path] = []
+    published_identity: dict[Path, tuple[int, int]] = {}
+
+    def _cleanup_published() -> None:
+        for cleanup_path in published:
+            try:
+                p23._safe_unlink_owned(cleanup_path, published_identity.get(cleanup_path))
+            except p23.UnsafePathError:
+                pass
+
+    try:
+        for path, header, rows in outputs:
+            _write_csv_no_clobber(path, header, rows)
+            published.append(path)
+            published_identity[path] = p23._file_identity(path)
+        for path, text in file_writes:
+            _write_text_no_clobber(path, text)
+            published.append(path)
+            published_identity[path] = p23._file_identity(path)
+    except (p23.UnsafePathError, OSError) as exc:
+        _cleanup_published()
+        return False, [f"analysis artifact publication failed: {exc}"]
+
+    try:
+        artifact_hashes = {path.relative_to(campaign_dir).as_posix(): p23.sha256_of(path) for path, _, _ in outputs}
+        artifact_hashes.update({path.relative_to(campaign_dir).as_posix(): p23.sha256_of(path) for path, _ in file_writes})
+    except p23.UnsafePathError as exc:
+        _cleanup_published()
+        return False, [str(exc)]
+
+    if _test_hook_before_final_gate is not None:
+        _test_hook_before_final_gate()
+
+    integrity_errors2, _verified_after = verify_campaign_evidence_integrity(campaign_dir, manifest)
+    if integrity_errors2:
+        _cleanup_published()
+        return False, [
+            "evidence changed while analysis was being computed/published, detected by the second "
+            "(pre-terminal) integrity gate; the terminal state was not published and the analysis "
+            "artifacts just written were removed:",
+        ] + integrity_errors2
+
+    updates = {
+        "analysis_completed_at_utc": analyzed_at_utc,
+        "artifact_sha256": {**manifest.get("artifact_sha256", {}), **artifact_hashes},
+    }
+    if outcome_state == "INCONCLUSIVE":
+        updates["inconclusive_reason"] = inconclusive_reason
+    try:
+        p24_merge_manifest(campaign_dir, updates, state=outcome_state)
+    except p23.ManifestTransitionError as exc:
+        return False, [str(exc)]
+    return True, []
+
+
+def cmd_analyze(args: argparse.Namespace) -> int:
+    try:
+        campaign_dir = resolve_p24_campaign_dir(args.campaign_dir)
+    except p23.UnsafePathError as exc:
+        print(f"analyze_exp02_umma_throughput_p24: analyze: ERROR: {exc}", file=sys.stderr)
+        return 2
+    success, errors = _do_analyze(campaign_dir=campaign_dir, analyzed_at_utc=args.analyzed_at_utc)
+    if not success:
+        print("analyze_exp02_umma_throughput_p24: analyze: ERROR:", file=sys.stderr)
+        for error in errors:
+            print(f"analyze_exp02_umma_throughput_p24: analyze:   - {error}", file=sys.stderr)
+        return 1
+    print("analyze_exp02_umma_throughput_p24: analyze: OK", file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: manifest-write (FAILED/INTERRUPTED only)
+# ---------------------------------------------------------------------------
+def cmd_manifest_write(args: argparse.Namespace) -> int:
+    try:
+        campaign_dir = resolve_p24_campaign_dir(args.campaign_dir)
+    except p23.UnsafePathError as exc:
+        print(f"analyze_exp02_umma_throughput_p24: manifest-write: ERROR: {exc}", file=sys.stderr)
+        return 2
+    updates: dict = {}
+    if args.merge_json:
+        merge_path = Path(args.merge_json)
+        try:
+            updates = json.loads(merge_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"analyze_exp02_umma_throughput_p24: manifest-write: ERROR: cannot read --merge-json: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(updates, dict):
+            print("analyze_exp02_umma_throughput_p24: manifest-write: ERROR: --merge-json must contain a JSON object", file=sys.stderr)
+            return 2
+    try:
+        p24_merge_manifest(campaign_dir, updates, state=args.status)
+    except p23.ManifestTransitionError as exc:
+        print(f"analyze_exp02_umma_throughput_p24: manifest-write: ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(f"analyze_exp02_umma_throughput_p24: manifest-write: OK: state={args.status}", file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Self-test: GPU-free synthetic/adversarial tests. Never touches CUDA,
+# Docker, nvidia-smi, either UMMA binary, NCU, the network, or real raw
+# results. Every campaign directory is built under a
+# tempfile.TemporaryDirectory with both this module's and p23's REPO_ROOT
+# patched to it.
+# ---------------------------------------------------------------------------
+class _Recorder:
+    def __init__(self) -> None:
+        self.failures: list[str] = []
+        self.total = 0
+
+    def check(self, name: str, condition: bool, detail: str = "") -> None:
+        self.total += 1
+        if condition:
+            print(f"analyze_exp02_umma_throughput_p24: self-test: PASS: {name}", file=sys.stderr)
+        else:
+            self.failures.append(name)
+            suffix = f"; {detail}" if detail else ""
+            print(f"analyze_exp02_umma_throughput_p24: self-test: FAIL: {name}{suffix}", file=sys.stderr)
+
+    def expect_error_containing(self, name: str, errors: list[str], needle: str) -> None:
+        self.check(name, any(needle in error for error in errors), detail=f"expected substring {needle!r} in errors={errors}")
+
+
+_FIXED_GIT_COMMIT = "d" * 40
+_FIXED_GPU_UUID = "GPU-22222222-3333-4444-5555-666666666666"
+_FIXED_GPU_NAME = "NVIDIA B300 SXM6"
+
+
+def _default_preflight_doc(
+    *, timestamp_utc: str = "20260804T100000Z", overall_status: str = "PASS", git_dirty: bool = False,
+    git_commit: str = _FIXED_GIT_COMMIT, gpu_uuid: str = _FIXED_GPU_UUID, gpu_name: str = _FIXED_GPU_NAME,
+    compute_cap: str = "10.3", driver_version: str = "580.95.05",
+    gpu_visibility_status: str = "PASS", ncu_profile_status: str = "PASS",
+) -> dict:
+    return {
+        "schema_version": "1", "timestamp_utc": timestamp_utc, "git_commit": git_commit, "git_dirty": git_dirty,
+        "host_arch": "x86_64", "tool_versions": {"nvcc": "release 13.1", "ncu": "version 2025.4.0.0"},
+        "gpu": {
+            "logical_index": "0", "name": gpu_name, "uuid": gpu_uuid, "driver_version": driver_version,
+            "compute_cap": compute_cap, "memory_total": "288 GiB",
+        },
+        "checks": [
+            {"name": "gpu_visibility", "required": True, "status": gpu_visibility_status, "reason_code": "OK"},
+            {"name": "tool_versions", "required": True, "status": "PASS", "reason_code": "OK"},
+            {"name": "cuda_smoke_compile", "required": True, "status": "PASS", "reason_code": "OK"},
+            {"name": "cuda_smoke_run", "required": True, "status": "PASS", "reason_code": "OK"},
+            {"name": "cutedsl_smoke", "required": True, "status": "PASS", "reason_code": "OK"},
+            {"name": "ncu_profile", "required": True, "status": ncu_profile_status, "reason_code": "OK"},
+        ],
+        "overall_status": overall_status,
+    }
+
+
+def _write_preflight_json(path: Path, doc: dict) -> None:
+    path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+
+
+def _build_p23_pilot_campaign_fixture(
+    tmp_path: Path, campaign_id: str, *, git_commit: str = _FIXED_GIT_COMMIT,
+    gpu_uuid: str = _FIXED_GPU_UUID, gpu_name: str = _FIXED_GPU_NAME, repetitions: int = 30,
+    elapsed_cycles_fn=None,
+) -> tuple[Path, dict]:
+    """Builds a complete, self-consistent, COMPLETE-state synthetic P2.3
+    campaign directly on disk, reusing p23's own fixture/aggregate helpers so
+    it is byte-for-byte the shape a real P2.3 finalize produces, at the same
+    canonical results/raw/exp02_umma_throughput/<campaign_id> path a real
+    P2.3 campaign occupies (relative to the patched REPO_ROOT)."""
+    plan = p23.build_plan()
+    campaign_dir = tmp_path.joinpath(*p23.RAW_ROOT_PARTS, campaign_id)
+    (campaign_dir / "cases").mkdir(parents=True)
+    (campaign_dir / "logs").mkdir(parents=True)
+    cases: list[tuple[dict, list[dict]]] = []
+    for entry in plan:
+        rows = []
+        for sample_index in range(repetitions):
+            overrides = {"gpu_uuid": gpu_uuid, "gpu_name": gpu_name}
+            if elapsed_cycles_fn is not None:
+                overrides["elapsed_cycles"] = str(elapsed_cycles_fn(entry, sample_index))
+                total_umma = entry["depth"] * FROZEN_PILOT_PARAMS["iterations"]
+                info = p23.METHOD_INFO[entry["method"]]
+                flops_per_umma = 2 * info["m"] * entry["n"] * p23.FROZEN_K
+                total_flops = flops_per_umma * total_umma
+                ec = int(overrides["elapsed_cycles"])
+                overrides["cycles_per_umma"] = f"{ec / total_umma:.6f}"
+                overrides["flops_per_cycle"] = f"{total_flops / ec:.6f}"
+            row = p23._default_row(
+                entry, sample_index, repetitions=repetitions, run_kind="benchmark",
+                iterations=FROZEN_PILOT_PARAMS["iterations"], warmup_iterations=FROZEN_PILOT_PARAMS["warmup_iterations"],
+                git_commit=git_commit, overrides=overrides,
+            )
+            rows.append(row)
+        p23._write_case_csv(campaign_dir / "cases" / f"{entry['case_name']}.csv", rows)
+        cases.append((entry, rows))
+    p23.write_execution_order(campaign_dir, plan)
+    started = "20260804T090000Z"
+    p23.merge_manifest(
+        campaign_dir,
+        {
+            "campaign_id": campaign_id, "run_kind": "benchmark", "started_at_utc": started,
+            "configuration_count_expected": p23.EXPECTED_CONFIGURATION_COUNT,
+            "configuration_count_completed": p23.EXPECTED_CONFIGURATION_COUNT,
+            "sample_count_expected": p23.EXPECTED_CONFIGURATION_COUNT * repetitions,
+            "sample_count_completed": p23.EXPECTED_CONFIGURATION_COUNT * repetitions,
+            "requested": {
+                "run_kind": "benchmark", "iterations": FROZEN_PILOT_PARAMS["iterations"],
+                "warmup_iterations": FROZEN_PILOT_PARAMS["warmup_iterations"], "repetitions": repetitions,
+                "campaign_id": campaign_id,
+            },
+            "selected_gpu_index": 0, "git_commit": git_commit, "git_dirty": False,
+            "self_test_outcomes": {"umma_1sm": "PASS", "umma_2sm": "PASS"},
+        },
+        status="IN_PROGRESS",
+    )
+    args = argparse.Namespace(
+        campaign_id=campaign_id, run_kind="benchmark", repetitions=repetitions,
+        iterations=FROZEN_PILOT_PARAMS["iterations"], warmup_iterations=FROZEN_PILOT_PARAMS["warmup_iterations"],
+        git_commit=git_commit, gpu_index=0, started_at_utc=started, completed_at_utc="20260804T093000Z",
+        self_test_umma_1sm="PASS", self_test_umma_2sm="PASS",
+    )
+    synthetic_artifact = tmp_path / f"synthetic_build_artifact_{campaign_id}"
+    synthetic_artifact.write_bytes(b"synthetic non-empty artifact\n")
+    synthetic_final_artifacts = {label: synthetic_artifact for label in p23.DEFAULT_FINAL_ARTIFACTS}
+    synthetic_versions = tmp_path / f"VERSIONS_{campaign_id}.env"
+    synthetic_versions.write_text(
+        "CUDA_VERSION=13.1.0\nCUDA_IMAGE=nvidia/cuda:13.1.0-devel-ubuntu24.04\n"
+        "CUDA_IMAGE_DIGEST=sha256:" + "0" * 64 + "\nCUDA_IMAGE_PLATFORM=linux/amd64\n"
+        "CUTLASS_VERSION=v4.6.1\nCUTLASS_COMMIT=" + "0" * 40 + "\nCUDA_ARCH=sm_103a\nMAX_BUILD_JOBS=2\n",
+        encoding="utf-8",
+    )
+    success, errors = p23._do_finalize(campaign_dir, args, artifact_paths=synthetic_final_artifacts, versions_path=synthetic_versions)
+    if not success:
+        raise AssertionError(f"self-test fixture: P2.3 finalize failed: {errors}")
+    manifest = p23.load_manifest(campaign_dir)
+    return campaign_dir, manifest
+
+
+def _build_ncu_case_fixture(
+    tmp_path: Path, entry: dict, *, git_commit: str = _FIXED_GIT_COMMIT, gpu_uuid: str = _FIXED_GPU_UUID,
+    gpu_name: str = _FIXED_GPU_NAME, sm_cycles_per_second: float | None = 1_400_000_000.0,
+    kernel_name_in_csv: str | None = None, unit_override: str | None = None,
+    resolved_metrics: tuple[str, ...] = CANDIDATE_METRICS, omit_metrics: tuple[str, ...] = (),
+    case_dir: Path | None = None,
+) -> tuple[Path, Path, Path, dict]:
+    info = p23.METHOD_INFO[entry["method"]]
+    row = p23._default_row(
+        entry, 0, repetitions=1, run_kind="benchmark", iterations=FROZEN_PROFILE_PARAMS["iterations"],
+        warmup_iterations=FROZEN_PROFILE_PARAMS["warmup_iterations"], git_commit=git_commit,
+        overrides={"gpu_uuid": gpu_uuid, "gpu_name": gpu_name},
+    )
+    out_dir = case_dir if case_dir is not None else tmp_path
+    out_dir.mkdir(parents=True, exist_ok=True)
+    app_csv = out_dir / f"{entry['case_name']}.application.csv"
+    p23._write_case_csv(app_csv, [row])
+
+    kernel_name_field = kernel_name_in_csv or entry["kernel_symbol"]
+    metadata_header = ["ID", "Process ID", "Process Name", "Host Name", "Kernel Name", "Kernel Time", "Context", "Stream"]
+    metadata_values = ["1", "1234", "fixture", "fixture-host", kernel_name_field, "2026-Aug-04 00:00:00", "1", "7"]
+    default_values: dict[str, str] = {
+        MANDATORY_SM_CLOCK_METRIC: "" if sm_cycles_per_second is None else f"{sm_cycles_per_second / 1e9}",
+        "gpu__time_duration.sum": "654321",
+        "device__attribute_multiprocessor_count": "132",
+        "sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_elapsed": "88.5",
+        "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": "90.1",
+        "sm__inst_executed_pipe_tensor.sum": "4096",
+        "smsp__inst_executed_pipe_tensor.sum": "1024",
+    }
+    default_units: dict[str, str] = {
+        MANDATORY_SM_CLOCK_METRIC: EXPECTED_SM_CLOCK_UNIT if unit_override is None else unit_override,
+        "gpu__time_duration.sum": "ns", "device__attribute_multiprocessor_count": "",
+        "sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_elapsed": "%",
+        "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": "%",
+        "sm__inst_executed_pipe_tensor.sum": "inst", "smsp__inst_executed_pipe_tensor.sum": "inst",
+    }
+    metric_names, metric_units, metric_values = [], [], []
+    for candidate in resolved_metrics:
+        if candidate in omit_metrics:
+            continue
+        metric_names.append(candidate)
+        metric_units.append(default_units[candidate])
+        metric_values.append(default_values[candidate])
+    header = metadata_header + metric_names
+    units = [""] * len(metadata_header) + metric_units
+    launch_values = metadata_values + metric_values
+    metrics_csv = out_dir / f"{entry['case_name']}.metrics_raw.csv"
+    with open(metrics_csv, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(header)
+        writer.writerow(units)
+        writer.writerow(launch_values)
+    ncu_rep = out_dir / f"{entry['case_name']}_report.ncu-rep"
+    ncu_rep.write_bytes(b"synthetic ncu report bytes, never a real profile\n")
+    return app_csv, metrics_csv, ncu_rep, row
+
+
+def _run_full_pipeline(tmp_path: Path, campaign_id: str, *, sm_cycles_fn=None) -> Path:
+    """End-to-end fixture: P2.3 pilot -> record-pilot -> discover-metrics ->
+    all 24 profile cases validated. sm_cycles_fn(entry) -> float|None
+    overrides the per-case SM-clock reading (None omits the metric's value
+    entirely, simulating a counter this GB300 build did not populate)."""
+    p23_campaign_dir, _ = _build_p23_pilot_campaign_fixture(tmp_path, f"p23_{campaign_id}")
+    p24_campaign_dir = _do_init_campaign(campaign_id=campaign_id, started_at_utc="20260804T100000Z")
+    preflight_path = tmp_path / f"preflight_{campaign_id}.json"
+    _write_preflight_json(preflight_path, _default_preflight_doc())
+    now = _datetime(2026, 8, 4, 11, 0, tzinfo=_timezone.utc)
+    ok, errors = _do_record_pilot(
+        campaign_dir=p24_campaign_dir, p23_campaign_dir=p23_campaign_dir, preflight_path=preflight_path,
+        git_commit=_FIXED_GIT_COMMIT, completed_at_utc="20260804T103000Z", now_utc=now,
+    )
+    if not ok:
+        raise AssertionError(f"self-test fixture: record-pilot failed: {errors}")
+    discovery_log = tmp_path / f"discovery_{campaign_id}.log"
+    discovery_log.write_text("\n".join(CANDIDATE_METRICS) + "\n", encoding="utf-8")
+    ok, errors, _resolved = _do_discover_metrics(
+        campaign_dir=p24_campaign_dir, discovery_log=discovery_log, preflight_path=preflight_path,
+        git_commit=_FIXED_GIT_COMMIT, started_at_utc="20260804T103100Z", now_utc=now,
+    )
+    if not ok:
+        raise AssertionError(f"self-test fixture: discover-metrics failed: {errors}")
+    for entry in build_profile_plan():
+        sm_cycles = sm_cycles_fn(entry) if sm_cycles_fn is not None else 1_400_000_000.0
+        _build_ncu_case_fixture(
+            tmp_path, entry, sm_cycles_per_second=sm_cycles, case_dir=p24_campaign_dir / "profiles" / entry["case_name"],
+        )
+        ok, errors = _do_validate_profile_case(campaign_dir=p24_campaign_dir, index=entry["index"], git_commit=_FIXED_GIT_COMMIT)
+        if not ok:
+            raise AssertionError(f"self-test fixture: validate-profile-case {entry['case_name']} failed: {errors}")
+    return p24_campaign_dir
+
+
+def run_self_test() -> int:  # noqa: C901
+    rec = _Recorder()
+
+    plan = build_profile_plan()
+    plan_errors = check_profile_plan_contract(plan)
+    rec.check("profile plan has exactly 24 cases, identical to P2.3's own plan plus kernel_symbol", not plan_errors, detail=str(plan_errors))
+    rec.check(
+        "kernel_symbol matches the documented P2.1/P2.2 symbol form",
+        all(
+            e["kernel_symbol"] == (f"umma_1sm_m128n{e['n']}k16_d{e['depth']}" if e["method"] == "umma_1sm" else f"umma_2sm_m256n{e['n']}k16_d{e['depth']}")
+            for e in plan
+        ),
+    )
+    rec.check("every kernel_symbol is unique", len({e["kernel_symbol"] for e in plan}) == len(plan))
+
+    # --- statistics: determinism, sample stdev, bootstrap determinism ------
+    try:
+        compute_metric_stats([1000.0])
+        single_sample_rejected = False
+    except ValueError:
+        single_sample_rejected = True
+    rec.check("compute_metric_stats refuses to silently report zero stdev/CV for a single observation", single_sample_rejected)
+    two_sample = compute_metric_stats([1000.0, 1002.0])
+    rec.check("compute_metric_stats computes a real, non-zero sample stdev for two or more observations", two_sample["stdev"] > 0.0)
+
+    values_a = [100.0 + i for i in range(30)]
+    rng1 = random.Random(BOOTSTRAP_SEED)
+    ci1 = bootstrap_indices_median_ci(values_a, rng1)
+    rng2 = random.Random(BOOTSTRAP_SEED)
+    ci2 = bootstrap_indices_median_ci(values_a, rng2)
+    rec.check("bootstrap median CI is deterministic for a fixed seed and identical input", ci1 == ci2)
+
+    values_b = [200.0 + i for i in range(30)]
+    rng3 = random.Random(BOOTSTRAP_SEED)
+    ratio_ci1 = bootstrap_indices_ratio_ci(values_a, values_b, rng3)
+    rng4 = random.Random(BOOTSTRAP_SEED)
+    ratio_ci2 = bootstrap_indices_ratio_ci(values_a, values_b, rng4)
+    rec.check("bootstrap ratio CI is deterministic for a fixed seed and identical input", ratio_ci1 == ratio_ci2)
+
+    lower, upper, flagged = iqr_bounds([1.0, 2.0, 3.0, 4.0, 5.0, 100.0])
+    rec.check("iqr_bounds flags a clear outlier without removing it from the input", flagged == 1)
+
+    # --- scaling / efficiency formulas, never clamped -----------------------
+    fake_samples = {
+        ("umma_1sm", 128, 16): {"flops_per_cycle": [10.0] * 30, "elapsed_cycles": [1.0] * 30, "cycles_per_umma": [1.0] * 30, "flops_per_cycle_per_sm": [10.0] * 30, "cta_group": 1},
+        ("umma_2sm", 128, 16): {"flops_per_cycle": [25.0] * 30, "elapsed_cycles": [1.0] * 30, "cycles_per_umma": [1.0] * 30, "flops_per_cycle_per_sm": [12.5] * 30, "cta_group": 2},
+    }
+    rng5 = random.Random(BOOTSTRAP_SEED)
+    fake_stats = compute_all_config_stats(fake_samples, rng5)
+    scaling_rows = compute_scaling(fake_samples, fake_stats, rng5)
+    row = scaling_rows[0]
+    rec.check("speedup_2sm_over_1sm = median(2sm)/median(1sm)", math.isclose(row["speedup_2sm_over_1sm"], 2.5))
+    rec.check("scaling_efficiency = speedup / 2", math.isclose(row["scaling_efficiency"], 1.25))
+    rec.check("scaling_efficiency_percent = 100 * efficiency", math.isclose(row["scaling_efficiency_percent"], 125.0))
+    rec.check(
+        "scaling efficiency above 100% is never clamped and is flagged as surprising",
+        row["scaling_efficiency_percent"] > 100.0 and row["surprising_value_flag"] is True,
+    )
+
+    # --- saturation rule: boundary and CI-overlap behavior ------------------
+    # Bimodal (not constant) samples give the bootstrap median CI real width,
+    # so the overlap check is genuinely exercised rather than trivially
+    # comparing two zero-width points.
+    def _bimodal(lo: float, hi: float) -> list[float]:
+        return [lo] * 15 + [hi] * 15
+
+    sat_samples = {
+        ("umma_1sm", 64, 4): {"flops_per_cycle": [5.0] * 30, "elapsed_cycles": [1.0] * 30, "cycles_per_umma": [1.0] * 30, "flops_per_cycle_per_sm": [5.0] * 30, "cta_group": 1},
+        ("umma_1sm", 64, 16): {"flops_per_cycle": _bimodal(9.0, 10.2), "elapsed_cycles": [1.0] * 30, "cycles_per_umma": [1.0] * 30, "flops_per_cycle_per_sm": _bimodal(9.0, 10.2), "cta_group": 1},
+        ("umma_1sm", 64, 64): {"flops_per_cycle": _bimodal(9.6, 10.4), "elapsed_cycles": [1.0] * 30, "cycles_per_umma": [1.0] * 30, "flops_per_cycle_per_sm": _bimodal(9.6, 10.4), "cta_group": 1},
+        ("umma_1sm", 64, 256): {"flops_per_cycle": [8.0] * 30, "elapsed_cycles": [1.0] * 30, "cycles_per_umma": [1.0] * 30, "flops_per_cycle_per_sm": [8.0] * 30, "cta_group": 1},
+    }
+    rng6 = random.Random(BOOTSTRAP_SEED)
+    sat_stats = compute_all_config_stats(sat_samples, rng6)
+    sat_rows = compute_saturation(sat_stats)
+    sat_row = next(r for r in sat_rows if r["method"] == "umma_1sm" and r["n"] == 64)
+    rec.check(
+        "saturation selects an earlier depth once it meets both the 95% threshold and a CI overlapping the max's own CI",
+        sat_row["earliest_tested_candidate_saturation_depth"] == 16,
+        detail=str(sat_row),
+    )
+
+    sat_no_overlap_samples = {
+        ("umma_1sm", 64, 4): {"flops_per_cycle": [5.0] * 30, "elapsed_cycles": [1.0] * 30, "cycles_per_umma": [1.0] * 30, "flops_per_cycle_per_sm": [5.0] * 30, "cta_group": 1},
+        ("umma_1sm", 64, 16): {"flops_per_cycle": [9.6] * 30, "elapsed_cycles": [1.0] * 30, "cycles_per_umma": [1.0] * 30, "flops_per_cycle_per_sm": [9.6] * 30, "cta_group": 1},
+        ("umma_1sm", 64, 64): {"flops_per_cycle": [10.0] * 30, "elapsed_cycles": [1.0] * 30, "cycles_per_umma": [1.0] * 30, "flops_per_cycle_per_sm": [10.0] * 30, "cta_group": 1},
+        ("umma_1sm", 64, 256): {"flops_per_cycle": [10.0] * 30, "elapsed_cycles": [1.0] * 30, "cycles_per_umma": [1.0] * 30, "flops_per_cycle_per_sm": [10.0] * 30, "cta_group": 1},
+    }
+    rng6b = random.Random(BOOTSTRAP_SEED)
+    sat_no_overlap_stats = compute_all_config_stats(sat_no_overlap_samples, rng6b)
+    sat_no_overlap_rows = compute_saturation(sat_no_overlap_stats)
+    sat_no_overlap_row = next(r for r in sat_no_overlap_rows if r["method"] == "umma_1sm" and r["n"] == 64)
+    rec.check(
+        "a depth meeting the 95% threshold but whose (zero-width) CI does not overlap the max's own CI is "
+        "correctly rejected, falling through to the depth that actually achieves the maximum",
+        sat_no_overlap_row["earliest_tested_candidate_saturation_depth"] == 64,
+        detail=str(sat_no_overlap_row),
+    )
+    below_threshold_samples = {
+        ("umma_1sm", 64, 4): {"flops_per_cycle": [1.0] * 30, "elapsed_cycles": [1.0] * 30, "cycles_per_umma": [1.0] * 30, "flops_per_cycle_per_sm": [1.0] * 30, "cta_group": 1},
+        ("umma_1sm", 64, 16): {"flops_per_cycle": [1.0] * 30, "elapsed_cycles": [1.0] * 30, "cycles_per_umma": [1.0] * 30, "flops_per_cycle_per_sm": [1.0] * 30, "cta_group": 1},
+        ("umma_1sm", 64, 64): {"flops_per_cycle": [1.0] * 30, "elapsed_cycles": [1.0] * 30, "cycles_per_umma": [1.0] * 30, "flops_per_cycle_per_sm": [1.0] * 30, "cta_group": 1},
+        ("umma_1sm", 64, 256): {"flops_per_cycle": [10.0] * 30, "elapsed_cycles": [1.0] * 30, "cycles_per_umma": [1.0] * 30, "flops_per_cycle_per_sm": [10.0] * 30, "cta_group": 1},
+    }
+    rng7 = random.Random(BOOTSTRAP_SEED)
+    bt_stats = compute_all_config_stats(below_threshold_samples, rng7)
+    bt_rows = compute_saturation(bt_stats)
+    rec.check(
+        "saturation falls back to the depth achieving the maximum when no smaller depth qualifies",
+        bt_rows[0]["earliest_tested_candidate_saturation_depth"] == 256,
+    )
+
+    # --- ceiling selection: clock-independent FLOP/cycle-per-SM space -------
+    ceiling_samples = {
+        ("umma_1sm", 64, 4): {"flops_per_cycle": [8.0] * 30, "elapsed_cycles": [1.0] * 30, "cycles_per_umma": [1.0] * 30, "flops_per_cycle_per_sm": [8.0] * 30, "cta_group": 1},
+        ("umma_2sm", 64, 4): {"flops_per_cycle": [12.0] * 30, "elapsed_cycles": [1.0] * 30, "cycles_per_umma": [1.0] * 30, "flops_per_cycle_per_sm": [6.0] * 30, "cta_group": 2},
+    }
+    rng8 = random.Random(BOOTSTRAP_SEED)
+    ceiling_stats = compute_all_config_stats(ceiling_samples, rng8)
+    selection = select_ceiling(ceiling_stats)
+    rec.check(
+        "ceiling candidate is selected by median flops_per_cycle_per_sm, not raw flops_per_cycle "
+        "(1-SM's 8.0/SM beats 2-SM's 12.0 total / 6.0-per-SM)",
+        selection["empirical_per_sm_ceiling_candidate"] == ("umma_1sm", 64, 4),
+    )
+
+    # --- NCU metric resolution: canonical, qualified, ambiguous, missing ----
+    discovered_canonical = set(CANDIDATE_METRICS)
+    resolved = resolve_ncu_metrics_p24(discovered_canonical)
+    rec.check("canonical metric names resolve directly", resolved["sm_clock_metric_resolved"] and all(resolved["per_metric"][c]["status"] == "resolved" for c in CANDIDATE_METRICS))
+
+    discovered_qualified = {f"FBSP.TriageCompute.{MANDATORY_SM_CLOCK_METRIC}"}
+    resolved_q = resolve_ncu_metrics_p24(discovered_qualified)
+    rec.check(
+        "an exact namespace-qualified suffix match resolves the mandatory metric",
+        resolved_q["per_metric"][MANDATORY_SM_CLOCK_METRIC]["status"] == "resolved"
+        and resolved_q["per_metric"][MANDATORY_SM_CLOCK_METRIC]["resolved_name"] == f"FBSP.TriageCompute.{MANDATORY_SM_CLOCK_METRIC}",
+    )
+
+    discovered_ambiguous = {f"A.{MANDATORY_SM_CLOCK_METRIC}", f"B.{MANDATORY_SM_CLOCK_METRIC}"}
+    resolved_amb = resolve_ncu_metrics_p24(discovered_ambiguous)
+    rec.check(
+        "an ambiguous mandatory metric is recorded as ambiguous (never guessed) and never marked resolved",
+        resolved_amb["per_metric"][MANDATORY_SM_CLOCK_METRIC]["status"] == "ambiguous"
+        and not resolved_amb["sm_clock_metric_resolved"],
+    )
+
+    resolved_missing = resolve_ncu_metrics_p24(set())
+    rec.check("a missing mandatory metric is recorded as missing, not resolved", resolved_missing["per_metric"][MANDATORY_SM_CLOCK_METRIC]["status"] == "missing")
+
+    substring_decoy = {f"not_{MANDATORY_SM_CLOCK_METRIC}_at_all"}
+    resolved_decoy = resolve_ncu_metrics_p24(substring_decoy)
+    rec.check("a substring decoy (not an exact suffix match) never resolves the mandatory metric", resolved_decoy["per_metric"][MANDATORY_SM_CLOCK_METRIC]["status"] == "missing")
+
+    # --- exact cycle/nsecond -> Hz conversion and unit rejection -------------
+    ok_parsed = {"metrics": {MANDATORY_SM_CLOCK_METRIC: 1.4}, "units": {MANDATORY_SM_CLOCK_METRIC: "cycle/nsecond"}}
+    ok_eval = evaluate_sm_clock(sm_clock_metric_resolved=True, actual_column_name=MANDATORY_SM_CLOCK_METRIC, parsed_metrics=ok_parsed)
+    rec.check("sm_clock_hz = metric_value * 1e9 for the verified cycle/nsecond unit", ok_eval["sm_clock_valid"] and math.isclose(ok_eval["sm_clock_hz"], 1.4e9))
+
+    wrong_unit_parsed = {"metrics": {MANDATORY_SM_CLOCK_METRIC: 1.4}, "units": {MANDATORY_SM_CLOCK_METRIC: "GHz"}}
+    wrong_unit_eval = evaluate_sm_clock(sm_clock_metric_resolved=True, actual_column_name=MANDATORY_SM_CLOCK_METRIC, parsed_metrics=wrong_unit_parsed)
+    rec.check("an unknown SM-clock unit is rejected, never rescaled or guessed", not wrong_unit_eval["sm_clock_valid"] and wrong_unit_eval["sm_clock_issue"].startswith("unknown_unit"))
+
+    non_finite_parsed = {"metrics": {MANDATORY_SM_CLOCK_METRIC: float("nan")}, "units": {MANDATORY_SM_CLOCK_METRIC: "cycle/nsecond"}}
+    non_finite_eval = evaluate_sm_clock(sm_clock_metric_resolved=True, actual_column_name=MANDATORY_SM_CLOCK_METRIC, parsed_metrics=non_finite_parsed)
+    rec.check("a non-finite SM-clock value is rejected", not non_finite_eval["sm_clock_valid"] and non_finite_eval["sm_clock_issue"] == "non_finite")
+
+    non_positive_parsed = {"metrics": {MANDATORY_SM_CLOCK_METRIC: 0.0}, "units": {MANDATORY_SM_CLOCK_METRIC: "cycle/nsecond"}}
+    non_positive_eval = evaluate_sm_clock(sm_clock_metric_resolved=True, actual_column_name=MANDATORY_SM_CLOCK_METRIC, parsed_metrics=non_positive_parsed)
+    rec.check("a non-positive SM-clock value is rejected", not non_positive_eval["sm_clock_valid"] and non_positive_eval["sm_clock_issue"] == "non_positive")
+
+    unavailable_eval = evaluate_sm_clock(sm_clock_metric_resolved=False, actual_column_name=None, parsed_metrics={"metrics": {}, "units": {}})
+    rec.check("an unresolved mandatory metric is recorded unavailable, never guessed", not unavailable_eval["sm_clock_valid"] and unavailable_eval["sm_clock_issue"] == "metric_unavailable_at_discovery")
+
+    # --- ambiguous/duplicate/malformed NCU raw CSV parsing -------------------
+    dup_rows = [["ID", "Kernel Name", MANDATORY_SM_CLOCK_METRIC, MANDATORY_SM_CLOCK_METRIC], ["", "", "cycle/nsecond", "cycle/nsecond"], ["1", "k", "1.4", "1.4"]]
+    raised = False
+    try:
+        _parse_ncu_raw_csv_rows(dup_rows, label="dup")
+    except NcuCsvParseError:
+        raised = True
+    rec.check("a duplicate NCU CSV header column name is rejected", raised)
+
+    wrong_launch_count_rows = [["ID", "Kernel Name"], ["", ""], ["1", "k"], ["2", "k"]]
+    raised = False
+    try:
+        _parse_ncu_raw_csv_rows(wrong_launch_count_rows, label="two-launch")
+    except NcuCsvParseError:
+        raised = True
+    rec.check("more than one profiled launch row is rejected (launch-skip/launch-count contract)", raised)
+
+    missing_id_rows = [["Kernel Name"], [""], ["k"]]
+    raised = False
+    try:
+        _parse_ncu_raw_csv_rows(missing_id_rows, label="no-id")
+    except NcuCsvParseError:
+        raised = True
+    rec.check("a missing required ID/Kernel Name column is rejected", raised)
+
+    with tempfile.TemporaryDirectory(prefix="p24_selftest_") as tmp:
+        tmp_path = Path(tmp).resolve()
+        with mock.patch.object(sys.modules[__name__], "REPO_ROOT", tmp_path), mock.patch.object(p23, "REPO_ROOT", tmp_path):
+
+            # --- preflight validation ---------------------------------------
+            now = _datetime(2026, 8, 4, 12, 0, tzinfo=_timezone.utc)
+            good_preflight = tmp_path / "good_preflight.json"
+            _write_preflight_json(good_preflight, _default_preflight_doc())
+            errors, snapshot = validate_preflight_file(good_preflight, expected_git_commit=_FIXED_GIT_COMMIT, now_utc=now)
+            rec.check("valid preflight is accepted", not errors, detail=str(errors))
+            rec.check("preflight snapshot carries gpu_uuid", snapshot.get("gpu_uuid") == _FIXED_GPU_UUID)
+
+            stale_preflight = tmp_path / "stale.json"
+            _write_preflight_json(stale_preflight, _default_preflight_doc(timestamp_utc="20260803T110000Z"))
+            errors, _ = validate_preflight_file(stale_preflight, expected_git_commit=_FIXED_GIT_COMMIT, now_utc=now)
+            rec.expect_error_containing("a preflight older than 24h is rejected", errors, "24h")
+
+            dirty_preflight = tmp_path / "dirty.json"
+            _write_preflight_json(dirty_preflight, _default_preflight_doc(git_dirty=True))
+            errors, _ = validate_preflight_file(dirty_preflight, expected_git_commit=_FIXED_GIT_COMMIT, now_utc=now)
+            rec.expect_error_containing("a dirty-worktree preflight is rejected", errors, "git_dirty")
+
+            # --- campaign init + manifest hash-chain determinism ------------
+            campaign_dir = _do_init_campaign(campaign_id="20260804T120000Z", started_at_utc="20260804T120000Z")
+            m0, rev0 = load_p24_manifest_chain(campaign_dir)
+            rec.check("init-campaign publishes revision 0 in PILOT_IN_PROGRESS with publishable=false", rev0 == 0 and m0["state"] == "PILOT_IN_PROGRESS" and m0["publishable"] is False)
+
+            try:
+                create_p24_campaign_dir("20260804T120000Z")
+                dup_campaign_rejected = False
+            except p23.UnsafePathError:
+                dup_campaign_rejected = True
+            rec.check("an existing campaign directory cannot be silently reused (no-clobber)", dup_campaign_rejected)
+
+            try:
+                validate_p24_campaign_id("not-a-timestamp")
+                bad_id_rejected = False
+            except p23.UnsafePathError:
+                bad_id_rejected = True
+            rec.check("a non-canonical-timestamp campaign ID is rejected", bad_id_rejected)
+
+            # --- illegal manifest transitions and wrong state-field introduction --
+            try:
+                p24_merge_manifest(campaign_dir, {}, state="COMPLETE")
+                illegal_skip_rejected = False
+            except p23.ManifestTransitionError:
+                illegal_skip_rejected = True
+            rec.check("PILOT_IN_PROGRESS -> COMPLETE (skipping intermediate states) is rejected", illegal_skip_rejected)
+
+            premature = dict(m0)
+            premature["case_results"] = {}
+            premature_errors = validate_manifest_state_shape(premature, campaign_dir.name)
+            rec.check("case_results present during PILOT_IN_PROGRESS is rejected by state-shape validation", bool(premature_errors))
+
+            premature_null = dict(m0)
+            premature_null["profile_completed_at_utc"] = None
+            try:
+                _validate_p24_manifest_updates(premature_null)
+                null_field_type_ok = False
+            except p23.ManifestTransitionError:
+                null_field_type_ok = True
+            rec.check("an unexpected null value for a non-nullable field is rejected, never treated as absent", null_field_type_ok)
+
+            # --- hash-chain corruption ---------------------------------------
+            rev0_path = _manifest_revision_path(campaign_dir, 0)
+            corrupted_dir = tmp_path.joinpath(*RAW_ROOT_PARTS_P24, "20260804T120099Z_corrupt")
+            corrupted_dir.mkdir(parents=True)
+            (corrupted_dir / "manifest").mkdir()
+            (corrupted_dir / "manifest" / "000000.json").write_text(rev0_path.read_text(encoding="utf-8"), encoding="utf-8")
+            doc = json.loads((corrupted_dir / "manifest" / "000000.json").read_text(encoding="utf-8"))
+            doc["campaign_id"] = "20260804T120099Z_corrupt"
+            (corrupted_dir / "manifest" / "000001.json").write_text(
+                json.dumps({**doc, "manifest_revision": 1, "previous_manifest_sha256": "0" * 64}, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            raised = False
+            try:
+                load_p24_manifest_chain(corrupted_dir)
+            except p23.ManifestTransitionError:
+                raised = True
+            rec.check("a manifest revision whose previous_manifest_sha256 does not match the prior file's real hash is rejected", raised)
+
+            # --- full happy-path pipeline: pilot -> profile -> COMPLETE -> ANALYZED --
+            good_campaign_id = "20260804T130000Z"
+            good_campaign = _run_full_pipeline(tmp_path, good_campaign_id)
+            m_complete, _rev = load_p24_manifest_chain(good_campaign)
+            rec.check("all 24 profile cases recorded before finalize-profile", m_complete.get("profile_count_completed") == EXPECTED_PROFILE_CASE_COUNT)
+
+            ok, errors = _do_finalize_profile(campaign_dir=good_campaign, completed_at_utc="20260804T140000Z")
+            rec.check("finalize-profile succeeds against a fully validated 24-case campaign", ok, detail=str(errors))
+            m_after_finalize, _ = load_p24_manifest_chain(good_campaign)
+            rec.check("finalize-profile publishes state=COMPLETE with the canonical profile_order", m_after_finalize.get("state") == "COMPLETE" and m_after_finalize.get("profile_order") == build_profile_plan())
+
+            ok, errors = _do_analyze(campaign_dir=good_campaign, analyzed_at_utc="20260804T150000Z")
+            rec.check("analyze succeeds and reaches ANALYZED when every SM-clock reading is valid", ok, detail=str(errors))
+            m_analyzed, _ = load_p24_manifest_chain(good_campaign)
+            rec.check("analyze publishes state=ANALYZED with all ten analysis artifacts hashed", m_analyzed.get("state") == "ANALYZED" and set(ANALYSIS_ARTIFACT_RELATIVE_PATHS) <= set(m_analyzed.get("artifact_sha256", {})))
+            ceiling_doc = json.loads((good_campaign / "analysis" / "empirical_ceiling.json").read_text(encoding="utf-8"))
+            rec.check("a fully valid campaign's empirical_ceiling.json reports status=ANALYZED with a real TFLOP/s figure", ceiling_doc["status"] == "ANALYZED" and ceiling_doc["empirical_per_sm_ceiling_candidate"]["estimated_tflops_per_sm"] is not None)
+
+            byte_identical_report = (good_campaign / "analysis" / "report.md").read_bytes()
+            rec.check("configuration_statistics.csv processes configs in deterministic sorted order", (good_campaign / "analysis" / "configuration_statistics.csv").exists())
+
+            try:
+                p24_merge_manifest(good_campaign, {}, state="PILOT_IN_PROGRESS")
+                terminal_reopen_rejected = False
+            except p23.ManifestTransitionError:
+                terminal_reopen_rejected = True
+            rec.check("a terminal (ANALYZED) campaign can never be reopened or rewritten", terminal_reopen_rejected)
+
+            # --- INCONCLUSIVE path: one bad SM-clock reading anywhere ---------
+            def _one_case_missing_clock(entry: dict) -> float | None:
+                return None if entry["index"] == 0 else 1_400_000_000.0
+
+            inconclusive_campaign_id = "20260804T160000Z"
+            inconclusive_campaign = _run_full_pipeline(tmp_path, inconclusive_campaign_id, sm_cycles_fn=_one_case_missing_clock)
+            ok, errors = _do_finalize_profile(campaign_dir=inconclusive_campaign, completed_at_utc="20260804T170000Z")
+            rec.check("finalize-profile still reaches COMPLETE even when one case's SM-clock metric is unavailable (raw evidence capture always succeeds)", ok, detail=str(errors))
+            ok, errors = _do_analyze(campaign_dir=inconclusive_campaign, analyzed_at_utc="20260804T180000Z")
+            rec.check("analyze succeeds (produces artifacts) even for the INCONCLUSIVE outcome", ok, detail=str(errors))
+            m_inconclusive, _ = load_p24_manifest_chain(inconclusive_campaign)
+            rec.check(
+                "one invalid SM-clock reading drives the whole campaign to INCONCLUSIVE with a non-empty reason",
+                m_inconclusive.get("state") == "INCONCLUSIVE" and bool(m_inconclusive.get("inconclusive_reason")),
+            )
+            inconclusive_ceiling = json.loads((inconclusive_campaign / "analysis" / "empirical_ceiling.json").read_text(encoding="utf-8"))
+            rec.check(
+                "an INCONCLUSIVE campaign's empirical_ceiling.json never emits a TFLOP/s figure anywhere",
+                inconclusive_ceiling["status"] == "INCONCLUSIVE"
+                and inconclusive_ceiling["best_1sm_configuration"]["estimated_tflops_per_sm"] is None
+                and inconclusive_ceiling["best_2sm_configuration"]["estimated_tflops_per_sm"] is None
+                and inconclusive_ceiling["empirical_per_sm_ceiling_candidate"]["estimated_tflops_per_sm"] is None
+                and inconclusive_ceiling["device_equivalent_estimate"]["available"] is False,
+            )
+            rec.check(
+                "INCONCLUSIVE still produces all ten analysis artifacts (clock-independent statistics remain reviewable)",
+                set(ANALYSIS_ARTIFACT_RELATIVE_PATHS) <= set(m_inconclusive.get("artifact_sha256", {})),
+            )
+
+            # --- evidence-integrity gate: tampering after validate-profile-case ----
+            tamper_campaign_id = "20260804T190000Z"
+            tamper_campaign = _run_full_pipeline(tmp_path, tamper_campaign_id)
+            first_case_name = build_profile_plan()[0]["case_name"]
+            tampered_app_csv = tamper_campaign / "profiles" / first_case_name / f"{first_case_name}.application.csv"
+            original_bytes = tampered_app_csv.read_bytes()
+            tampered_app_csv.write_bytes(original_bytes.replace(b"benchmark", b"benchmar1"))
+            integrity_errors, verified = verify_campaign_evidence_integrity(tamper_campaign, load_p24_manifest_chain(tamper_campaign)[0])
+            rec.check("tampering a validated application.csv after the fact is caught by the evidence-integrity gate", bool(integrity_errors) and verified is None)
+            tampered_app_csv.write_bytes(original_bytes)
+
+            ok2, errors2 = _do_finalize_profile(campaign_dir=tamper_campaign, completed_at_utc="20260804T200000Z")
+            rec.check("finalize-profile succeeds again once tampered evidence is restored", ok2, detail=str(errors2))
+
+            # --- missing/extra/symlinked profiles/ entries ---------------------
+            extra_dir_campaign_id = "20260804T210000Z"
+            extra_dir_campaign = _run_full_pipeline(tmp_path, extra_dir_campaign_id)
+            (extra_dir_campaign / "profiles" / "unexpected_case_dir").mkdir()
+            extra_errors, extra_snapshot = verify_campaign_evidence_integrity(extra_dir_campaign, load_p24_manifest_chain(extra_dir_campaign)[0])
+            rec.check("an unplanned extra directory under profiles/ is rejected, never silently ignored", bool(extra_errors) and extra_snapshot is None)
+            (extra_dir_campaign / "profiles" / "unexpected_case_dir").rmdir()
+
+            symlink_case_name = build_profile_plan()[1]["case_name"]
+            symlink_campaign_id = "20260804T220000Z"
+            symlink_campaign = _run_full_pipeline(tmp_path, symlink_campaign_id)
+            real_case_dir = symlink_campaign / "profiles" / symlink_case_name
+            outside_dir = tmp_path / "outside_profiles_target"
+            outside_dir.mkdir()
+            import shutil as _shutil
+            _shutil.rmtree(real_case_dir)
+            real_case_dir.symlink_to(outside_dir)
+            symlink_errors, symlink_snapshot = verify_campaign_evidence_integrity(symlink_campaign, load_p24_manifest_chain(symlink_campaign)[0])
+            rec.check("a profile case directory replaced by a symlink is rejected", bool(symlink_errors) and symlink_snapshot is None)
+
+            # --- provenance/GPU mismatch between pilot and profile preflight ------
+            mismatch_campaign_id = "20260804T230000Z"
+            p23_campaign_dir_mm, _ = _build_p23_pilot_campaign_fixture(tmp_path, f"p23_{mismatch_campaign_id}")
+            mismatch_campaign = _do_init_campaign(campaign_id=mismatch_campaign_id, started_at_utc="20260804T230000Z")
+            preflight_mm = tmp_path / "preflight_mm.json"
+            _write_preflight_json(preflight_mm, _default_preflight_doc())
+            ok, errors = _do_record_pilot(
+                campaign_dir=mismatch_campaign, p23_campaign_dir=p23_campaign_dir_mm, preflight_path=preflight_mm,
+                git_commit=_FIXED_GIT_COMMIT, completed_at_utc="20260804T233000Z", now_utc=now,
+            )
+            rec.check("record-pilot fixture setup succeeds", ok, detail=str(errors))
+            different_gpu_preflight = tmp_path / "preflight_mm_different_gpu.json"
+            _write_preflight_json(different_gpu_preflight, _default_preflight_doc(gpu_uuid="GPU-99999999-9999-9999-9999-999999999999"))
+            ok, errors = _do_validate_profile_preconditions(campaign_dir=mismatch_campaign, preflight_path=different_gpu_preflight, git_commit=_FIXED_GIT_COMMIT, now_utc=now)
+            rec.expect_error_containing("a profiling preflight from a different GPU UUID than the pilot's is rejected", errors, "gpu_uuid")
+            rec.check("validate-profile-preconditions returns False on GPU/driver provenance mismatch", not ok)
+
+            # --- interrupted/failed campaigns never reach COMPLETE or ANALYZED ----
+            failed_campaign_id = "20260805T000000Z"
+            failed_campaign = _do_init_campaign(campaign_id=failed_campaign_id, started_at_utc="20260805T000000Z")
+            _fail_p24(failed_campaign, "synthetic_self_test_failure", ["synthetic reason"])
+            m_failed, _ = load_p24_manifest_chain(failed_campaign)
+            rec.check("a campaign driven to FAILED carries required failure telemetry and no completing-state field", m_failed.get("state") == "FAILED" and m_failed.get("failure_stage") == "synthetic_self_test_failure" and "profile_order" not in m_failed)
+            try:
+                p24_merge_manifest(failed_campaign, {}, state="COMPLETE")
+                failed_cannot_complete = False
+            except p23.ManifestTransitionError:
+                failed_cannot_complete = True
+            rec.check("a FAILED campaign can never subsequently reach COMPLETE", failed_cannot_complete)
+
+    if rec.failures:
+        print(f"analyze_exp02_umma_throughput_p24: self-test: FAILED ({len(rec.failures)}/{rec.total} case(s)): {rec.failures}", file=sys.stderr)
+        print("analyze_exp02_umma_throughput_p24: SELF_TEST_RESULT=FAIL", file=sys.stderr)
+        return 1
+    print(f"analyze_exp02_umma_throughput_p24: self-test: OK ({rec.total} cases)", file=sys.stderr)
+    print("analyze_exp02_umma_throughput_p24: SELF_TEST_RESULT=PASS", file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="analyze_exp02_umma_throughput_p24.py",
+        description="P2.4 plan/preflight/pilot-recording/NCU-validation/analysis helper (see module docstring).",
+    )
+    parser.add_argument("--self-test", action="store_true", help="Run GPU-free synthetic tests and exit.")
+    subparsers = parser.add_subparsers(dest="command")
+
+    plan_parser = subparsers.add_parser("plan", help="Print the frozen 24-case profile plan.")
+    plan_parser.add_argument("--format", choices=("text", "lines", "json"), default="text")
+    plan_parser.set_defaults(func=cmd_plan)
+
+    init_parser = subparsers.add_parser("init-campaign", help="Symlink-safe P2.4 campaign creation.")
+    init_parser.add_argument("--campaign-id", required=True)
+    init_parser.add_argument("--started-at-utc", required=True)
+    init_parser.set_defaults(func=cmd_init_campaign)
+
+    vp_parser = subparsers.add_parser("validate-preflight", help="Validate a preflight summary.json.")
+    vp_parser.add_argument("--preflight", required=True)
+    vp_parser.add_argument("--expected-git-commit", required=True)
+    vp_parser.add_argument("--now", default=None, help="Override 'now' (YYYY-MM-DDTHH:MM:SSZ); for tests.")
+    vp_parser.set_defaults(func=cmd_validate_preflight)
+
+    rp_parser = subparsers.add_parser("record-pilot", help="Validate a completed P2.3 benchmark campaign as this campaign's pilot input.")
+    rp_parser.add_argument("--campaign-dir", required=True)
+    rp_parser.add_argument("--p23-campaign-dir", required=True)
+    rp_parser.add_argument("--preflight", required=True)
+    rp_parser.add_argument("--git-commit", required=True)
+    rp_parser.add_argument("--completed-at-utc", required=True)
+    rp_parser.add_argument("--now", default=None)
+    rp_parser.set_defaults(func=cmd_record_pilot)
+
+    dm_parser = subparsers.add_parser("discover-metrics", help="Resolve NCU metrics; start the profiling phase.")
+    dm_parser.add_argument("--campaign-dir", required=True)
+    dm_parser.add_argument("--discovery-log", required=True)
+    dm_parser.add_argument("--preflight", required=True)
+    dm_parser.add_argument("--git-commit", required=True)
+    dm_parser.add_argument("--started-at-utc", required=True)
+    dm_parser.add_argument("--now", default=None)
+    dm_parser.set_defaults(func=cmd_discover_metrics)
+
+    vpp_parser = subparsers.add_parser("validate-profile-preconditions", help="GPU-free check that a fresh profiling preflight matches the recorded pilot preflight.")
+    vpp_parser.add_argument("--campaign-dir", required=True)
+    vpp_parser.add_argument("--preflight", required=True)
+    vpp_parser.add_argument("--git-commit", required=True)
+    vpp_parser.add_argument("--now", default=None)
+    vpp_parser.set_defaults(func=cmd_validate_profile_preconditions)
+
+    vc_parser = subparsers.add_parser("validate-profile-case", help="Validate one captured NCU profile case.")
+    vc_parser.add_argument("--campaign-dir", required=True)
+    vc_parser.add_argument("--index", required=True, type=int)
+    vc_parser.add_argument("--git-commit", required=True)
+    vc_parser.set_defaults(func=cmd_validate_profile_case)
+
+    fp_parser = subparsers.add_parser("finalize-profile", help="Re-validate and close the 24-case profile set.")
+    fp_parser.add_argument("--campaign-dir", required=True)
+    fp_parser.add_argument("--completed-at-utc", required=True)
+    fp_parser.set_defaults(func=cmd_finalize_profile)
+
+    an_parser = subparsers.add_parser("analyze", help="Generate analysis/* from a COMPLETE campaign (state ANALYZED or INCONCLUSIVE).")
+    an_parser.add_argument("--campaign-dir", required=True)
+    an_parser.add_argument("--analyzed-at-utc", required=True)
+    an_parser.set_defaults(func=cmd_analyze)
+
+    mw_parser = subparsers.add_parser("manifest-write", help="Mark FAILED/INTERRUPTED with required failure metadata (never a completing state).")
+    mw_parser.add_argument("--campaign-dir", required=True)
+    mw_parser.add_argument("--status", required=True, choices=("FAILED", "INTERRUPTED"))
+    mw_parser.add_argument("--merge-json", required=True)
+    mw_parser.set_defaults(func=cmd_manifest_write)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv == ["--self-test"]:
+        return run_self_test()
+
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    if args.self_test:
+        return run_self_test()
+    if not getattr(args, "command", None):
+        parser.print_usage(sys.stderr)
+        return 2
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

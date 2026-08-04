@@ -9,7 +9,9 @@
 # compute-umma-1sm-check, compute-umma-1sm-self-test, compute-umma-1sm-smoke,
 # compute-umma-2sm-build, compute-umma-2sm-sass, compute-umma-2sm-check,
 # compute-umma-2sm-self-test, compute-umma-2sm-smoke, compute-umma-sweep-plan,
-# compute-umma-sweep-check, compute-umma-sweep-smoke.
+# compute-umma-sweep-check, compute-umma-sweep-smoke, compute-umma-p24-plan,
+# compute-umma-p24-check, compute-umma-p24-pilot, compute-umma-p24-profile,
+# compute-umma-p24-analyze.
 # No target selects a GPU automatically, elevates privileges, or exceeds two
 # build jobs.
 
@@ -78,6 +80,13 @@ EXP02_RUNNER := scripts/run_exp02_umma_throughput.sh
 EXP02_AGGREGATOR := scripts/aggregate_exp02_umma_throughput.py
 EXP02_PROTOCOL := src/compute/P2_3_PROTOCOL.md
 
+EXP02_P24_RUNNER := scripts/run_exp02_umma_throughput_p24.sh
+EXP02_P24_ANALYZER := scripts/analyze_exp02_umma_throughput_p24.py
+EXP02_P24_SAFE_CAPTURE := scripts/p24_safe_capture.py
+EXP02_P24_NCU_BRIDGE := scripts/p24_ncu_bridge.py
+EXP02_P24_PROTOCOL := src/compute/P2_4_PROTOCOL.md
+EXP02_P24_RAW_ROOT := results/raw/exp02_umma_throughput_p24
+
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
 	Dockerfile Makefile \
@@ -91,7 +100,9 @@ REQUIRED_FILES := \
 	$(EXP01_P14_PROTOCOL) \
 	$(COMPUTE_UMMA_1SM_SRC) $(COMPUTE_UMMA_1SM_CHECKER) $(COMPUTE_UMMA_1SM_PROTOCOL) \
 	$(COMPUTE_UMMA_2SM_SRC) $(COMPUTE_UMMA_2SM_CHECKER) $(COMPUTE_UMMA_2SM_PROTOCOL) \
-	$(EXP02_RUNNER) $(EXP02_AGGREGATOR) $(EXP02_PROTOCOL)
+	$(EXP02_RUNNER) $(EXP02_AGGREGATOR) $(EXP02_PROTOCOL) \
+	$(EXP02_P24_RUNNER) $(EXP02_P24_ANALYZER) $(EXP02_P24_SAFE_CAPTURE) $(EXP02_P24_NCU_BRIDGE) \
+	$(EXP02_P24_PROTOCOL)
 
 .DEFAULT_GOAL := help
 .PHONY: help check-static build-image check-env preflight \
@@ -104,6 +115,8 @@ REQUIRED_FILES := \
 	compute-umma-1sm-self-test compute-umma-1sm-smoke \
 	compute-umma-2sm-build compute-umma-2sm-sass compute-umma-2sm-check \
 	compute-umma-2sm-self-test compute-umma-2sm-smoke \
+	compute-umma-p24-plan compute-umma-p24-check compute-umma-p24-pilot \
+	compute-umma-p24-profile compute-umma-p24-analyze \
 	compute-umma-sweep-plan compute-umma-sweep-check compute-umma-sweep-smoke
 
 help:
@@ -178,8 +191,9 @@ help:
 	@echo "     src/compute/P2_PROTOCOL.md; implemented, independently audited,"
 	@echo "     functionally verified on GB300, no publishable result;"
 	@echo "     P2.2 implemented; independently audited; GB300 verification passed."
-	@echo "     P2.3 implemented; not yet audited; not yet GB300-verified. P2.4 not"
-	@echo "     implemented. No publishable P2.2/P2.3 result exists.) --"
+	@echo "     P2.3 implemented; independently audited; GB300 verification passed."
+	@echo "     P2.4 implemented; not yet audited; not yet GB300-verified. No"
+	@echo "     publishable P2.2/P2.3/P2.4 result exists.) --"
 	@echo "  GPU-free build/SASS/check (no GPU, no network):"
 	@echo "  make compute-umma-1sm-build    Compile the twelve P2.1 specializations. No GPU."
 	@echo "  make compute-umma-1sm-sass     Disassemble and verify the real cubin: exactly"
@@ -217,8 +231,8 @@ help:
 	@echo "                                   measurement (NOT a final result)."
 	@echo ""
 	@echo "  -- P2.3 joint 1-SM/2-SM BF16 UMMA sweep infrastructure (exp02_umma_throughput;"
-	@echo "     see src/compute/P2_3_PROTOCOL.md; implemented; not yet independently"
-	@echo "     audited; not yet verified on GB300. Reuses the audited P2.1/P2.2 binaries"
+	@echo "     see src/compute/P2_3_PROTOCOL.md; implemented; independently audited;"
+	@echo "     verified on GB300. Reuses the audited P2.1/P2.2 binaries"
 	@echo "     and CLIs unmodified; introduces no new CUDA kernel; no Nsight Compute) --"
 	@echo "  GPU-free P2.3 planning/checking (no GPU, no Docker, no network):"
 	@echo "  make compute-umma-sweep-plan   Print the deterministic 24-invocation plan."
@@ -232,8 +246,35 @@ help:
 	@echo "  make compute-umma-sweep-smoke  run_kind=smoke only; functional verification,"
 	@echo "                                 NOT a publishable performance result."
 	@echo "  P2.3 never runs Nsight Compute and never computes TFLOP/s, an empirical"
-	@echo "  ceiling, 1-SM/2-SM speedup, scaling efficiency, or saturation; P2.4 (not yet"
-	@echo "  implemented) owns that interpretation."
+	@echo "  ceiling, 1-SM/2-SM speedup, scaling efficiency, or saturation; P2.4 owns"
+	@echo "  that interpretation."
+	@echo ""
+	@echo "  -- P2.4 profiling and empirical BF16 UMMA per-SM ceiling candidate"
+	@echo "     (exp02_umma_throughput_p24; see src/compute/P2_4_PROTOCOL.md; implemented;"
+	@echo "     not yet independently audited; not yet verified on GB300. Drives the"
+	@echo "     unmodified P2.3 runner for one frozen 24-configuration pilot, profiles the"
+	@echo "     same 24 configurations with Nsight Compute, and computes deterministic"
+	@echo "     TFLOP/s, 1-SM/2-SM scaling, candidate saturation, and an empirical"
+	@echo "     per-SM ceiling candidate. No P2.4 campaign has been executed;"
+	@echo "     no empirical ceiling has been measured; no publishable result exists.) --"
+	@echo "  GPU-free P2.4 planning/checking (no GPU, no Docker, no network):"
+	@echo "  make compute-umma-p24-plan     Print the frozen 24-case profile plan (the"
+	@echo "                                 same P2.3 configurations, plus kernel_symbol)."
+	@echo "  make compute-umma-p24-check    Shell/Python syntax, executable bits, GPU-free"
+	@echo "                                 synthetic/adversarial tests, exact 24-way plan"
+	@echo "                                 validation, plus the existing P2.1/P2.2/P2.3 gates."
+	@echo "  GPU-executing (requires BLACKWELL_GPU_INDEX, P2_4_CAMPAIGN_ID, and"
+	@echo "  P2_4_PREFLIGHT_SUMMARY; never selects a GPU automatically):"
+	@echo "  make compute-umma-p24-pilot    The frozen 24-configuration run_kind=benchmark"
+	@echo "                                 pilot, through the unmodified P2.3 runner."
+	@echo "  make compute-umma-p24-profile  Nsight Compute on the same 24 configurations"
+	@echo "                                 against an already-PILOT_COMPLETE campaign."
+	@echo "  GPU-free P2.4 analysis (requires P2_4_CAMPAIGN_ID; a completed pilot+profile):"
+	@echo "  make compute-umma-p24-analyze  Validate and analyze a COMPLETE P2.4 campaign;"
+	@echo "                                 all outputs remain publishable=false; state"
+	@echo "                                 becomes ANALYZED or, if the mandatory SM-clock"
+	@echo "                                 metric could not be trusted for every"
+	@echo "                                 configuration, INCONCLUSIVE (no TFLOP/s emitted)."
 	@echo ""
 	@echo "Pinned contract (VERSIONS.env): CUDA $(CUDA_VERSION), CUTLASS $(CUTLASS_VERSION),"
 	@echo "arch $(CUDA_ARCH), max build jobs $(MAX_BUILD_JOBS)."
@@ -525,9 +566,53 @@ check-static:
 	@echo "== truthful P2.3 status assertions =="
 	@grep -Fq 'P2.3 | Sweep (≤24 configurations) | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P2.3 = YES / YES / YES' $(EXP02_PROTOCOL)
-	@! grep -rnF 'Phase 2 is closed' PLAN.md README.md $(EXP02_PROTOCOL)
+	@! grep -rnF 'Phase 2 is closed' PLAN.md README.md $(EXP02_PROTOCOL) $(EXP02_P24_PROTOCOL)
 	@! grep -rnF 'P2.3 (joint sweep) has not been started' PLAN.md README.md
 	@! grep -F 'No runner, no campaign, no sweep script exists.' $(COMPUTE_UMMA_1SM_PROTOCOL) $(COMPUTE_UMMA_2SM_PROTOCOL)
+	@echo "== P2.4 required files present, executable, and syntactically valid =="
+	@test -x $(EXP02_P24_RUNNER)
+	@test -x $(EXP02_P24_ANALYZER)
+	@test -x $(EXP02_P24_SAFE_CAPTURE)
+	@test -x $(EXP02_P24_NCU_BRIDGE)
+	bash -n $(EXP02_P24_RUNNER)
+	python3 -m py_compile $(EXP02_P24_ANALYZER) $(EXP02_P24_SAFE_CAPTURE) $(EXP02_P24_NCU_BRIDGE)
+	@rm -rf scripts/__pycache__
+	@echo "== P2.4 GPU-free synthetic/adversarial tests (self-test) =="
+	python3 $(EXP02_P24_ANALYZER) --self-test
+	python3 $(EXP02_P24_SAFE_CAPTURE) --self-test
+	python3 $(EXP02_P24_NCU_BRIDGE) --self-test
+	$(EXP02_P24_RUNNER) --self-test
+	@echo "== P2.4 exact plan validation (24-way P2.3 pilot, 24-way P2.4 profile) =="
+	@test "$$(python3 $(EXP02_AGGREGATOR) plan --format lines | wc -l | tr -d ' ')" -eq 24
+	@test "$$(python3 $(EXP02_P24_ANALYZER) plan --format lines | wc -l | tr -d ' ')" -eq 24
+	@echo "== P2.4 forbidden patterns absent (ncu itself is expected/required in P2.4) =="
+	@pat='--gpus[ =]+all|NVIDIA_VISIBLE_DEVICES=all|--privileged|--pid[ =]+host|docker\.sock|--cap-add|SYS_ADMIN|set -x'; \
+	pat="$$pat|\bs""udo\b|\$$\(np""roc\)|--force-overwrite|--set[ =]+full"; \
+	pat="$$pat|clock-control[ =]+base|clock-control[ =]+boost|clock-control[ =]+force-boost"; \
+	pat="$$pat|nvidia-smi[^|]*(-pm|--persistence-mode|-lgc|--lock-gpu-clocks|-pl|--power-limit)"; \
+	! grep -nE -- "$$pat" $(EXP02_P24_RUNNER) $(EXP02_P24_ANALYZER) $(EXP02_P24_SAFE_CAPTURE) $(EXP02_P24_NCU_BRIDGE)
+	@echo "== P2.4 runner uses the audited launcher/P2.3 runner and never selects a GPU automatically =="
+	@grep -Fq 'run_container.sh' $(EXP02_P24_RUNNER)
+	@grep -Fq 'BLACKWELL_GPU_INDEX' $(EXP02_P24_RUNNER)
+	@grep -Fq '$(EXP02_RUNNER)' $(EXP02_P24_RUNNER)
+	@grep -Fq -- '--iterations 1000' $(EXP02_P24_RUNNER)
+	@grep -Fq -- '--warmup-iterations 10' $(EXP02_P24_RUNNER)
+	@grep -Fq -- '--repetitions 30' $(EXP02_P24_RUNNER)
+	@echo "== P2.4 profile invocations use the frozen warmup-iterations 0 / repetitions 1 contract =="
+	@grep -Fq -- '--warmup-iterations 0 --repetitions 1' $(EXP02_P24_RUNNER)
+	@echo "== P2.4 profile invocation uses an exact kernel-name filter and the second (timed) launch =="
+	@grep -Fq -- '--launch-skip' $(EXP02_P24_NCU_BRIDGE)
+	@grep -Fq -- '--kernel-name-base' $(EXP02_P24_NCU_BRIDGE)
+	@echo "== P2.4 raw campaign output is git-ignored (shared results/raw/ rule) =="
+	@grep -Fq 'results/raw/' .gitignore
+	@echo "== truthful P2.4 status assertions =="
+	@grep -Fq 'P2.4 | Profiling and empirical ceiling | YES | NO | NO |' PLAN.md
+	@grep -Fq 'P2.4 | Profiling and empirical ceiling | YES | NO | NO |' $(EXP02_P24_PROTOCOL)
+	@! grep -rnF 'Phase 2 is closed' PLAN.md README.md
+	@! grep -rnF 'P2.4 remains entirely unimplemented' PLAN.md README.md $(COMPUTE_UMMA_1SM_PROTOCOL) $(COMPUTE_UMMA_2SM_PROTOCOL)
+	@! grep -rnF 'P2.4 (profiling and empirical ceiling) remains entirely **not implemented**' README.md
+	@echo "== P2.3's own closed audit history may still name P2.4 as unimplemented at that past point; only its current-status sections were corrected =="
+	@grep -Fq 'P2.4 is `YES / NO / NO`' $(EXP02_PROTOCOL)
 	@echo "check-static: OK"
 
 build-image:
@@ -1086,3 +1171,86 @@ compute-umma-sweep-smoke:
 	@echo "TFLOP/s, empirical ceiling, 1-SM/2-SM speedup, scaling efficiency, or"
 	@echo "saturation, and must not be cited as a performance number."
 	@echo "=============================================================================="
+
+# --- P2.4: profiling and empirical BF16 UMMA per-SM ceiling candidate (exp02_umma_throughput_p24) -
+# compute-umma-p24-plan and compute-umma-p24-check never touch a GPU, Docker,
+# or the network: they only exercise scripts/run_exp02_umma_throughput_p24.sh's
+# and scripts/analyze_exp02_umma_throughput_p24.py's own GPU-free CLI paths
+# and synthetic/adversarial self-tests, plus the existing P2.1/P2.2/P2.3
+# gates. compute-umma-p24-pilot and compute-umma-p24-profile are the only
+# P2.4 targets that execute on GPU; each requires an explicit
+# BLACKWELL_GPU_INDEX, P2_4_CAMPAIGN_ID (a canonical UTC timestamp), and
+# P2_4_PREFLIGHT_SUMMARY, and never selects a GPU automatically. Neither has
+# a Make prerequisite of its own (mirrors compute-umma-sweep-smoke's own
+# audited reasoning): scripts/run_exp02_umma_throughput_p24.sh checks every
+# mandatory environment variable itself, before delegating to the unmodified
+# P2.3 runner (which performs its own build/SASS gate) or touching NCU, so a
+# Make prerequisite here would let Docker/compilation run before that check.
+# compute-umma-p24-analyze is GPU-free and validates/analyzes an
+# already-COMPLETE P2.4 campaign; it requires only P2_4_CAMPAIGN_ID.
+
+compute-umma-p24-plan:
+	$(EXP02_P24_RUNNER) --print-plan
+
+compute-umma-p24-check:
+	bash -n $(EXP02_P24_RUNNER)
+	@test -x $(EXP02_P24_RUNNER)
+	@test -x $(EXP02_P24_ANALYZER)
+	@test -x $(EXP02_P24_SAFE_CAPTURE)
+	@test -x $(EXP02_P24_NCU_BRIDGE)
+	python3 -m py_compile $(EXP02_P24_ANALYZER) $(EXP02_P24_SAFE_CAPTURE) $(EXP02_P24_NCU_BRIDGE)
+	@rm -rf scripts/__pycache__
+	python3 $(EXP02_P24_ANALYZER) --self-test
+	python3 $(EXP02_P24_SAFE_CAPTURE) --self-test
+	python3 $(EXP02_P24_NCU_BRIDGE) --self-test
+	@test "$$(python3 $(EXP02_AGGREGATOR) plan --format lines | wc -l | tr -d ' ')" -eq 24
+	@test "$$(python3 $(EXP02_P24_ANALYZER) plan --format lines | wc -l | tr -d ' ')" -eq 24
+	$(EXP02_P24_RUNNER) --self-test
+	@echo "compute-umma-p24-check: OK"
+
+compute-umma-p24-pilot:
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make compute-umma-p24-pilot"; \
+		echo "       This project never selects a GPU automatically."; \
+		exit 2; \
+	fi
+	@if [ -z "$${P2_4_CAMPAIGN_ID:-}" ]; then \
+		echo "ERROR: P2_4_CAMPAIGN_ID must be set explicitly to a canonical UTC timestamp"; \
+		echo "       YYYYMMDDTHHMMSSZ. Example: P2_4_CAMPAIGN_ID=$$(date -u +%Y%m%dT%H%M%SZ)"; \
+		exit 2; \
+	fi
+	@if [ -z "$${P2_4_PREFLIGHT_SUMMARY:-}" ]; then \
+		echo "ERROR: P2_4_PREFLIGHT_SUMMARY must be set explicitly to a fresh preflight"; \
+		echo "       summary.json path (see 'make preflight')."; \
+		exit 2; \
+	fi
+	$(EXP02_P24_RUNNER) --pilot
+
+compute-umma-p24-profile:
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make compute-umma-p24-profile"; \
+		echo "       This project never selects a GPU automatically."; \
+		exit 2; \
+	fi
+	@if [ -z "$${P2_4_CAMPAIGN_ID:-}" ]; then \
+		echo "ERROR: P2_4_CAMPAIGN_ID must be set explicitly to the same canonical UTC"; \
+		echo "       timestamp used for 'make compute-umma-p24-pilot'."; \
+		exit 2; \
+	fi
+	@if [ -z "$${P2_4_PREFLIGHT_SUMMARY:-}" ]; then \
+		echo "ERROR: P2_4_PREFLIGHT_SUMMARY must be set explicitly to a fresh preflight"; \
+		echo "       summary.json path (see 'make preflight')."; \
+		exit 2; \
+	fi
+	$(EXP02_P24_RUNNER) --profile
+
+compute-umma-p24-analyze:
+	@if [ -z "$${P2_4_CAMPAIGN_ID:-}" ]; then \
+		echo "ERROR: P2_4_CAMPAIGN_ID must be set explicitly to the campaign to analyze."; \
+		exit 2; \
+	fi
+	python3 $(EXP02_P24_ANALYZER) analyze \
+		--campaign-dir $(EXP02_P24_RAW_ROOT)/$${P2_4_CAMPAIGN_ID} \
+		--analyzed-at-utc "$$(date -u +%Y%m%dT%H%M%SZ)"

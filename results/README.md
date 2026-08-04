@@ -9,6 +9,10 @@ bandwidth values are experimental results. P1.4 pilot campaign
 `20260730T073045Z` completed its frozen benchmark, six-case NCU validation,
 analysis, integrity check, and independent review. It is reviewed pilot
 evidence, but remains `publishable: false` and is not a final campaign.
+P2.4 (profiling and empirical BF16 UMMA per-SM ceiling) is implemented but
+has not yet run any campaign on GB300: no pilot, no Nsight Compute
+profiling, and no empirical ceiling have been executed or measured. See
+`src/compute/P2_4_PROTOCOL.md` for the frozen contract.
 
 ## Trust model
 
@@ -254,6 +258,49 @@ without rerunning any GPU work, see `scripts/aggregate_exp01_memory_paths.py`'s
 `results/raw/` is ignored by Git: raw campaign output is never committed
 automatically. P1.4 decides which small, curated, reviewed results (if any)
 are suitable for publication under a future `results/` subdirectory.
+
+### `results/raw/exp02_umma_throughput_p24/<campaign_id>/` (raw, not committed)
+
+Each P2.4 campaign (`scripts/run_exp02_umma_throughput_p24.sh --pilot` /
+`--profile`, an explicit canonical UTC timestamp `--campaign-id` shared with
+the P2.3 campaign it drives) creates exactly one directory, symlink-safe
+like every other raw tree in this repository, containing `manifest/` (an
+append-only, hash-chained sequence of complete manifest snapshots, never a
+single mutable `manifest.json`), `profile_plan.csv` (the frozen 24-case
+Nsight Compute plan -- the same 24 configurations as P2.3's own plan, plus
+each case's exact kernel symbol -- written once), `profiles/` (one
+subdirectory per profiled case: its `.ncu-rep`, NCU tool log, captured
+container stdout/stderr, extracted application CSV, and exported raw
+metrics CSV -- NCU itself never receives any of these as a pathname to
+open; a container-side bridge, `scripts/p24_ncu_bridge.py`, stages every
+NCU output inside the container's own private, non-host-mounted `/tmp` and
+hands the host a single versioned bundle over its own stdout, decoded and
+published by `scripts/p24_safe_capture.py`), `logs/` (metric-discovery and
+NCU-help-capability-probe logs), and, once `make compute-umma-p24-analyze`
+has run against a `COMPLETE` campaign, `analysis/` (deterministic
+configuration-statistics/scaling/saturation/profile-validation CSVs,
+`empirical_ceiling.json`, `report.md`, three SVG figures, and
+`analysis_manifest.json`). The manifest's `state` field follows
+`PILOT_IN_PROGRESS`→`PILOT_COMPLETE`→`PROFILE_IN_PROGRESS`→`COMPLETE`→
+(`ANALYZED` or `INCONCLUSIVE`), or terminal `FAILED`/`INTERRUPTED`.
+`COMPLETE` means the raw pilot-plus-profile collection succeeded, not that
+the result is publishable -- `publishable` is always `false`. `ANALYZED`
+means every one of the 24 profiled configurations' mandatory SM-clock
+reading was trustworthy and a full TFLOP/s/empirical-ceiling analysis was
+produced; `INCONCLUSIVE` means the raw evidence and every clock-independent
+statistic were still produced, but at least one configuration's SM-clock
+reading could not be trusted, so no TFLOP/s or completed empirical-ceiling
+claim was ever emitted. Before both `COMPLETE` and publishing
+`ANALYZED`/`INCONCLUSIVE`, the campaign directory, `profiles/`, and each
+case directory are opened with descriptor-anchored, no-follow resolution
+and held open for the whole check; every trusted artifact recorded in the
+manifest is re-hashed from disk, and every profiled case's complete
+recorded result is compared -- via strict recursive structural comparison,
+never `dict.get()`-based equality -- against what its raw evidence alone
+reconstructs. This raw tree is covered by the same blanket `results/raw/`
+Git-ignore rule as every other campaign tree in this repository. No P2.4
+campaign has been executed on GB300 yet; see
+`src/compute/P2_4_PROTOCOL.md` for the complete frozen contract.
 
 ## Safe public metadata
 
