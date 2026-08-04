@@ -603,6 +603,8 @@ check-static:
 	@echo "== P2.4 profile invocation uses an exact kernel-name filter and the second (timed) launch =="
 	@grep -Fq -- '--launch-skip' $(EXP02_P24_NCU_BRIDGE)
 	@grep -Fq -- '--kernel-name-base' $(EXP02_P24_NCU_BRIDGE)
+	@echo "== P2.4 repair: the P2.4 Make gate actually executes the P2.1/P2.2/P2.3 GPU-free gates =="
+	@grep -Eq '^compute-umma-p24-check: compute-umma-1sm-check compute-umma-2sm-check compute-umma-sweep-check$$' Makefile
 	@echo "== P2.4 raw campaign output is git-ignored (shared results/raw/ rule) =="
 	@grep -Fq 'results/raw/' .gitignore
 	@echo "== truthful P2.4 status assertions =="
@@ -1177,8 +1179,20 @@ compute-umma-sweep-smoke:
 # or the network: they only exercise scripts/run_exp02_umma_throughput_p24.sh's
 # and scripts/analyze_exp02_umma_throughput_p24.py's own GPU-free CLI paths
 # and synthetic/adversarial self-tests, plus the existing P2.1/P2.2/P2.3
-# gates. compute-umma-p24-pilot and compute-umma-p24-profile are the only
-# P2.4 targets that execute on GPU; each requires an explicit
+# gates. compute-umma-p24-check (audit repair) has a REAL Make prerequisite
+# on all three earlier GPU-free validation gates -- compute-umma-1sm-check,
+# compute-umma-2sm-check, and compute-umma-sweep-check -- so a P2.1, P2.2, or
+# P2.3 regression fails compute-umma-p24-check before any P2.4-specific check
+# ever runs; each of those three gates is itself GPU-free (compilation and
+# disassembly happen inside the pinned, network-less, unprivileged image,
+# never against a selected GPU), so this adds no GPU selection, no
+# benchmark, and no NCU profiling. Make only ever executes each of those
+# three targets' recipe once per invocation (a target already brought up to
+# date earlier in the same `make` run, e.g. compute-umma-1sm-sass via
+# compute-umma-1sm-check, is not rebuilt again when compute-umma-sweep-check
+# lists it too), so this reuses the existing targets rather than duplicating
+# their commands. compute-umma-p24-pilot and compute-umma-p24-profile are
+# the only P2.4 targets that execute on GPU; each requires an explicit
 # BLACKWELL_GPU_INDEX, P2_4_CAMPAIGN_ID (a canonical UTC timestamp), and
 # P2_4_PREFLIGHT_SUMMARY, and never selects a GPU automatically. Neither has
 # a Make prerequisite of its own (mirrors compute-umma-sweep-smoke's own
@@ -1192,7 +1206,8 @@ compute-umma-sweep-smoke:
 compute-umma-p24-plan:
 	$(EXP02_P24_RUNNER) --print-plan
 
-compute-umma-p24-check:
+compute-umma-p24-check: compute-umma-1sm-check compute-umma-2sm-check compute-umma-sweep-check
+	@echo "== P2.4 gate: P2.1/P2.2/P2.3 GPU-free gates passed (compute-umma-1sm-check, compute-umma-2sm-check, compute-umma-sweep-check) =="
 	bash -n $(EXP02_P24_RUNNER)
 	@test -x $(EXP02_P24_RUNNER)
 	@test -x $(EXP02_P24_ANALYZER)

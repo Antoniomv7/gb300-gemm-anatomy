@@ -6,9 +6,19 @@ Adapts the audited P1.4 design (``scripts/p14_safe_capture.py``,
 (``results/raw/exp02_umma_throughput_p24/``). Every raw-campaign write the
 P2.4 wrapper performs -- the NCU-help-capability-probe log, the
 metric-discovery logs, each case's captured NCU-bridge bundle and bridge
-stderr, and (after decoding) the seven per-case artifacts the bundle
-carries -- goes exclusively through this module, never a plain
-``>``/``>>``/``2>``/``2>>`` shell redirection into the raw tree. Every
+stderr, and (after decoding) the six per-case artifacts the bundle carries
+plus the seventh (``<case>.application.csv``, published separately by the
+bash runner via ``write``) -- goes exclusively through this module, never a
+plain ``>``/``>>``/``2>``/``2>>`` shell redirection into the raw tree. The
+frozen per-case inventory is exactly seven files (never eight): the
+bridge's own orchestration stderr -- captured separately from the bundle,
+since it is the *outer* ``run_exp02_umma_throughput_p24.sh``/
+``run_container.sh`` invocation's stderr, not one of the six bundle
+segments -- is folded into the published ``<case>.ncu_tool.log`` by
+``publish_ncu_bundle``'s optional ``bridge_stderr_name`` and never persists
+under its own name (audit repair: the runner previously published it
+separately as an unauthorized eighth ``<case>.ncu_bridge_stderr.log``
+file). Every
 directory component from the repository root down to ``logs/`` or
 ``profiles/<case>/`` is opened exactly once with Linux no-follow semantics
 (``os.open(..., dir_fd=parent_fd)`` with ``O_DIRECTORY | O_NOFOLLOW``); the
@@ -346,7 +356,25 @@ def decode_ncu_bundle(raw: bytes) -> dict[str, bytes]:
     return segments
 
 
-def publish_ncu_bundle(*, campaign_dir_rel: str, rel_dir: str, bundle_name: str, output_names: Sequence[str]) -> None:
+_BRIDGE_STDERR_FOLD_TARGET_SEGMENT = "ncu_tool_log"
+_BRIDGE_STDERR_FOLD_SEPARATOR = b"\n\n=== p24_ncu_bridge orchestration stderr (outer run_container.sh/bridge invocation) ===\n"
+
+
+def publish_ncu_bundle(
+    *, campaign_dir_rel: str, rel_dir: str, bundle_name: str, output_names: Sequence[str],
+    bridge_stderr_name: str | None = None,
+) -> None:
+    """Decodes an already-captured scripts/p24_ncu_bridge.py bundle and
+    republishes its six fixed segments under output_names, no-clobber. If
+    bridge_stderr_name is given, that already-anchored file (the *outer*
+    bridge invocation's own stderr, captured separately by a prior "run"
+    call -- never one of the six bundle segments) is read, and any non-empty
+    content is folded into the published ncu_tool_log artifact before it is
+    written for the first time, so orchestration-level diagnostics are never
+    silently discarded; the standalone bridge_stderr_name file is then
+    removed, so the case directory's published inventory never grows an
+    eighth file. Removing an empty bridge_stderr_name file loses nothing,
+    since it carried no content."""
     _validate_basename(bundle_name, what="--bundle-name")
     if len(output_names) != len(NCU_BUNDLE_SEGMENT_NAMES):
         raise UnsafeCaptureError(
@@ -354,6 +382,8 @@ def publish_ncu_bundle(*, campaign_dir_rel: str, rel_dir: str, bundle_name: str,
         )
     for output_name in output_names:
         _validate_basename(output_name, what="--names")
+    if bridge_stderr_name is not None:
+        _validate_basename(bridge_stderr_name, what="--bridge-stderr-name")
 
     dir_fd = resolve_campaign_rel_dir_fd(campaign_dir_rel, rel_dir)
     try:
@@ -374,9 +404,31 @@ def publish_ncu_bundle(*, campaign_dir_rel: str, rel_dir: str, bundle_name: str,
             os.close(bundle_fd)
 
         try:
-            segments = decode_ncu_bundle(raw)
+            segments = dict(decode_ncu_bundle(raw))
         except NcuBundleParseError as exc:
             raise UnsafeCaptureError(f"{bundle_name}: {exc}") from exc
+
+        bridge_stderr_identity: os.stat_result | None = None
+        if bridge_stderr_name is not None:
+            # Empty is the expected, common case (the bridge only ever
+            # writes to its own stderr on a diagnostic/error path); a
+            # non-empty capture is real orchestration-level evidence and
+            # must not be silently discarded.
+            try:
+                bridge_stderr_fd = os.open(bridge_stderr_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+            except OSError as exc:
+                raise UnsafeCaptureError(f"{bridge_stderr_name}: cannot open to fold into {_BRIDGE_STDERR_FOLD_TARGET_SEGMENT}: {exc}") from exc
+            try:
+                bridge_stderr_identity = os.fstat(bridge_stderr_fd)
+                if not stat.S_ISREG(bridge_stderr_identity.st_mode) or stat.S_ISLNK(bridge_stderr_identity.st_mode):
+                    raise UnsafeCaptureError(f"{bridge_stderr_name}: not a regular non-symlink file")
+                bridge_stderr_bytes = b"".join(iter(lambda: os.read(bridge_stderr_fd, 1 << 20), b""))
+            finally:
+                os.close(bridge_stderr_fd)
+            if bridge_stderr_bytes:
+                segments[_BRIDGE_STDERR_FOLD_TARGET_SEGMENT] = (
+                    segments[_BRIDGE_STDERR_FOLD_TARGET_SEGMENT] + _BRIDGE_STDERR_FOLD_SEPARATOR + bridge_stderr_bytes
+                )
 
         published: dict[str, os.stat_result] = {}
         try:
@@ -408,13 +460,18 @@ def publish_ncu_bundle(*, campaign_dir_rel: str, rel_dir: str, bundle_name: str,
             raise
 
         unlink_if_same_owned_inode(dir_fd, bundle_name, bundle_identity)
+        if bridge_stderr_name is not None and bridge_stderr_identity is not None:
+            unlink_if_same_owned_inode(dir_fd, bridge_stderr_name, bridge_stderr_identity)
     finally:
         os.close(dir_fd)
 
 
 def cmd_publish_bundle(args: argparse.Namespace) -> int:
     try:
-        publish_ncu_bundle(campaign_dir_rel=args.campaign_dir, rel_dir=args.rel_dir, bundle_name=args.bundle_name, output_names=args.names)
+        publish_ncu_bundle(
+            campaign_dir_rel=args.campaign_dir, rel_dir=args.rel_dir, bundle_name=args.bundle_name,
+            output_names=args.names, bridge_stderr_name=args.bridge_stderr_name,
+        )
     except UnsafeCaptureError as exc:
         print(f"p24_safe_capture: publish-bundle: ERROR: {exc}", file=sys.stderr)
         return 2
@@ -897,6 +954,86 @@ def run_self_test() -> int:
             )
             rec.check("publish-bundle removes the raw transport bundle after successfully republishing it", not (bundle_case_dir / "raw_bundle.bin").exists())
 
+            # --- bridge-stderr folding into ncu_tool_log (Defect 2 repair: the
+            # runner previously published this as an unauthorized eighth file,
+            # <case>.ncu_bridge_stderr.log) -------------------------------------
+            fold_case_name = p24.build_profile_plan()[2]["case_name"]
+            fold_case_dir = tmp_path / campaign_rel / "profiles" / fold_case_name
+            fold_case_rel = f"profiles/{fold_case_name}"
+            fd = resolve_profiles_root_fd(campaign_rel)
+            try:
+                mkdir_case_dir(fd, fold_case_name)
+            finally:
+                os.close(fd)
+            fold_bundle_script = tmp_path / "fake_bundle_emitter_fold.py"
+            fold_bundle_script.write_text("import sys\nsys.stdout.buffer.write(" + repr(encoded) + ")\n", encoding="utf-8")
+            run_capturing_outputs(
+                campaign_dir_rel=campaign_rel, rel_dir=fold_case_rel, stdout_name="raw_bundle_fold.bin", stderr_name=None,
+                combine_stderr=False, argv=[sys.executable, str(fold_bundle_script)],
+            )
+            write_stdin_safely(campaign_dir_rel=campaign_rel, rel_dir=fold_case_rel, name="bridge_stderr_nonempty.log", content=b"real bridge diagnostic output\n")
+            fold_output_names = [
+                f"{fold_case_name}.container_stdout.log", f"{fold_case_name}.container_stderr.log",
+                f"{fold_case_name}.ncu_tool.log", f"{fold_case_name}_report.ncu-rep",
+                f"{fold_case_name}.metrics_raw.csv", f"{fold_case_name}.metrics_export_stderr.log",
+            ]
+            publish_ncu_bundle(
+                campaign_dir_rel=campaign_rel, rel_dir=fold_case_rel, bundle_name="raw_bundle_fold.bin",
+                output_names=fold_output_names, bridge_stderr_name="bridge_stderr_nonempty.log",
+            )
+            fold_ncu_tool_log_bytes = (fold_case_dir / f"{fold_case_name}.ncu_tool.log").read_bytes()
+            rec.check(
+                "publish-bundle folds non-empty bridge stderr into the published ncu_tool_log artifact",
+                fold_ncu_tool_log_bytes.startswith(sample_segments["ncu_tool_log"]) and b"real bridge diagnostic output" in fold_ncu_tool_log_bytes,
+                detail=repr(fold_ncu_tool_log_bytes),
+            )
+            rec.check(
+                "publish-bundle removes the standalone bridge-stderr file after folding it in (never an eighth published file)",
+                not (fold_case_dir / "bridge_stderr_nonempty.log").exists(),
+            )
+            rec.check(
+                "the case directory ends up with exactly the six bundle-derived artifacts (no eighth file)",
+                sorted(p.name for p in fold_case_dir.iterdir()) == sorted(fold_output_names),
+            )
+
+            fold_empty_case_name = p24.build_profile_plan()[3]["case_name"]
+            fold_empty_case_dir = tmp_path / campaign_rel / "profiles" / fold_empty_case_name
+            fold_empty_case_rel = f"profiles/{fold_empty_case_name}"
+            fd = resolve_profiles_root_fd(campaign_rel)
+            try:
+                mkdir_case_dir(fd, fold_empty_case_name)
+            finally:
+                os.close(fd)
+            fold_empty_bundle_script = tmp_path / "fake_bundle_emitter_fold_empty.py"
+            fold_empty_bundle_script.write_text("import sys\nsys.stdout.buffer.write(" + repr(encoded) + ")\n", encoding="utf-8")
+            run_capturing_outputs(
+                campaign_dir_rel=campaign_rel, rel_dir=fold_empty_case_rel, stdout_name="raw_bundle_fold_empty.bin", stderr_name=None,
+                combine_stderr=False, argv=[sys.executable, str(fold_empty_bundle_script)],
+            )
+            write_stdin_safely(campaign_dir_rel=campaign_rel, rel_dir=fold_empty_case_rel, name="bridge_stderr_empty.log", content=b"", allow_empty=True)
+            fold_empty_output_names = [
+                f"{fold_empty_case_name}.container_stdout.log", f"{fold_empty_case_name}.container_stderr.log",
+                f"{fold_empty_case_name}.ncu_tool.log", f"{fold_empty_case_name}_report.ncu-rep",
+                f"{fold_empty_case_name}.metrics_raw.csv", f"{fold_empty_case_name}.metrics_export_stderr.log",
+            ]
+            publish_ncu_bundle(
+                campaign_dir_rel=campaign_rel, rel_dir=fold_empty_case_rel, bundle_name="raw_bundle_fold_empty.bin",
+                output_names=fold_empty_output_names, bridge_stderr_name="bridge_stderr_empty.log",
+            )
+            fold_empty_ncu_tool_log_bytes = (fold_empty_case_dir / f"{fold_empty_case_name}.ncu_tool.log").read_bytes()
+            rec.check(
+                "publish-bundle leaves ncu_tool_log content unchanged when the bridge-stderr file is empty",
+                fold_empty_ncu_tool_log_bytes == sample_segments["ncu_tool_log"], detail=repr(fold_empty_ncu_tool_log_bytes),
+            )
+            rec.check(
+                "publish-bundle removes an empty standalone bridge-stderr file too (nothing lost, nothing left behind)",
+                not (fold_empty_case_dir / "bridge_stderr_empty.log").exists(),
+            )
+            rec.check(
+                "publish-bundle with no bridge_stderr_name at all still publishes exactly six artifacts (unchanged default behavior)",
+                sorted(p.name for p in fold_empty_case_dir.iterdir()) == sorted(fold_empty_output_names),
+            )
+
             malformed_script = tmp_path / "fake_malformed_bundle_emitter.py"
             malformed_script.write_text("import sys\nsys.stdout.buffer.write(b'not a real bundle')\n", encoding="utf-8")
             run_capturing_outputs(
@@ -962,6 +1099,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     bundle_parser.add_argument(
         "--names", required=True, nargs=len(NCU_BUNDLE_SEGMENT_NAMES), metavar=tuple(n.upper() for n in NCU_BUNDLE_SEGMENT_NAMES),
         help="Exactly " + str(len(NCU_BUNDLE_SEGMENT_NAMES)) + " output names, in fixed order " + str(NCU_BUNDLE_SEGMENT_NAMES) + ".",
+    )
+    bundle_parser.add_argument(
+        "--bridge-stderr-name", default=None,
+        help="Optional: an already-anchored file holding the outer bridge invocation's own stderr; "
+        "non-empty content is folded into the published ncu_tool_log artifact and the standalone file "
+        "is removed, so the case directory never grows an eighth published file.",
     )
     bundle_parser.set_defaults(func=cmd_publish_bundle)
 

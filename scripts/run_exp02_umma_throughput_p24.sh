@@ -642,9 +642,14 @@ if [ "${PROFILE_COUNT}" -eq 1 ]; then
             fail_run "NCU bridge failed for ${p_case_name}; see ${case_dir}/${bridge_stderr_name}"
         fi
 
+        # --bridge-stderr-name folds this already-captured orchestration
+        # stderr into the published <case>.ncu_tool.log and removes the
+        # standalone file, so the case directory ends up with exactly the
+        # seven canonical artifacts -- never an eighth
+        # <case>.ncu_bridge_stderr.log (audit repair).
         if ! python3 "${P24_SAFE_CAPTURE}" publish-bundle \
                 --campaign-dir "${CAMPAIGN_REL}" --rel-dir "${rel_case_dir}" \
-                --bundle-name "${bundle_name}" \
+                --bundle-name "${bundle_name}" --bridge-stderr-name "${bridge_stderr_name}" \
                 --names "${container_stdout_name}" "${container_stderr_name}" \
                         "${p_case_name}.ncu_tool.log" "${p_case_name}_report.ncu-rep" \
                         "${p_case_name}.metrics_raw.csv" "${p_case_name}.metrics_export_stderr.log"; then

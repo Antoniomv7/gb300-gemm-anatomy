@@ -14,7 +14,12 @@ Compute, and computes deterministic statistics, clock-calibrated TFLOP/s,
 1-SM/2-SM scaling, candidate depth saturation, and an empirical per-SM BF16
 Tensor Core ceiling *candidate*.
 
-**Status: implemented. Independent audit: pending. GB300 verification:
+**Status: implemented; a first independent GPU-free audit found seven
+evidence-integrity and validation defects (provenance binding, the
+per-case profile inventory, SM-count device extrapolation, P2.3 pilot
+trust, analysis-publication retryability, the publication-status token,
+and the P2.4 Make gate), all repaired GPU-free (see sections 2.1, 5.1,
+6.3, 7, 7.1, and 7.2). Independent re-audit: pending. GB300 verification:
 pending. No P2.4 campaign has been executed. No empirical ceiling has been
 measured. Publishable results: NONE. Phase 2: not closed.**
 
@@ -98,11 +103,69 @@ results/raw/exp02_umma_throughput_p24/<campaign-id>/   (owned by P2.4)
 `record-pilot` validates the P2.3 campaign's manifest (`status=COMPLETE`,
 `run_kind=benchmark`, `requested.iterations=1000`,
 `requested.warmup_iterations=10`, `requested.repetitions=30`,
-`configuration_count_completed=24`, matching `git_commit`, and matching
+`configuration_count_completed=24`, matching `git_commit`, a P2.3 campaign
+directory name equal to this P2.4 campaign's own ID, and matching
 `gpu_uuid`/`gpu_name`/`compute_capability` against the pilot preflight) and
 records a reference to it (campaign ID, path, and SHA-256 of
 `manifest.json`, `combined_samples.csv`, and `summary.csv`) -- it never
 reimplements or rewrites P2.3's own files.
+
+### 2.1 Independent, read-only P2.3 pilot revalidation (repair)
+
+`record-pilot` accepting a valid manifest and matching aggregate-file
+hashes is necessary but not sufficient: P2.4 must not trust the closed P2.3
+campaign merely because its own manifest and file hashes claim to be
+valid. `revalidate_p23_pilot_campaign()` is a read-only P2.4-side verifier,
+built entirely from `scripts/aggregate_exp02_umma_throughput.py`'s own
+exported protocol/schema functions (`build_plan`, `scan_case_directory`,
+`validate_execution_order_file`, `validate_case_file`,
+`check_cross_case_consistency`, `write_combined_samples`, `write_summary`,
+`sha256_of`, ...) -- it changes no P2.3 runner, aggregator, or schema file,
+and never repairs, removes, or replaces any P2.3 evidence; any defect
+rejects the whole P2.4 campaign closed. It independently re-derives, fresh
+from the raw `cases/` directory and `execution_order.csv` on disk (never
+from `combined_samples.csv`/`summary.csv` alone):
+
+* the exact files/directory inventory (`scan_case_directory`: no missing,
+  extra, duplicate, non-canonically-named, or symlinked case file);
+* the exact 24-configuration canonical plan and order
+  (`validate_execution_order_file`);
+* exactly 30 retained samples per configuration, 720 total, with no
+  missing, duplicate, or extra row and canonical `sample_index` values
+  (`validate_case_file`, one call per case against that case's own
+  `_expect_for_entry()`);
+* method, M, N, K, depth, CTA group, run kind, iterations, warmup
+  iterations, repetitions, correctness/mismatches, and full commit and GPU
+  provenance for every one of the 720 rows (the same `FIELD_VALIDATORS`
+  P2.3's own `finalize` uses, plus `check_cross_case_consistency` against
+  one single reference row);
+* every stored derived formula (`cycles_per_umma`, `flops_per_cycle`,
+  `total_umma`, `total_flops`, ...), recomputed from its raw inputs by
+  `validate_case_file`'s own formula checks;
+* agreement between the 720 raw sample rows, `combined_samples.csv`, and
+  `summary.csv`: both aggregate files are independently regenerated in a
+  private temporary directory with P2.3's own `write_combined_samples`/
+  `write_summary` and compared byte-for-byte against what P2.3 actually
+  published -- proving every derived statistic, not only the ones
+  `validate_case_file` spot-checks per row;
+* SHA-256 hashes of every trusted input (each of the 24 case files,
+  `execution_order.csv`, `combined_samples.csv`, `summary.csv`,
+  `manifest.json`), recomputed from disk and cross-checked against P2.3's
+  own recorded `case_file_sha256`/`execution_order_sha256`/
+  `aggregate_file_sha256`.
+
+Integer, categorical, and hash fields are compared exactly; the recomputed
+aggregate files are compared byte-for-byte (not field-by-field), which is
+strict enough to detect an altered formula while tolerating only the
+serialization behavior the closed P2.3 `write_combined_samples`/
+`write_summary` implementation itself already produces (no separate
+floating-point tolerance is introduced by this verifier). This
+revalidation runs before both `finalize-profile` (immediately before
+`COMPLETE`) and `analyze` (once at the start, and again immediately before
+its final manifest revision, mirroring the evidence-integrity gate's own
+two-point placement) -- a P2.3 pilot campaign that was valid at
+`record-pilot` time but tampered afterward fails the P2.4 campaign closed
+(terminally `FAILED`) the next time either subcommand runs.
 
 ## 3. Frozen 24-case profile plan and kernel-symbol derivation
 
@@ -259,15 +322,62 @@ moment of the check: a non-empty, non-symlink regular JSON file;
 `overall_status == "PASS"`; fresh within 24 hours; `git_dirty == false`; a
 full 40-character commit equal to the current, clean `HEAD`; compute
 capability `10.3`; exactly one visible logical GPU
-(`checks.gpu_visibility.status == "PASS"`); `checks.ncu_profile.status ==
-"PASS"`. `compare_preflight_provenance()` requires the same `git_commit`,
-GPU UUID, GPU name, compute capability, and driver version across the
-pilot-phase and profiling-phase preflight snapshots, enforced twice: once
-by the GPU-free `validate-profile-preconditions` subcommand before any
-Docker/NCU invocation, and again by `discover-metrics` itself as a hard
-gate at the exact point the campaign commits to `PROFILE_IN_PROGRESS`.
-Never stores secrets, unrelated host metadata, usernames, or absolute
-home/repository paths.
+(`checks.gpu_visibility.status == "PASS"`, which itself only ever reaches
+`PASS` after `preflight.sh` confirms `nvidia-smi` enumerated exactly one
+GPU row -- `visible_device_count` in every snapshot below is this already-
+enforced fact, recorded explicitly, never independently guessed);
+`gpu.logical_index == "0"`; `checks.ncu_profile.status == "PASS"`.
+`compare_preflight_provenance()` requires the same `git_commit`, GPU UUID,
+GPU name, compute capability, driver version, logical device index, and
+visible-device count across the pilot-phase and profiling-phase preflight
+snapshots, enforced twice: once by the GPU-free
+`validate-profile-preconditions` subcommand before any Docker/NCU
+invocation, and again by `discover-metrics` itself as a hard gate at the
+exact point the campaign commits to `PROFILE_IN_PROGRESS`. Never stores
+secrets, unrelated host metadata, usernames, or absolute home/repository
+paths.
+
+### 5.1 The immutable campaign provenance tuple and strict per-profile comparison (repair)
+
+`record-pilot` builds one immutable campaign provenance tuple, written once
+to the manifest's `provenance` field at `PILOT_COMPLETE` and never
+changed afterward: full 40-character `git_commit`, `gpu_uuid`, `gpu_name`,
+`compute_capability`, `cuda_driver_version`, `cuda_runtime_version` (all
+five sourced from the P2.3 pilot's own recorded, preflight-cross-checked
+manifest, not from this campaign's own preflight, which lacks a CUDA
+runtime-version field), `visible_device_count` and `logical_device_index`
+(from the validated pilot preflight snapshot), and `campaign_id` (this
+P2.4 campaign directory's own name). `validate_provenance_tuple()`
+requires every one of these nine fields to be present (checked by key
+membership, never truthiness -- an absent field and one holding JSON
+`null` are never equivalent), non-null, correctly typed, and -- for
+`git_commit`/`gpu_uuid`/`visible_device_count`/`logical_device_index` --
+individually well-formed (`visible_device_count` must equal `1`;
+`logical_device_index` must equal `0`). `record-pilot` also requires the
+P2.3 campaign's own directory name to equal this P2.4 campaign's name (one
+explicit shared `P2_4_CAMPAIGN_ID`), and rejects a mismatch before ever
+constructing the tuple.
+
+For every one of the 24 profiled cases, `compare_application_provenance()`
+compares that case's own **independently parsed** `application.csv` row
+-- never a value copied from the campaign tuple itself, which would make
+the comparison vacuous -- against the immutable tuple: `git_commit`,
+`gpu_uuid`, `gpu_name`, `compute_capability`, `cuda_driver_version`, and
+`cuda_runtime_version` must all match exactly (driver/runtime compared as
+strings, so an integer-vs-string type difference from either source never
+causes a false mismatch). A mismatch on any field -- including the
+originally audited case, an application row reporting a different GPU
+UUID than the campaign -- is rejected. The reconstructed `case_results`
+entry additionally records these six fields under an `application_`
+prefix (`application_git_commit`, `application_gpu_uuid`, ...), so the
+comparison's own inputs are visible in the manifest for audit, and so a
+later re-reconstruction from raw evidence re-derives and re-compares them
+identically. This whole gate -- tuple well-formedness plus all 24
+per-case comparisons -- runs inside `verify_campaign_evidence_integrity()`,
+itself re-run immediately before `COMPLETE` (via `finalize-profile`) and
+twice more immediately before publishing `ANALYZED`/`INCONCLUSIVE` (once
+at the start of `analyze`, once again immediately before its final
+manifest revision).
 
 ## 6. Required calculations (frozen formulas)
 
@@ -347,17 +457,38 @@ estimated_local_tflops  = median_flops_per_cycle * sm_clock_hz / 1e12
 estimated_tflops_per_sm = estimated_local_tflops / cta_group
 ```
 
-A device-wide extrapolation is emitted only when a trustworthy SM-count
-attribute (`device__attribute_multiprocessor_count`) resolves and is
-identical across every profiled configuration that reported it:
+A device-wide extrapolation is available only when `evaluate_device_
+multiprocessor_count()` -- `device__attribute_multiprocessor_count` -- finds
+that **every one of the 24 profiled cases**, without exception, independently
+reports exactly one value that is: present; a real number (never a bool);
+finite; strictly positive; mathematically integral (no truncation or
+rounding); and in the documented unit representation (an empty/blank unit,
+matching this raw device attribute's real NCU 2025.4 `--page raw --csv`
+output -- any other unit string is rejected outright, never rescaled or
+guessed). If all 24 values pass those checks, they must additionally all be
+identical (repair: the pre-repair implementation extrapolated from
+whichever subset of profiles happened to agree, including a single
+profile out of 24, and never checked finiteness, positivity, or
+integrality at all):
 
 ```text
 estimated_device_equivalent_tflops = estimated_tflops_per_sm * multiprocessor_count
 ```
 
-always labelled an extrapolation from a one-/two-SM microbenchmark, never a
-directly measured whole-GPU throughput, and never a theoretical
-architectural peak.
+Any missing, non-finite, non-positive, non-integral, wrong-unit, or
+mutually inconsistent value in **any** one of the 24 cases suppresses only
+`device_equivalent_estimate` (`available: false`, with a deterministic
+per-case reason recorded in JSON, CSV validation output, and `report.md`);
+it never suppresses or corrupts `estimated_local_tflops`/
+`estimated_tflops_per_sm` for any configuration, since the SM count is
+optional evidence used only for the whole-device figure. A duplicate or
+ambiguous `device__attribute_multiprocessor_count` column within one
+case's own raw metrics CSV is rejected at the NCU CSV-parsing layer itself
+(the same ambiguous-canonical-metric-mapping rule applied to every
+candidate metric), before this evaluation ever runs. The device-wide
+figure is always labelled an extrapolation from a one-/two-SM
+microbenchmark, never a directly measured whole-GPU throughput, and never
+a theoretical architectural peak.
 
 ### 6.4 The INCONCLUSIVE outcome
 
@@ -453,17 +584,98 @@ Before both `COMPLETE` and publishing `ANALYZED`/`INCONCLUSIVE`,
 `verify_campaign_evidence_integrity()` re-opens the campaign directory,
 `profiles/`, and every case directory with descriptor-anchored, no-follow
 resolution (held open for the whole check), confirms `profiles/` contains
-exactly the 24 canonical case directories, re-hashes every trusted input
-fresh from disk, reconstructs every case's complete result from its raw
-evidence alone, and compares the reconstruction against what is recorded
-via a strict recursive structural comparison (exact key sets, exact types,
-never `dict.get()`-based equality) -- so a validated artifact, or any single
+exactly the 24 canonical case directories, confirms **every one of those
+24 case directories itself contains exactly the seven canonical
+per-case artifacts above -- no missing, extra, duplicate, symlinked, or
+wrong-type entry** (`_check_case_directory_inventory`; repair -- the
+pre-repair finalizer opened and hashed only three of the seven, and the
+runner separately published an unauthorized eighth
+`<case>.ncu_bridge_stderr.log`, now folded into the published
+`<case>.ncu_tool.log` by `scripts/p24_safe_capture.py`'s `publish-bundle
+--bridge-stderr-name` and never persisted under its own name -- see
+section 4.3), re-hashes all seven files of all 24 cases fresh from disk,
+reconstructs every case's complete result from its raw evidence alone
+(including the strict campaign-provenance comparison of section 5.1), and
+compares the reconstruction against what is recorded via a strict
+recursive structural comparison (exact key sets, exact types, never
+`dict.get()`-based equality) -- so a validated artifact, or any single
 recorded derived value, modified after the fact is rejected rather than
-silently accepted. `analyze()` re-runs this gate a second time, immediately
-before publishing the terminal state, so evidence that changed *while
-analysis itself was running* is also caught; on failure, the analysis
-artifacts just written are removed (ownership/identity-checked, never an
-unfamiliar replacement) and no terminal state is published.
+silently accepted. `analyze()` re-runs this gate, and the independent P2.3
+pilot revalidation of section 2.1, a second time immediately before
+publishing the terminal state, so evidence that changed *while analysis
+itself was running* is also caught; on failure, the analysis artifacts
+just written are removed (ownership/identity-checked, never an unfamiliar
+replacement) and no terminal state is published.
+
+### 7.1 Deterministic, no-clobber, resumable analysis publication (repair)
+
+The pre-repair `analyze()` could publish all ten `analysis/*` artifacts
+and then fail the final manifest transition (e.g. a process interruption
+between the last artifact write and the `ANALYZED` manifest revision); the
+next invocation rejected every one of the ten artifacts merely because
+they already existed, permanently blocking the campaign. `analyze()` is
+now safely retryable at any of these points:
+
+1. **Before anything is written**, the complete `ANALYZED`/`INCONCLUSIVE`
+   transition eligibility is validated: the manifest hash chain, the full
+   evidence-integrity gate (including the strict per-profile provenance
+   comparison), and the independent P2.3 pilot revalidation.
+2. All ten output byte streams are derived deterministically, in memory,
+   from that freshly validated raw evidence, before any filesystem write
+   is attempted.
+3. If `analysis/` does not yet exist, or exists but is missing some
+   artifacts, only the missing artifacts are created, each exclusively
+   (`O_EXCL`, no-clobber, hard-link-then-unlink publish, never
+   `os.replace()`). Every already-present artifact is resolved first
+   (`_resolve_retryable_artifact`): a genuine, non-symlink, regular file
+   whose on-disk bytes exactly equal the freshly recomputed content is
+   left completely untouched (`"skip"`); anything else -- a symlink, a
+   wrong file type, unreadable content, or content that differs from the
+   fresh recomputation -- is a `"conflict"` that fails the *entire* call
+   closed before any artifact is created, overwritten, or deleted. An
+   unexpected entry under `analysis/` (e.g. an orphaned `.tmp` from a
+   crash mid-write) is likewise rejected outright, never silently ignored
+   or cleaned up.
+4. If every one of the ten artifacts already exists and matches, but the
+   manifest still says `COMPLETE` (only the final transition was
+   interrupted), all ten are still re-hashed fresh from disk and the
+   missing `ANALYZED`/`INCONCLUSIVE` manifest revision is appended safely.
+5. If the manifest already says `ANALYZED`/`INCONCLUSIVE`, `analyze()`
+   performs a **pure revalidation**: every one of the ten artifacts is
+   recomputed and compared byte-for-byte against what is on disk, and the
+   manifest's own recorded `artifact_sha256` entries are compared against
+   freshly recomputed hashes; success is returned only if everything
+   matches, without writing, overwriting, deleting, or appending a new
+   manifest revision. If the freshly recomputed outcome
+   (`ANALYZED`/`INCONCLUSIVE`) would differ from what is already recorded,
+   or if any artifact the manifest claims exists is actually missing, this
+   is treated as a real contradiction and rejected closed.
+6. `os.replace()` is never used for evidence, artifacts, or manifest
+   revisions anywhere in this path.
+
+A clean retry never changes the bytes or the inode of an artifact a prior,
+possibly-interrupted attempt already safely published. A retry over
+altered, partial, symlinked, or otherwise unexpected evidence always fails
+closed rather than overwriting or deleting anything.
+
+### 7.2 Publication status: `publishable=false` in every artifact (repair)
+
+Every one of the ten `analysis/*` artifacts carries the exact ASCII token
+`publishable=false` (`PUBLICATION_STATUS_TOKEN`) in a format-appropriate,
+machine-readable field, in addition to any existing descriptive text:
+`configuration_statistics.csv`, `scaling.csv`, `saturation.csv`, and
+`profile_validation.csv` each carry a `publication_status` column whose
+value is the literal token on every row; `empirical_ceiling.json` and
+`analysis_manifest.json` each retain their existing boolean
+`"publishable": false` field and additionally carry a string
+`"publication_status"` field equal to the exact token; `report.md`
+carries an explicit `` `publishable=false` `` status line (distinct from
+its existing prose); `throughput.svg`, `scaling_efficiency.svg`, and
+`saturation.svg` each carry the token in a deterministic
+`<metadata>publishable=false</metadata>` element. No artifact ever
+contains or implies `publishable=true`. This never changes the scientific
+status: every P2.4 artifact remains a non-publishable pilot and empirical-
+ceiling candidate.
 
 ## 8. Safety and evidence integrity
 
@@ -505,6 +717,14 @@ python3 scripts/p24_ncu_bridge.py --self-test
 make compute-umma-p24-plan
 make compute-umma-p24-check
 ```
+
+`make compute-umma-p24-check` (repair) has a real Make prerequisite on all
+three earlier GPU-free validation gates -- `compute-umma-1sm-check`,
+`compute-umma-2sm-check`, and `compute-umma-sweep-check` (P2.1/P2.2/P2.3
+respectively) -- reused as-is, not duplicated, and never invoking a
+benchmark, NCU profiling, or GPU selection; a regression in any of the
+three earlier gates now fails `compute-umma-p24-check` before any
+P2.4-specific check runs.
 
 GB300-executing (not yet run; requires an explicit, conservatively verified
 free physical GPU and a fresh preflight):
@@ -551,7 +771,15 @@ Phase 2 gate passing.
   one-profile-pass campaign -- not a final architectural peak, and a
   one-/two-SM device-wide extrapolation (when emitted at all) is explicitly
   labelled as such, never a directly measured whole-device throughput.
-* This document, the five new files it describes, and the Make/documentation
-  updates around them have not yet been independently audited or exercised
-  on GB300 hardware. Every claim of correctness above is a design claim
-  backed by GPU-free synthetic/adversarial self-tests only.
+* This document, the five files it describes, and the Make/documentation
+  updates around them have not yet been independently *re*-audited or
+  exercised on GB300 hardware. A first independent GPU-free audit found
+  seven defects (strict campaign-provenance binding, the seven-file
+  per-case profile inventory, the all-24-profiles SM-count extrapolation
+  rule, independent P2.3 pilot revalidation, resumable analysis
+  publication, the `publishable=false` token in every artifact, and the
+  P2.4 Make gate not executing the P2.1-P2.3 gates); all seven were
+  repaired GPU-free, each with new adversarial regression tests that
+  exercise the originally reproduced failure mode. Every claim of
+  correctness above is a design claim backed by GPU-free
+  synthetic/adversarial self-tests only.

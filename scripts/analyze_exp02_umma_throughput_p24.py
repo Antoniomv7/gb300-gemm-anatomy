@@ -66,6 +66,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -112,9 +113,16 @@ FROZEN_PROFILE_PARAMS = {
 
 MANDATORY_SM_CLOCK_METRIC = "sm__cycles_elapsed.avg.per_second"
 EXPECTED_SM_CLOCK_UNIT = "cycle/nsecond"
+DEVICE_MULTIPROCESSOR_COUNT_METRIC = "device__attribute_multiprocessor_count"
+# A raw device attribute count has no physical unit; the pinned NCU 2025.4
+# build leaves this column blank (verified against real --page raw --csv
+# output). Never rescaled or guessed: any other unit representation is
+# rejected outright, exactly like the mandatory SM-clock metric's own unit
+# policy (EXPECTED_SM_CLOCK_UNIT).
+EXPECTED_MULTIPROCESSOR_COUNT_UNIT = ""
 DIAGNOSTIC_METRICS = (
     "gpu__time_duration.sum",
-    "device__attribute_multiprocessor_count",
+    DEVICE_MULTIPROCESSOR_COUNT_METRIC,
     "sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_elapsed",
     "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed",
     "sm__inst_executed_pipe_tensor.sum",
@@ -200,7 +208,31 @@ CASE_ARTIFACT_HASH_FIELDS: tuple[str, ...] = (
     "application_csv_sha256",
     "metrics_csv_sha256",
     "ncu_rep_sha256",
+    "ncu_tool_log_sha256",
+    "container_stdout_log_sha256",
+    "container_stderr_log_sha256",
+    "metrics_export_stderr_log_sha256",
 )
+
+# The frozen, exhaustive seven-file per-case profile inventory
+# (src/compute/P2_4_PROTOCOL.md section 7). Defect-2 repair: the finalizer
+# previously opened/validated only three of these seven, and the runner
+# separately published an unauthorized eighth file
+# (<case>.ncu_bridge_stderr.log, folded into <case>.ncu_tool.log instead --
+# see scripts/p24_safe_capture.py's publish_ncu_bundle()).
+CANONICAL_PROFILE_CASE_FILE_LABELS: tuple[tuple[str, str], ...] = (
+    ("ncu_rep", "_report.ncu-rep"),
+    ("ncu_tool_log", ".ncu_tool.log"),
+    ("container_stdout_log", ".container_stdout.log"),
+    ("container_stderr_log", ".container_stderr.log"),
+    ("application_csv", ".application.csv"),
+    ("metrics_csv", ".metrics_raw.csv"),
+    ("metrics_export_stderr_log", ".metrics_export_stderr.log"),
+)
+
+
+def canonical_profile_case_filenames(case_name: str) -> tuple[str, ...]:
+    return tuple(f"{case_name}{suffix}" for _label, suffix in CANONICAL_PROFILE_CASE_FILE_LABELS)
 
 ANALYSIS_ARTIFACT_RELATIVE_PATHS: tuple[str, ...] = (
     "analysis/configuration_statistics.csv",
@@ -344,10 +376,23 @@ def validate_preflight_fields(doc: dict, *, expected_git_commit: str, now_utc: _
         errors.append(f"gpu.uuid={uuid!r} is not a canonical GPU-xxxxxxxx-... UUID")
     if gpu.get("compute_cap") != "10.3":
         errors.append(f"gpu.compute_cap={gpu.get('compute_cap')!r} != '10.3'")
+    # Defect-1 repair: AGENTS.md requires exactly one GPU visible inside the
+    # container, exposed as CUDA logical device 0. preflight.sh's own
+    # gpu_visibility check already fails closed (VISIBLE_GPU_COUNT_<n>)
+    # whenever nvidia-smi --query-gpu reports other than exactly one row, so
+    # checks.gpu_visibility==PASS (checked below) already proves "exactly
+    # one visible logical GPU" -- visible_device_count is recorded as an
+    # explicit, independently-labeled fact of that already-enforced
+    # invariant, never fabricated independently of it. gpu.logical_index
+    # (the sole visible GPU's own index, as nvidia-smi enumerates it inside
+    # the container) must additionally equal "0".
+    if gpu.get("logical_index") != "0":
+        errors.append(f"gpu.logical_index={gpu.get('logical_index')!r} != '0' (exactly one GPU must be visible, as CUDA logical device 0)")
     snapshot["gpu_uuid"] = gpu.get("uuid")
     snapshot["gpu_name"] = gpu.get("name")
     snapshot["gpu_driver_version"] = gpu.get("driver_version")
     snapshot["gpu_compute_cap"] = gpu.get("compute_cap")
+    snapshot["gpu_logical_index"] = gpu.get("logical_index")
 
     checks = doc.get("checks")
     check_status: dict[str, object] = {}
@@ -361,6 +406,14 @@ def validate_preflight_fields(doc: dict, *, expected_git_commit: str, now_utc: _
         errors.append(f"checks.gpu_visibility={check_status.get('gpu_visibility')!r} != 'PASS'")
     if check_status.get("ncu_profile") != "PASS":
         errors.append(f"checks.ncu_profile={check_status.get('ncu_profile')!r} != 'PASS'")
+    # visible_device_count is derived, not read from a dedicated JSON field:
+    # preflight.sh (Phase 0, frozen -- never modified by this repair) has no
+    # such field, but its gpu_visibility check can only ever reach PASS after
+    # confirming nvidia-smi enumerated exactly one GPU row, so PASS is itself
+    # the proof. Recorded only once every field-level error above is absent,
+    # so a malformed/failing preflight never fabricates a trustworthy count.
+    if not errors and check_status.get("gpu_visibility") == "PASS":
+        snapshot["visible_device_count"] = 1
 
     ts = doc.get("timestamp_utc")
     if not isinstance(ts, str) or not P24_TIMESTAMP_RE.fullmatch(ts):
@@ -400,7 +453,10 @@ def validate_preflight_file(path: Path, *, expected_git_commit: str, now_utc: _d
     return [], snapshot
 
 
-PREFLIGHT_PROVENANCE_FIELDS = ("git_commit", "gpu_uuid", "gpu_name", "gpu_compute_cap", "gpu_driver_version")
+PREFLIGHT_PROVENANCE_FIELDS = (
+    "git_commit", "gpu_uuid", "gpu_name", "gpu_compute_cap", "gpu_driver_version",
+    "gpu_logical_index", "visible_device_count",
+)
 
 
 def compare_preflight_provenance(pilot_snapshot: dict, profile_snapshot: dict) -> list[str]:
@@ -412,6 +468,96 @@ def compare_preflight_provenance(pilot_snapshot: dict, profile_snapshot: dict) -
             errors.append(
                 f"profile preflight {field}={profile_value!r} != pilot preflight {field}={pilot_value!r} "
                 f"(the pilot and profiling phases of one campaign must run on the identical GPU/driver/commit)"
+            )
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# Defect-1 repair: the immutable campaign provenance tuple. Every profile
+# case's own, independently-reported application evidence must be compared
+# against this tuple (never the reverse -- this tuple is never copied
+# *into* a case's derived output as if that were "validation"). Presence is
+# checked by key membership, never truthiness, so an absent field and one
+# holding JSON `null` are never treated as equivalent.
+# ---------------------------------------------------------------------------
+MANDATORY_PROVENANCE_FIELDS: tuple[str, ...] = (
+    "git_commit", "gpu_uuid", "gpu_name", "compute_capability",
+    "cuda_driver_version", "cuda_runtime_version",
+    "visible_device_count", "logical_device_index", "campaign_id",
+)
+PROVENANCE_FIELD_TYPES: dict[str, tuple[type, ...]] = {
+    "git_commit": (str,), "gpu_uuid": (str,), "gpu_name": (str,), "compute_capability": (str,),
+    "cuda_driver_version": (str, int), "cuda_runtime_version": (str, int),
+    "visible_device_count": (int,), "logical_device_index": (int,), "campaign_id": (str,),
+}
+# Application-CSV field -> campaign-provenance-tuple field. Both sides use
+# the identical underlying measurement (the profiled binary's own
+# cudaDriverGetVersion()/cudaRuntimeGetVersion()/device-query report), so an
+# equality comparison is meaningful; driver_version as reported by
+# nvidia-smi (a human-readable package version string) is a *different*
+# measurement and is intentionally never compared here.
+APPLICATION_PROVENANCE_FIELD_MAP: tuple[tuple[str, str], ...] = (
+    ("git_commit", "git_commit"),
+    ("gpu_uuid", "gpu_uuid"),
+    ("gpu_name", "gpu_name"),
+    ("compute_capability", "compute_capability"),
+    ("cuda_driver_version", "cuda_driver_version"),
+    ("cuda_runtime_version", "cuda_runtime_version"),
+)
+
+
+def validate_provenance_tuple(provenance: object, *, label: str) -> list[str]:
+    """Requires every MANDATORY_PROVENANCE_FIELD to be present (by key, not
+    truthiness), non-null, and correctly typed. Does not compare values to
+    anything; only proves the tuple itself is well-formed enough to compare
+    against. Returns a non-empty error list for anything else, including a
+    non-dict input."""
+    if not isinstance(provenance, dict):
+        return [f"{label}: must be an object, got {type(provenance).__name__}"]
+    errors: list[str] = []
+    for field in MANDATORY_PROVENANCE_FIELDS:
+        if field not in provenance:
+            errors.append(f"{label}.{field}: absent (mandatory campaign provenance field)")
+            continue
+        value = provenance[field]
+        if value is None:
+            errors.append(f"{label}.{field}: is null (an absent field and a null field are never equivalent; this field is mandatory)")
+            continue
+        allowed_types = PROVENANCE_FIELD_TYPES[field]
+        if isinstance(value, bool) or not isinstance(value, allowed_types):
+            errors.append(f"{label}.{field}={value!r}: wrong type {type(value).__name__}, expected one of {[t.__name__ for t in allowed_types]}")
+            continue
+        if field == "git_commit" and not p23.GIT_COMMIT_RE.fullmatch(value):
+            errors.append(f"{label}.{field}={value!r}: not a 40-character lowercase hex commit")
+        if field == "gpu_uuid" and not p23.GPU_UUID_RE.fullmatch(value):
+            errors.append(f"{label}.{field}={value!r}: not a canonical GPU-xxxxxxxx-... UUID")
+        if field == "visible_device_count" and value != 1:
+            errors.append(f"{label}.{field}={value!r}: must be exactly 1 (exactly one GPU must ever be visible)")
+        if field == "logical_device_index" and value != 0:
+            errors.append(f"{label}.{field}={value!r}: must be exactly 0 (the visible GPU must be CUDA logical device 0)")
+    return errors
+
+
+def compare_application_provenance(*, app_row: dict[str, str], campaign_provenance: dict, label: str) -> list[str]:
+    """Compares one profiled application CSV row's own, independently
+    reported identity fields against the already-validated immutable
+    campaign provenance tuple. app_row must come from freshly parsed raw
+    evidence (never from campaign_provenance itself, which would make this
+    comparison vacuous); this is the check that closes the originally
+    audited cross-GPU-UUID defect. campaign_provenance is assumed already
+    passed through validate_provenance_tuple by the caller."""
+    errors: list[str] = []
+    for row_field, provenance_field in APPLICATION_PROVENANCE_FIELD_MAP:
+        row_value = app_row.get(row_field)
+        provenance_value = campaign_provenance.get(provenance_field)
+        if row_field in ("cuda_driver_version", "cuda_runtime_version"):
+            matches = row_value is not None and provenance_value is not None and str(row_value) == str(provenance_value)
+        else:
+            matches = row_value == provenance_value
+        if not matches:
+            errors.append(
+                f"{label}: application {row_field}={row_value!r} != campaign provenance {provenance_field}={provenance_value!r} "
+                f"(this profile's own evidence does not match the campaign this profile is claimed to belong to)"
             )
     return errors
 
@@ -674,6 +820,15 @@ def _validate_p24_manifest_document(manifest: dict, *, require_initialized: bool
         raise p23.ManifestTransitionError("P2.4 manifest experiment_id is invalid")
     if "publishable" in manifest and manifest["publishable"] is not False:
         raise p23.ManifestTransitionError("P2.4 manifest publishable must be false")
+    if "provenance" in manifest:
+        provenance_errors = validate_provenance_tuple(manifest["provenance"], label="manifest.provenance")
+        if provenance_errors:
+            raise p23.ManifestTransitionError(f"P2.4 manifest provenance is malformed: {provenance_errors}")
+        if "campaign_id" in manifest and manifest["provenance"].get("campaign_id") != manifest["campaign_id"]:
+            raise p23.ManifestTransitionError(
+                f"P2.4 manifest provenance.campaign_id={manifest['provenance'].get('campaign_id')!r} != "
+                f"manifest.campaign_id={manifest['campaign_id']!r}"
+            )
     if "campaign_id" in manifest:
         try:
             validate_p24_campaign_id(manifest["campaign_id"])
@@ -1091,6 +1246,40 @@ def _open_profiles_fd_anchored(campaign_dir: Path) -> int:
     return _open_dir_component_chain(*campaign_parts, "profiles")
 
 
+def _check_case_directory_inventory(case_fd: int, case_name: str) -> list[str]:
+    """Requires the case directory to contain EXACTLY the seven canonical
+    per-case artifacts (src/compute/P2_4_PROTOCOL.md section 7): no missing,
+    extra, duplicate (by name, impossible on a POSIX directory, but a
+    differently-cased or differently-spelled decoy is caught as "extra"),
+    symlinked, or wrong-type entry. Every directory entry is inspected via
+    lstat, never following a symlink."""
+    errors: list[str] = []
+    expected = set(canonical_profile_case_filenames(case_name))
+    try:
+        actual = set(os.listdir(case_fd))
+    except OSError as exc:
+        return [f"profiles/{case_name}: cannot list directory: {exc}"]
+    for extra in sorted(actual - expected):
+        errors.append(
+            f"profiles/{case_name}/{extra}: unplanned entry (not one of the seven canonical per-case artifacts)"
+        )
+    for missing in sorted(expected - actual):
+        errors.append(f"profiles/{case_name}/{missing}: missing canonical artifact")
+    for name in sorted(actual & expected):
+        try:
+            st = os.stat(name, dir_fd=case_fd, follow_symlinks=False)
+        except OSError as exc:
+            errors.append(f"profiles/{case_name}/{name}: cannot stat: {exc}")
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            errors.append(f"profiles/{case_name}/{name}: is a symlink; refusing")
+        elif not stat.S_ISREG(st.st_mode):
+            errors.append(f"profiles/{case_name}/{name}: is not a regular file")
+        elif st.st_size == 0:
+            errors.append(f"profiles/{case_name}/{name}: is empty")
+    return errors
+
+
 def _open_case_evidence_fds(profiles_fd: int, case_name: str) -> dict[str, int]:
     case_fd = None
     try:
@@ -1099,11 +1288,11 @@ def _open_case_evidence_fds(profiles_fd: int, case_name: str) -> dict[str, int]:
         raise p23.UnsafePathError(f"profiles/{case_name}: {exc}") from exc
     fds: dict[str, int] = {"_case_dir": case_fd}
     try:
-        for label, filename in (
-            ("application_csv", f"{case_name}.application.csv"),
-            ("metrics_csv", f"{case_name}.metrics_raw.csv"),
-            ("ncu_rep", f"{case_name}_report.ncu-rep"),
-        ):
+        inventory_errors = _check_case_directory_inventory(case_fd, case_name)
+        if inventory_errors:
+            raise p23.UnsafePathError("; ".join(inventory_errors))
+        for label, suffix in CANONICAL_PROFILE_CASE_FILE_LABELS:
+            filename = f"{case_name}{suffix}"
             file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
             try:
                 fd = os.open(filename, file_flags, dir_fd=case_fd)
@@ -1809,9 +1998,20 @@ def _reconstruct_case_result_core(
     *, entry: dict, application_rows: list[list[str]], metrics_rows: list[list[str]],
     application_label: str, metrics_label: str,
     application_hash: str, metrics_hash: str, ncu_rep_hash: str,
-    resolved_ncu_metrics: dict, git_commit: str,
+    ncu_tool_log_hash: str, container_stdout_log_hash: str, container_stderr_log_hash: str,
+    metrics_export_stderr_log_hash: str,
+    resolved_ncu_metrics: dict, git_commit: str, campaign_provenance: dict,
 ) -> tuple[dict | None, list[str]]:
     errors: list[str] = []
+    provenance_errors = validate_provenance_tuple(campaign_provenance, label=f"{entry['case_name']}: campaign provenance")
+    if provenance_errors:
+        return None, provenance_errors
+    if campaign_provenance.get("git_commit") != git_commit:
+        return None, [
+            f"{entry['case_name']}: internal error: campaign_provenance.git_commit="
+            f"{campaign_provenance.get('git_commit')!r} != the git_commit this reconstruction was asked to expect {git_commit!r}"
+        ]
+
     method = entry["method"]
     info = p23.METHOD_INFO[method]
     expect = {
@@ -1824,6 +2024,18 @@ def _reconstruct_case_result_core(
     app_rows, app_errors = p24_validate_case_rows(application_rows, expect, label=application_label)
     errors.extend(app_errors)
     app_row = app_rows[0] if (app_rows and not app_errors) else None
+
+    # Defect-1 repair: the row's own, independently-parsed identity fields
+    # (never a value copied from campaign_provenance itself) are compared
+    # against the immutable campaign tuple. This is what actually rejects a
+    # profile whose application evidence reports a different GPU
+    # UUID/name/compute-capability/driver/runtime than the campaign this
+    # profile is claimed to belong to -- src/compute/P2_PROTOCOL.md's/
+    # P2_2_PROTOCOL.md's own case-CSV field validators only check that
+    # gpu_uuid/gpu_name/compute_capability/driver/runtime are well-formed,
+    # never that they equal a specific expected campaign identity.
+    if app_row is not None:
+        errors.extend(compare_application_provenance(app_row=app_row, campaign_provenance=campaign_provenance, label=entry["case_name"]))
 
     parsed_metrics = None
     try:
@@ -1878,6 +2090,22 @@ def _reconstruct_case_result_core(
         "application_flops_per_cycle_per_sm": float(app_row["flops_per_cycle"]) / info["cta_group"],
         "application_total_flops": int(app_row["total_flops"]),
         "application_total_umma": int(app_row["total_umma"]),
+        # Independently reported by this profile's own application evidence
+        # (never copied from campaign_provenance) -- see the
+        # compare_application_provenance() call above, which already
+        # rejected any mismatch against the immutable campaign tuple before
+        # this dict is built. Recorded so a later, second reconstruction
+        # (e.g. the evidence-integrity gate re-run immediately before
+        # publishing ANALYZED) independently re-derives and re-compares the
+        # identical facts from the identical raw bytes, rather than trusting
+        # a previously derived value.
+        "application_git_commit": app_row["git_commit"],
+        "application_git_dirty": app_row["git_dirty"],
+        "application_gpu_uuid": app_row["gpu_uuid"],
+        "application_gpu_name": app_row["gpu_name"],
+        "application_compute_capability": app_row["compute_capability"],
+        "application_cuda_driver_version": app_row["cuda_driver_version"],
+        "application_cuda_runtime_version": app_row["cuda_runtime_version"],
         "sm_clock_valid": sm_clock["sm_clock_valid"],
         "sm_clock_issue": sm_clock["sm_clock_issue"],
         "sm_clock_raw_value": sm_clock["sm_clock_raw_value"],
@@ -1888,17 +2116,27 @@ def _reconstruct_case_result_core(
         "application_csv_sha256": application_hash,
         "metrics_csv_sha256": metrics_hash,
         "ncu_rep_sha256": ncu_rep_hash,
+        # Defect-2 repair: all seven canonical per-case artifacts are hashed
+        # (not just the three the pre-repair finalizer opened), so the
+        # evidence-integrity gate's recorded-vs-reconstructed comparison
+        # (_strict_compare_values) covers the complete frozen inventory.
+        "ncu_tool_log_sha256": ncu_tool_log_hash,
+        "container_stdout_log_sha256": container_stdout_log_hash,
+        "container_stderr_log_sha256": container_stderr_log_hash,
+        "metrics_export_stderr_log_sha256": metrics_export_stderr_log_hash,
     }
     return case_result, []
 
 
 def reconstruct_case_result(
     *, entry: dict, application_csv: Path, metrics_csv: Path, ncu_rep: Path,
-    resolved_ncu_metrics: dict, git_commit: str,
+    ncu_tool_log: Path, container_stdout_log: Path, container_stderr_log: Path, metrics_export_stderr_log: Path,
+    resolved_ncu_metrics: dict, git_commit: str, campaign_provenance: dict,
 ) -> tuple[dict | None, list[str]]:
-    ncu_rep_err = p23._verify_artifact(ncu_rep)
-    if ncu_rep_err:
-        return None, [ncu_rep_err]
+    for path in (ncu_rep, ncu_tool_log, container_stdout_log, container_stderr_log, metrics_export_stderr_log):
+        artifact_err = p23._verify_artifact(path)
+        if artifact_err:
+            return None, [artifact_err]
     try:
         with p23._open_regular_nofollow(application_csv, binary=False) as handle:
             application_rows = list(csv.reader(handle))
@@ -1913,30 +2151,38 @@ def reconstruct_case_result(
         application_hash = p23.sha256_of(application_csv)
         metrics_hash = p23.sha256_of(metrics_csv)
         ncu_rep_hash = p23.sha256_of(ncu_rep)
+        ncu_tool_log_hash = p23.sha256_of(ncu_tool_log)
+        container_stdout_log_hash = p23.sha256_of(container_stdout_log)
+        container_stderr_log_hash = p23.sha256_of(container_stderr_log)
+        metrics_export_stderr_log_hash = p23.sha256_of(metrics_export_stderr_log)
     except p23.UnsafePathError as exc:
         return None, [str(exc)]
     return _reconstruct_case_result_core(
         entry=entry, application_rows=application_rows, metrics_rows=metrics_rows,
         application_label=str(application_csv), metrics_label=str(metrics_csv),
         application_hash=application_hash, metrics_hash=metrics_hash, ncu_rep_hash=ncu_rep_hash,
-        resolved_ncu_metrics=resolved_ncu_metrics, git_commit=git_commit,
+        ncu_tool_log_hash=ncu_tool_log_hash, container_stdout_log_hash=container_stdout_log_hash,
+        container_stderr_log_hash=container_stderr_log_hash, metrics_export_stderr_log_hash=metrics_export_stderr_log_hash,
+        resolved_ncu_metrics=resolved_ncu_metrics, git_commit=git_commit, campaign_provenance=campaign_provenance,
     )
 
 
 def _reconstruct_case_result_from_fds(
     *, entry: dict, case_name: str, fds: dict[str, int], resolved_ncu_metrics: dict, git_commit: str,
+    campaign_provenance: dict,
 ) -> tuple[dict | None, list[str]]:
     application_rows = _read_csv_rows_from_fd(fds["application_csv"])
     metrics_rows = _read_csv_rows_from_fd(fds["metrics_csv"])
-    application_hash = _sha256_of_fd(fds["application_csv"])
-    metrics_hash = _sha256_of_fd(fds["metrics_csv"])
-    ncu_rep_hash = _sha256_of_fd(fds["ncu_rep"])
     return _reconstruct_case_result_core(
         entry=entry, application_rows=application_rows, metrics_rows=metrics_rows,
         application_label=f"profiles/{case_name}/{case_name}.application.csv",
         metrics_label=f"profiles/{case_name}/{case_name}.metrics_raw.csv",
-        application_hash=application_hash, metrics_hash=metrics_hash, ncu_rep_hash=ncu_rep_hash,
-        resolved_ncu_metrics=resolved_ncu_metrics, git_commit=git_commit,
+        application_hash=_sha256_of_fd(fds["application_csv"]), metrics_hash=_sha256_of_fd(fds["metrics_csv"]),
+        ncu_rep_hash=_sha256_of_fd(fds["ncu_rep"]), ncu_tool_log_hash=_sha256_of_fd(fds["ncu_tool_log"]),
+        container_stdout_log_hash=_sha256_of_fd(fds["container_stdout_log"]),
+        container_stderr_log_hash=_sha256_of_fd(fds["container_stderr_log"]),
+        metrics_export_stderr_log_hash=_sha256_of_fd(fds["metrics_export_stderr_log"]),
+        resolved_ncu_metrics=resolved_ncu_metrics, git_commit=git_commit, campaign_provenance=campaign_provenance,
     )
 
 
@@ -2051,6 +2297,206 @@ def _verify_hash(label: str, path: Path, expected_sha256: object, errors: list[s
     return actual
 
 
+# ---------------------------------------------------------------------------
+# Defect-4 repair: a read-only, independent P2.4-side re-validation of the
+# closed P2.3 pilot campaign's complete raw evidence -- 24 configurations x
+# 30 retained samples = 720 rows. P2.4 must not trust P2.3 merely because
+# its manifest and file hashes claim to be valid (that was the pre-repair
+# behavior: _do_record_pilot only compared P2.3's own recorded hashes
+# against fresh ones for the two already-aggregated files). This function
+# instead re-derives every fact using scripts/aggregate_exp02_umma_throughput.py's
+# own exact protocol/schema validators and recomputation helpers (imported
+# as p23, never modified, never reimplemented) applied fresh to the raw
+# cases/ directory and execution_order.csv on disk -- including an
+# independent recomputation of combined_samples.csv/summary.csv from the raw
+# per-sample rows, compared byte-for-byte, so every stored derived formula
+# is proved, not merely the ones validate_case_file()'s own per-row checks
+# already cover. Never writes anything under p23_campaign_dir; never
+# repairs or removes malformed evidence -- any defect rejects the whole
+# campaign closed.
+# ---------------------------------------------------------------------------
+def revalidate_p23_pilot_campaign(p23_campaign_dir: Path, *, git_commit: str) -> tuple[list[str], dict | None]:
+    errors: list[str] = []
+    plan = p23.build_plan()
+    plan_errors = p23.check_plan_contract(plan)
+    if plan_errors:
+        return [f"internal P2.3 plan contract violation: {plan_errors}"], None
+
+    manifest_path = p23_campaign_dir / "manifest.json"
+    try:
+        manifest = p23.load_manifest(p23_campaign_dir)
+        p23._validate_manifest_document(manifest, require_initialized=True)
+    except (p23.ManifestTransitionError, p23.UnsafePathError) as exc:
+        return [f"P2.3 manifest: {exc}"], None
+    if not manifest:
+        return ["P2.3 manifest.json does not exist"], None
+    if manifest.get("status") != "COMPLETE":
+        return [f"P2.3 campaign status={manifest.get('status')!r} != 'COMPLETE'"], None
+    if manifest.get("run_kind") != "benchmark":
+        return [f"P2.3 campaign run_kind={manifest.get('run_kind')!r} != 'benchmark'"], None
+    if manifest.get("git_commit") != git_commit:
+        errors.append(f"P2.3 manifest git_commit={manifest.get('git_commit')!r} != expected {git_commit!r}")
+    if manifest.get("campaign_id") != p23_campaign_dir.name:
+        errors.append(f"P2.3 manifest campaign_id={manifest.get('campaign_id')!r} != its own directory name {p23_campaign_dir.name!r}")
+
+    repetitions = FROZEN_PILOT_PARAMS["repetitions"]
+    requested = manifest.get("requested", {}) if isinstance(manifest.get("requested"), dict) else {}
+    for key in ("iterations", "warmup_iterations", "repetitions"):
+        expected = FROZEN_PILOT_PARAMS[key]
+        if requested.get(key) != expected:
+            errors.append(f"P2.3 campaign requested.{key}={requested.get(key)!r} != frozen pilot value {expected!r}")
+    if errors:
+        return errors, None
+
+    # Exact 24-configuration canonical plan and order, independently
+    # re-validated against execution_order.csv on disk.
+    order_errors = p23.validate_execution_order_file(p23_campaign_dir / "execution_order.csv", plan)
+    errors.extend(order_errors)
+
+    # Exact files/directory inventory: no missing, extra, duplicate,
+    # non-canonically-named, or symlinked case file.
+    index_to_path, scan_errors = p23.scan_case_directory(p23_campaign_dir / "cases", plan)
+    errors.extend(scan_errors)
+    if errors:
+        return errors, None
+
+    # Every one of the 720 rows: canonical configuration/repetition indices;
+    # method, M, N, K, depth, CTA group; run kind, iterations, warmup
+    # iterations, repetitions; correctness=OK/mismatches=0; full commit and
+    # GPU provenance; positive finite raw timing values; every stored
+    # derived formula (cycles_per_umma, flops_per_cycle, total_umma,
+    # total_flops, ...) recomputed from its raw inputs -- all via P2.3's own
+    # unmodified validate_case_file()/FIELD_VALIDATORS.
+    cases: list[tuple[dict, list[dict[str, str]]]] = []
+    for entry in plan:
+        path = index_to_path[entry["index"]]
+        expect = p23._expect_for_entry(
+            entry, run_kind="benchmark", iterations=FROZEN_PILOT_PARAMS["iterations"],
+            warmup_iterations=FROZEN_PILOT_PARAMS["warmup_iterations"], repetitions=repetitions,
+            git_commit=git_commit,
+        )
+        rows, case_errors = p23.validate_case_file(path, expect)
+        if case_errors:
+            errors.extend(f"{entry['case_name']}: {e}" for e in case_errors)
+            continue
+        cases.append((entry, rows))
+    if errors:
+        return errors, None
+
+    total_samples = sum(len(rows) for _entry, rows in cases)
+    expected_total = len(plan) * repetitions
+    if len(cases) != len(plan) or total_samples != expected_total:
+        return errors + [
+            f"retained sample total={total_samples} across {len(cases)} configuration(s); expected exactly "
+            f"{expected_total} samples across {len(plan)} configurations ({len(plan)} x {repetitions})"
+        ], None
+
+    # No missing, duplicate, or extra row: every configuration has exactly
+    # `repetitions` rows (validate_case_file already proved this per case);
+    # identical commit/GPU/driver/runtime/run-kind/iteration provenance
+    # across all 720 rows, compared against one single reference row (never
+    # just each case's own first row).
+    errors.extend(p23.check_cross_case_consistency(cases))
+    if errors:
+        return errors, None
+
+    # Agreement between sample files, combined CSV, and the P2.3 manifest:
+    # independently recompute combined_samples.csv/summary.csv from the raw
+    # 720 rows with P2.3's own writer functions and require byte-for-byte
+    # agreement with what P2.3 actually published -- proves every derived
+    # statistic, not just the formulas validate_case_file() spot-checks.
+    with tempfile.TemporaryDirectory(prefix="p24_p23_revalidate_") as tmp:
+        tmp_combined = Path(tmp) / "combined_samples.csv"
+        tmp_summary = Path(tmp) / "summary.csv"
+        p23.write_combined_samples(plan, cases, tmp_combined)
+        p23.write_summary(cases, tmp_summary)
+        recomputed_combined = tmp_combined.read_bytes()
+        recomputed_summary = tmp_summary.read_bytes()
+
+    actual_combined_path = p23_campaign_dir / "combined_samples.csv"
+    actual_summary_path = p23_campaign_dir / "summary.csv"
+    try:
+        actual_combined = actual_combined_path.read_bytes()
+        actual_summary = actual_summary_path.read_bytes()
+    except OSError as exc:
+        return [f"cannot read P2.3 aggregate artifact: {exc}"], None
+    if actual_combined != recomputed_combined:
+        errors.append(
+            "combined_samples.csv on disk does not byte-for-byte match a fresh recomputation from the raw "
+            "720 case-file samples"
+        )
+    if actual_summary != recomputed_summary:
+        errors.append(
+            "summary.csv on disk does not byte-for-byte match a fresh recomputation from the raw 720 "
+            "case-file samples"
+        )
+    if errors:
+        return errors, None
+
+    # Hashes of every trusted input: independently recomputed from disk and
+    # cross-checked against P2.3's own recorded values -- never trusted
+    # merely because the manifest claims them valid.
+    try:
+        case_file_hashes = {entry["case_name"]: p23.sha256_of(index_to_path[entry["index"]]) for entry in plan}
+        execution_order_hash = p23.sha256_of(p23_campaign_dir / "execution_order.csv")
+        combined_hash = p23.sha256_of(actual_combined_path)
+        summary_hash = p23.sha256_of(actual_summary_path)
+        manifest_hash = p23.sha256_of(manifest_path)
+    except p23.UnsafePathError as exc:
+        return [str(exc)], None
+
+    recorded_case_hashes = manifest.get("case_file_sha256")
+    if not isinstance(recorded_case_hashes, dict):
+        errors.append("P2.3 manifest case_file_sha256 is missing or not an object")
+    else:
+        for case_name, actual_hash in case_file_hashes.items():
+            if recorded_case_hashes.get(case_name) != actual_hash:
+                errors.append(
+                    f"{case_name}: on-disk case-file SHA-256 {actual_hash} != P2.3 manifest's recorded "
+                    f"{recorded_case_hashes.get(case_name)!r}"
+                )
+    if manifest.get("execution_order_sha256") != execution_order_hash:
+        errors.append(
+            f"execution_order.csv on-disk SHA-256 {execution_order_hash} != P2.3 manifest's recorded "
+            f"{manifest.get('execution_order_sha256')!r}"
+        )
+    recorded_aggregate_hashes = manifest.get("aggregate_file_sha256")
+    if not isinstance(recorded_aggregate_hashes, dict):
+        errors.append("P2.3 manifest aggregate_file_sha256 is missing or not an object")
+    else:
+        if recorded_aggregate_hashes.get("combined_samples.csv") != combined_hash:
+            errors.append(
+                f"combined_samples.csv on-disk SHA-256 {combined_hash} != P2.3 manifest's recorded "
+                f"{recorded_aggregate_hashes.get('combined_samples.csv')!r}"
+            )
+        if recorded_aggregate_hashes.get("summary.csv") != summary_hash:
+            errors.append(
+                f"summary.csv on-disk SHA-256 {summary_hash} != P2.3 manifest's recorded "
+                f"{recorded_aggregate_hashes.get('summary.csv')!r}"
+            )
+    if errors:
+        return errors, None
+
+    reference_row = cases[0][1][0]
+    snapshot = {
+        "campaign_id": manifest["campaign_id"],
+        "manifest_sha256": manifest_hash,
+        "combined_samples_sha256": combined_hash,
+        "summary_sha256": summary_hash,
+        "execution_order_sha256": execution_order_hash,
+        "case_file_sha256": case_file_hashes,
+        "sample_count": total_samples,
+        "configuration_count": len(cases),
+        "gpu_uuid": reference_row["gpu_uuid"],
+        "gpu_name": reference_row["gpu_name"],
+        "compute_capability": reference_row["compute_capability"],
+        "cuda_driver_version": reference_row["cuda_driver_version"],
+        "cuda_runtime_version": reference_row["cuda_runtime_version"],
+        "git_commit": reference_row["git_commit"],
+    }
+    return [], snapshot
+
+
 def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> tuple[list[str], dict | None]:
     """Re-verified before COMPLETE and before publishing ANALYZED/
     INCONCLUSIVE. Returns (errors, verified_snapshot); snapshot is None
@@ -2088,6 +2534,20 @@ def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> tu
     plan_errors = check_profile_plan_contract(plan)
     if plan_errors:
         return errors + [f"internal profile plan contract violation: {plan_errors}"], None
+
+    # Defect-1 repair: the immutable campaign provenance tuple must itself
+    # be well-formed before it can be used to validate any of the 24
+    # profiles' own evidence below; a missing/malformed tuple fails the
+    # whole campaign closed rather than silently skipping the comparison.
+    campaign_provenance = manifest.get("provenance")
+    provenance_tuple_errors = validate_provenance_tuple(campaign_provenance, label="manifest.provenance")
+    if provenance_tuple_errors:
+        return errors + provenance_tuple_errors, None
+    if campaign_provenance.get("campaign_id") != campaign_dir.name:
+        return errors + [
+            f"manifest.provenance.campaign_id={campaign_provenance.get('campaign_id')!r} != "
+            f"campaign directory {campaign_dir.name!r}"
+        ], None
 
     case_results = manifest.get("case_results")
     if not isinstance(case_results, dict):
@@ -2140,9 +2600,10 @@ def verify_campaign_evidence_integrity(campaign_dir: Path, manifest: dict) -> tu
 
                     reconstructed, case_errors = _reconstruct_case_result_from_fds(
                         entry=entry, case_name=case_name, fds=evidence_fds,
-                        resolved_ncu_metrics=resolved_ncu_metrics, git_commit=manifest.get("provenance", {}).get("git_commit"),
+                        resolved_ncu_metrics=resolved_ncu_metrics, git_commit=campaign_provenance.get("git_commit"),
+                        campaign_provenance=campaign_provenance,
                     )
-                    for label in ("application_csv", "metrics_csv", "ncu_rep"):
+                    for label, _suffix in CANONICAL_PROFILE_CASE_FILE_LABELS:
                         os.close(evidence_fds[label])
                     if reconstructed is None:
                         errors.extend(f"{case_name}: {e}" for e in case_errors)
@@ -2303,6 +2764,13 @@ def _do_record_pilot(
         errors.append(f"P2.3 campaign configuration_count_completed={p23_manifest.get('configuration_count_completed')!r} != {p23.EXPECTED_CONFIGURATION_COUNT}")
     if p23_manifest.get("git_commit") != git_commit:
         errors.append(f"P2.3 campaign git_commit={p23_manifest.get('git_commit')!r} != expected {git_commit!r}")
+    if p23_campaign_dir.name != campaign_dir.name:
+        errors.append(
+            f"P2.3 campaign ID {p23_campaign_dir.name!r} != P2.4 campaign ID {campaign_dir.name!r} "
+            f"(the P2.4 wrapper and the P2.3 campaign it drives must share one explicit P2_4_CAMPAIGN_ID)"
+        )
+    if p23_manifest.get("campaign_id") != p23_campaign_dir.name:
+        errors.append(f"P2.3 manifest campaign_id={p23_manifest.get('campaign_id')!r} != its own directory name {p23_campaign_dir.name!r}")
 
     if not preflight_errors:
         for field, snapshot_key in (("gpu_uuid", "gpu_uuid"), ("gpu_name", "gpu_name")):
@@ -2344,6 +2812,13 @@ def _do_record_pilot(
             "summary_sha256": summary_hash,
         },
         "preflight_reference_pilot": preflight_snapshot,
+        # The immutable campaign provenance tuple (Defect 1 repair): every
+        # one of the 24 profile cases' own application evidence is compared
+        # against this tuple by compare_application_provenance(), never the
+        # reverse. visible_device_count/logical_device_index are carried
+        # over from the already-validated pilot preflight snapshot (proven
+        # by validate_preflight_fields, never fabricated here); campaign_id
+        # binds the tuple to this exact P2.4 campaign directory.
         "provenance": {
             "git_commit": git_commit,
             "gpu_uuid": p23_manifest["gpu_uuid"],
@@ -2351,8 +2826,18 @@ def _do_record_pilot(
             "compute_capability": p23_manifest["compute_capability"],
             "cuda_driver_version": p23_manifest["cuda_driver_version"],
             "cuda_runtime_version": p23_manifest["cuda_runtime_version"],
+            "visible_device_count": preflight_snapshot.get("visible_device_count"),
+            "logical_device_index": (
+                int(preflight_snapshot["gpu_logical_index"])
+                if isinstance(preflight_snapshot.get("gpu_logical_index"), str) and preflight_snapshot["gpu_logical_index"].isdigit()
+                else preflight_snapshot.get("gpu_logical_index")
+            ),
+            "campaign_id": campaign_dir.name,
         },
     }
+    provenance_errors = validate_provenance_tuple(updates["provenance"], label="constructed provenance")
+    if provenance_errors:
+        return _fail_p24(campaign_dir, "pilot_provenance_construction", provenance_errors)
     try:
         p24_merge_manifest(campaign_dir, updates, state="PILOT_COMPLETE")
     except p23.ManifestTransitionError as exc:
@@ -2535,11 +3020,25 @@ def _resolve_case_evidence_paths(campaign_dir: Path, case_name: str, errors: lis
         errors.append(f"{case_name}: {exc}")
         return None
 
-    paths = {
-        "application_csv": case_dir / f"{case_name}.application.csv",
-        "metrics_csv": case_dir / f"{case_name}.metrics_raw.csv",
-        "ncu_rep": case_dir / f"{case_name}_report.ncu-rep",
-    }
+    # Defect-2 repair: require the exact seven-file canonical inventory --
+    # no missing, extra, or wrongly named entry -- before trusting any of
+    # them individually.
+    expected_names = set(canonical_profile_case_filenames(case_name))
+    try:
+        actual_names = {entry.name for entry in case_dir.iterdir()}
+    except OSError as exc:
+        errors.append(f"{case_name}: cannot list profile case directory: {exc}")
+        return None
+    unexpected = sorted(actual_names - expected_names)
+    missing = sorted(expected_names - actual_names)
+    if unexpected:
+        errors.append(f"{case_name}: unplanned entrie(s) in profile case directory: {unexpected}")
+    if missing:
+        errors.append(f"{case_name}: missing canonical artifact(s): {missing}")
+    if unexpected or missing:
+        return None
+
+    paths = {label: case_dir / f"{case_name}{suffix}" for label, suffix in CANONICAL_PROFILE_CASE_FILE_LABELS}
     for label, path in paths.items():
         artifact_err = p23._verify_artifact(path)
         if artifact_err:
@@ -2571,6 +3070,21 @@ def _do_validate_profile_case(*, campaign_dir: Path, index: int, git_commit: str
     if entry["case_name"] in existing_results:
         return False, [f"case {entry['case_name']} was already validated and recorded; refusing to redo it"]
 
+    campaign_provenance = manifest.get("provenance")
+    provenance_tuple_errors = validate_provenance_tuple(campaign_provenance, label="manifest.provenance")
+    if provenance_tuple_errors:
+        return False, provenance_tuple_errors
+    if campaign_provenance.get("campaign_id") != campaign_dir.name:
+        return False, [
+            f"manifest.provenance.campaign_id={campaign_provenance.get('campaign_id')!r} != "
+            f"campaign directory {campaign_dir.name!r}"
+        ]
+    if campaign_provenance.get("git_commit") != git_commit:
+        return False, [
+            f"--git-commit={git_commit!r} != this campaign's own recorded provenance.git_commit="
+            f"{campaign_provenance.get('git_commit')!r}"
+        ]
+
     path_errors: list[str] = []
     paths = _resolve_case_evidence_paths(campaign_dir, entry["case_name"], path_errors)
     if paths is None:
@@ -2579,7 +3093,11 @@ def _do_validate_profile_case(*, campaign_dir: Path, index: int, git_commit: str
     resolved_ncu_metrics = manifest.get("resolved_ncu_metrics", {})
     case_result, errors = reconstruct_case_result(
         entry=entry, application_csv=paths["application_csv"], metrics_csv=paths["metrics_csv"],
-        ncu_rep=paths["ncu_rep"], resolved_ncu_metrics=resolved_ncu_metrics, git_commit=git_commit,
+        ncu_rep=paths["ncu_rep"], ncu_tool_log=paths["ncu_tool_log"],
+        container_stdout_log=paths["container_stdout_log"], container_stderr_log=paths["container_stderr_log"],
+        metrics_export_stderr_log=paths["metrics_export_stderr_log"],
+        resolved_ncu_metrics=resolved_ncu_metrics, git_commit=git_commit,
+        campaign_provenance=campaign_provenance,
     )
     if case_result is None:
         return False, errors
@@ -2649,6 +3167,23 @@ def _do_finalize_profile(*, campaign_dir: Path, completed_at_utc: str) -> tuple[
 
     if errors:
         return _fail_p24(campaign_dir, "profile_finalize", errors)
+
+    # Defect-4 repair: before COMPLETE, independently revalidate the
+    # complete raw P2.3 pilot evidence (24 x 30 = 720 samples) -- never
+    # trusted merely because record-pilot once accepted its manifest/file
+    # hashes.
+    pilot_ref = manifest.get("pilot_campaign_reference", {})
+    if not isinstance(pilot_ref, dict) or "path" not in pilot_ref:
+        return _fail_p24(campaign_dir, "profile_finalize_p23_revalidation", ["pilot_campaign_reference is missing or incomplete; cannot revalidate P2.3 pilot evidence"])
+    try:
+        p23_campaign_dir_for_revalidation = resolve_p23_campaign_dir_arg(pilot_ref["path"])
+    except p23.UnsafePathError as exc:
+        return _fail_p24(campaign_dir, "profile_finalize_p23_revalidation", [f"pilot_campaign_reference.path: {exc}"])
+    p23_revalidation_errors, _p23_snapshot = revalidate_p23_pilot_campaign(
+        p23_campaign_dir_for_revalidation, git_commit=manifest.get("provenance", {}).get("git_commit"),
+    )
+    if p23_revalidation_errors:
+        return _fail_p24(campaign_dir, "profile_finalize_p23_revalidation", p23_revalidation_errors)
 
     integrity_errors, verified = verify_campaign_evidence_integrity(campaign_dir, manifest)
     if integrity_errors:
@@ -2738,6 +3273,10 @@ def _svg_header(width: int, height: int, title: str) -> list[str]:
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
         f'width="{width}" height="{height}" font-family="monospace" font-size="12">',
         f'<title>{_xml_escape(title)}</title>',
+        # Defect-6 repair: deterministic, machine-readable metadata carrying
+        # the exact publication-status token, shared by all three SVG
+        # artifacts via this one helper.
+        f"<metadata>{_xml_escape(PUBLICATION_STATUS_TOKEN)}</metadata>",
         f'<rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff" stroke="none"/>',
     ]
 
@@ -2927,6 +3466,63 @@ def _configuration_summary(
     return summary
 
 
+def evaluate_device_multiprocessor_count(case_results: dict[str, dict], plan: list[dict]) -> dict:
+    """Strict, fail-closed evaluation of DEVICE_MULTIPROCESSOR_COUNT_METRIC
+    across every one of the frozen plan's profiles (audit repair: the prior
+    implementation extrapolated from whichever profiles happened to report a
+    consistent value, including just one out of 24, and never checked
+    finiteness, positivity, or integrality). A device-wide extrapolation may
+    be available only when every single one of the len(plan) profiles
+    independently reports one finite, strictly positive, mathematically
+    integral value in the documented unit representation
+    (EXPECTED_MULTIPROCESSOR_COUNT_UNIT), and every one of those values is
+    identical. Returns {"available": True, "multiprocessor_count": int} or
+    {"available": False, "reasons": [...]} with one deterministic reason per
+    offending case; never raises."""
+    reasons: list[str] = []
+    values: dict[str, int] = {}
+    for entry in plan:
+        case_name = entry["case_name"]
+        result = case_results.get(case_name)
+        if not isinstance(result, dict):
+            reasons.append(f"{case_name}: no recorded profile result")
+            continue
+        diag_values = result.get("diagnostic_metric_values", {})
+        diag_units = result.get("diagnostic_metric_units", {})
+        if not isinstance(diag_values, dict) or DEVICE_MULTIPROCESSOR_COUNT_METRIC not in diag_values:
+            reasons.append(f"{case_name}: {DEVICE_MULTIPROCESSOR_COUNT_METRIC} was not resolved/reported for this profile")
+            continue
+        value = diag_values[DEVICE_MULTIPROCESSOR_COUNT_METRIC]
+        unit = diag_units.get(DEVICE_MULTIPROCESSOR_COUNT_METRIC, "") if isinstance(diag_units, dict) else ""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            reasons.append(f"{case_name}: {DEVICE_MULTIPROCESSOR_COUNT_METRIC} value {value!r} is not numeric")
+            continue
+        if not math.isfinite(value):
+            reasons.append(f"{case_name}: {DEVICE_MULTIPROCESSOR_COUNT_METRIC} value {value!r} is not finite")
+            continue
+        if value <= 0:
+            reasons.append(f"{case_name}: {DEVICE_MULTIPROCESSOR_COUNT_METRIC} value {value!r} is not strictly positive")
+            continue
+        if value != math.floor(value):
+            reasons.append(f"{case_name}: {DEVICE_MULTIPROCESSOR_COUNT_METRIC} value {value!r} is not mathematically integral")
+            continue
+        if (unit or "").strip() != EXPECTED_MULTIPROCESSOR_COUNT_UNIT:
+            reasons.append(f"{case_name}: {DEVICE_MULTIPROCESSOR_COUNT_METRIC} unit {unit!r} != expected {EXPECTED_MULTIPROCESSOR_COUNT_UNIT!r}")
+            continue
+        values[case_name] = int(value)
+
+    if len(values) != len(plan):
+        missing = [entry["case_name"] for entry in plan if entry["case_name"] not in values]
+        if missing and not reasons:
+            reasons.append(f"missing/invalid value(s) for: {missing}")
+        return {"available": False, "reasons": reasons}
+
+    distinct = sorted(set(values.values()))
+    if len(distinct) != 1:
+        return {"available": False, "reasons": [f"inconsistent values across profiles (all {len(plan)} must agree): {distinct}"]}
+    return {"available": True, "multiprocessor_count": distinct[0], "reasons": []}
+
+
 def build_empirical_ceiling(
     *, stats_by_config: dict, case_results: dict[str, dict], all_sm_clock_valid: bool, inconclusive_reason: list[str],
 ) -> dict:
@@ -2935,22 +3531,31 @@ def build_empirical_ceiling(
     best_2sm = _configuration_summary(selection["best_2sm"], stats_by_config, case_results, campaign_may_emit_tflops=all_sm_clock_valid)
     ceiling = _configuration_summary(selection["empirical_per_sm_ceiling_candidate"], stats_by_config, case_results, campaign_may_emit_tflops=all_sm_clock_valid)
 
-    multiprocessor_counts: set[float] = set()
-    for result in case_results.values():
-        value = result.get("diagnostic_metric_values", {}).get("device__attribute_multiprocessor_count")
-        if value is not None:
-            multiprocessor_counts.add(value)
-    device_extrapolation = None
-    if all_sm_clock_valid and len(multiprocessor_counts) == 1 and ceiling["estimated_tflops_per_sm"] is not None:
-        (mp_count,) = tuple(multiprocessor_counts)
+    # The SM count is optional: its absence/invalidity can only suppress the
+    # whole-device extrapolation below, and must never reach or corrupt the
+    # per-configuration local/per-SM estimates computed above.
+    mp_eval = evaluate_device_multiprocessor_count(case_results, build_profile_plan())
+    if all_sm_clock_valid and mp_eval["available"] and ceiling["estimated_tflops_per_sm"] is not None:
+        mp_count = mp_eval["multiprocessor_count"]
         device_extrapolation = {
             "available": True,
             "multiprocessor_count": mp_count,
             "estimated_device_equivalent_tflops": ceiling["estimated_tflops_per_sm"] * mp_count,
             "label": "extrapolation from a one-/two-SM microbenchmark, never a directly measured whole-GPU throughput",
         }
+    elif not all_sm_clock_valid:
+        device_extrapolation = {"available": False, "reason": "campaign is INCONCLUSIVE: the mandatory SM-clock metric is not trustworthy for every profiled configuration"}
+    elif ceiling["estimated_tflops_per_sm"] is None:
+        device_extrapolation = {"available": False, "reason": "no estimated_tflops_per_sm is available for the selected ceiling configuration"}
     else:
-        device_extrapolation = {"available": False, "reason": "no trustworthy, campaign-uniform SM-count attribute resolved, or the campaign is INCONCLUSIVE"}
+        device_extrapolation = {
+            "available": False,
+            "reason": (
+                f"device__attribute_multiprocessor_count is not a single finite, strictly positive, "
+                f"mathematically integral value identical across all {len(build_profile_plan())} profiled "
+                f"configurations: {'; '.join(mp_eval['reasons'])}"
+            ),
+        }
 
     return {
         "status": "ANALYZED" if all_sm_clock_valid else "INCONCLUSIVE",
@@ -2960,6 +3565,8 @@ def build_empirical_ceiling(
         "empirical_per_sm_ceiling_candidate": ceiling,
         "device_equivalent_estimate": device_extrapolation,
         "pilot_is_not_publishable": True,
+        "publishable": False,
+        "publication_status": PUBLICATION_STATUS_TOKEN,
         "notes": [
             "ceiling selected in clock-independent FLOP/cycle-per-SM space first, then converted using that "
             "same configuration's own matching NCU SM-frequency profile",
@@ -2981,6 +3588,8 @@ def render_report_markdown(
         "**publishable: false.** This report is generated from a single reviewed pilot pending independent "
         "audit and GB300 re-verification; it is not a final experimental result."
     )
+    lines.append("")
+    lines.append(f"Status line: `{PUBLICATION_STATUS_TOKEN}`")
     lines.append("")
     lines.append("## What this is, and is not")
     lines.append("")
@@ -3078,6 +3687,17 @@ _STAT_FIELD_SUFFIXES = (
 )
 
 
+# Defect-6 repair: every one of the ten analysis artifacts must carry the
+# exact ASCII token "publishable=false" in a format-appropriate
+# machine-readable field -- never merely implied by the surrounding text (a
+# CSV row's own value, a JSON string field, a Markdown status line, an SVG
+# metadata element). PUBLICATION_STATUS_TOKEN is the single source of truth
+# for the literal token; it never changes the scientific status (this
+# remains a non-publishable pilot and empirical-ceiling candidate).
+PUBLICATION_STATUS_TOKEN = "publishable=false"
+PUBLICATION_STATUS_COLUMN = "publication_status"
+
+
 def _config_stats_columns() -> list[str]:
     columns = ["method", "n", "depth", "cta_group", "sample_count"]
     for metric in STAT_METRIC_NAMES:
@@ -3085,6 +3705,7 @@ def _config_stats_columns() -> list[str]:
             columns.append(f"{metric}_{suffix}")
         if metric == "flops_per_cycle":
             columns.append("flops_per_cycle_stability_review")
+    columns.append(PUBLICATION_STATUS_COLUMN)
     return columns
 
 
@@ -3092,15 +3713,17 @@ CONFIGURATION_STATISTICS_HEADER = _config_stats_columns()
 SCALING_HEADER = [
     "n", "depth", "median_flops_per_cycle_1sm", "median_flops_per_cycle_2sm", "speedup_2sm_over_1sm",
     "speedup_ci_low", "speedup_ci_high", "scaling_efficiency", "scaling_efficiency_percent", "surprising_value_flag",
+    PUBLICATION_STATUS_COLUMN,
 ]
 SATURATION_HEADER = [
     "method", "n", "depth_4_median_flops_per_cycle", "depth_16_median_flops_per_cycle",
     "depth_64_median_flops_per_cycle", "depth_256_median_flops_per_cycle", "max_median_flops_per_cycle",
-    "earliest_tested_candidate_saturation_depth",
+    "earliest_tested_candidate_saturation_depth", PUBLICATION_STATUS_COLUMN,
 ]
 PROFILE_VALIDATION_HEADER = [
     "index", "case_name", "method", "n", "depth", "cta_group", "kernel_symbol", "launch_id",
     "sm_clock_status", "sm_clock_raw_value", "sm_clock_unit", "sm_clock_hz", "diagnostic_metrics_resolved_count",
+    PUBLICATION_STATUS_COLUMN,
 ]
 
 
@@ -3114,21 +3737,40 @@ def _stats_to_csv_row(key: tuple[str, int, int], config_result: dict) -> dict:
             row[f"{metric}_{suffix}"] = stats[source_key]
         if metric == "flops_per_cycle":
             row["flops_per_cycle_stability_review"] = "REVIEW" if stats["stability_review"] else "ok"
+    row[PUBLICATION_STATUS_COLUMN] = PUBLICATION_STATUS_TOKEN
     return row
 
 
-def _write_csv_no_clobber(path: Path, header: list[str], rows: list[dict]) -> None:
+def _with_publication_status(row: dict) -> dict:
+    """Projects a pure, already-computed row (scaling.csv/saturation.csv --
+    never a frozen formula function's own return value, only its CSV
+    serialization) with the mandatory publication-status column appended."""
+    return {**row, PUBLICATION_STATUS_COLUMN: PUBLICATION_STATUS_TOKEN}
+
+
+def _csv_bytes(header: list[str], rows: list[dict]) -> bytes:
+    """Deterministically renders one CSV artifact's exact bytes in memory
+    (never touching disk), so Defect-5's retry logic can compare a
+    freshly recomputed artifact against an existing one byte-for-byte
+    before deciding whether a retry may skip, create, or must fail
+    closed."""
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf)
+    writer.writerow(header)
+    for row in rows:
+        writer.writerow([row[field] for field in header])
+    return buf.getvalue().encode("utf-8")
+
+
+def _write_bytes_no_clobber(path: Path, content: bytes) -> None:
     if os.path.lexists(path):
         raise p23.UnsafePathError(f"{path}: already exists, refusing to overwrite")
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     if os.path.lexists(tmp_path):
         raise p23.UnsafePathError(f"{tmp_path}: existing temporary; refusing to overwrite")
     try:
-        with p23._open_exclusive(tmp_path, binary=False, newline="") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(header)
-            for row in rows:
-                writer.writerow([row[field] for field in header])
+        with p23._open_exclusive(tmp_path, binary=True) as handle:
+            handle.write(content)
     except Exception:
         if os.path.lexists(tmp_path):
             p23._safe_unlink_owned(tmp_path)
@@ -3141,49 +3783,95 @@ def _write_csv_no_clobber(path: Path, header: list[str], rows: list[dict]) -> No
         raise
 
 
-def _write_text_no_clobber(path: Path, text: str) -> None:
-    if os.path.lexists(path):
-        raise p23.UnsafePathError(f"{path}: already exists, refusing to overwrite")
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    if os.path.lexists(tmp_path):
-        raise p23.UnsafePathError(f"{tmp_path}: existing temporary; refusing to overwrite")
+def _resolve_retryable_artifact(path: Path, content: bytes) -> tuple[str, str | None]:
+    """Defect-5 repair: resolves exactly one of three actions for one
+    planned analysis artifact, without creating, overwriting, or deleting
+    anything. "create" if path does not exist at all. "skip" if path
+    already exists as a genuine, non-symlink, regular file whose on-disk
+    bytes exactly equal the freshly recomputed content (i.e. a clean retry
+    may safely leave it untouched). "conflict" (with a human-readable
+    detail) for anything else a retry must fail closed on: a symlink, a
+    non-regular-file entry, unreadable content, or content that differs
+    from the current, freshly validated recomputation."""
+    if not os.path.lexists(path):
+        return "create", None
     try:
-        with p23._open_exclusive(tmp_path, binary=False) as handle:
-            handle.write(text)
-    except Exception:
-        if os.path.lexists(tmp_path):
-            p23._safe_unlink_owned(tmp_path)
-        raise
+        st = os.lstat(path)
+    except OSError as exc:
+        return "conflict", f"{path}: cannot stat existing analysis artifact: {exc}"
+    if stat.S_ISLNK(st.st_mode):
+        return "conflict", f"{path}: existing analysis artifact is a symlink; refusing to touch it"
+    if not stat.S_ISREG(st.st_mode):
+        return "conflict", f"{path}: existing analysis artifact is not a regular file; refusing to touch it"
     try:
-        p23._publish_no_clobber(tmp_path, path)
-    except p23.UnsafePathError:
-        if os.path.lexists(tmp_path):
-            p23._safe_unlink_owned(tmp_path)
-        raise
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            fst = os.fstat(fd)
+            if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(fst.st_mode):
+                return "conflict", f"{path}: changed identity while being checked; refusing to touch it"
+            existing_bytes = b"".join(iter(lambda: os.read(fd, 1 << 20), b""))
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        return "conflict", f"{path}: cannot read existing analysis artifact to verify a safe retry: {exc}"
+    if existing_bytes != content:
+        return "conflict", (
+            f"{path}: existing analysis artifact differs from the freshly recomputed evidence; refusing to "
+            f"overwrite (a retry must never clobber divergent evidence)"
+        )
+    return "skip", None
 
 
 def _do_analyze(
-    *, campaign_dir: Path, analyzed_at_utc: str, _test_hook_before_final_gate: Callable[[], None] | None = None,
+    *, campaign_dir: Path, analyzed_at_utc: str,
+    _test_hook_before_final_gate: Callable[[], None] | None = None,
+    _test_hook_during_publication: Callable[[int, int], None] | None = None,
+    _test_hook_before_manifest_append: Callable[[], None] | None = None,
 ) -> tuple[bool, list[str]]:
+    """Defect-5 repair: deterministic, no-clobber, resumable publication. A
+    campaign already at COMPLETE creates only the analysis artifacts that
+    are actually missing (a clean retry after a partial or fully-interrupted
+    earlier publication attempt); a campaign already ANALYZED/INCONCLUSIVE
+    is purely revalidated -- every one of the ten artifacts and the
+    manifest's own recorded hashes are re-checked byte-for-byte, and success
+    is returned only if everything still matches, without writing anything.
+    Any existing artifact that differs from a fresh recomputation, or any
+    unexpected entry under analysis/, fails the whole call closed without
+    overwriting or deleting anything."""
     try:
         manifest, _revision = load_p24_manifest_chain(campaign_dir)
         _validate_p24_manifest_document(manifest, require_initialized=True)
     except (p23.ManifestTransitionError, p23.UnsafePathError) as exc:
         return False, [f"P2.4 manifest: {exc}"]
-    if manifest.get("state") != "COMPLETE":
-        return False, [f"P2.4 manifest state={manifest.get('state')!r} != 'COMPLETE'; cannot analyze"]
+    state = manifest.get("state")
+    if state not in ("COMPLETE", "ANALYZED", "INCONCLUSIVE"):
+        return False, [f"P2.4 manifest state={state!r} not in ('COMPLETE', 'ANALYZED', 'INCONCLUSIVE'); cannot analyze"]
 
+    # Validate the complete transition eligibility -- the manifest hash
+    # chain (already re-loaded/re-validated above), every one of the 24
+    # profiles' own evidence (Defects 1/2), and the complete raw P2.3 pilot
+    # evidence (Defect 4, 720 samples) -- before deriving or publishing
+    # anything, whether this is a first publication, a retry, or a pure
+    # revalidation of an already-terminal campaign.
     integrity_errors, _verified_before = verify_campaign_evidence_integrity(campaign_dir, manifest)
     if integrity_errors:
         return False, integrity_errors
 
-    errors: list[str] = []
     pilot_ref = manifest.get("pilot_campaign_reference", {})
     if not isinstance(pilot_ref, dict) or "path" not in pilot_ref:
         return False, ["manifest pilot_campaign_reference is missing or incomplete"]
-    p23_campaign_dir = REPO_ROOT / pilot_ref["path"]
+    try:
+        p23_campaign_dir = resolve_p23_campaign_dir_arg(pilot_ref["path"])
+    except p23.UnsafePathError as exc:
+        return False, [f"pilot_campaign_reference.path: {exc}"]
+    p23_revalidation_errors, _p23_snapshot_before = revalidate_p23_pilot_campaign(
+        p23_campaign_dir, git_commit=manifest.get("provenance", {}).get("git_commit"),
+    )
+    if p23_revalidation_errors:
+        return False, p23_revalidation_errors
     combined_path = p23_campaign_dir / "combined_samples.csv"
 
+    errors: list[str] = []
     samples_by_config = _read_combined_samples(combined_path)
     plan = build_profile_plan()
     expected_configs = {(e["method"], e["n"], e["depth"]) for e in plan}
@@ -3201,6 +3889,9 @@ def _do_analyze(
     if errors:
         return False, errors
 
+    # Derive all ten output byte streams deterministically from the
+    # freshly validated raw evidence above -- never from anything cached or
+    # previously derived.
     rng = random.Random(BOOTSTRAP_SEED)
     stats_by_config = compute_all_config_stats(samples_by_config, rng)
     scaling_rows = compute_scaling(samples_by_config, stats_by_config, rng)
@@ -3232,31 +3923,23 @@ def _do_analyze(
         return False, errors
 
     stats_rows = [_stats_to_csv_row(key, stats_by_config[key]) for key in sorted(stats_by_config, key=lambda k: (k[1], k[2], k[0]))]
+    scaling_csv_rows = [_with_publication_status(row) for row in scaling_rows]
+    saturation_csv_rows = [_with_publication_status(row) for row in saturation_rows]
+    profile_validation_csv_rows = [_with_publication_status(row) for row in profile_validation_rows]
 
     empirical_ceiling = build_empirical_ceiling(
         stats_by_config=stats_by_config, case_results=case_results,
         all_sm_clock_valid=all_sm_clock_valid, inconclusive_reason=inconclusive_reason,
     )
     outcome_state = "ANALYZED" if all_sm_clock_valid else "INCONCLUSIVE"
+    if state in ("ANALYZED", "INCONCLUSIVE") and state != outcome_state:
+        return False, [
+            f"manifest already reached terminal state={state!r}, but a fresh recomputation from currently "
+            f"validated raw evidence independently derives outcome={outcome_state!r}; refusing to silently "
+            f"accept a contradiction"
+        ]
 
     provenance = manifest.get("provenance", {})
-    analysis_dir = campaign_dir / "analysis"
-    try:
-        p23._mkdir_component(analysis_dir, must_not_exist=False, root=REPO_ROOT)
-    except p23.UnsafePathError as exc:
-        return False, [str(exc)]
-
-    outputs: list[tuple[Path, list[str], list[dict]]] = [
-        (analysis_dir / "configuration_statistics.csv", CONFIGURATION_STATISTICS_HEADER, stats_rows),
-        (analysis_dir / "scaling.csv", SCALING_HEADER, scaling_rows),
-        (analysis_dir / "saturation.csv", SATURATION_HEADER, saturation_rows),
-        (analysis_dir / "profile_validation.csv", PROFILE_VALIDATION_HEADER, profile_validation_rows),
-    ]
-    for path, _, _ in outputs:
-        for candidate in (path, path.with_suffix(path.suffix + ".tmp")):
-            if os.path.lexists(candidate):
-                return False, [f"{candidate}: existing analysis artifact; refusing to overwrite"]
-
     report_md = render_report_markdown(
         campaign_id=str(manifest.get("campaign_id")), stats_rows=stats_rows, scaling_rows=scaling_rows,
         saturation_rows=saturation_rows, profile_validation_rows=profile_validation_rows,
@@ -3265,11 +3948,11 @@ def _do_analyze(
     throughput_svg = render_throughput_svg(stats_by_config)
     scaling_svg = render_scaling_efficiency_svg(scaling_rows)
     saturation_svg = render_saturation_svg(saturation_rows)
-
     analysis_manifest = {
         "schema_version": P24_SCHEMA_VERSION,
         "campaign_id": manifest.get("campaign_id"),
         "publishable": False,
+        "publication_status": PUBLICATION_STATUS_TOKEN,
         "status": outcome_state,
         "provenance": provenance,
         "resolved_ncu_metrics": manifest.get("resolved_ncu_metrics", {}),
@@ -3282,25 +3965,78 @@ def _do_analyze(
         ],
     }
 
-    file_writes: list[tuple[Path, str]] = [
-        (analysis_dir / "empirical_ceiling.json", json.dumps(empirical_ceiling, indent=2, sort_keys=True) + "\n"),
-        (analysis_dir / "report.md", report_md),
-        (analysis_dir / "throughput.svg", throughput_svg),
-        (analysis_dir / "scaling_efficiency.svg", scaling_svg),
-        (analysis_dir / "saturation.svg", saturation_svg),
-        (analysis_dir / "analysis_manifest.json", json.dumps(analysis_manifest, indent=2, sort_keys=True) + "\n"),
+    analysis_dir = campaign_dir / "analysis"
+    artifacts: list[tuple[Path, bytes]] = [
+        (analysis_dir / "configuration_statistics.csv", _csv_bytes(CONFIGURATION_STATISTICS_HEADER, stats_rows)),
+        (analysis_dir / "scaling.csv", _csv_bytes(SCALING_HEADER, scaling_csv_rows)),
+        (analysis_dir / "saturation.csv", _csv_bytes(SATURATION_HEADER, saturation_csv_rows)),
+        (analysis_dir / "profile_validation.csv", _csv_bytes(PROFILE_VALIDATION_HEADER, profile_validation_csv_rows)),
+        (analysis_dir / "empirical_ceiling.json", (json.dumps(empirical_ceiling, indent=2, sort_keys=True) + "\n").encode("utf-8")),
+        (analysis_dir / "report.md", report_md.encode("utf-8")),
+        (analysis_dir / "throughput.svg", throughput_svg.encode("utf-8")),
+        (analysis_dir / "scaling_efficiency.svg", scaling_svg.encode("utf-8")),
+        (analysis_dir / "saturation.svg", saturation_svg.encode("utf-8")),
+        (analysis_dir / "analysis_manifest.json", (json.dumps(analysis_manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")),
     ]
-    planned_analysis_paths = tuple(path.relative_to(campaign_dir).as_posix() for path in [*(o[0] for o in outputs), *(f[0] for f in file_writes)])
+    planned_analysis_paths = tuple(path.relative_to(campaign_dir).as_posix() for path, _content in artifacts)
     if len(planned_analysis_paths) != len(ANALYSIS_ARTIFACT_RELATIVE_PATHS) or set(planned_analysis_paths) != set(ANALYSIS_ARTIFACT_RELATIVE_PATHS):
         return False, [
             f"internal analysis artifact inventory differs from the canonical terminal manifest contract: "
             f"planned={sorted(planned_analysis_paths)!r} canonical={sorted(ANALYSIS_ARTIFACT_RELATIVE_PATHS)!r}"
         ]
-    for path, _ in file_writes:
-        for candidate in (path, path.with_suffix(path.suffix + ".tmp")):
-            if os.path.lexists(candidate):
-                return False, [f"{candidate}: existing analysis artifact; refusing to overwrite"]
 
+    # No unexpected entry may exist under analysis/ (a stray file -- e.g. an
+    # orphaned .tmp from a crash mid-write -- fails closed rather than being
+    # silently ignored or cleaned up).
+    expected_basenames = {path.name for path, _content in artifacts}
+    if os.path.lexists(analysis_dir):
+        if os.path.islink(analysis_dir):
+            return False, [f"{analysis_dir}: is a symlink; refusing"]
+        try:
+            actual_names = set(os.listdir(analysis_dir))
+        except OSError as exc:
+            return False, [f"{analysis_dir}: cannot list directory: {exc}"]
+        unexpected = sorted(actual_names - expected_basenames)
+        if unexpected:
+            return False, [f"{analysis_dir}: unexpected entrie(s) present: {unexpected}"]
+
+    # Resolve exactly one action per artifact -- create/skip/conflict --
+    # before creating, overwriting, or deleting anything.
+    to_create: list[tuple[Path, bytes]] = []
+    conflicts: list[str] = []
+    for path, content in artifacts:
+        action, conflict_detail = _resolve_retryable_artifact(path, content)
+        if action == "create":
+            to_create.append((path, content))
+        elif action == "conflict":
+            conflicts.append(conflict_detail)
+    if conflicts:
+        return False, conflicts
+
+    if state in ("ANALYZED", "INCONCLUSIVE"):
+        # A terminal campaign must never gain a newly created artifact; if
+        # one is missing here, the campaign's own claim of being terminal is
+        # itself untrustworthy -- fail closed rather than complete it now.
+        if to_create:
+            return False, [
+                f"manifest already reached terminal state={state!r}, but {len(to_create)} analysis "
+                f"artifact(s) are missing on disk: {[p.name for p, _c in to_create]}"
+            ]
+        recorded_hashes = manifest.get("artifact_sha256", {})
+        hash_errors = []
+        for path, content in artifacts:
+            rel = path.relative_to(campaign_dir).as_posix()
+            actual_hash = hashlib.sha256(content).hexdigest()
+            if recorded_hashes.get(rel) != actual_hash:
+                hash_errors.append(f"{rel}: recomputed SHA-256 {actual_hash} != manifest's recorded {recorded_hashes.get(rel)!r}")
+        if hash_errors:
+            return False, hash_errors
+        return True, []
+
+    # state == "COMPLETE": create only the artifacts that are actually
+    # missing, exclusively, no-clobber; every already-valid existing
+    # artifact is left completely untouched (never rewritten, never
+    # re-hashed-and-republished).
     published: list[Path] = []
     published_identity: dict[Path, tuple[int, int]] = {}
 
@@ -3312,21 +4048,26 @@ def _do_analyze(
                 pass
 
     try:
-        for path, header, rows in outputs:
-            _write_csv_no_clobber(path, header, rows)
-            published.append(path)
-            published_identity[path] = p23._file_identity(path)
-        for path, text in file_writes:
-            _write_text_no_clobber(path, text)
+        p23._mkdir_component(analysis_dir, must_not_exist=False, root=REPO_ROOT)
+    except p23.UnsafePathError as exc:
+        return False, [str(exc)]
+
+    try:
+        for i, (path, content) in enumerate(to_create):
+            if _test_hook_during_publication is not None:
+                _test_hook_during_publication(i, len(to_create))
+            _write_bytes_no_clobber(path, content)
             published.append(path)
             published_identity[path] = p23._file_identity(path)
     except (p23.UnsafePathError, OSError) as exc:
         _cleanup_published()
         return False, [f"analysis artifact publication failed: {exc}"]
 
+    # Re-read and re-hash all ten outputs fresh from disk immediately before
+    # the final manifest revision -- including any artifact a prior,
+    # interrupted attempt had already safely published.
     try:
-        artifact_hashes = {path.relative_to(campaign_dir).as_posix(): p23.sha256_of(path) for path, _, _ in outputs}
-        artifact_hashes.update({path.relative_to(campaign_dir).as_posix(): p23.sha256_of(path) for path, _ in file_writes})
+        artifact_hashes = {path.relative_to(campaign_dir).as_posix(): p23.sha256_of(path) for path, _content in artifacts}
     except p23.UnsafePathError as exc:
         _cleanup_published()
         return False, [str(exc)]
@@ -3342,6 +4083,20 @@ def _do_analyze(
             "(pre-terminal) integrity gate; the terminal state was not published and the analysis "
             "artifacts just written were removed:",
         ] + integrity_errors2
+
+    p23_revalidation_errors2, _p23_snapshot_after = revalidate_p23_pilot_campaign(
+        p23_campaign_dir, git_commit=manifest.get("provenance", {}).get("git_commit"),
+    )
+    if p23_revalidation_errors2:
+        _cleanup_published()
+        return False, [
+            "P2.3 pilot evidence changed while analysis was being computed/published, detected by the "
+            "second (pre-terminal) P2.3 revalidation; the terminal state was not published and the "
+            "analysis artifacts just written were removed:",
+        ] + p23_revalidation_errors2
+
+    if _test_hook_before_manifest_append is not None:
+        _test_hook_before_manifest_append()
 
     updates = {
         "analysis_completed_at_utc": analyzed_at_utc,
@@ -3594,6 +4349,13 @@ def _build_ncu_case_fixture(
         writer.writerow(launch_values)
     ncu_rep = out_dir / f"{entry['case_name']}_report.ncu-rep"
     ncu_rep.write_bytes(b"synthetic ncu report bytes, never a real profile\n")
+    # The remaining four canonical per-case artifacts (Defect-2 repair: the
+    # frozen inventory is exactly seven files -- see
+    # CANONICAL_PROFILE_CASE_FILE_LABELS).
+    (out_dir / f"{entry['case_name']}.ncu_tool.log").write_text("synthetic ncu tool log\n", encoding="utf-8")
+    (out_dir / f"{entry['case_name']}.container_stdout.log").write_text("synthetic container stdout\n", encoding="utf-8")
+    (out_dir / f"{entry['case_name']}.container_stderr.log").write_text("synthetic container stderr\n", encoding="utf-8")
+    (out_dir / f"{entry['case_name']}.metrics_export_stderr.log").write_text("synthetic metrics export stderr\n", encoding="utf-8")
     return app_csv, metrics_csv, ncu_rep, row
 
 
@@ -3602,7 +4364,11 @@ def _run_full_pipeline(tmp_path: Path, campaign_id: str, *, sm_cycles_fn=None) -
     all 24 profile cases validated. sm_cycles_fn(entry) -> float|None
     overrides the per-case SM-clock reading (None omits the metric's value
     entirely, simulating a counter this GB300 build did not populate)."""
-    p23_campaign_dir, _ = _build_p23_pilot_campaign_fixture(tmp_path, f"p23_{campaign_id}")
+    # The P2.4 wrapper and the P2.3 campaign it drives share one explicit
+    # campaign ID (src/compute/P2_4_PROTOCOL.md section 2); the two live
+    # under different raw roots (exp02_umma_throughput vs.
+    # exp02_umma_throughput_p24) so this never collides.
+    p23_campaign_dir, _ = _build_p23_pilot_campaign_fixture(tmp_path, campaign_id)
     p24_campaign_dir = _do_init_campaign(campaign_id=campaign_id, started_at_utc="20260804T100000Z")
     preflight_path = tmp_path / f"preflight_{campaign_id}.json"
     _write_preflight_json(preflight_path, _default_preflight_doc())
@@ -4006,7 +4772,7 @@ def run_self_test() -> int:  # noqa: C901
 
             # --- provenance/GPU mismatch between pilot and profile preflight ------
             mismatch_campaign_id = "20260804T230000Z"
-            p23_campaign_dir_mm, _ = _build_p23_pilot_campaign_fixture(tmp_path, f"p23_{mismatch_campaign_id}")
+            p23_campaign_dir_mm, _ = _build_p23_pilot_campaign_fixture(tmp_path, mismatch_campaign_id)
             mismatch_campaign = _do_init_campaign(campaign_id=mismatch_campaign_id, started_at_utc="20260804T230000Z")
             preflight_mm = tmp_path / "preflight_mm.json"
             _write_preflight_json(preflight_mm, _default_preflight_doc())
@@ -4033,6 +4799,665 @@ def run_self_test() -> int:  # noqa: C901
             except p23.ManifestTransitionError:
                 failed_cannot_complete = True
             rec.check("a FAILED campaign can never subsequently reach COMPLETE", failed_cannot_complete)
+
+            # =================================================================
+            # Defect 1 repair: strict campaign-provenance comparison
+            # =================================================================
+            valid_provenance = {
+                "git_commit": _FIXED_GIT_COMMIT, "gpu_uuid": _FIXED_GPU_UUID, "gpu_name": _FIXED_GPU_NAME,
+                "compute_capability": "10.3", "cuda_driver_version": "13010", "cuda_runtime_version": "13010",
+                "visible_device_count": 1, "logical_device_index": 0, "campaign_id": "20260805T010000Z",
+            }
+            prov_errors = validate_provenance_tuple(valid_provenance, label="test")
+            rec.check("validate_provenance_tuple accepts a fully valid campaign provenance tuple", not prov_errors, detail=str(prov_errors))
+            rec.check("validate_provenance_tuple rejects a non-dict input", bool(validate_provenance_tuple(None, label="test")))
+
+            for field in MANDATORY_PROVENANCE_FIELDS:
+                absent = dict(valid_provenance)
+                del absent[field]
+                errs = validate_provenance_tuple(absent, label="test")
+                rec.check(f"validate_provenance_tuple rejects an absent {field}", any("absent" in e for e in errs), detail=str(errs))
+
+                nulled = dict(valid_provenance)
+                nulled[field] = None
+                errs = validate_provenance_tuple(nulled, label="test")
+                rec.check(f"validate_provenance_tuple rejects a null {field}, distinctly from absent", any("is null" in e for e in errs), detail=str(errs))
+
+            wrong_type = dict(valid_provenance)
+            wrong_type["visible_device_count"] = "1"
+            rec.check("validate_provenance_tuple rejects a wrong-typed visible_device_count (str instead of int)", bool(validate_provenance_tuple(wrong_type, label="test")))
+
+            bad_commit = dict(valid_provenance)
+            bad_commit["git_commit"] = "not-a-commit"
+            rec.check("validate_provenance_tuple rejects a malformed git_commit", bool(validate_provenance_tuple(bad_commit, label="test")))
+
+            bad_uuid = dict(valid_provenance)
+            bad_uuid["gpu_uuid"] = "not-a-uuid"
+            rec.check("validate_provenance_tuple rejects a malformed gpu_uuid", bool(validate_provenance_tuple(bad_uuid, label="test")))
+
+            for count in (0, 2, -1):
+                bad_count = dict(valid_provenance)
+                bad_count["visible_device_count"] = count
+                rec.check(f"validate_provenance_tuple rejects visible_device_count={count} (must be exactly 1)", bool(validate_provenance_tuple(bad_count, label="test")))
+
+            for index in (1, -1, 2):
+                bad_index = dict(valid_provenance)
+                bad_index["logical_device_index"] = index
+                rec.check(f"validate_provenance_tuple rejects logical_device_index={index} (must be exactly 0)", bool(validate_provenance_tuple(bad_index, label="test")))
+
+            valid_app_row = {
+                "git_commit": _FIXED_GIT_COMMIT, "gpu_uuid": _FIXED_GPU_UUID, "gpu_name": _FIXED_GPU_NAME,
+                "compute_capability": "10.3", "cuda_driver_version": "13010", "cuda_runtime_version": "13010",
+            }
+            rec.check(
+                "compare_application_provenance accepts a row that matches the campaign tuple exactly",
+                not compare_application_provenance(app_row=valid_app_row, campaign_provenance=valid_provenance, label="test"),
+            )
+            for row_field, _prov_field in APPLICATION_PROVENANCE_FIELD_MAP:
+                mismatched_row = dict(valid_app_row)
+                mismatched_row[row_field] = "DEFINITELY_DIFFERENT_VALUE"
+                errs = compare_application_provenance(app_row=mismatched_row, campaign_provenance=valid_provenance, label="test")
+                rec.check(f"compare_application_provenance rejects a mismatched {row_field}", bool(errs), detail=str(errs))
+
+            cross_uuid_row = dict(valid_app_row)
+            cross_uuid_row["gpu_uuid"] = "GPU-99999999-9999-9999-9999-999999999999"
+            cross_uuid_errors = compare_application_provenance(app_row=cross_uuid_row, campaign_provenance=valid_provenance, label="test")
+            rec.check(
+                "compare_application_provenance rejects application evidence from a different GPU UUID (the reproduced audit finding)",
+                any("gpu_uuid" in e for e in cross_uuid_errors), detail=str(cross_uuid_errors),
+            )
+
+            # --- end-to-end: application evidence from a different GPU UUID is rejected by the full pipeline ---
+            uuid_tamper_campaign_id = "20260805T020000Z"
+            uuid_tamper_campaign = _run_full_pipeline(tmp_path, uuid_tamper_campaign_id)
+            uuid_case_name = build_profile_plan()[2]["case_name"]
+            uuid_app_csv = uuid_tamper_campaign / "profiles" / uuid_case_name / f"{uuid_case_name}.application.csv"
+            original_uuid_bytes = uuid_app_csv.read_bytes()
+            uuid_app_csv.write_bytes(original_uuid_bytes.replace(_FIXED_GPU_UUID.encode(), b"GPU-99999999-9999-9999-9999-999999999999"))
+            uuid_integrity_errors, uuid_verified = verify_campaign_evidence_integrity(uuid_tamper_campaign, load_p24_manifest_chain(uuid_tamper_campaign)[0])
+            rec.check(
+                "end-to-end: one profile's application evidence reporting a different GPU UUID than the campaign "
+                "is rejected by the evidence-integrity gate",
+                bool(uuid_integrity_errors) and uuid_verified is None and any("gpu_uuid" in e for e in uuid_integrity_errors),
+                detail=str(uuid_integrity_errors),
+            )
+            uuid_app_csv.write_bytes(original_uuid_bytes)
+            uuid_ok, uuid_finalize_errors = _do_finalize_profile(campaign_dir=uuid_tamper_campaign, completed_at_utc="20260805T021000Z")
+            rec.check("end-to-end cross-UUID campaign finalizes successfully once evidence is restored", uuid_ok, detail=str(uuid_finalize_errors))
+
+            # --- preflight requires exactly logical device 0 ------------------------
+            default_preflight_doc = _default_preflight_doc()
+            bad_logical_index_preflight = tmp_path / "preflight_bad_logical_index.json"
+            _write_preflight_json(
+                bad_logical_index_preflight,
+                {**default_preflight_doc, "gpu": {**default_preflight_doc["gpu"], "logical_index": "1"}},
+            )
+            bad_index_errors, _snap = validate_preflight_file(bad_logical_index_preflight, expected_git_commit=_FIXED_GIT_COMMIT, now_utc=now)
+            rec.check("a preflight reporting logical_index != '0' is rejected", any("logical_index" in e for e in bad_index_errors), detail=str(bad_index_errors))
+
+            # --- P2.3 and P2.4 campaign IDs must match -------------------------------
+            mismatched_ids_p24 = _do_init_campaign(campaign_id="20260805T030000Z", started_at_utc="20260805T030000Z")
+            mismatched_ids_p23, _ = _build_p23_pilot_campaign_fixture(tmp_path, "p23_deliberately_different_id")
+            preflight_ids = tmp_path / "preflight_ids.json"
+            _write_preflight_json(preflight_ids, _default_preflight_doc())
+            ok_ids, errors_ids = _do_record_pilot(
+                campaign_dir=mismatched_ids_p24, p23_campaign_dir=mismatched_ids_p23, preflight_path=preflight_ids,
+                git_commit=_FIXED_GIT_COMMIT, completed_at_utc="20260805T030500Z", now_utc=now,
+            )
+            rec.check(
+                "record-pilot rejects a P2.3 campaign whose ID does not match the P2.4 campaign's own ID",
+                not ok_ids and any("campaign ID" in e for e in errors_ids), detail=str(errors_ids),
+            )
+
+            # =================================================================
+            # Defect 2 repair: exact seven-file per-case profile inventory
+            # =================================================================
+            canonical_names_check = canonical_profile_case_filenames(build_profile_plan()[3]["case_name"])
+            rec.check("canonical_profile_case_filenames returns exactly seven names", len(canonical_names_check) == 7, detail=str(canonical_names_check))
+
+            file_removal_campaign_id = "20260805T040000Z"
+            file_removal_campaign = _run_full_pipeline(tmp_path, file_removal_campaign_id)
+            fr_case_name = build_profile_plan()[3]["case_name"]
+            fr_case_dir = file_removal_campaign / "profiles" / fr_case_name
+            for _label, _suffix in CANONICAL_PROFILE_CASE_FILE_LABELS:
+                target = fr_case_dir / f"{fr_case_name}{_suffix}"
+                original = target.read_bytes()
+                target.unlink()
+                errs, verified = verify_campaign_evidence_integrity(file_removal_campaign, load_p24_manifest_chain(file_removal_campaign)[0])
+                rec.check(f"removing the canonical {fr_case_name}{_suffix} artifact is rejected, never reaches COMPLETE", bool(errs) and verified is None, detail=str(errs))
+                target.write_bytes(original)
+            fr_ok, fr_errors = _do_finalize_profile(campaign_dir=file_removal_campaign, completed_at_utc="20260805T041000Z")
+            rec.check("campaign finalizes successfully once all seven files are restored", fr_ok, detail=str(fr_errors))
+
+            eighth_file_campaign_id = "20260805T050000Z"
+            eighth_file_campaign = _run_full_pipeline(tmp_path, eighth_file_campaign_id)
+            ef_case_name = build_profile_plan()[4]["case_name"]
+            ef_case_dir = eighth_file_campaign / "profiles" / ef_case_name
+
+            eighth_path = ef_case_dir / f"{ef_case_name}.ncu_bridge_stderr.log"
+            eighth_path.write_text("leaked bridge stderr\n", encoding="utf-8")
+            eighth_errors, eighth_verified = verify_campaign_evidence_integrity(eighth_file_campaign, load_p24_manifest_chain(eighth_file_campaign)[0])
+            rec.check(
+                "the former unauthorized eighth file (<case>.ncu_bridge_stderr.log) is rejected as an unplanned entry",
+                bool(eighth_errors) and eighth_verified is None, detail=str(eighth_errors),
+            )
+            eighth_path.unlink()
+
+            extra_path = ef_case_dir / "notes.txt"
+            extra_path.write_text("arbitrary extra file\n", encoding="utf-8")
+            extra_file_errors, extra_file_verified = verify_campaign_evidence_integrity(eighth_file_campaign, load_p24_manifest_chain(eighth_file_campaign)[0])
+            rec.check("an arbitrary extra file in a case directory is rejected", bool(extra_file_errors) and extra_file_verified is None)
+            extra_path.unlink()
+
+            symlinked_target = ef_case_dir / f"{ef_case_name}.ncu_tool.log"
+            symlinked_original = symlinked_target.read_bytes()
+            elsewhere = tmp_path / "elsewhere_ncu_tool.log"
+            elsewhere.write_bytes(symlinked_original)
+            symlinked_target.unlink()
+            symlinked_target.symlink_to(elsewhere)
+            symlink_file_errors, symlink_file_verified = verify_campaign_evidence_integrity(eighth_file_campaign, load_p24_manifest_chain(eighth_file_campaign)[0])
+            rec.check("a canonical per-case artifact replaced by a symlink is rejected", bool(symlink_file_errors) and symlink_file_verified is None)
+            symlinked_target.unlink()
+            symlinked_target.write_bytes(symlinked_original)
+
+            wrong_type_target = ef_case_dir / f"{ef_case_name}.container_stdout.log"
+            wrong_type_original = wrong_type_target.read_bytes()
+            wrong_type_target.unlink()
+            wrong_type_target.mkdir()
+            wrong_type_errors, wrong_type_verified = verify_campaign_evidence_integrity(eighth_file_campaign, load_p24_manifest_chain(eighth_file_campaign)[0])
+            rec.check("a canonical per-case artifact replaced by a directory is rejected", bool(wrong_type_errors) and wrong_type_verified is None)
+            wrong_type_target.rmdir()
+            wrong_type_target.write_bytes(wrong_type_original)
+
+            eighth_ok, eighth_finalize_errors = _do_finalize_profile(campaign_dir=eighth_file_campaign, completed_at_utc="20260805T051000Z")
+            rec.check("campaign finalizes successfully once all decoy/extra/symlinked entries are removed and restored", eighth_ok, detail=str(eighth_finalize_errors))
+
+            # =================================================================
+            # Defect 3 repair: all-24-valid rule for SM-count device
+            # extrapolation
+            # =================================================================
+            mp_plan = build_profile_plan()
+
+            def _case_results_with_mp(values: dict, units: dict | None = None) -> dict:
+                results = {}
+                for e in mp_plan:
+                    entry_values: dict = {}
+                    entry_units: dict = {}
+                    if e["case_name"] in values:
+                        entry_values[DEVICE_MULTIPROCESSOR_COUNT_METRIC] = values[e["case_name"]]
+                        entry_units[DEVICE_MULTIPROCESSOR_COUNT_METRIC] = (units or {}).get(e["case_name"], "")
+                    results[e["case_name"]] = {"diagnostic_metric_values": entry_values, "diagnostic_metric_units": entry_units}
+                return results
+
+            all_valid_132 = {e["case_name"]: 132.0 for e in mp_plan}
+            mp_eval = evaluate_device_multiprocessor_count(_case_results_with_mp(all_valid_132), mp_plan)
+            rec.check(
+                "evaluate_device_multiprocessor_count: a valid identical positive integer in all 24 profiles enables extrapolation",
+                mp_eval["available"] and mp_eval["multiprocessor_count"] == 132, detail=str(mp_eval),
+            )
+
+            mp_eval_missing_all = evaluate_device_multiprocessor_count(_case_results_with_mp({}), mp_plan)
+            rec.check("evaluate_device_multiprocessor_count: missing in all profiles suppresses extrapolation", not mp_eval_missing_all["available"])
+
+            missing_one = dict(all_valid_132)
+            del missing_one[mp_plan[0]["case_name"]]
+            mp_eval_missing_one = evaluate_device_multiprocessor_count(_case_results_with_mp(missing_one), mp_plan)
+            rec.check(
+                "evaluate_device_multiprocessor_count: missing in exactly one profile suppresses extrapolation "
+                "(audit repair: one profile's absence used to be silently ignored)",
+                not mp_eval_missing_one["available"],
+            )
+
+            for _label, _bad_value in (("negative", -5.0), ("zero", 0.0), ("NaN", float("nan")), ("infinity", float("inf")), ("non-integer", 132.5)):
+                tampered = dict(all_valid_132)
+                tampered[mp_plan[1]["case_name"]] = _bad_value
+                mp_eval_bad = evaluate_device_multiprocessor_count(_case_results_with_mp(tampered), mp_plan)
+                rec.check(
+                    f"evaluate_device_multiprocessor_count: a {_label} value in one profile suppresses extrapolation",
+                    not mp_eval_bad["available"], detail=str(mp_eval_bad),
+                )
+
+            inconsistent = dict(all_valid_132)
+            inconsistent[mp_plan[2]["case_name"]] = 148.0
+            mp_eval_inconsistent = evaluate_device_multiprocessor_count(_case_results_with_mp(inconsistent), mp_plan)
+            rec.check(
+                "evaluate_device_multiprocessor_count: inconsistent (but individually valid positive) values across "
+                "profiles suppress extrapolation",
+                not mp_eval_inconsistent["available"],
+            )
+
+            wrong_unit_result = _case_results_with_mp(all_valid_132, units={mp_plan[3]["case_name"]: "count"})
+            mp_eval_wrong_unit = evaluate_device_multiprocessor_count(wrong_unit_result, mp_plan)
+            rec.check("evaluate_device_multiprocessor_count: an unexpected unit representation suppresses extrapolation", not mp_eval_wrong_unit["available"])
+
+            dup_metric_rows = [
+                ["ID", "Kernel Name", DEVICE_MULTIPROCESSOR_COUNT_METRIC, f"A.{DEVICE_MULTIPROCESSOR_COUNT_METRIC}"],
+                ["", "", "", ""],
+                ["1", "k", "132", "148"],
+            ]
+            dup_metric_raised = False
+            try:
+                _parse_ncu_raw_csv_rows(dup_metric_rows, label="dup-mp-count")
+            except NcuCsvParseError:
+                dup_metric_raised = True
+            rec.check("duplicate/ambiguous device__attribute_multiprocessor_count columns within one profile's raw CSV are rejected", dup_metric_raised)
+
+            ceiling_case_results = {
+                e["case_name"]: {"sm_clock_valid": True, "sm_clock_hz": 1.4e9, "diagnostic_metric_values": {}, "diagnostic_metric_units": {}}
+                for e in mp_plan
+            }
+            ceiling_stats = {
+                (e["method"], e["n"], e["depth"]): {
+                    "cta_group": p23.METHOD_INFO[e["method"]]["cta_group"],
+                    "flops_per_cycle": {"median": 10.0},
+                    "flops_per_cycle_per_sm": {"median": 10.0 / p23.METHOD_INFO[e["method"]]["cta_group"]},
+                }
+                for e in mp_plan
+            }
+            ceiling_doc = build_empirical_ceiling(stats_by_config=ceiling_stats, case_results=ceiling_case_results, all_sm_clock_valid=True, inconclusive_reason=[])
+            rec.check(
+                "a missing/invalid SM count suppresses only the device-wide estimate, never the local/per-SM TFLOP/s estimates",
+                ceiling_doc["device_equivalent_estimate"]["available"] is False
+                and ceiling_doc["empirical_per_sm_ceiling_candidate"]["estimated_local_tflops"] is not None
+                and ceiling_doc["empirical_per_sm_ceiling_candidate"]["estimated_tflops_per_sm"] is not None,
+                detail=str(ceiling_doc["device_equivalent_estimate"]),
+            )
+
+            # =================================================================
+            # Defect 4 repair: full 720-sample P2.3 pilot revalidation
+            # =================================================================
+            p23_reval_id = "20260805T060000Z"
+            p23_reval_dir, _p23_reval_manifest = _build_p23_pilot_campaign_fixture(tmp_path, p23_reval_id)
+            reval_errors, reval_snapshot = revalidate_p23_pilot_campaign(p23_reval_dir, git_commit=_FIXED_GIT_COMMIT)
+            rec.check(
+                "revalidate_p23_pilot_campaign accepts a genuinely valid, untampered 720-sample (24x30) P2.3 campaign",
+                not reval_errors and reval_snapshot is not None and reval_snapshot["sample_count"] == 720,
+                detail=str(reval_errors),
+            )
+
+            reval_plan = p23.build_plan()
+            reval_case_path = p23_reval_dir / "cases" / f"{reval_plan[5]['case_name']}.csv"
+
+            def _mutate_case_row(path: Path, sample_index: int, field: str, new_value: str) -> bytes:
+                original = path.read_bytes()
+                with open(path, "r", newline="", encoding="utf-8") as fh:
+                    rows = list(csv.reader(fh))
+                header, data = rows[0], rows[1:]
+                col = header.index(field)
+                si_col = header.index("sample_index")
+                for row in data:
+                    if row[si_col] == str(sample_index):
+                        row[col] = new_value
+                        break
+                with open(path, "w", newline="", encoding="utf-8") as fh:
+                    writer = csv.writer(fh)
+                    writer.writerow(header)
+                    writer.writerows(data)
+                return original
+
+            def _check_reval_rejects(label: str, path: Path, original: bytes) -> None:
+                errs, snap = revalidate_p23_pilot_campaign(p23_reval_dir, git_commit=_FIXED_GIT_COMMIT)
+                rec.check(f"revalidate_p23_pilot_campaign rejects {label}", bool(errs) and snap is None, detail=str(errs))
+                path.write_bytes(original)
+
+            _check_reval_rejects(
+                "a mutated raw elapsed_cycles value inconsistent with its own stored derived fields",
+                reval_case_path, _mutate_case_row(reval_case_path, 0, "elapsed_cycles", "999999999"),
+            )
+            _check_reval_rejects(
+                "a mutated stored derived value (flops_per_cycle) inconsistent with its own raw inputs",
+                reval_case_path, _mutate_case_row(reval_case_path, 0, "flops_per_cycle", "999.999999"),
+            )
+            _check_reval_rejects("a mutated correctness flag", reval_case_path, _mutate_case_row(reval_case_path, 0, "correctness", "FAIL"))
+            _check_reval_rejects("a mutated mismatches count", reval_case_path, _mutate_case_row(reval_case_path, 0, "mismatches", "1"))
+            _check_reval_rejects("a mutated commit in one row", reval_case_path, _mutate_case_row(reval_case_path, 0, "git_commit", "e" * 40))
+            _check_reval_rejects(
+                "a mutated GPU UUID in one row", reval_case_path,
+                _mutate_case_row(reval_case_path, 0, "gpu_uuid", "GPU-99999999-9999-9999-9999-999999999999"),
+            )
+            _check_reval_rejects(
+                "a mutated driver/runtime field in one row", reval_case_path,
+                _mutate_case_row(reval_case_path, 0, "cuda_driver_version", "99999"),
+            )
+            _reval_new_n = 256 if reval_plan[5]["n"] != 256 else 64
+            _check_reval_rejects(
+                "a mutated configuration field (n) in one row", reval_case_path,
+                _mutate_case_row(reval_case_path, 0, "n", str(_reval_new_n)),
+            )
+
+            # one sample/repetition index: overwrite sample_index=1 with a
+            # duplicate of sample_index=0, simultaneously producing a
+            # duplicate row and a missing index.
+            original_si = reval_case_path.read_bytes()
+            with open(reval_case_path, "r", newline="", encoding="utf-8") as fh:
+                rows = list(csv.reader(fh))
+            header, data = rows[0], rows[1:]
+            si_col = header.index("sample_index")
+            for row in data:
+                if row[si_col] == "1":
+                    row[si_col] = "0"
+                    break
+            with open(reval_case_path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(header)
+                writer.writerows(data)
+            _check_reval_rejects("a mutated sample/repetition index producing a duplicate and a missing index", reval_case_path, original_si)
+
+            # one file hash: tamper the P2.3 manifest's own recorded case-file hash
+            manifest_path_reval = p23_reval_dir / "manifest.json"
+            original_manifest_bytes = manifest_path_reval.read_bytes()
+            manifest_doc = json.loads(original_manifest_bytes)
+            manifest_doc["case_file_sha256"][reval_plan[5]["case_name"]] = "0" * 64
+            manifest_path_reval.write_bytes((json.dumps(manifest_doc, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+            _check_reval_rejects("a tampered recorded case-file SHA-256 in the P2.3 manifest", manifest_path_reval, original_manifest_bytes)
+
+            # one row order / canonical-plan position: corrupt execution_order.csv
+            eo_path = p23_reval_dir / "execution_order.csv"
+            original_eo = eo_path.read_bytes()
+            with open(eo_path, "r", newline="", encoding="utf-8") as fh:
+                eo_rows = list(csv.reader(fh))
+            eo_header, eo_data = eo_rows[0], eo_rows[1:]
+            eo_data[0], eo_data[1] = eo_data[1], eo_data[0]
+            with open(eo_path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(eo_header)
+                writer.writerows(eo_data)
+            _check_reval_rejects("a mutated row order/canonical-plan position in execution_order.csv", eo_path, original_eo)
+
+            # missing row
+            original_missing = reval_case_path.read_bytes()
+            with open(reval_case_path, "r", newline="", encoding="utf-8") as fh:
+                rows = list(csv.reader(fh))
+            header, data = rows[0], rows[1:]
+            data = [row for row in data if row[header.index("sample_index")] != "29"]
+            with open(reval_case_path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(header)
+                writer.writerows(data)
+            _check_reval_rejects("a missing row (29 of 30 retained samples in one configuration)", reval_case_path, original_missing)
+
+            # duplicate row
+            original_dup = reval_case_path.read_bytes()
+            with open(reval_case_path, "r", newline="", encoding="utf-8") as fh:
+                rows = list(csv.reader(fh))
+            header, data = rows[0], rows[1:]
+            duplicate_row = list(data[0])
+            with open(reval_case_path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(header)
+                writer.writerows(data + [duplicate_row])
+            _check_reval_rejects("a duplicate row (31 rows, one sample_index repeated)", reval_case_path, original_dup)
+
+            # extra row (out-of-range sample_index)
+            original_extra = reval_case_path.read_bytes()
+            with open(reval_case_path, "r", newline="", encoding="utf-8") as fh:
+                rows = list(csv.reader(fh))
+            header, data = rows[0], rows[1:]
+            extra_row = list(data[0])
+            extra_row[header.index("sample_index")] = "30"
+            with open(reval_case_path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(header)
+                writer.writerows(data + [extra_row])
+            _check_reval_rejects("an extra row with an out-of-range sample_index", reval_case_path, original_extra)
+
+            reval_errors2, reval_snapshot2 = revalidate_p23_pilot_campaign(p23_reval_dir, git_commit=_FIXED_GIT_COMMIT)
+            rec.check(
+                "revalidate_p23_pilot_campaign accepts the campaign again once every mutation is fully restored",
+                not reval_errors2 and reval_snapshot2 is not None, detail=str(reval_errors2),
+            )
+
+            # --- end-to-end: P2.4 finalize-profile now revalidates the full P2.3 pilot ---
+            # Detection is checked read-only first (mirroring the existing
+            # application.csv tamper test's pattern), so the P2.4 manifest is
+            # never driven to FAILED before the evidence is restored --
+            # exactly like the already-audited P2.4 manifest state machine
+            # (a real _do_finalize_profile failure is intentionally terminal;
+            # see "a FAILED campaign can never subsequently reach COMPLETE").
+            p24_p23_integration_id = "20260805T070000Z"
+            p24_p23_integration_campaign = _run_full_pipeline(tmp_path, p24_p23_integration_id)
+            integration_p23_dir = tmp_path.joinpath(*p23.RAW_ROOT_PARTS, p24_p23_integration_id)
+            integration_case_path = integration_p23_dir / "cases" / f"{p23.build_plan()[7]['case_name']}.csv"
+            integration_original = _mutate_case_row(integration_case_path, 3, "elapsed_cycles", "123456789")
+            integration_reval_errors, integration_reval_snapshot = revalidate_p23_pilot_campaign(integration_p23_dir, git_commit=_FIXED_GIT_COMMIT)
+            rec.check(
+                "P2.4's read-only P2.3 revalidation rejects the underlying pilot evidence once tampered after "
+                "record-pilot originally accepted it (Defect 4: P2.4 no longer trusts P2.3 merely because its "
+                "manifest/hashes were once valid)",
+                bool(integration_reval_errors) and integration_reval_snapshot is None, detail=str(integration_reval_errors),
+            )
+            integration_case_path.write_bytes(integration_original)
+            integration_ok, integration_errors = _do_finalize_profile(campaign_dir=p24_p23_integration_campaign, completed_at_utc="20260805T071000Z")
+            rec.check(
+                "finalize-profile succeeds once the underlying P2.3 pilot evidence is genuinely valid throughout",
+                integration_ok, detail=str(integration_errors),
+            )
+
+            # finalize-profile itself (not just the standalone revalidation
+            # function) must call the P2.3 revalidation and fail the P2.4
+            # campaign closed when it is tampered.
+            p24_p23_direct_id = "20260805T072000Z"
+            p24_p23_direct_campaign = _run_full_pipeline(tmp_path, p24_p23_direct_id)
+            direct_p23_dir = tmp_path.joinpath(*p23.RAW_ROOT_PARTS, p24_p23_direct_id)
+            direct_case_path = direct_p23_dir / "cases" / f"{p23.build_plan()[9]['case_name']}.csv"
+            _mutate_case_row(direct_case_path, 7, "elapsed_cycles", "555555555")
+            direct_ok, direct_errors = _do_finalize_profile(campaign_dir=p24_p23_direct_campaign, completed_at_utc="20260805T072500Z")
+            rec.check(
+                "finalize-profile itself calls the P2.3 pilot revalidation and fails the P2.4 campaign closed "
+                "(terminally FAILED) when the underlying pilot evidence is tampered",
+                not direct_ok, detail=str(direct_errors),
+            )
+            m_direct, _ = load_p24_manifest_chain(p24_p23_direct_campaign)
+            rec.check("the P2.4 campaign is driven to FAILED, never silently left COMPLETE, by a P2.3 revalidation failure", m_direct.get("state") == "FAILED")
+
+            # =================================================================
+            # Defect 5 repair: deterministic, no-clobber, resumable analysis
+            # publication -- fault injection at all four required points.
+            # =================================================================
+            def _build_complete_campaign(campaign_id: str, finalize_at: str) -> Path:
+                camp = _run_full_pipeline(tmp_path, campaign_id)
+                ok, errs = _do_finalize_profile(campaign_dir=camp, completed_at_utc=finalize_at)
+                if not ok:
+                    raise AssertionError(f"self-test fixture: finalize-profile failed: {errs}")
+                return camp
+
+            # --- fault before the first artifact ------------------------------------
+            fault1_campaign = _build_complete_campaign("20260805T080000Z", "20260805T080100Z")
+
+            def _raise_before_first(i: int, _n: int) -> None:
+                if i == 0:
+                    raise RuntimeError("injected: before first artifact")
+
+            raised1 = False
+            try:
+                _do_analyze(campaign_dir=fault1_campaign, analyzed_at_utc="20260805T080200Z", _test_hook_during_publication=_raise_before_first)
+            except RuntimeError:
+                raised1 = True
+            rec.check("fault injection before the first artifact interrupts publication as expected", raised1)
+            fault1_analysis_dir = fault1_campaign / "analysis"
+            fault1_files_after_crash = sorted(p.name for p in fault1_analysis_dir.iterdir()) if fault1_analysis_dir.exists() else []
+            rec.check("a crash before the first artifact leaves zero analysis artifacts published", fault1_files_after_crash == [], detail=str(fault1_files_after_crash))
+            ok1, errs1 = _do_analyze(campaign_dir=fault1_campaign, analyzed_at_utc="20260805T080200Z")
+            rec.check("a clean retry after a before-first-artifact crash completes successfully", ok1, detail=str(errs1))
+            m1, _ = load_p24_manifest_chain(fault1_campaign)
+            rec.check("the retried campaign reaches ANALYZED", m1.get("state") == "ANALYZED")
+
+            # --- fault halfway through artifact publication -------------------------
+            fault2_campaign = _build_complete_campaign("20260805T090000Z", "20260805T090100Z")
+
+            def _raise_halfway(i: int, n: int) -> None:
+                if i == n // 2:
+                    raise RuntimeError("injected: halfway through publication")
+
+            raised2 = False
+            try:
+                _do_analyze(campaign_dir=fault2_campaign, analyzed_at_utc="20260805T090200Z", _test_hook_during_publication=_raise_halfway)
+            except RuntimeError:
+                raised2 = True
+            rec.check("fault injection halfway through publication interrupts it as expected", raised2)
+            fault2_analysis_dir = fault2_campaign / "analysis"
+            fault2_files_after_crash = sorted(p.name for p in fault2_analysis_dir.iterdir())
+            rec.check(
+                "a crash halfway through publication leaves a genuine, non-empty, strict subset of the ten artifacts",
+                0 < len(fault2_files_after_crash) < len(ANALYSIS_ARTIFACT_RELATIVE_PATHS), detail=str(fault2_files_after_crash),
+            )
+            fault2_partial_bytes = {name: (fault2_analysis_dir / name).read_bytes() for name in fault2_files_after_crash}
+            fault2_partial_inodes = {name: os.stat(fault2_analysis_dir / name).st_ino for name in fault2_files_after_crash}
+            ok2, errs2 = _do_analyze(campaign_dir=fault2_campaign, analyzed_at_utc="20260805T090200Z")
+            rec.check("a clean retry after a halfway crash completes successfully", ok2, detail=str(errs2))
+            rec.check(
+                "a clean retry never changes the bytes or the inode of an artifact a prior interrupted attempt already safely published",
+                all(
+                    (fault2_analysis_dir / name).read_bytes() == fault2_partial_bytes[name]
+                    and os.stat(fault2_analysis_dir / name).st_ino == fault2_partial_inodes[name]
+                    for name in fault2_files_after_crash
+                ),
+            )
+            m2, _ = load_p24_manifest_chain(fault2_campaign)
+            rec.check(
+                "the retried halfway-crashed campaign reaches ANALYZED with all ten artifacts",
+                m2.get("state") == "ANALYZED" and set(ANALYSIS_ARTIFACT_RELATIVE_PATHS) <= set(m2.get("artifact_sha256", {})),
+            )
+
+            # --- fault after all artifacts but before the ANALYZED revision ---------
+            fault3_campaign = _build_complete_campaign("20260805T100000Z", "20260805T100100Z")
+
+            def _raise_before_final_gate() -> None:
+                raise RuntimeError("injected: after all artifacts, before the final gate")
+
+            raised3 = False
+            try:
+                _do_analyze(campaign_dir=fault3_campaign, analyzed_at_utc="20260805T100200Z", _test_hook_before_final_gate=_raise_before_final_gate)
+            except RuntimeError:
+                raised3 = True
+            rec.check("fault injection after all artifacts but before the final gate interrupts publication as expected", raised3)
+            fault3_analysis_dir = fault3_campaign / "analysis"
+            fault3_files_after_crash = sorted(p.name for p in fault3_analysis_dir.iterdir())
+            rec.check(
+                "a crash after all artifacts but before the final gate leaves all ten artifacts published, manifest still COMPLETE",
+                len(fault3_files_after_crash) == len(ANALYSIS_ARTIFACT_RELATIVE_PATHS),
+            )
+            m3_before, _ = load_p24_manifest_chain(fault3_campaign)
+            rec.check("the manifest is still COMPLETE (never a partial ANALYZED) after this crash", m3_before.get("state") == "COMPLETE")
+            fault3_bytes_before_retry = {name: (fault3_analysis_dir / name).read_bytes() for name in fault3_files_after_crash}
+            ok3, errs3 = _do_analyze(campaign_dir=fault3_campaign, analyzed_at_utc="20260805T100200Z")
+            rec.check("a clean retry after an after-artifacts crash completes successfully and appends the missing ANALYZED revision", ok3, detail=str(errs3))
+            rec.check(
+                "the retry does not change any already-valid artifact's bytes",
+                all((fault3_analysis_dir / name).read_bytes() == fault3_bytes_before_retry[name] for name in fault3_files_after_crash),
+            )
+
+            # --- fault during the final manifest append -----------------------------
+            fault4_campaign = _build_complete_campaign("20260805T110000Z", "20260805T110100Z")
+
+            def _raise_before_manifest_append() -> None:
+                raise RuntimeError("injected: during the final manifest append")
+
+            raised4 = False
+            try:
+                _do_analyze(campaign_dir=fault4_campaign, analyzed_at_utc="20260805T110200Z", _test_hook_before_manifest_append=_raise_before_manifest_append)
+            except RuntimeError:
+                raised4 = True
+            rec.check("fault injection during the final manifest append interrupts it as expected", raised4)
+            m4_before, _ = load_p24_manifest_chain(fault4_campaign)
+            rec.check("the manifest is still COMPLETE after a fault injected during the final manifest append", m4_before.get("state") == "COMPLETE")
+            ok4, errs4 = _do_analyze(campaign_dir=fault4_campaign, analyzed_at_utc="20260805T110200Z")
+            rec.check("a clean retry after a during-manifest-append crash completes successfully", ok4, detail=str(errs4))
+            m4_after, _ = load_p24_manifest_chain(fault4_campaign)
+            rec.check("the retried campaign reaches ANALYZED", m4_after.get("state") == "ANALYZED")
+
+            # --- pure revalidation of an already-ANALYZED campaign (no writes) ------
+            reval_only_campaign = _build_complete_campaign("20260805T120000Z", "20260805T120100Z")
+            ok_first, errs_first = _do_analyze(campaign_dir=reval_only_campaign, analyzed_at_utc="20260805T120200Z")
+            rec.check("first analyze of a fresh COMPLETE campaign succeeds", ok_first, detail=str(errs_first))
+            reval_only_dir = reval_only_campaign / "analysis"
+            reval_only_inodes_before = {p.name: os.stat(p).st_ino for p in reval_only_dir.iterdir()}
+            reval_only_bytes_before = {p.name: p.read_bytes() for p in reval_only_dir.iterdir()}
+            _m_reval_only_before, rev_before = load_p24_manifest_chain(reval_only_campaign)
+            ok_second, errs_second = _do_analyze(campaign_dir=reval_only_campaign, analyzed_at_utc="20260805T120200Z")
+            rec.check("calling analyze again on an already-ANALYZED campaign succeeds (pure revalidation, not an error)", ok_second, detail=str(errs_second))
+            reval_only_inodes_after = {p.name: os.stat(p).st_ino for p in reval_only_dir.iterdir()}
+            rec.check(
+                "revalidating an already-ANALYZED campaign never rewrites any artifact (identical inodes, identical bytes)",
+                reval_only_inodes_after == reval_only_inodes_before
+                and all(p.read_bytes() == reval_only_bytes_before[p.name] for p in reval_only_dir.iterdir()),
+            )
+            _m_reval_only_after, rev_after = load_p24_manifest_chain(reval_only_campaign)
+            rec.check("revalidating an already-ANALYZED campaign never appends a new manifest revision", rev_before == rev_after)
+
+            # --- retry over altered/unexpected evidence must fail, never silently accept or overwrite ---
+            tampered_retry_campaign = _build_complete_campaign("20260805T130000Z", "20260805T130100Z")
+            ok_pre, errs_pre = _do_analyze(campaign_dir=tampered_retry_campaign, analyzed_at_utc="20260805T130200Z")
+            rec.check("fixture for tampered-retry test reaches ANALYZED", ok_pre, detail=str(errs_pre))
+            tampered_path = tampered_retry_campaign / "analysis" / "report.md"
+            original_report_bytes = tampered_path.read_bytes()
+            tampered_path.write_bytes(original_report_bytes + b"\ntampered by an adversary\n")
+            ok_tampered, errs_tampered = _do_analyze(campaign_dir=tampered_retry_campaign, analyzed_at_utc="20260805T130300Z")
+            rec.check("a retry over a tampered already-published artifact fails closed, never overwrites it", not ok_tampered, detail=str(errs_tampered))
+            rec.check(
+                "the tampered artifact is left untouched (not silently repaired or deleted) after a failed retry",
+                tampered_path.read_bytes() == original_report_bytes + b"\ntampered by an adversary\n",
+            )
+            tampered_path.write_bytes(original_report_bytes)
+            ok_restored, errs_restored = _do_analyze(campaign_dir=tampered_retry_campaign, analyzed_at_utc="20260805T130300Z")
+            rec.check("a retry succeeds again once the tampered artifact is restored", ok_restored, detail=str(errs_restored))
+
+            # --- an unexpected extra entry under analysis/ fails closed --------------
+            extra_entry_campaign = _build_complete_campaign("20260805T140000Z", "20260805T140100Z")
+            (extra_entry_campaign / "analysis" / "unexpected_extra_file.txt").write_text("adversarial\n", encoding="utf-8")
+            ok_extra, errs_extra = _do_analyze(campaign_dir=extra_entry_campaign, analyzed_at_utc="20260805T140200Z")
+            rec.check("an unexpected extra entry under analysis/ fails the whole retry closed", not ok_extra, detail=str(errs_extra))
+            (extra_entry_campaign / "analysis" / "unexpected_extra_file.txt").unlink()
+            ok_extra2, errs_extra2 = _do_analyze(campaign_dir=extra_entry_campaign, analyzed_at_utc="20260805T140200Z")
+            rec.check("the retry succeeds again once the unexpected extra entry is removed", ok_extra2, detail=str(errs_extra2))
+
+            # =================================================================
+            # Defect 6 repair: every one of the ten analysis artifacts carries
+            # the exact ASCII token "publishable=false"
+            # =================================================================
+            token_campaign = _build_complete_campaign("20260805T150000Z", "20260805T150100Z")
+            ok_token, errs_token = _do_analyze(campaign_dir=token_campaign, analyzed_at_utc="20260805T150200Z")
+            rec.check("fixture for publication-token test reaches a terminal state", ok_token, detail=str(errs_token))
+            token_analysis_dir = token_campaign / "analysis"
+            token_bytes_by_name = {Path(rel).name: (token_campaign / rel).read_bytes() for rel in ANALYSIS_ARTIFACT_RELATIVE_PATHS}
+            rec.check(
+                "exactly the ten canonical analysis artifacts exist on disk",
+                set(token_bytes_by_name) == {Path(rel).name for rel in ANALYSIS_ARTIFACT_RELATIVE_PATHS} and len(token_bytes_by_name) == 10,
+            )
+            token_token_bytes = PUBLICATION_STATUS_TOKEN.encode("ascii")
+            for _name, _content in token_bytes_by_name.items():
+                rec.check(f"{_name} contains the exact ASCII token {PUBLICATION_STATUS_TOKEN!r}", token_token_bytes in _content)
+                rec.check(f"{_name} never contains or implies 'publishable=true'", b"publishable=true" not in _content)
+
+            ceiling_doc_token = json.loads((token_analysis_dir / "empirical_ceiling.json").read_text(encoding="utf-8"))
+            rec.check("empirical_ceiling.json retains a boolean publishable=false field", ceiling_doc_token.get("publishable") is False)
+            rec.check("empirical_ceiling.json carries a string publication_status field containing the exact token", ceiling_doc_token.get("publication_status") == PUBLICATION_STATUS_TOKEN)
+
+            analysis_manifest_doc_token = json.loads((token_analysis_dir / "analysis_manifest.json").read_text(encoding="utf-8"))
+            rec.check("analysis_manifest.json retains a boolean publishable=false field", analysis_manifest_doc_token.get("publishable") is False)
+            rec.check("analysis_manifest.json carries a string publication_status field containing the exact token", analysis_manifest_doc_token.get("publication_status") == PUBLICATION_STATUS_TOKEN)
+
+            for csv_name, header in (
+                ("configuration_statistics.csv", CONFIGURATION_STATISTICS_HEADER),
+                ("scaling.csv", SCALING_HEADER),
+                ("saturation.csv", SATURATION_HEADER),
+                ("profile_validation.csv", PROFILE_VALIDATION_HEADER),
+            ):
+                with open(token_analysis_dir / csv_name, newline="", encoding="utf-8") as fh:
+                    csv_rows = list(csv.reader(fh))
+                rec.check(f"{csv_name} has a publication_status column", PUBLICATION_STATUS_COLUMN in csv_rows[0])
+                status_col = csv_rows[0].index(PUBLICATION_STATUS_COLUMN)
+                rec.check(
+                    f"every {csv_name} data row's publication_status column is exactly {PUBLICATION_STATUS_TOKEN!r}",
+                    all(row[status_col] == PUBLICATION_STATUS_TOKEN for row in csv_rows[1:]),
+                )
+
+            report_text = (token_analysis_dir / "report.md").read_text(encoding="utf-8")
+            rec.check("report.md contains an explicit publishable=false status line", f"`{PUBLICATION_STATUS_TOKEN}`" in report_text)
+
+            for svg_name in ("throughput.svg", "scaling_efficiency.svg", "saturation.svg"):
+                svg_text = (token_analysis_dir / svg_name).read_text(encoding="utf-8")
+                rec.check(f"{svg_name} carries the token in deterministic <metadata>", f"<metadata>{PUBLICATION_STATUS_TOKEN}</metadata>" in svg_text)
 
     if rec.failures:
         print(f"analyze_exp02_umma_throughput_p24: self-test: FAILED ({len(rec.failures)}/{rec.total} case(s)): {rec.failures}", file=sys.stderr)
