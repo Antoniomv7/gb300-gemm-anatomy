@@ -277,11 +277,55 @@ independently audited, and verified on GB300. Phase 3 may begin.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
-| P3.1 | Pinned official CuTe DSL example | NO | NO | NO |
+| P3.1 | Pinned official CuTe DSL example | YES | NO | NO |
 | P3.2 | One-shape wrapper | NO | NO | NO |
 | P3.3 | cuBLASLt baseline | NO | NO | NO |
 | P3.4 | Three execution variants | NO | NO | NO |
 | P3.5 | Five shapes and comparison | NO | NO | NO |
+
+P3.1 (`src/gemm/P3_1_PROTOCOL.md`) is implemented: it executes one pinned,
+unmodified, official NVIDIA CuTe DSL example — `NVIDIA/cutlass` v4.6.1,
+commit `e05f953a5b3d38adc240df2ff928e0421c2abba3`,
+`examples/python/CuTeDSL/cute/blackwell/kernel/dense_gemm/dense_gemm.py`,
+Git blob `6c6144bc88896cffb3c8c4692ca915f993c71e1d`, SHA-256
+`f99bc4cc1e0aea8990e2929d7c703dfc8196d797b7c9f5a889eabcd3c4ff67ec`,
+BSD-3-Clause — in place from the pinned `/opt/cutlass` checkout. That
+approximately 1,800-line file is never copied, vendored, forked, reformatted,
+or patched into this repository, and P3.1 adds no GEMM source of its own. The
+frozen functional configuration is BF16 × BF16 → FP32 with FP32 accumulation,
+`(M,N,K,L) = (256,256,512,1)`, `a_major=k`, `b_major=k`, `c_major=n`, MMA tiler
+`(128,128)`, cluster `(1,1)`, non-persistent, 1-CTA MMA group, TMA loads,
+TMA store, `tcgen05`/UMMA with the FP32 accumulator in TMEM, an identity FP32
+epilogue, and mandatory reference validation performed by the unchanged
+example. Two Make targets were added: GPU-free `gemm-cutedsl-p31-check`
+(fails closed unless the checkout HEAD, cleanliness, regular-file identity,
+Git blob SHA, SHA-256, CuTe DSL version, PyTorch version, `torch.version.cuda`,
+and the example's own GPU-free `--help` and frozen options all match the pinned
+contract) and `gemm-cutedsl-p31-smoke`, which validates `BLACKWELL_GPU_INDEX`
+before any Docker work, runs exclusively through `scripts/run_container.sh`,
+re-checks the upstream commit and SHA-256 inside that same GPU container, runs
+exactly the frozen command with reference checking enabled, preserves the
+example's exit code, and prints an explicit non-performance notice.
+`VERSIONS.env` gained the exact auxiliary PyTorch pins (`2.10.0+cu130` from
+the official cu130 index, `torch.version.cuda == 13.0`) and the example's
+path/blob/SHA-256; no existing pin changed. The small shape is deliberate:
+P3.1 is a functional compatibility check, not one of the five final shapes.
+P3.1 introduces no wrapper, no persistent variant, no 2-CTA instruction, no
+cuBLASLt baseline, no sweep, no autotuning, no Nsight Compute, no campaign
+infrastructure, and no result file, and it **produces no experimental result**;
+any timing the example computes internally is discarded and explicitly
+classified as non-publishable functional-smoke output. Two consequences are
+recorded openly in `src/gemm/P3_1_PROTOCOL.md` rather than worked around: the
+pinned PyTorch build hard-requires `cuda-bindings==13.0.3` and therefore
+replaces the `cuda-bindings 13.3.1` the CuTe DSL installer had resolved (CuTe
+DSL is re-verified as `4.6.1` afterwards, at image-build time and in the check
+target), and the six new `VERSIONS.env` keys are rejected by the closed
+allowlists in the audited P1.3/P2.3 aggregators, so a *future* P1/P2 campaign
+finalize would fail there until an explicit, separately audited decision
+extends them. P3.1's GPU-free checks pass, but they are the author's own
+checks: `Audited` stays `NO` pending an independent review, and
+`Verified on GB300` stays `NO` because no GPU index was supplied and no GB300
+run was performed. P3.2–P3.5 remain unimplemented.
 
 ## Phase 4 — Campaigns and integration (10–15 August 2026)
 

@@ -13,6 +13,14 @@ ARG CUDA_VERSION=13.1.0
 ARG CUTLASS_VERSION=v4.6.1
 ARG CUTLASS_COMMIT=e05f953a5b3d38adc240df2ff928e0421c2abba3
 ARG MAX_BUILD_JOBS=2
+# P3.1 auxiliary runtime dependency (see VERSIONS.env and
+# src/gemm/P3_1_PROTOCOL.md): NVIDIA's own CuTe DSL examples use PyTorch for
+# allocation, DLPack interoperability, CUDA stream access, and CPU reference
+# validation. This wheel does not replace the pinned CUDA 13.1 toolkit or the
+# CuTe DSL v4.6.1 pin above, and no existing pin changes because of it.
+ARG PYTORCH_VERSION=2.10.0+cu130
+ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
+ARG PYTORCH_CUDA_VERSION=13.0
 
 LABEL org.opencontainers.image.title="gb300-gemm-anatomy-phase0" \
       org.opencontainers.image.description="Reproducible CUDA 13.1 + CuTe DSL v4.6.1 environment for BF16 GEMM anatomy on GB300" \
@@ -21,7 +29,8 @@ LABEL org.opencontainers.image.title="gb300-gemm-anatomy-phase0" \
       anatomy.cutlass.version="${CUTLASS_VERSION}" \
       anatomy.cutlass.commit="${CUTLASS_COMMIT}" \
       anatomy.cuda.arch="sm_103a" \
-      anatomy.max.build.jobs="${MAX_BUILD_JOBS}"
+      anatomy.max.build.jobs="${MAX_BUILD_JOBS}" \
+      anatomy.pytorch.version="${PYTORCH_VERSION}"
 
 # Cap every build system that honours these variables at two jobs.
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -62,5 +71,22 @@ RUN git init -q /opt/cutlass \
 # already prevents cache writes, so no cache cleanup step is needed.
 RUN bash /opt/cutlass/python/CuTeDSL/setup.sh --cu13 \
     && python3 -c "import cutlass; v = cutlass.__version__; assert v == '4.6.1', f'unexpected CuTe DSL version {v}'; print('CuTeDSL', v)"
+
+# P3.1: the exact, non-floating PyTorch build, into the same virtual environment
+# (never a second environment, never a nightly, never an unversioned install).
+# It is only an allocation/DLPack/stream/reference-check dependency of NVIDIA's
+# own CuTe DSL examples. Importing torch and reading its version strings never
+# initializes a device, so no GPU is used or required at build time.
+#
+# Recorded consequence (audited, not silent): torch 2.10.0+cu130 hard-requires
+# cuda-bindings==13.0.3, so this step replaces the cuda-bindings 13.3.1 that the
+# CuTe DSL v4.6.1 installer above resolved. `pip check` afterwards reports one
+# unsatisfied requirement (cuda-python 13.3.1 wants cuda-bindings~=13.3.1). No
+# pin in VERSIONS.env is weakened or changed, and the check below re-verifies
+# that CuTe DSL still reports exactly the pinned version after the install.
+# See src/gemm/P3_1_PROTOCOL.md for the full record.
+RUN python3 -m pip install --no-cache-dir --index-url "${PYTORCH_INDEX_URL}" "torch==${PYTORCH_VERSION}" \
+    && python3 -c "import torch; v = torch.__version__; assert v == '${PYTORCH_VERSION}', f'unexpected torch version {v}'; c = torch.version.cuda; assert c == '${PYTORCH_CUDA_VERSION}', f'unexpected torch CUDA version {c}'; print('torch', v, 'cuda', c)" \
+    && python3 -c "import cutlass; expected = '${CUTLASS_VERSION}'.lstrip('v'); v = cutlass.__version__; assert v == expected, f'CuTe DSL {v} != pinned {expected} after the torch install'; print('CuTeDSL', v, '(unchanged)')"
 
 WORKDIR /workspace

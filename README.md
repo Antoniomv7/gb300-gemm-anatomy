@@ -22,7 +22,10 @@ NONE`. `P2.4 (profiling and empirical BF16 UMMA per-SM ceiling) —
 implemented; independently audited: YES; verified on GB300: YES; campaign
 executed: YES; 24/24 profiles validated; analysis: ANALYZED; empirical
 per-SM ceiling candidate: 16.37244853848296 TFLOP/s/SM; publishable results:
-NONE; Phase 2: CLOSED`.**
+NONE; Phase 2: CLOSED`. `P3.1 (pinned official CuTe DSL example) —
+implemented; independently audited: NO; verified on GB300: NO; executes an
+exact pinned official NVIDIA example unchanged; publishable results: NONE.
+P3.2–P3.5: not implemented.`**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -296,6 +299,72 @@ checks at `OK`. The empirical per-SM ceiling candidate is
 NCU did not resolve the SM-count metric. Every artifact remains
 `publishable: false` unconditionally. P2.4 and Phase 2 are closed.
 
+## Phase 3 status: P3.1 implemented, pending audit and GB300 verification
+
+Phase 2 is closed and the Phase 3 gate has passed, so Phase 3 may begin.
+
+P3.1, the pinned official CuTe DSL example, is implemented. It executes one
+exact, unmodified, official NVIDIA example — `NVIDIA/cutlass` v4.6.1, commit
+`e05f953a5b3d38adc240df2ff928e0421c2abba3`,
+`examples/python/CuTeDSL/cute/blackwell/kernel/dense_gemm/dense_gemm.py`,
+BSD-3-Clause — in place from the pinned `/opt/cutlass` checkout inside the
+image, checked against the upstream commit, Git blob SHA, and SHA-256. That
+file is never copied, vendored, forked, reformatted, or patched into this
+repository; P3.1 adds no GEMM source of its own, and the only file it creates
+is `src/gemm/P3_1_PROTOCOL.md`. The frozen functional configuration is
+BF16 × BF16 → FP32 with FP32 accumulation at `(M,N,K,L) = (256,256,512,1)`,
+non-persistent, 1-CTA MMA group, MMA tiler `(128,128)`, cluster `(1,1)`, TMA
+loads, TMA store, and mandatory reference validation performed by the unchanged
+example. The shape is deliberately small: this is a functional compatibility
+check, not one of the five final shapes.
+
+**P3.1 creates no performance result.** Any timing the example computes
+internally is discarded and explicitly classified as non-publishable
+functional-smoke output. No TFLOP/s, no comparison, and no cuBLASLt baseline
+exists yet, and nothing here says or implies that a CuTe DSL GEMM approaches
+cuBLASLt. P3.1 introduces no wrapper, no persistent variant, no 2-CTA
+instruction, no sweep, no autotuning, no Nsight Compute, and no result file.
+
+Two Make targets were added:
+
+```bash
+make gemm-cutedsl-p31-check   # GPU-free, network-free, unprivileged: verifies
+                              # the upstream commit, checkout cleanliness, the
+                              # example's regular-file identity, Git blob SHA,
+                              # SHA-256, the CuTe DSL and PyTorch pins, and the
+                              # example's own GPU-free --help.
+
+BLACKWELL_GPU_INDEX=<physical-index> make gemm-cutedsl-p31-smoke
+                              # The only P3.1 GPU target. Validates the index
+                              # first, runs exclusively through
+                              # scripts/run_container.sh, re-checks the
+                              # upstream commit and SHA-256 inside that same
+                              # container, then runs the frozen command with
+                              # reference checking enabled.
+```
+
+The version contract gained the exact auxiliary PyTorch pins
+(`2.10.0+cu130` from the official cu130 index, `torch.version.cuda == 13.0`)
+plus the example's path, blob SHA, and SHA-256. PyTorch is used only by
+NVIDIA's example for allocation, DLPack interoperability, CUDA stream access,
+and the CPU reference; it does **not** replace the pinned CUDA 13.1.0 CuTe DSL
+toolchain, and no existing CUDA, digest, CUTLASS, architecture, or build-job
+pin changed. Two consequences are recorded openly in
+`src/gemm/P3_1_PROTOCOL.md`: the pinned PyTorch build hard-requires
+`cuda-bindings==13.0.3` and so replaces the `cuda-bindings 13.3.1` that the
+CuTe DSL installer had resolved (CuTe DSL is re-verified as `4.6.1`
+afterwards), and the six new `VERSIONS.env` keys are rejected by the closed
+allowlists inside the audited P1.3/P2.3 aggregators, which would fail a
+*future* P1/P2 campaign finalize until that is resolved by an explicit,
+separately audited decision.
+
+P3.1's GPU-free checks pass, but those are the author's own checks, not an
+audit: P3.1 is **not** audited and **not** verified on GB300 — no GPU index was
+supplied and no GB300 run was performed. P3.2 (one-shape wrapper), P3.3
+(cuBLASLt baseline), P3.4 (three execution variants), and P3.5 (five shapes and
+comparison) remain unimplemented. See `src/gemm/P3_1_PROTOCOL.md` for the
+frozen protocol and the exact verification commands.
+
 ## Research question
 
 How do HBM-to-SMEM data movement and fifth-generation Tensor Core throughput
@@ -436,9 +505,12 @@ successful NCU cases; it closes the Phase 1 technical gate but remains
 P2.1, P2.2, P2.3, and P2.4 are implemented, independently audited, and
 verified on GB300. Reviewed P2.4 pilot `20260805T102759Z` reached
 `ANALYZED` and established the non-publishable empirical per-SM ceiling
-candidate described above, so the Phase 2 gate has passed and Phase 3 may
-begin; experiment 3 remains unimplemented. The repository still contains no
+candidate described above, so the Phase 2 gate has passed and Phase 3 has
+begun. Of experiment 3, only P3.1 (executing the pinned official NVIDIA CuTe
+DSL example unchanged) is implemented; it is neither audited nor verified on
+GB300, and P3.2–P3.5 do not exist yet. The repository still contains no
 publishable bandwidth, throughput, GEMM-performance, or cuBLASLt-comparison
-result. The pinned
-CUDA 13.1 container contract remains unchanged. See `PLAN.md` for the
-remaining schedule and `AGENTS.md` for the mandatory shared-cluster rules.
+result. The pinned CUDA 13.1, CUTLASS v4.6.1, and `sm_103a` contract remains
+unchanged; P3.1 only added the exactly pinned auxiliary PyTorch dependency and
+the upstream example's provenance values. See `PLAN.md` for the remaining
+schedule and `AGENTS.md` for the mandatory shared-cluster rules.

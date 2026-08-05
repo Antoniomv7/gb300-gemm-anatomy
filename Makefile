@@ -11,7 +11,7 @@
 # compute-umma-2sm-self-test, compute-umma-2sm-smoke, compute-umma-sweep-plan,
 # compute-umma-sweep-check, compute-umma-sweep-smoke, compute-umma-p24-plan,
 # compute-umma-p24-check, compute-umma-p24-pilot, compute-umma-p24-profile,
-# compute-umma-p24-analyze.
+# compute-umma-p24-analyze, gemm-cutedsl-p31-check, gemm-cutedsl-p31-smoke.
 # No target selects a GPU automatically, elevates privileges, or exceeds two
 # build jobs.
 
@@ -87,6 +87,14 @@ EXP02_P24_NCU_BRIDGE := scripts/p24_ncu_bridge.py
 EXP02_P24_PROTOCOL := src/compute/P2_4_PROTOCOL.md
 EXP02_P24_RAW_ROOT := results/raw/exp02_umma_throughput_p24
 
+# P3.1: NVIDIA's own dense GEMM example, executed unmodified from the pinned
+# CUTLASS checkout inside the image. This repository owns no GEMM source: the
+# only P3.1 file it adds is the protocol below. Every provenance value comes
+# from VERSIONS.env (CUTLASS_COMMIT, CUTEDSL_P31_EXAMPLE_PATH,
+# CUTEDSL_P31_EXAMPLE_GIT_BLOB, CUTEDSL_P31_EXAMPLE_SHA256).
+GEMM_P31_PROTOCOL := src/gemm/P3_1_PROTOCOL.md
+GEMM_P31_EXAMPLE := /opt/cutlass/$(CUTEDSL_P31_EXAMPLE_PATH)
+
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
 	Dockerfile Makefile \
@@ -102,7 +110,8 @@ REQUIRED_FILES := \
 	$(COMPUTE_UMMA_2SM_SRC) $(COMPUTE_UMMA_2SM_CHECKER) $(COMPUTE_UMMA_2SM_PROTOCOL) \
 	$(EXP02_RUNNER) $(EXP02_AGGREGATOR) $(EXP02_PROTOCOL) \
 	$(EXP02_P24_RUNNER) $(EXP02_P24_ANALYZER) $(EXP02_P24_SAFE_CAPTURE) $(EXP02_P24_NCU_BRIDGE) \
-	$(EXP02_P24_PROTOCOL)
+	$(EXP02_P24_PROTOCOL) \
+	$(GEMM_P31_PROTOCOL)
 
 .DEFAULT_GOAL := help
 .PHONY: help check-static build-image check-env preflight \
@@ -117,7 +126,8 @@ REQUIRED_FILES := \
 	compute-umma-2sm-self-test compute-umma-2sm-smoke \
 	compute-umma-p24-plan compute-umma-p24-check compute-umma-p24-pilot \
 	compute-umma-p24-profile compute-umma-p24-analyze \
-	compute-umma-sweep-plan compute-umma-sweep-check compute-umma-sweep-smoke
+	compute-umma-sweep-plan compute-umma-sweep-check compute-umma-sweep-smoke \
+	gemm-cutedsl-p31-check gemm-cutedsl-p31-smoke
 
 help:
 	@echo "gb300-gemm-anatomy — Phase 0 + P1.1 (LDGSTS) + P1.2 (TMA) + P1.3 (sweep) targets"
@@ -276,8 +286,28 @@ help:
 	@echo "                                 metric could not be trusted for every"
 	@echo "                                 configuration, INCONCLUSIVE (no TFLOP/s emitted)."
 	@echo ""
+	@echo "  -- P3.1 pinned official CuTe DSL example (see src/gemm/P3_1_PROTOCOL.md;"
+	@echo "     implemented; pending independent audit and GB300 verification. Executes"
+	@echo "     NVIDIA's own unmodified dense_gemm.py from the pinned /opt/cutlass"
+	@echo "     checkout: BF16 x BF16 -> FP32, (M,N,K,L)=(256,256,512,1), non-persistent,"
+	@echo "     1-CTA MMA group, mma tiler (128,128), cluster (1,1), TMA store. This"
+	@echo "     repository owns no GEMM source and P3.1 produces NO performance result.) --"
+	@echo "  GPU-free P3.1 provenance/environment gate (no GPU, no network):"
+	@echo "  make gemm-cutedsl-p31-check    Verify /opt/cutlass HEAD, checkout cleanliness,"
+	@echo "                                 the example's regular-file identity, Git blob"
+	@echo "                                 SHA and SHA-256, the CuTe DSL/PyTorch pins, and"
+	@echo "                                 that the example's own --help runs GPU-free."
+	@echo "  GPU-executing (requires BLACKWELL_GPU_INDEX; never selects a GPU automatically):"
+	@echo "  make gemm-cutedsl-p31-smoke    Re-check the upstream commit and SHA-256 inside"
+	@echo "                                 the GPU container, then run the frozen official"
+	@echo "                                 command with mandatory reference validation."
+	@echo "                                 Functional smoke check only, NOT a performance"
+	@echo "                                 result; any internally computed timing is"
+	@echo "                                 discarded."
+	@echo ""
 	@echo "Pinned contract (VERSIONS.env): CUDA $(CUDA_VERSION), CUTLASS $(CUTLASS_VERSION),"
-	@echo "arch $(CUDA_ARCH), max build jobs $(MAX_BUILD_JOBS)."
+	@echo "arch $(CUDA_ARCH), max build jobs $(MAX_BUILD_JOBS), auxiliary PyTorch"
+	@echo "$(PYTORCH_VERSION) (CUDA $(PYTORCH_CUDA_VERSION))."
 
 check-static:
 	@echo "== required files present =="
@@ -300,9 +330,19 @@ check-static:
 	@grep -Eq '^CUTLASS_COMMIT=[0-9a-f]{40}$$' VERSIONS.env
 	@grep -Eq '^CUDA_ARCH=sm_103a$$' VERSIONS.env
 	@grep -Eq '^MAX_BUILD_JOBS=2$$' VERSIONS.env
+	@echo "== P3.1 version contract format (exact, non-floating pins) =="
+	@grep -Eq '^PYTORCH_VERSION=2\.10\.0\+cu130$$' VERSIONS.env
+	@grep -Eq '^PYTORCH_INDEX_URL=https://download\.pytorch\.org/whl/cu130$$' VERSIONS.env
+	@grep -Eq '^PYTORCH_CUDA_VERSION=13\.0$$' VERSIONS.env
+	@grep -Eq '^CUTEDSL_P31_EXAMPLE_PATH=examples/python/CuTeDSL/cute/blackwell/kernel/dense_gemm/dense_gemm\.py$$' VERSIONS.env
+	@grep -Eq '^CUTEDSL_P31_EXAMPLE_GIT_BLOB=[0-9a-f]{40}$$' VERSIONS.env
+	@grep -Eq '^CUTEDSL_P31_EXAMPLE_SHA256=[0-9a-f]{64}$$' VERSIONS.env
 	@echo "== Dockerfile consistent with VERSIONS.env =="
 	@grep -Fq "$(CUDA_IMAGE)@$(CUDA_IMAGE_DIGEST)" Dockerfile
 	@grep -Fq "CUTLASS_COMMIT=$(CUTLASS_COMMIT)" Dockerfile
+	@grep -Fq "PYTORCH_VERSION=$(PYTORCH_VERSION)" Dockerfile
+	@grep -Fq "PYTORCH_INDEX_URL=$(PYTORCH_INDEX_URL)" Dockerfile
+	@grep -Fq "PYTORCH_CUDA_VERSION=$(PYTORCH_CUDA_VERSION)" Dockerfile
 	@echo "== preflight targets pinned architecture =="
 	@grep -Fq -- "-arch=$(CUDA_ARCH)" scripts/preflight.sh
 	@echo "== forbidden patterns absent from scripts, Dockerfile, smoke, memory =="
@@ -618,6 +658,40 @@ check-static:
 	@! grep -rnF 'P2.4 remains entirely unimplemented' PLAN.md README.md $(COMPUTE_UMMA_1SM_PROTOCOL) $(COMPUTE_UMMA_2SM_PROTOCOL)
 	@! grep -rnF 'P2.4 (profiling and empirical ceiling) remains entirely **not implemented**' README.md
 	@grep -Fq 'P2.4 is also `YES / YES / YES`' $(EXP02_PROTOCOL)
+	@echo "== P3.1 protocol present; no NVIDIA GEMM source is vendored into this repository =="
+	@test -f $(GEMM_P31_PROTOCOL)
+	@! grep -nE '^(import|from|def|class) ' $(GEMM_P31_PROTOCOL)
+	@! test -e src/gemm/dense_gemm.py
+	@echo "== P3.1 resolves the official example from the pinned VERSIONS.env values =="
+	@grep -Fq 'GEMM_P31_EXAMPLE := /opt/cutlass/$$(CUTEDSL_P31_EXAMPLE_PATH)' Makefile
+	@grep -Fq '$(CUTEDSL_P31_EXAMPLE_GIT_BLOB)' $(GEMM_P31_PROTOCOL)
+	@grep -Fq '$(CUTEDSL_P31_EXAMPLE_SHA256)' $(GEMM_P31_PROTOCOL)
+	@grep -Fq '$(CUTLASS_COMMIT)' $(GEMM_P31_PROTOCOL)
+	@echo "== P3.1 frozen functional configuration cannot silently change =="
+	@grep -Fq -- '--mnkl 256,256,512,1' Makefile
+	@grep -Fq -- '--ab_dtype BFloat16 --c_dtype Float32 --acc_dtype Float32' Makefile
+	@grep -Fq -- '--a_major k --b_major k --c_major n' Makefile
+	@grep -Fq -- '--mma_tiler_mn 128,128 --cluster_shape_mn 1,1' Makefile
+	@grep -Fq -- '--use_tma_store' Makefile
+	@grep -Fq -- '--warmup_iterations 0 --iterations 1' Makefile
+	@echo "== P3.1 never adds 2-CTA instructions, skips reference checking, uses cold L2,"
+	@echo "   or executes the persistent example (those are later units) =="
+	@pat='--use_2cta'; pat="$$pat""_instrs|--skip_ref""_check|--use_cold""_l2|dense_gemm""_persistent"; \
+	! grep -nE -- "$$pat" Makefile
+	@echo "== P3.1 smoke validates BLACKWELL_GPU_INDEX before any Docker prerequisite =="
+	@grep -Eq '^gemm-cutedsl-p31-smoke:$$' Makefile
+	@grep -Fq 'scripts/run_container.sh' Makefile
+	@echo "== truthful P3.1 status assertions =="
+	@grep -Fq 'P3.1 | Pinned official CuTe DSL example | YES | NO | NO |' PLAN.md
+	@grep -Fq 'P3.2 | One-shape wrapper | NO | NO | NO |' PLAN.md
+	@grep -Fq 'P3.3 | cuBLASLt baseline | NO | NO | NO |' PLAN.md
+	@grep -Fq 'P3.4 | Three execution variants | NO | NO | NO |' PLAN.md
+	@grep -Fq 'P3.5 | Five shapes and comparison | NO | NO | NO |' PLAN.md
+	@grep -Fq 'P3.1 = YES / NO / NO' $(GEMM_P31_PROTOCOL)
+	@grep -Fq 'P3.1 produces no experimental result' $(GEMM_P31_PROTOCOL)
+	@grep -Fq 'non-persistent' $(GEMM_P31_PROTOCOL)
+	@grep -Fq 'P3.1 (pinned official CuTe DSL example)' README.md
+	@! grep -nF 'P3.1 | Pinned official CuTe DSL example | YES | YES' PLAN.md
 	@echo "check-static: OK"
 
 build-image:
@@ -628,6 +702,9 @@ build-image:
 		--build-arg CUTLASS_VERSION="$(CUTLASS_VERSION)" \
 		--build-arg CUTLASS_COMMIT="$(CUTLASS_COMMIT)" \
 		--build-arg MAX_BUILD_JOBS="$(MAX_BUILD_JOBS)" \
+		--build-arg PYTORCH_VERSION="$(PYTORCH_VERSION)" \
+		--build-arg PYTORCH_INDEX_URL="$(PYTORCH_INDEX_URL)" \
+		--build-arg PYTORCH_CUDA_VERSION="$(PYTORCH_CUDA_VERSION)" \
 		--tag "$(IMAGE_TAG)" \
 		.
 
@@ -638,6 +715,8 @@ check-env:
 		--cap-drop ALL \
 		-e CUDA_SHORT_VERSION="$(CUDA_SHORT_VERSION)" \
 		-e CUTEDSL_VERSION="$(CUTEDSL_VERSION)" \
+		-e PYTORCH_VERSION="$(PYTORCH_VERSION)" \
+		-e PYTORCH_CUDA_VERSION="$(PYTORCH_CUDA_VERSION)" \
 		"$(IMAGE_TAG)" \
 		bash -c 'set -euo pipefail; \
 			for tool in nvcc ptxas cuobjdump nvdisasm ncu python3; do \
@@ -671,6 +750,7 @@ check-env:
 			[ -n "$$py_v" ] || { echo "check-env: empty python3 version output" >&2; exit 1; }; \
 			echo "python3: $$py_v"; \
 			python3 -c "import os, cutlass; v = cutlass.__version__; expected = os.environ[\"CUTEDSL_VERSION\"]; assert v == expected, f\"CuTeDSL {v} != pinned {expected}\"; print(\"cutedsl:\", v)"; \
+			python3 -c "import os, torch; v = torch.__version__; expected = os.environ[\"PYTORCH_VERSION\"]; assert v == expected, f\"torch {v} != pinned {expected}\"; c = torch.version.cuda; expected_cuda = os.environ[\"PYTORCH_CUDA_VERSION\"]; assert c == expected_cuda, f\"torch CUDA {c} != pinned {expected_cuda}\"; print(\"torch:\", v, \"cuda:\", c)"; \
 			echo "check-env: OK"'
 
 preflight:
@@ -1271,3 +1351,126 @@ compute-umma-p24-analyze:
 	python3 $(EXP02_P24_ANALYZER) analyze \
 		--campaign-dir $(EXP02_P24_RAW_ROOT)/$${P2_4_CAMPAIGN_ID} \
 		--analyzed-at-utc "$$(date -u +%Y%m%dT%H%M%SZ)"
+
+# --- P3.1: pinned official CuTe DSL dense GEMM example ----------------------
+# P3.1 executes NVIDIA's own example unmodified from the pinned /opt/cutlass
+# checkout. This repository owns no GEMM source, adds no wrapper, no persistent
+# variant, no 2-CTA instruction, no cuBLASLt baseline, no sweep, no Nsight
+# Compute, and writes no result file; see src/gemm/P3_1_PROTOCOL.md.
+#
+# gemm-cutedsl-p31-check never touches a GPU, the network, or elevated
+# privileges: it runs inside the pinned image (--network none, --cap-drop ALL,
+# no-new-privileges, no --gpus, the invoking user, no repository mount) and
+# fails closed unless /opt/cutlass exists, its HEAD is exactly the pinned
+# CUTLASS_COMMIT, the checkout has no tracked or untracked modification, the
+# example is a non-symlink regular file whose Git blob SHA and SHA-256 match
+# the pinned values, CuTe DSL and PyTorch report the pinned versions, and the
+# example's own --help exits successfully -- with every frozen option present
+# -- without a device. Every expected value is passed in from VERSIONS.env;
+# none is duplicated as an unconnected constant here. /opt/cutlass is a
+# root-owned checkout inside the image while the container runs as the invoking
+# user, so each Git query carries an explicit, per-invocation
+# -c safe.directory for that one path; nothing is ever written to the checkout.
+#
+# gemm-cutedsl-p31-smoke is the only P3.1 target that executes on GPU. Its
+# first recipe line validates BLACKWELL_GPU_INDEX before Docker, any build, or
+# any check can start, which is why it deliberately has no Make prerequisite
+# (same audited reasoning as compute-umma-sweep-smoke). It then goes
+# exclusively through scripts/run_container.sh, which alone owns GPU selection,
+# UUID resolution, and the idle-device proof -- this target never calls Docker
+# or --gpus itself. Inside that same GPU container it re-checks the upstream
+# commit and source SHA-256 immediately before exec'ing the frozen command,
+# never passes the upstream skip-reference-checking flag (reference validation
+# is mandatory and is performed by the unchanged official example), and
+# preserves the official program's exit code.
+
+gemm-cutedsl-p31-check:
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-e CUTLASS_COMMIT="$(CUTLASS_COMMIT)" \
+		-e CUTEDSL_VERSION="$(CUTEDSL_VERSION)" \
+		-e PYTORCH_VERSION="$(PYTORCH_VERSION)" \
+		-e PYTORCH_CUDA_VERSION="$(PYTORCH_CUDA_VERSION)" \
+		-e P31_EXAMPLE="$(GEMM_P31_EXAMPLE)" \
+		-e P31_EXAMPLE_GIT_BLOB="$(CUTEDSL_P31_EXAMPLE_GIT_BLOB)" \
+		-e P31_EXAMPLE_SHA256="$(CUTEDSL_P31_EXAMPLE_SHA256)" \
+		"$(IMAGE_TAG)" \
+		bash -c 'set -euo pipefail; \
+			fail() { echo "gemm-cutedsl-p31-check: FAIL: $$*" >&2; exit 1; }; \
+			[ -d /opt/cutlass ] || fail "/opt/cutlass is missing"; \
+			head_commit="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass rev-parse HEAD)" \
+				|| fail "cannot read the /opt/cutlass HEAD commit"; \
+			[ "$$head_commit" = "$$CUTLASS_COMMIT" ] \
+				|| fail "/opt/cutlass HEAD $$head_commit != pinned $$CUTLASS_COMMIT"; \
+			dirty="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass status --porcelain --untracked-files=all)" \
+				|| fail "cannot read the /opt/cutlass working tree status"; \
+			[ -z "$$dirty" ] || fail "/opt/cutlass has tracked or untracked modifications"; \
+			[ ! -L "$$P31_EXAMPLE" ] || fail "$$P31_EXAMPLE is a symlink"; \
+			[ -f "$$P31_EXAMPLE" ] || fail "$$P31_EXAMPLE is not a regular file"; \
+			blob="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass hash-object -- "$$P31_EXAMPLE")" \
+				|| fail "cannot compute the Git blob SHA of $$P31_EXAMPLE"; \
+			[ "$$blob" = "$$P31_EXAMPLE_GIT_BLOB" ] \
+				|| fail "Git blob $$blob != pinned $$P31_EXAMPLE_GIT_BLOB"; \
+			sha="$$(sha256sum "$$P31_EXAMPLE" | cut -d" " -f1)" \
+				|| fail "cannot compute the SHA-256 of $$P31_EXAMPLE"; \
+			[ "$$sha" = "$$P31_EXAMPLE_SHA256" ] \
+				|| fail "SHA-256 $$sha != pinned $$P31_EXAMPLE_SHA256"; \
+			echo "upstream provenance OK: commit $$head_commit"; \
+			echo "                       blob   $$blob"; \
+			echo "                       sha256 $$sha"; \
+			python3 -c "import os, cutlass, torch; \
+				ce = os.environ[\"CUTEDSL_VERSION\"]; \
+				assert cutlass.__version__ == ce, f\"CuTeDSL {cutlass.__version__} != pinned {ce}\"; \
+				pe = os.environ[\"PYTORCH_VERSION\"]; \
+				assert torch.__version__ == pe, f\"torch {torch.__version__} != pinned {pe}\"; \
+				pc = os.environ[\"PYTORCH_CUDA_VERSION\"]; \
+				assert torch.version.cuda == pc, f\"torch CUDA {torch.version.cuda} != pinned {pc}\"; \
+				print(\"versions OK: cutedsl\", ce, \"torch\", pe, \"torch-cuda\", pc)"; \
+			help_text="$$(python3 "$$P31_EXAMPLE" --help)" \
+				|| fail "the official example --help did not exit successfully"; \
+			for opt in --mnkl --ab_dtype --c_dtype --acc_dtype --a_major --b_major \
+				--c_major --mma_tiler_mn --cluster_shape_mn --use_tma_store \
+				--warmup_iterations --iterations; do \
+				case "$$help_text" in \
+					*"$$opt"*) ;; \
+					*) fail "the official example does not offer $$opt";; \
+				esac; \
+			done; \
+			echo "example --help OK (GPU-free); every frozen option is present"'
+	@echo "gemm-cutedsl-p31-check: OK"
+
+gemm-cutedsl-p31-smoke:
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make gemm-cutedsl-p31-smoke"; \
+		echo "       This project never selects a GPU automatically."; \
+		exit 2; \
+	fi
+	status=0; \
+	scripts/run_container.sh bash -c 'set -euo pipefail; \
+		head_commit="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass rev-parse HEAD)"; \
+		[ "$$head_commit" = "$(CUTLASS_COMMIT)" ] \
+			|| { echo "gemm-cutedsl-p31-smoke: FAIL: /opt/cutlass HEAD $$head_commit != pinned $(CUTLASS_COMMIT)" >&2; exit 1; }; \
+		sha="$$(sha256sum "$(GEMM_P31_EXAMPLE)" | cut -d" " -f1)"; \
+		[ "$$sha" = "$(CUTEDSL_P31_EXAMPLE_SHA256)" ] \
+			|| { echo "gemm-cutedsl-p31-smoke: FAIL: SHA-256 $$sha != pinned $(CUTEDSL_P31_EXAMPLE_SHA256)" >&2; exit 1; }; \
+		echo "gemm-cutedsl-p31-smoke: upstream re-checked in this GPU container: commit $$head_commit sha256 $$sha"; \
+		exec python3 "$(GEMM_P31_EXAMPLE)" \
+			--mnkl 256,256,512,1 \
+			--ab_dtype BFloat16 --c_dtype Float32 --acc_dtype Float32 \
+			--a_major k --b_major k --c_major n \
+			--mma_tiler_mn 128,128 --cluster_shape_mn 1,1 \
+			--use_tma_store \
+			--warmup_iterations 0 --iterations 1' || status=$$?; \
+	echo "=============================================================================="; \
+	echo "P3.1 FUNCTIONAL SMOKE CHECK ONLY -- NOT A PERFORMANCE RESULT."; \
+	echo "The output above comes from NVIDIA's unmodified official CuTe DSL example,"; \
+	echo "run once at (M,N,K,L)=(256,256,512,1) with mandatory reference validation."; \
+	echo "Any timing the example computed internally is discarded: P3.1 emits no"; \
+	echo "TFLOP/s, no comparison, no cuBLASLt baseline, and no publishable result."; \
+	echo "=============================================================================="; \
+	exit $$status
