@@ -952,6 +952,15 @@ def run_self_test() -> int:
                 and published_contents[output_names[3]] == sample_segments["ncu_rep"]
                 and published_contents[output_names[4]] == sample_segments["metrics_csv"],
             )
+            rec.check(
+                "publish-bundle preserves successful zero-length application/export stderr as present regular files",
+                published_contents[output_names[1]] == b""
+                and published_contents[output_names[5]] == b""
+                and (bundle_case_dir / output_names[1]).is_file()
+                and not (bundle_case_dir / output_names[1]).is_symlink()
+                and (bundle_case_dir / output_names[5]).is_file()
+                and not (bundle_case_dir / output_names[5]).is_symlink(),
+            )
             rec.check("publish-bundle removes the raw transport bundle after successfully republishing it", not (bundle_case_dir / "raw_bundle.bin").exists())
 
             # --- bridge-stderr folding into ncu_tool_log (Defect 2 repair: the

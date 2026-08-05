@@ -22,7 +22,10 @@ Design:
   2. Creates a private directory in the container's own, non-mounted /tmp.
   3. Gives NCU only paths inside that private directory for "-o",
      "--log-file", and "--import".
-  4. Verifies every expected output is a genuine, non-empty regular file.
+  4. Verifies every expected output is a genuine regular file and requires
+     payload outputs (application stdout, NCU tool log, report, metrics CSV)
+     to be non-empty. The two diagnostic stderr streams may legitimately be
+     empty after successful commands, but are still bundled as real files.
   5. Emits a versioned, length-delimited bundle (see p24_safe_capture's
      NCU_BUNDLE_* helpers) containing exactly: application stdout,
      application stderr, the NCU tool log, the raw ".ncu-rep" bytes, the
@@ -43,8 +46,9 @@ Usage:
 
 Exit codes: 0 on success (the bundle is written to stdout, and stdout
 contains nothing else); 1 if NCU collection or export failed, or an
-expected private-directory output was missing/empty (nothing is written to
-stdout in this case -- only diagnostics on stderr); 2 on a usage error.
+expected private-directory output was missing (or a required payload output
+was empty; nothing is written to stdout in this case -- only diagnostics on
+stderr); 2 on a usage error.
 """
 
 from __future__ import annotations
@@ -246,6 +250,10 @@ def run_self_test() -> int:
         )
         check("the bundled .ncu-rep segment is the fake NCU's own report bytes", segments["ncu_rep"] == b"FAKE_NCU_REP_BYTES")
         check("the bundled metrics_csv segment is the fake NCU's own exported CSV", b"sm__cycles_elapsed" in segments["metrics_csv"])
+        check(
+            "a successful benchmark and metrics export preserve their legitimately empty stderr streams as zero-length bundle segments",
+            segments["app_stderr"] == b"" and segments["metrics_export_stderr"] == b"",
+        )
         check(
             "the collection flags include --launch-skip 1 --launch-count 1 so only the second (timed) "
             "launch of the exact kernel symbol is ever profiled",

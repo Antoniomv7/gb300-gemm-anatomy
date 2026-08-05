@@ -230,6 +230,69 @@ CANONICAL_PROFILE_CASE_FILE_LABELS: tuple[tuple[str, str], ...] = (
     ("metrics_export_stderr_log", ".metrics_export_stderr.log"),
 )
 
+# These are diagnostic streams, not payload artifacts. A successful command
+# commonly writes zero bytes to stderr, but the zero-length file is still
+# mandatory evidence and is still type-checked, opened without following
+# symlinks, hashed, and re-read at both terminal publication gates.
+EMPTY_ALLOWED_PROFILE_CASE_FILE_LABELS: frozenset[str] = frozenset((
+    "container_stderr_log",
+    "metrics_export_stderr_log",
+))
+
+
+def _verify_profile_case_artifact(path: Path, label: str) -> str | None:
+    """P2.4-specific seven-file policy without weakening P2.3's verifier."""
+    if label not in {item_label for item_label, _suffix in CANONICAL_PROFILE_CASE_FILE_LABELS}:
+        return f"{path}: unknown P2.4 profile artifact label {label!r}"
+    if not os.path.lexists(path):
+        return f"{path}: does not exist"
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        return f"{path}: is a symlink; refusing"
+    if not stat.S_ISREG(st.st_mode):
+        return f"{path}: is not a regular file"
+    if st.st_size == 0 and label not in EMPTY_ALLOWED_PROFILE_CASE_FILE_LABELS:
+        return f"{path}: is empty"
+    return None
+
+
+def _sha256_profile_case_artifact(path: Path, label: str) -> str:
+    """Safely hash a P2.4 artifact, including an allowed zero-length stderr."""
+    artifact_error = _verify_profile_case_artifact(path, label)
+    if artifact_error:
+        raise p23.UnsafePathError(artifact_error)
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise p23.UnsafePathError(f"{path}: safe open failed: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        current = os.lstat(path)
+        if not stat.S_ISREG(opened.st_mode):
+            raise p23.UnsafePathError(f"{path}: opened object is not a regular file")
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise p23.UnsafePathError(f"{path}: changed while being opened")
+        if opened.st_size == 0 and label not in EMPTY_ALLOWED_PROFILE_CASE_FILE_LABELS:
+            raise p23.UnsafePathError(f"{path}: is empty")
+        digest = hashlib.sha256()
+        bytes_read = 0
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            digest.update(chunk)
+            bytes_read += len(chunk)
+        if bytes_read == 0 and label not in EMPTY_ALLOWED_PROFILE_CASE_FILE_LABELS:
+            raise p23.UnsafePathError(f"{path}: became empty while being hashed")
+        return digest.hexdigest()
+    except OSError as exc:
+        raise p23.UnsafePathError(f"{path}: safe hash read failed: {exc}") from exc
+    finally:
+        os.close(fd)
+
 
 def canonical_profile_case_filenames(case_name: str) -> tuple[str, ...]:
     return tuple(f"{case_name}{suffix}" for _label, suffix in CANONICAL_PROFILE_CASE_FILE_LABELS)
@@ -1255,6 +1318,10 @@ def _check_case_directory_inventory(case_fd: int, case_name: str) -> list[str]:
     lstat, never following a symlink."""
     errors: list[str] = []
     expected = set(canonical_profile_case_filenames(case_name))
+    labels_by_name = {
+        f"{case_name}{suffix}": label
+        for label, suffix in CANONICAL_PROFILE_CASE_FILE_LABELS
+    }
     try:
         actual = set(os.listdir(case_fd))
     except OSError as exc:
@@ -1275,7 +1342,7 @@ def _check_case_directory_inventory(case_fd: int, case_name: str) -> list[str]:
             errors.append(f"profiles/{case_name}/{name}: is a symlink; refusing")
         elif not stat.S_ISREG(st.st_mode):
             errors.append(f"profiles/{case_name}/{name}: is not a regular file")
-        elif st.st_size == 0:
+        elif st.st_size == 0 and labels_by_name[name] not in EMPTY_ALLOWED_PROFILE_CASE_FILE_LABELS:
             errors.append(f"profiles/{case_name}/{name}: is empty")
     return errors
 
@@ -1303,9 +1370,12 @@ def _open_case_evidence_fds(profiles_fd: int, case_name: str) -> dict[str, int]:
             except OSError:
                 os.close(fd)
                 raise
-            if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
+            if not stat.S_ISREG(st.st_mode):
                 os.close(fd)
-                raise p23.UnsafePathError(f"profiles/{case_name}/{filename}: not a non-empty regular file")
+                raise p23.UnsafePathError(f"profiles/{case_name}/{filename}: not a regular file")
+            if st.st_size == 0 and label not in EMPTY_ALLOWED_PROFILE_CASE_FILE_LABELS:
+                os.close(fd)
+                raise p23.UnsafePathError(f"profiles/{case_name}/{filename}: empty payload artifact")
             fds[label] = fd
     except Exception:
         for fd in fds.values():
@@ -2133,8 +2203,17 @@ def reconstruct_case_result(
     ncu_tool_log: Path, container_stdout_log: Path, container_stderr_log: Path, metrics_export_stderr_log: Path,
     resolved_ncu_metrics: dict, git_commit: str, campaign_provenance: dict,
 ) -> tuple[dict | None, list[str]]:
-    for path in (ncu_rep, ncu_tool_log, container_stdout_log, container_stderr_log, metrics_export_stderr_log):
-        artifact_err = p23._verify_artifact(path)
+    artifact_paths = {
+        "ncu_rep": ncu_rep,
+        "ncu_tool_log": ncu_tool_log,
+        "container_stdout_log": container_stdout_log,
+        "container_stderr_log": container_stderr_log,
+        "application_csv": application_csv,
+        "metrics_csv": metrics_csv,
+        "metrics_export_stderr_log": metrics_export_stderr_log,
+    }
+    for label, path in artifact_paths.items():
+        artifact_err = _verify_profile_case_artifact(path, label)
         if artifact_err:
             return None, [artifact_err]
     try:
@@ -2148,13 +2227,15 @@ def reconstruct_case_result(
     except (OSError, p23.UnsafePathError, UnicodeError) as exc:
         return None, [f"{metrics_csv}: unable to read: {exc}"]
     try:
-        application_hash = p23.sha256_of(application_csv)
-        metrics_hash = p23.sha256_of(metrics_csv)
-        ncu_rep_hash = p23.sha256_of(ncu_rep)
-        ncu_tool_log_hash = p23.sha256_of(ncu_tool_log)
-        container_stdout_log_hash = p23.sha256_of(container_stdout_log)
-        container_stderr_log_hash = p23.sha256_of(container_stderr_log)
-        metrics_export_stderr_log_hash = p23.sha256_of(metrics_export_stderr_log)
+        application_hash = _sha256_profile_case_artifact(application_csv, "application_csv")
+        metrics_hash = _sha256_profile_case_artifact(metrics_csv, "metrics_csv")
+        ncu_rep_hash = _sha256_profile_case_artifact(ncu_rep, "ncu_rep")
+        ncu_tool_log_hash = _sha256_profile_case_artifact(ncu_tool_log, "ncu_tool_log")
+        container_stdout_log_hash = _sha256_profile_case_artifact(container_stdout_log, "container_stdout_log")
+        container_stderr_log_hash = _sha256_profile_case_artifact(container_stderr_log, "container_stderr_log")
+        metrics_export_stderr_log_hash = _sha256_profile_case_artifact(
+            metrics_export_stderr_log, "metrics_export_stderr_log",
+        )
     except p23.UnsafePathError as exc:
         return None, [str(exc)]
     return _reconstruct_case_result_core(
@@ -3040,7 +3121,7 @@ def _resolve_case_evidence_paths(campaign_dir: Path, case_name: str, errors: lis
 
     paths = {label: case_dir / f"{case_name}{suffix}" for label, suffix in CANONICAL_PROFILE_CASE_FILE_LABELS}
     for label, path in paths.items():
-        artifact_err = p23._verify_artifact(path)
+        artifact_err = _verify_profile_case_artifact(path, label)
         if artifact_err:
             errors.append(f"{case_name}.{label}: {artifact_err}")
             return None
@@ -4354,8 +4435,12 @@ def _build_ncu_case_fixture(
     # CANONICAL_PROFILE_CASE_FILE_LABELS).
     (out_dir / f"{entry['case_name']}.ncu_tool.log").write_text("synthetic ncu tool log\n", encoding="utf-8")
     (out_dir / f"{entry['case_name']}.container_stdout.log").write_text("synthetic container stdout\n", encoding="utf-8")
-    (out_dir / f"{entry['case_name']}.container_stderr.log").write_text("synthetic container stderr\n", encoding="utf-8")
-    (out_dir / f"{entry['case_name']}.metrics_export_stderr.log").write_text("synthetic metrics export stderr\n", encoding="utf-8")
+    # Successful application/NCU-export invocations commonly produce no
+    # stderr. Keep the fixture faithful to the real GB300 failure that
+    # exposed the validator bug: both mandatory diagnostic artifacts exist
+    # as genuine regular files, but legitimately contain zero bytes.
+    (out_dir / f"{entry['case_name']}.container_stderr.log").write_bytes(b"")
+    (out_dir / f"{entry['case_name']}.metrics_export_stderr.log").write_bytes(b"")
     return app_csv, metrics_csv, ncu_rep, row
 
 
@@ -4914,11 +4999,67 @@ def run_self_test() -> int:  # noqa: C901
             # =================================================================
             canonical_names_check = canonical_profile_case_filenames(build_profile_plan()[3]["case_name"])
             rec.check("canonical_profile_case_filenames returns exactly seven names", len(canonical_names_check) == 7, detail=str(canonical_names_check))
+            nonempty_required_labels = {
+                label for label, _suffix in CANONICAL_PROFILE_CASE_FILE_LABELS
+                if label not in EMPTY_ALLOWED_PROFILE_CASE_FILE_LABELS
+            }
+            rec.check(
+                "only container_stderr.log and metrics_export_stderr.log may be empty; the other five canonical artifacts remain payload-bearing",
+                EMPTY_ALLOWED_PROFILE_CASE_FILE_LABELS == {"container_stderr_log", "metrics_export_stderr_log"}
+                and len(nonempty_required_labels) == 5,
+                detail=f"empty_allowed={sorted(EMPTY_ALLOWED_PROFILE_CASE_FILE_LABELS)}, required={sorted(nonempty_required_labels)}",
+            )
 
             file_removal_campaign_id = "20260805T040000Z"
             file_removal_campaign = _run_full_pipeline(tmp_path, file_removal_campaign_id)
+            empty_stderr_manifest = load_p24_manifest_chain(file_removal_campaign)[0]
+            empty_sha256 = hashlib.sha256(b"").hexdigest()
+            rec.check(
+                "end-to-end validate-profile-case accepts all 24 cases when both mandatory diagnostic stderr artifacts are genuine zero-length files",
+                all(
+                    (file_removal_campaign / "profiles" / entry["case_name"] / f"{entry['case_name']}.container_stderr.log").stat().st_size == 0
+                    and (file_removal_campaign / "profiles" / entry["case_name"] / f"{entry['case_name']}.metrics_export_stderr.log").stat().st_size == 0
+                    and empty_stderr_manifest["case_results"][entry["case_name"]]["container_stderr_log_sha256"] == empty_sha256
+                    and empty_stderr_manifest["case_results"][entry["case_name"]]["metrics_export_stderr_log_sha256"] == empty_sha256
+                    for entry in build_profile_plan()
+                ),
+            )
+            empty_stderr_integrity_errors, empty_stderr_verified = verify_campaign_evidence_integrity(
+                file_removal_campaign, empty_stderr_manifest,
+            )
+            rec.check(
+                "descriptor-anchored terminal validation re-opens, hashes, and accepts both zero-length diagnostic stderr artifacts for all 24 cases",
+                not empty_stderr_integrity_errors and empty_stderr_verified is not None,
+                detail=str(empty_stderr_integrity_errors),
+            )
             fr_case_name = build_profile_plan()[3]["case_name"]
             fr_case_dir = file_removal_campaign / "profiles" / fr_case_name
+            suffix_by_label = dict(CANONICAL_PROFILE_CASE_FILE_LABELS)
+            for label in sorted(nonempty_required_labels):
+                target = fr_case_dir / f"{fr_case_name}{suffix_by_label[label]}"
+                original = target.read_bytes()
+                target.write_bytes(b"")
+                path_errors: list[str] = []
+                resolved_paths = _resolve_case_evidence_paths(file_removal_campaign, fr_case_name, path_errors)
+                anchored_error = ""
+                profiles_fd = _open_profiles_fd_anchored(file_removal_campaign)
+                try:
+                    try:
+                        unexpected_fds = _open_case_evidence_fds(profiles_fd, fr_case_name)
+                    except p23.UnsafePathError as exc:
+                        anchored_error = str(exc)
+                    else:
+                        for fd in unexpected_fds.values():
+                            os.close(fd)
+                finally:
+                    os.close(profiles_fd)
+                rec.check(
+                    f"an empty {label} is rejected by both the initial path validation and descriptor-anchored terminal validation",
+                    resolved_paths is None and any("empty" in error for error in path_errors)
+                    and "empty" in anchored_error,
+                    detail=f"path_errors={path_errors}; anchored_error={anchored_error!r}",
+                )
+                target.write_bytes(original)
             for _label, _suffix in CANONICAL_PROFILE_CASE_FILE_LABELS:
                 target = fr_case_dir / f"{fr_case_name}{_suffix}"
                 original = target.read_bytes()
@@ -4927,7 +5068,10 @@ def run_self_test() -> int:  # noqa: C901
                 rec.check(f"removing the canonical {fr_case_name}{_suffix} artifact is rejected, never reaches COMPLETE", bool(errs) and verified is None, detail=str(errs))
                 target.write_bytes(original)
             fr_ok, fr_errors = _do_finalize_profile(campaign_dir=file_removal_campaign, completed_at_utc="20260805T041000Z")
-            rec.check("campaign finalizes successfully once all seven files are restored", fr_ok, detail=str(fr_errors))
+            rec.check(
+                "campaign finalizes successfully with all seven files present and both diagnostic stderr artifacts legitimately empty",
+                fr_ok, detail=str(fr_errors),
+            )
 
             eighth_file_campaign_id = "20260805T050000Z"
             eighth_file_campaign = _run_full_pipeline(tmp_path, eighth_file_campaign_id)

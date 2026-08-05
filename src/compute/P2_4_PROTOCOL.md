@@ -309,7 +309,12 @@ emits one versioned, length-delimited bundle (six fixed segments:
 `app_stdout`, `app_stderr`, `ncu_tool_log`, `ncu_rep`, `metrics_csv`,
 `metrics_export_stderr`) on its own stdout; the host captures it through
 `scripts/p24_safe_capture.py run` and republishes it through
-`publish-bundle`. The application CSV (the profiled UMMA binary's own
+`publish-bundle`. `app_stdout`, `ncu_tool_log`, `ncu_rep`, and
+`metrics_csv` are payload segments and must be non-empty. `app_stderr` and
+`metrics_export_stderr` are diagnostic streams: after successful commands
+they may legitimately contain zero bytes, but their zero-length files are
+still published as mandatory canonical evidence. The application CSV (the
+profiled UMMA binary's own
 37-column stdout row) is recovered separately from the published
 `container_stdout.log`, exactly as P1.4 recovers its own application CSV.
 
@@ -536,6 +541,18 @@ results/raw/exp02_umma_throughput_p24/<campaign-id>/
     └── analysis_manifest.json
 ```
 
+All seven entries are mandatory regular, non-symlink files under their
+exact case directory and are always hashed. Five payload artifacts must be
+non-empty: `<case>_report.ncu-rep`, `<case>.ncu_tool.log`,
+`<case>.container_stdout.log`, `<case>.application.csv`, and
+`<case>.metrics_raw.csv`. The two diagnostic stderr artifacts,
+`<case>.container_stderr.log` and
+`<case>.metrics_export_stderr.log`, may legitimately be zero-length after
+a successful invocation. Zero length does not make either artifact
+optional: absence, a wrong type/name/location, a symlink, or a hash change
+still fails the campaign. This P2.4-specific policy does not weaken the
+closed P2.3 artifact contract.
+
 State machine (`ALLOWED_P24_TRANSITIONS` in
 `scripts/analyze_exp02_umma_throughput_p24.py`):
 
@@ -587,7 +604,8 @@ resolution (held open for the whole check), confirms `profiles/` contains
 exactly the 24 canonical case directories, confirms **every one of those
 24 case directories itself contains exactly the seven canonical
 per-case artifacts above -- no missing, extra, duplicate, symlinked, or
-wrong-type entry** (`_check_case_directory_inventory`; repair -- the
+wrong-type entry, with only the two diagnostic stderr artifacts permitted
+to be zero-length** (`_check_case_directory_inventory`; repair -- the
 pre-repair finalizer opened and hashed only three of the seven, and the
 runner separately published an unauthorized eighth
 `<case>.ncu_bridge_stderr.log`, now folded into the published
@@ -726,8 +744,9 @@ benchmark, NCU profiling, or GPU selection; a regression in any of the
 three earlier gates now fails `compute-umma-p24-check` before any
 P2.4-specific check runs.
 
-GB300-executing (not yet run; requires an explicit, conservatively verified
-free physical GPU and a fresh preflight):
+GB300-executing (must be rerun from the beginning after this repair;
+requires an explicit, conservatively verified free physical GPU and a
+fresh preflight):
 
 ```bash
 BLACKWELL_GPU_INDEX=<i> make preflight
@@ -749,11 +768,15 @@ P2.4 | Profiling and empirical ceiling | YES | NO | NO |
 ```
 
 That is: Implemented = **YES**; Independently audited = **NO** (pending);
-Verified on GB300 = **NO** (pending). No P2.4 campaign has been executed on
-real hardware. No empirical ceiling has been measured. No publishable
-result exists. Phase 2 remains **not closed** (P2.4's own audit and GB300
-verification are the remaining gate items). Phase 3 remains gated on the
-Phase 2 gate passing.
+Verified on GB300 = **NO** (pending). Two GB300 attempts made before this
+repair terminated without a complete campaign: one pilot was interrupted
+by host-filesystem exhaustion, and a later campaign failed on its first
+profile because the pre-repair validator rejected a legitimate zero-length
+metrics-export stderr artifact. Both incomplete campaign trees remain
+non-scientific failure evidence and must not be resumed or analyzed. No
+empirical ceiling has been measured. No publishable result exists. Phase 2
+remains **not closed** (a fresh full campaign and final review are the
+remaining gate items). Phase 3 remains gated on the Phase 2 gate passing.
 
 ## 11. Verification and scientific limitations (recorded in advance)
 
