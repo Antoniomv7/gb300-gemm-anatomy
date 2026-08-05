@@ -14,14 +14,13 @@ Compute, and computes deterministic statistics, clock-calibrated TFLOP/s,
 1-SM/2-SM scaling, candidate depth saturation, and an empirical per-SM BF16
 Tensor Core ceiling *candidate*.
 
-**Status: implemented; a first independent GPU-free audit found seven
-evidence-integrity and validation defects (provenance binding, the
-per-case profile inventory, SM-count device extrapolation, P2.3 pilot
-trust, analysis-publication retryability, the publication-status token,
-and the P2.4 Make gate), all repaired GPU-free (see sections 2.1, 5.1,
-6.3, 7, 7.1, and 7.2). Independent re-audit: pending. GB300 verification:
-pending. No P2.4 campaign has been executed. No empirical ceiling has been
-measured. Publishable results: NONE. Phase 2: not closed.**
+**Status: implemented, independently audited, and verified end-to-end on
+GB300. Campaign `20260805T102759Z` at Git commit
+`65f14d1069f0f04cb591ccdb9262c6222797042e` completed the frozen pilot,
+validated 24/24 Nsight Compute profiles, and reached `ANALYZED` with 24/24
+mandatory SM-clock checks at `OK`. Empirical per-SM ceiling candidate:
+`16.37244853848296 TFLOP/s/SM`. Publishable results: NONE; every artifact
+remains `publishable: false`. P2.4 and Phase 2: closed.**
 
 ## 0. Trust model (binding on this document, mirrors P1_4_PROTOCOL.md section 0)
 
@@ -73,7 +72,7 @@ campaigns remain Phase 4 work.
 | P2.1 | 1-SM UMMA. | **Implemented, independently audited, functionally verified on GB300.** Unmodified by P2.4. |
 | P2.2 | 2-SM UMMA. | **Implemented, independently audited, functionally verified on GB300.** Unmodified by P2.4. |
 | P2.3 | Joint 1-SM/2-SM sweep infrastructure, exactly 24 configurations. | **Implemented, independently audited, functionally verified on GB300.** Unmodified by P2.4. |
-| P2.4 | Profiling and empirical ceiling: Nsight Compute, TFLOP/s, scaling, saturation. | **Implemented. Independently audited: NO. Verified on GB300: NO.** |
+| P2.4 | Profiling and empirical ceiling: Nsight Compute, TFLOP/s, scaling, saturation. | **Implemented, independently audited, verified on GB300.** |
 
 ## 2. Frozen pilot protocol
 
@@ -751,9 +750,9 @@ benchmark, NCU profiling, or GPU selection; a regression in any of the
 three earlier gates now fails `compute-umma-p24-check` before any
 P2.4-specific check runs.
 
-GB300-executing (must be rerun from the beginning after this repair;
-requires an explicit, conservatively verified free physical GPU and a
-fresh preflight):
+GB300-executing (the sequence validated by campaign `20260805T102759Z`;
+any future rerun still requires an explicit, conservatively verified free
+physical GPU, a fresh preflight, and a new campaign ID):
 
 ```bash
 BLACKWELL_GPU_INDEX=<i> make preflight
@@ -771,21 +770,28 @@ P2_4_CAMPAIGN_ID=<same-id> make compute-umma-p24-analyze
 ## 10. Status
 
 ```text
-P2.4 | Profiling and empirical ceiling | YES | NO | NO |
+P2.4 | Profiling and empirical ceiling | YES | YES | YES |
 ```
 
-That is: Implemented = **YES**; Independently audited = **NO** (pending);
-Verified on GB300 = **NO** (pending). Two GB300 attempts made before this
-repair terminated without a complete campaign: one pilot was interrupted
-by host-filesystem exhaustion, and a later campaign failed on its first
-profile because the pre-repair validator rejected a legitimate zero-length
-metrics-export stderr artifact. Both incomplete campaign trees remain
-non-scientific failure evidence and must not be resumed or analyzed. No
-empirical ceiling has been measured. No publishable result exists. Phase 2
-remains **not closed** (a fresh full campaign and final review are the
-remaining gate items). Phase 3 remains gated on the Phase 2 gate passing.
+That is: Implemented = **YES**; Independently audited = **YES**; Verified on
+GB300 = **YES**. The final implementation at Git commit
+`65f14d1069f0f04cb591ccdb9262c6222797042e` and its generated evidence
+passed independent review. On 5 August 2026, campaign `20260805T102759Z`
+completed 24 pilot configurations with 30 retained repetitions each,
+validated all 24 NCU profiles, and reached `ANALYZED`; profiling preflight
+`20260805T102944Z` reported `OVERALL=PASS`, and all 24 mandatory SM-clock
+readings were `OK`. The empirical per-SM ceiling candidate is
+`16.37244853848296 TFLOP/s/SM`, selected from
+`umma_1sm_m128n256k16_d256`. The best 2-SM case measured
+`16.220558567678513 TFLOP/s/SM`, with 99.16% scaling efficiency at
+`N=256`, `depth=256`. The optional device-wide extrapolation is unavailable
+because NCU did not resolve `device__attribute_multiprocessor_count`; this
+does not affect the per-SM ceiling. Every artifact remains
+`publishable: false`, so this is reviewed pilot evidence rather than a final
+publishable campaign. P2.4 and Phase 2 are **closed**; the Phase 3 gate is
+open.
 
-## 11. Verification and scientific limitations (recorded in advance)
+## 11. Verification and scientific limitations
 
 * `elapsed_cycles`, `cycles_per_umma`, and `flops_per_cycle` are exactly the
   raw, unconverted per-sample quantities P2.1/P2.2/P2.3 already produce and
@@ -801,18 +807,16 @@ remaining gate items). Phase 3 remains gated on the Phase 2 gate passing.
   one-profile-pass campaign -- not a final architectural peak, and a
   one-/two-SM device-wide extrapolation (when emitted at all) is explicitly
   labelled as such, never a directly measured whole-device throughput.
-* This document, the five files it describes, and the Make/documentation
-  updates around them have not yet been independently *re*-audited or
-  verified end-to-end on GB300 hardware. A first independent GPU-free audit
-  found seven defects (strict campaign-provenance binding, the seven-file
-  per-case profile inventory, the all-24-profiles SM-count extrapolation
-  rule, independent P2.3 pilot revalidation, resumable analysis
-  publication, the `publishable=false` token in every artifact, and the
-  P2.4 Make gate not executing the P2.1-P2.3 gates); all seven were repaired
-  GPU-free. Subsequent GB300 attempts exposed two additional integration
-  defects: legitimate empty diagnostic `stderr` files were rejected, and
-  the real NCU export's `hz` unit was not in the original single-unit
-  allowlist. Both reproduced failure modes now have synthetic/adversarial
-  regressions, including a full 24-profile `Hz`/`hz` path. The current unit
-  repair still requires a fresh end-to-end GB300 campaign before any
-  empirical ceiling or P2.4 verification claim can be made.
+* A first independent GPU-free audit found seven defects (strict campaign-
+  provenance binding, the seven-file per-case profile inventory, the all-24-
+  profiles SM-count extrapolation rule, independent P2.3 pilot revalidation,
+  resumable analysis publication, the `publishable=false` token in every
+  artifact, and the P2.4 Make gate not executing the P2.1-P2.3 gates); all
+  seven were repaired GPU-free. Subsequent GB300 attempts exposed two
+  additional integration defects: legitimate empty diagnostic `stderr`
+  files were rejected, and the real NCU export's `hz` unit was not in the
+  original single-unit allowlist. Both reproduced failure modes have
+  synthetic/adversarial regressions, including a full 24-profile `Hz`/`hz`
+  path. The final repaired revision and successful campaign evidence were
+  independently audited, and campaign `20260805T102759Z` supplied the fresh
+  end-to-end GB300 verification required for closure.

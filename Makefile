@@ -192,7 +192,7 @@ help:
 	@echo "     functionally verified on GB300, no publishable result;"
 	@echo "     P2.2 implemented; independently audited; GB300 verification passed."
 	@echo "     P2.3 implemented; independently audited; GB300 verification passed."
-	@echo "     P2.4 implemented; not yet audited; not yet GB300-verified. No"
+	@echo "     P2.4 implemented; independently audited; GB300 verification passed. No"
 	@echo "     publishable P2.2/P2.3/P2.4 result exists.) --"
 	@echo "  GPU-free build/SASS/check (no GPU, no network):"
 	@echo "  make compute-umma-1sm-build    Compile the twelve P2.1 specializations. No GPU."
@@ -251,12 +251,12 @@ help:
 	@echo ""
 	@echo "  -- P2.4 profiling and empirical BF16 UMMA per-SM ceiling candidate"
 	@echo "     (exp02_umma_throughput_p24; see src/compute/P2_4_PROTOCOL.md; implemented;"
-	@echo "     not yet independently audited; not yet verified on GB300. Drives the"
+	@echo "     independently audited and verified on GB300. Drives the"
 	@echo "     unmodified P2.3 runner for one frozen 24-configuration pilot, profiles the"
 	@echo "     same 24 configurations with Nsight Compute, and computes deterministic"
 	@echo "     TFLOP/s, 1-SM/2-SM scaling, candidate saturation, and an empirical"
-	@echo "     per-SM ceiling candidate. No P2.4 campaign has been executed;"
-	@echo "     no empirical ceiling has been measured; no publishable result exists.) --"
+	@echo "     per-SM ceiling candidate. Campaign 20260805T102759Z reached ANALYZED;"
+	@echo "     Phase 2 is closed; no publishable result exists.) --"
 	@echo "  GPU-free P2.4 planning/checking (no GPU, no Docker, no network):"
 	@echo "  make compute-umma-p24-plan     Print the frozen 24-case profile plan (the"
 	@echo "                                 same P2.3 configurations, plus kernel_symbol)."
@@ -388,7 +388,7 @@ check-static:
 	@grep -Fq 'P1.2 | Equivalent TMA path | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P1.3 | Joint sweep (≤18 configurations) | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P1.4 | Profiling, validation, analysis, pilot | YES | YES | YES |' PLAN.md
-	@grep -Fq 'Phase 1 gate passed; P2.1, P2.2, and P2.3 are closed.' PLAN.md
+	@grep -Fq 'The Phase 2 gate has passed' PLAN.md
 	@! grep -F 'P1.3, P1.4, and experiments 2' README.md
 	@! grep -F 'P1.3 (the joint LDGSTS/TMA sweep) has not started' README.md
 	@! grep -F 'P1.3 (the joint sweep) and P1.4' src/memory/README.md
@@ -566,7 +566,8 @@ check-static:
 	@echo "== truthful P2.3 status assertions =="
 	@grep -Fq 'P2.3 | Sweep (≤24 configurations) | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P2.3 = YES / YES / YES' $(EXP02_PROTOCOL)
-	@! grep -rnF 'Phase 2 is closed' PLAN.md README.md $(EXP02_PROTOCOL) $(EXP02_P24_PROTOCOL)
+	@grep -Fq 'Phase 2 is closed' PLAN.md
+	@grep -Fq 'Phase 2 is **closed**' $(EXP02_PROTOCOL)
 	@! grep -rnF 'P2.3 (joint sweep) has not been started' PLAN.md README.md
 	@! grep -F 'No runner, no campaign, no sweep script exists.' $(COMPUTE_UMMA_1SM_PROTOCOL) $(COMPUTE_UMMA_2SM_PROTOCOL)
 	@echo "== P2.4 required files present, executable, and syntactically valid =="
@@ -608,13 +609,15 @@ check-static:
 	@echo "== P2.4 raw campaign output is git-ignored (shared results/raw/ rule) =="
 	@grep -Fq 'results/raw/' .gitignore
 	@echo "== truthful P2.4 status assertions =="
-	@grep -Fq 'P2.4 | Profiling and empirical ceiling | YES | NO | NO |' PLAN.md
-	@grep -Fq 'P2.4 | Profiling and empirical ceiling | YES | NO | NO |' $(EXP02_P24_PROTOCOL)
-	@! grep -rnF 'Phase 2 is closed' PLAN.md README.md
+	@grep -Fq 'P2.4 | Profiling and empirical ceiling | YES | YES | YES |' PLAN.md
+	@grep -Fq 'P2.4 | Profiling and empirical ceiling | YES | YES | YES |' $(EXP02_P24_PROTOCOL)
+	@grep -Fq '* P2.4: **implemented, independently audited, and verified on GB300**' $(COMPUTE_UMMA_1SM_PROTOCOL)
+	@grep -Fq '* P2.4: **implemented, independently audited, and verified on GB300**' $(COMPUTE_UMMA_2SM_PROTOCOL)
+	@grep -Fq 'Phase 2 is closed' PLAN.md
+	@grep -Fq 'Phase 2: CLOSED' README.md
 	@! grep -rnF 'P2.4 remains entirely unimplemented' PLAN.md README.md $(COMPUTE_UMMA_1SM_PROTOCOL) $(COMPUTE_UMMA_2SM_PROTOCOL)
 	@! grep -rnF 'P2.4 (profiling and empirical ceiling) remains entirely **not implemented**' README.md
-	@echo "== P2.3's own closed audit history may still name P2.4 as unimplemented at that past point; only its current-status sections were corrected =="
-	@grep -Fq 'P2.4 is `YES / NO / NO`' $(EXP02_PROTOCOL)
+	@grep -Fq 'P2.4 is also `YES / YES / YES`' $(EXP02_PROTOCOL)
 	@echo "check-static: OK"
 
 build-image:
@@ -1152,10 +1155,9 @@ compute-umma-sweep-check: compute-umma-1sm-sass compute-umma-2sm-sass
 	$(EXP02_RUNNER) --self-test
 	@grep -Fq 'P2.3 | Sweep (≤24 configurations) | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P2.3 = YES / YES / YES' $(EXP02_PROTOCOL)
-	@! grep -rnF 'Phase 2 is closed' PLAN.md README.md $(EXP02_PROTOCOL)
-	@echo "== P2.3 repair: PLAN.md cannot claim the Phase 2 gate has passed =="
-	@! grep -F 'Gate: Phase 2 gate passed.' PLAN.md
-	@grep -Fq 'Gate: Phase 2 gate remains pending.' PLAN.md
+	@grep -Fq 'Phase 2 is closed' PLAN.md
+	@grep -Fq 'Phase 2 is **closed**' $(EXP02_PROTOCOL)
+	@grep -Fq 'Gate: Phase 2 gate passed.' PLAN.md
 	@echo "compute-umma-sweep-check: OK"
 
 compute-umma-sweep-smoke:

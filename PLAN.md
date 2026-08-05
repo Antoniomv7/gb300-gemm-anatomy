@@ -150,16 +150,16 @@ campaigns remain Phase 4 work.
 ## Phase 2 — BF16 UMMA throughput (27 July–2 August 2026)
 
 Entry condition for Phase 2: the Phase 1 gate must pass. Current status:
-Phase 1 gate passed; P2.1, P2.2, and P2.3 are closed. P2.4 is implemented
-but not yet independently audited or verified on GB300, so the Phase 2 gate
-has not yet passed.
+Phase 1 gate passed; P2.1, P2.2, P2.3, and P2.4 are implemented,
+independently audited, and verified on GB300. The Phase 2 gate has passed
+and Phase 2 is closed.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
 | P2.1 | 1-SM UMMA | YES | YES | YES |
 | P2.2 | 2-SM UMMA | YES | YES | YES |
 | P2.3 | Sweep (≤24 configurations) | YES | YES | YES |
-| P2.4 | Profiling and empirical ceiling | YES | NO | NO |
+| P2.4 | Profiling and empirical ceiling | YES | YES | YES |
 
 P2.1 at Git commit
 `1004666db7a2eef1ec499c60740cafc1e2f41328` passed an independent audit
@@ -255,19 +255,25 @@ empirical-ceiling claim is ever emitted; every other clock-independent
 statistic and artifact is still produced. See `src/compute/P2_4_PROTOCOL.md`
 for the complete frozen contract. P2.4 introduces no new CUDA kernel and
 does not modify `src/compute/umma_1sm.cu`, `src/compute/umma_2sm.cu`, either
-SASS checker, or any P2.3 file. This revision has not yet been independently
-audited or verified end-to-end on GB300. Earlier GB300 attempts exercised
-the pilot and profiling paths but exposed validator/unit-integration defects
-and produced no empirical ceiling; the repaired revision requires a fresh
-complete campaign. Every artifact this module can ever produce carries
-`publishable: false` unconditionally.
+SASS checker, or any P2.3 file. The final implementation at Git commit
+`65f14d1069f0f04cb591ccdb9262c6222797042e` passed an independent audit and
+was verified end-to-end on a physical NVIDIA B300 on 5 August 2026.
+Campaign `20260805T102759Z`, with profiling preflight
+`20260805T102944Z` reporting `OVERALL=PASS`, completed all 24 frozen
+profiles and reached `ANALYZED`; all 24 mandatory SM-clock readings were
+`OK`. The selected empirical per-SM ceiling candidate was
+`16.37244853848296 TFLOP/s/SM` (`umma_1sm`, `N=256`, `depth=256`). The
+corresponding best 2-SM case delivered `16.220558567678513 TFLOP/s/SM` and
+99.16% scaling efficiency at `N=256`, `depth=256`. NCU did not resolve the
+optional SM-count metric, so no device-wide extrapolation was emitted. The
+campaign is one reviewed pilot and every artifact remains
+`publishable: false`; it is not a final publishable campaign. These checks
+close P2.4 and Phase 2.
 
 ## Phase 3 — CuTe DSL GEMM versus cuBLASLt (3–9 August 2026)
 
-Gate: Phase 2 gate remains pending. P2.1, P2.2, and P2.3 are audited and
-verified on GB300; P2.4 is implemented but not yet independently audited or
-verified on GB300. Phase 3 cannot begin until all four P2 units are
-implemented, audited, and verified.
+Gate: Phase 2 gate passed. P2.1, P2.2, P2.3, and P2.4 are implemented,
+independently audited, and verified on GB300. Phase 3 may begin.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|

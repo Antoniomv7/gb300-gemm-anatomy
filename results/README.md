@@ -9,10 +9,13 @@ bandwidth values are experimental results. P1.4 pilot campaign
 `20260730T073045Z` completed its frozen benchmark, six-case NCU validation,
 analysis, integrity check, and independent review. It is reviewed pilot
 evidence, but remains `publishable: false` and is not a final campaign.
-P2.4 (profiling and empirical BF16 UMMA per-SM ceiling) is implemented but
-has not yet run any campaign on GB300: no pilot, no Nsight Compute
-profiling, and no empirical ceiling have been executed or measured. See
-`src/compute/P2_4_PROTOCOL.md` for the frozen contract.
+P2.4 campaign `20260805T102759Z` completed its frozen 24-configuration
+pilot, all 24 Nsight Compute profiles, deterministic analysis, evidence-
+integrity checks, and independent review. It reached `ANALYZED` and produced
+an empirical per-SM ceiling candidate of `16.37244853848296 TFLOP/s/SM`.
+This closes P2.4 and Phase 2, but the campaign remains reviewed pilot
+evidence with `publishable: false`, not a final campaign. See
+`src/compute/P2_4_PROTOCOL.md` for the frozen contract and limitations.
 
 ## Trust model
 
@@ -81,6 +84,39 @@ labels; the error was caused only by truth-testing the non-empty string
 `ok`/`REVIEW` label and adds a regression test. It changes no samples,
 statistics, profiler evidence, HBM classifications, kernels, or GPU
 execution. The original raw campaign remains untouched and hash-valid.
+
+## Recorded P2.4 pilot and empirical per-SM ceiling
+
+```text
+Date:                     2026-08-05
+Git commit:               65f14d1069f0f04cb591ccdb9262c6222797042e
+Profiling preflight:      20260805T102944Z (OVERALL=PASS)
+Campaign:                 20260805T102759Z
+GPU:                      NVIDIA B300 SXM6 AC (compute capability 10.3)
+P2.3 pilot:               COMPLETE (24 configurations, 720 samples)
+P2.4 profiles:            COMPLETE (24/24)
+P2.4 analysis:            ANALYZED
+SM-clock validation:      24/24 OK
+Per-SM ceiling candidate: 16.37244853848296 TFLOP/s/SM
+Best 1-SM case:           umma_1sm_m128n256k16_d256
+Best 2-SM result:         16.220558567678513 TFLOP/s/SM
+2-SM scaling efficiency:  99.16% (N=256, depth=256)
+Device-wide estimate:     unavailable (optional SM-count metric unresolved)
+P2.4 / Phase 2:           CLOSED
+Publishable:              false
+```
+
+The campaign's append-only manifest reached `ANALYZED`; all 24 mandatory
+SM-clock readings were valid, and independent recomputation matched the
+recorded ceiling exactly. The device-wide extrapolation is intentionally
+absent because NCU did not resolve
+`device__attribute_multiprocessor_count`; the protocol makes that estimate
+optional, so this does not invalidate the per-SM result. Scaling efficiency
+of 104.83% at `N=64`, `depth=256` remains preserved and explicitly flagged
+as surprising, but it did not determine the selected ceiling. The raw
+campaign remains immutable and ignored by Git. This is one independently
+reviewed pilot and must not be presented as a final architectural peak or a
+publishable whole-GPU throughput result.
 
 ### `results/raw/exp01_memory_paths_p14/<campaign_id>/` (raw, not committed)
 
@@ -298,8 +334,9 @@ manifest is re-hashed from disk, and every profiled case's complete
 recorded result is compared -- via strict recursive structural comparison,
 never `dict.get()`-based equality -- against what its raw evidence alone
 reconstructs. This raw tree is covered by the same blanket `results/raw/`
-Git-ignore rule as every other campaign tree in this repository. No P2.4
-campaign has been executed on GB300 yet; see
+Git-ignore rule as every other campaign tree in this repository. Campaign
+`20260805T102759Z` executed this complete path on GB300 and reached
+`ANALYZED`; its closure record appears above. See
 `src/compute/P2_4_PROTOCOL.md` for the complete frozen contract.
 
 ## Safe public metadata

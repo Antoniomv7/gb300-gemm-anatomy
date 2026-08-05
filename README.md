@@ -19,8 +19,10 @@ independently audited: YES; verified on GB300: YES; publishable results:
 NONE`. `P2.3 (joint 1-SM/2-SM UMMA sweep infrastructure) — implemented;
 independently audited: YES; verified on GB300: YES; publishable results:
 NONE`. `P2.4 (profiling and empirical BF16 UMMA per-SM ceiling) —
-implemented; independently audited: NO; verified on GB300: NO; campaign
-executed: NO; empirical ceiling measured: NO; publishable results: NONE`.**
+implemented; independently audited: YES; verified on GB300: YES; campaign
+executed: YES; 24/24 profiles validated; analysis: ANALYZED; empirical
+per-SM ceiling candidate: 16.37244853848296 TFLOP/s/SM; publishable results:
+NONE; Phase 2: CLOSED`.**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -44,6 +46,19 @@ reloaded the append-only manifest chain (revision 10), re-hashed the
 evidence, and reported `CIERRE TÉCNICO P1.4 / FASE 1: PASS`. This is one
 reviewed pilot, not a final campaign; every artifact remains
 `publishable: false`.
+
+P2.4 campaign `20260805T102759Z` was executed on GB300 at Git commit
+`65f14d1069f0f04cb591ccdb9262c6222797042e`. Profiling preflight
+`20260805T102944Z` reported `OVERALL=PASS`; the frozen pilot completed all
+24 configurations and 720 retained samples, all 24 Nsight Compute profiles
+were captured and validated, and the analysis reached `ANALYZED` with every
+mandatory SM-clock check at `OK`. The independently audited empirical
+per-SM ceiling candidate is `16.37244853848296 TFLOP/s/SM`, selected from
+the 1-SM `N=256`, `depth=256` configuration. The best 2-SM configuration
+reached `16.220558567678513 TFLOP/s/SM` and 99.16% scaling efficiency at
+the same `N` and `depth`. This closes P2.4 and Phase 2, but it remains one
+reviewed pilot: every artifact is `publishable: false` and no final
+publishable throughput result is claimed.
 
 P1.1, the standalone LDGSTS arm of the "LDGSTS versus TMA" experiment
 (`src/memory/ldgsts.cu`), is implemented as a global-memory-to-SMEM effective
@@ -165,7 +180,7 @@ renders the exact `ok`/`REVIEW` value and adds a regression test; it changes
 no sample, statistic, profiler evidence, HBM classification, kernel, or GPU
 path. No P1.4 result is publishable yet.
 
-## Phase 2 status: P2.1 (1-SM BF16 UMMA), P2.2 (2-SM BF16 UMMA), P2.3 (joint sweep)
+## Phase 2 status: CLOSED (P2.1–P2.4)
 
 P2.1, the 1-SM arm of the "BF16 UMMA throughput" experiment
 (`src/compute/umma_1sm.cu`), is implemented: twelve `tcgen05.mma.
@@ -269,11 +284,17 @@ configurations, the campaign becomes `INCONCLUSIVE` and no TFLOP/s or
 completed empirical-ceiling claim is emitted anywhere. See
 `src/compute/P2_4_PROTOCOL.md` for the complete frozen contract. P2.4
 introduces no new CUDA kernel and modifies no P2.1/P2.2/P2.3 file. This
-revision has not yet been independently audited or verified end-to-end on
-GB300. Earlier GB300 attempts exercised the pilot and profiling paths but
-exposed validator/unit-integration defects and produced no empirical
-ceiling; the repaired revision therefore requires a fresh complete
-campaign. Every artifact remains `publishable: false` unconditionally.
+implementation at Git commit
+`65f14d1069f0f04cb591ccdb9262c6222797042e` passed an independent audit and
+was verified end-to-end by GB300 campaign `20260805T102759Z`: the pilot
+completed all 24 configurations and 720 retained samples, all 24 NCU
+profiles validated, and the analysis reached `ANALYZED` with 24/24 SM-clock
+checks at `OK`. The empirical per-SM ceiling candidate is
+`16.37244853848296 TFLOP/s/SM`; the best 2-SM configuration reached
+`16.220558567678513 TFLOP/s/SM` and 99.16% scaling efficiency at `N=256`,
+`depth=256`. The optional device-wide extrapolation was not emitted because
+NCU did not resolve the SM-count metric. Every artifact remains
+`publishable: false` unconditionally. P2.4 and Phase 2 are closed.
 
 ## Research question
 
@@ -411,14 +432,12 @@ verified on GB300. P1.1/P1.2 and P1.3 campaign `20260728T103315Z` are
 functional checks only. P1.4 campaign `20260730T073045Z` is a reviewed,
 HBM-validated pilot with 18 configurations, 540 retained samples, and six
 successful NCU cases; it closes the Phase 1 technical gate but remains
-`publishable: false` pending later final campaigns. Experiment 2 is
-underway: P2.1 is implemented, independently audited, and functionally
-verified on GB300; P2.2 is likewise implemented, independently audited, and
-functionally verified on GB300; P2.3 (joint sweep infrastructure) is
-implemented, independently audited, and functionally verified on GB300;
-P2.4 (profiling and empirical ceiling) is implemented but not yet
-independently audited or verified on GB300, so the Phase 2 gate has not yet
-passed; experiment 3 remains unimplemented. The repository still contains no
+`publishable: false` pending later final campaigns. Experiment 2 is closed:
+P2.1, P2.2, P2.3, and P2.4 are implemented, independently audited, and
+verified on GB300. Reviewed P2.4 pilot `20260805T102759Z` reached
+`ANALYZED` and established the non-publishable empirical per-SM ceiling
+candidate described above, so the Phase 2 gate has passed and Phase 3 may
+begin; experiment 3 remains unimplemented. The repository still contains no
 publishable bandwidth, throughput, GEMM-performance, or cuBLASLt-comparison
 result. The pinned
 CUDA 13.1 container contract remains unchanged. See `PLAN.md` for the

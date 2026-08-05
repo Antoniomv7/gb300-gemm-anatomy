@@ -599,9 +599,12 @@ routing checks described in sections 16-17:
 * P2.3: **implemented, independently audited, and functionally verified on
   GB300** at commit `7a7cc2ab83197376720f030ba2e990092c3ada40` (see
   `src/compute/P2_3_PROTOCOL.md`).
-* P2.4: **implemented; independently audited: NO; verified on GB300: NO**
-  (see `src/compute/P2_4_PROTOCOL.md`). No P2.4 campaign has been executed;
-  no empirical ceiling has been measured.
+* P2.4: **implemented, independently audited, and verified on GB300** by
+  campaign `20260805T102759Z` at commit `65f14d1069f0f04cb591ccdb9262c6222797042e`
+  (see `src/compute/P2_4_PROTOCOL.md`). The reviewed pilot reached
+  `ANALYZED` and measured a `publishable=false` empirical per-SM ceiling
+  candidate of `16.37244853848296 TFLOP/s/SM`.
+* Phase 2: **closed**.
 
 ## 19. References
 
