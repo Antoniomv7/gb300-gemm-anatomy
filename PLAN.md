@@ -255,10 +255,11 @@ empirical-ceiling claim is ever emitted; every other clock-independent
 statistic and artifact is still produced. See `src/compute/P2_4_PROTOCOL.md`
 for the complete frozen contract. P2.4 introduces no new CUDA kernel and
 does not modify `src/compute/umma_1sm.cu`, `src/compute/umma_2sm.cu`, either
-SASS checker, or any P2.3 file. This implementation has not yet been
-independently audited, and no P2.4 campaign has been executed on GB300: no
-pilot has run, no NCU profiling has run, and no empirical ceiling has been
-measured. Every artifact this module can ever produce carries
+SASS checker, or any P2.3 file. This revision has not yet been independently
+audited or verified end-to-end on GB300. Earlier GB300 attempts exercised
+the pilot and profiling paths but exposed validator/unit-integration defects
+and produced no empirical ceiling; the repaired revision requires a fresh
+complete campaign. Every artifact this module can ever produce carries
 `publishable: false` unconditionally.
 
 ## Phase 3 — CuTe DSL GEMM versus cuBLASLt (3–9 August 2026)

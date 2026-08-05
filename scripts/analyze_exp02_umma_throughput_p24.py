@@ -112,13 +112,21 @@ FROZEN_PROFILE_PARAMS = {
 }
 
 MANDATORY_SM_CLOCK_METRIC = "sm__cycles_elapsed.avg.per_second"
-EXPECTED_SM_CLOCK_UNIT = "cycle/nsecond"
+# Support the original cycle/nsecond contract and the Hz representation
+# observed in a real NCU 2025.4 export on GB300.  Keep this allowlist closed:
+# the key is the exact unit after case/outer-whitespace normalization, and the
+# value is the only permitted scale factor to Hz.  In particular, prefixed
+# units such as GHz/kHz are not inferred or guessed.
+SM_CLOCK_UNIT_TO_HZ_SCALE = {
+    "cycle/nsecond": 1e9,
+    "hz": 1.0,
+}
 DEVICE_MULTIPROCESSOR_COUNT_METRIC = "device__attribute_multiprocessor_count"
 # A raw device attribute count has no physical unit; the pinned NCU 2025.4
 # build leaves this column blank (verified against real --page raw --csv
 # output). Never rescaled or guessed: any other unit representation is
-# rejected outright, exactly like the mandatory SM-clock metric's own unit
-# policy (EXPECTED_SM_CLOCK_UNIT).
+# rejected outright, exactly like the mandatory SM-clock metric's own closed
+# unit allowlist.
 EXPECTED_MULTIPROCESSOR_COUNT_UNIT = ""
 DIAGNOSTIC_METRICS = (
     "gpu__time_duration.sum",
@@ -2008,11 +2016,13 @@ def evaluate_sm_clock(
     if value <= 0:
         result["sm_clock_issue"] = "non_positive"
         return result
-    if unit.strip().lower() != EXPECTED_SM_CLOCK_UNIT.strip().lower():
+    normalized_unit = unit.strip().lower()
+    hz_scale = SM_CLOCK_UNIT_TO_HZ_SCALE.get(normalized_unit)
+    if hz_scale is None:
         result["sm_clock_issue"] = f"unknown_unit:{unit}"
         return result
     result["sm_clock_valid"] = True
-    result["sm_clock_hz"] = value * 1e9
+    result["sm_clock_hz"] = value * hz_scale
     return result
 
 
@@ -2745,7 +2755,7 @@ def _do_init_campaign(*, campaign_id: str, started_at_utc: str) -> Path:
         "profile_params": dict(FROZEN_PROFILE_PARAMS),
         "profile_plan": plan,
         "mandatory_sm_clock_metric": MANDATORY_SM_CLOCK_METRIC,
-        "expected_sm_clock_unit": EXPECTED_SM_CLOCK_UNIT,
+        "sm_clock_unit_to_hz_scale": dict(SM_CLOCK_UNIT_TO_HZ_SCALE),
         "diagnostic_metrics": list(DIAGNOSTIC_METRICS),
         "bootstrap_seed": BOOTSTRAP_SEED,
         "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
@@ -4394,10 +4404,20 @@ def _build_ncu_case_fixture(
     p23._write_case_csv(app_csv, [row])
 
     kernel_name_field = kernel_name_in_csv or entry["kernel_symbol"]
+    sm_clock_unit = "cycle/nsecond" if unit_override is None else unit_override
+    if sm_cycles_per_second is None:
+        sm_clock_raw_value = ""
+    elif sm_clock_unit.strip().lower() == "hz":
+        sm_clock_raw_value = f"{sm_cycles_per_second}"
+    else:
+        # The cycle/nsecond representation is the default.  Unknown-unit
+        # fixtures use this harmless finite value too; the production
+        # evaluator must reject them based on the unit before conversion.
+        sm_clock_raw_value = f"{sm_cycles_per_second / 1e9}"
     metadata_header = ["ID", "Process ID", "Process Name", "Host Name", "Kernel Name", "Kernel Time", "Context", "Stream"]
     metadata_values = ["1", "1234", "fixture", "fixture-host", kernel_name_field, "2026-Aug-04 00:00:00", "1", "7"]
     default_values: dict[str, str] = {
-        MANDATORY_SM_CLOCK_METRIC: "" if sm_cycles_per_second is None else f"{sm_cycles_per_second / 1e9}",
+        MANDATORY_SM_CLOCK_METRIC: sm_clock_raw_value,
         "gpu__time_duration.sum": "654321",
         "device__attribute_multiprocessor_count": "132",
         "sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_elapsed": "88.5",
@@ -4406,7 +4426,7 @@ def _build_ncu_case_fixture(
         "smsp__inst_executed_pipe_tensor.sum": "1024",
     }
     default_units: dict[str, str] = {
-        MANDATORY_SM_CLOCK_METRIC: EXPECTED_SM_CLOCK_UNIT if unit_override is None else unit_override,
+        MANDATORY_SM_CLOCK_METRIC: sm_clock_unit,
         "gpu__time_duration.sum": "ns", "device__attribute_multiprocessor_count": "",
         "sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_elapsed": "%",
         "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": "%",
@@ -4444,11 +4464,12 @@ def _build_ncu_case_fixture(
     return app_csv, metrics_csv, ncu_rep, row
 
 
-def _run_full_pipeline(tmp_path: Path, campaign_id: str, *, sm_cycles_fn=None) -> Path:
+def _run_full_pipeline(tmp_path: Path, campaign_id: str, *, sm_cycles_fn=None, sm_clock_unit_fn=None) -> Path:
     """End-to-end fixture: P2.3 pilot -> record-pilot -> discover-metrics ->
     all 24 profile cases validated. sm_cycles_fn(entry) -> float|None
     overrides the per-case SM-clock reading (None omits the metric's value
-    entirely, simulating a counter this GB300 build did not populate)."""
+    entirely, simulating a counter this GB300 build did not populate).
+    sm_clock_unit_fn(entry) -> str selects the raw NCU unit representation."""
     # The P2.4 wrapper and the P2.3 campaign it drives share one explicit
     # campaign ID (src/compute/P2_4_PROTOCOL.md section 2); the two live
     # under different raw roots (exp02_umma_throughput vs.
@@ -4474,8 +4495,10 @@ def _run_full_pipeline(tmp_path: Path, campaign_id: str, *, sm_cycles_fn=None) -
         raise AssertionError(f"self-test fixture: discover-metrics failed: {errors}")
     for entry in build_profile_plan():
         sm_cycles = sm_cycles_fn(entry) if sm_cycles_fn is not None else 1_400_000_000.0
+        sm_clock_unit = sm_clock_unit_fn(entry) if sm_clock_unit_fn is not None else None
         _build_ncu_case_fixture(
-            tmp_path, entry, sm_cycles_per_second=sm_cycles, case_dir=p24_campaign_dir / "profiles" / entry["case_name"],
+            tmp_path, entry, sm_cycles_per_second=sm_cycles, unit_override=sm_clock_unit,
+            case_dir=p24_campaign_dir / "profiles" / entry["case_name"],
         )
         ok, errors = _do_validate_profile_case(campaign_dir=p24_campaign_dir, index=entry["index"], git_commit=_FIXED_GIT_COMMIT)
         if not ok:
@@ -4637,10 +4660,39 @@ def run_self_test() -> int:  # noqa: C901
     resolved_decoy = resolve_ncu_metrics_p24(substring_decoy)
     rec.check("a substring decoy (not an exact suffix match) never resolves the mandatory metric", resolved_decoy["per_metric"][MANDATORY_SM_CLOCK_METRIC]["status"] == "missing")
 
-    # --- exact cycle/nsecond -> Hz conversion and unit rejection -------------
+    # --- closed SM-clock unit allowlist and exact conversions -----------------
     ok_parsed = {"metrics": {MANDATORY_SM_CLOCK_METRIC: 1.4}, "units": {MANDATORY_SM_CLOCK_METRIC: "cycle/nsecond"}}
     ok_eval = evaluate_sm_clock(sm_clock_metric_resolved=True, actual_column_name=MANDATORY_SM_CLOCK_METRIC, parsed_metrics=ok_parsed)
     rec.check("sm_clock_hz = metric_value * 1e9 for the verified cycle/nsecond unit", ok_eval["sm_clock_valid"] and math.isclose(ok_eval["sm_clock_hz"], 1.4e9))
+
+    for hz_spelling in ("Hz", "hz"):
+        hz_parsed = {
+            "metrics": {MANDATORY_SM_CLOCK_METRIC: 1.4e9},
+            "units": {MANDATORY_SM_CLOCK_METRIC: hz_spelling},
+        }
+        hz_eval = evaluate_sm_clock(
+            sm_clock_metric_resolved=True,
+            actual_column_name=MANDATORY_SM_CLOCK_METRIC,
+            parsed_metrics=hz_parsed,
+        )
+        rec.check(
+            f"sm_clock_hz preserves the metric value for the verified {hz_spelling} unit",
+            hz_eval["sm_clock_valid"] and math.isclose(hz_eval["sm_clock_hz"], 1.4e9),
+        )
+
+    whitespace_hz_parsed = {
+        "metrics": {MANDATORY_SM_CLOCK_METRIC: 1.4e9},
+        "units": {MANDATORY_SM_CLOCK_METRIC: "  Hz  "},
+    }
+    whitespace_hz_eval = evaluate_sm_clock(
+        sm_clock_metric_resolved=True,
+        actual_column_name=MANDATORY_SM_CLOCK_METRIC,
+        parsed_metrics=whitespace_hz_parsed,
+    )
+    rec.check(
+        "the closed SM-clock unit allowlist normalizes only case and outer whitespace",
+        whitespace_hz_eval["sm_clock_valid"] and math.isclose(whitespace_hz_eval["sm_clock_hz"], 1.4e9),
+    )
 
     wrong_unit_parsed = {"metrics": {MANDATORY_SM_CLOCK_METRIC: 1.4}, "units": {MANDATORY_SM_CLOCK_METRIC: "GHz"}}
     wrong_unit_eval = evaluate_sm_clock(sm_clock_metric_resolved=True, actual_column_name=MANDATORY_SM_CLOCK_METRIC, parsed_metrics=wrong_unit_parsed)
@@ -4708,6 +4760,11 @@ def run_self_test() -> int:  # noqa: C901
             campaign_dir = _do_init_campaign(campaign_id="20260804T120000Z", started_at_utc="20260804T120000Z")
             m0, rev0 = load_p24_manifest_chain(campaign_dir)
             rec.check("init-campaign publishes revision 0 in PILOT_IN_PROGRESS with publishable=false", rev0 == 0 and m0["state"] == "PILOT_IN_PROGRESS" and m0["publishable"] is False)
+            rec.check(
+                "init-campaign freezes the exact two-entry SM-clock unit conversion allowlist",
+                m0["frozen_protocol"].get("sm_clock_unit_to_hz_scale") == SM_CLOCK_UNIT_TO_HZ_SCALE,
+                detail=str(m0["frozen_protocol"]),
+            )
 
             try:
                 create_p24_campaign_dir("20260804T120000Z")
@@ -4791,6 +4848,55 @@ def run_self_test() -> int:  # noqa: C901
             except p23.ManifestTransitionError:
                 terminal_reopen_rejected = True
             rec.check("a terminal (ANALYZED) campaign can never be reopened or rewritten", terminal_reopen_rejected)
+
+            # --- GB300-observed Hz/hz representation: full 24-case pipeline --
+            def _alternating_hz_spelling(entry: dict) -> str:
+                return "Hz" if entry["index"] % 2 == 0 else "hz"
+
+            hz_campaign_id = "20260804T153000Z"
+            hz_campaign = _run_full_pipeline(
+                tmp_path,
+                hz_campaign_id,
+                sm_clock_unit_fn=_alternating_hz_spelling,
+            )
+            ok, errors = _do_finalize_profile(
+                campaign_dir=hz_campaign,
+                completed_at_utc="20260804T154000Z",
+            )
+            rec.check(
+                "a complete 24-profile campaign accepts NCU's GB300-observed Hz/hz SM-clock representation",
+                ok,
+                detail=str(errors),
+            )
+            ok, errors = _do_analyze(
+                campaign_dir=hz_campaign,
+                analyzed_at_utc="20260804T155000Z",
+            )
+            rec.check(
+                "the GB300-observed Hz/hz representation reaches ANALYZED instead of INCONCLUSIVE",
+                ok,
+                detail=str(errors),
+            )
+            hz_manifest, _ = load_p24_manifest_chain(hz_campaign)
+            rec.check(
+                "all 24 Hz/hz profile results preserve the raw unit and apply identity conversion to Hz",
+                hz_manifest.get("state") == "ANALYZED"
+                and all(
+                    result["sm_clock_unit"] == _alternating_hz_spelling(entry)
+                    and math.isclose(result["sm_clock_raw_value"], 1.4e9)
+                    and math.isclose(result["sm_clock_hz"], 1.4e9)
+                    for entry in build_profile_plan()
+                    for result in [hz_manifest["case_results"][entry["case_name"]]]
+                ),
+            )
+            hz_ceiling_doc = json.loads(
+                (hz_campaign / "analysis" / "empirical_ceiling.json").read_text(encoding="utf-8")
+            )
+            rec.check(
+                "the Hz/hz end-to-end regression emits a numeric TFLOP/s ceiling candidate",
+                hz_ceiling_doc["status"] == "ANALYZED"
+                and hz_ceiling_doc["empirical_per_sm_ceiling_candidate"]["estimated_tflops_per_sm"] is not None,
+            )
 
             # --- INCONCLUSIVE path: one bad SM-clock reading anywhere ---------
             def _one_case_missing_clock(entry: dict) -> float | None:

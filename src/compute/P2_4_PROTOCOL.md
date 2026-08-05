@@ -281,21 +281,28 @@ mandatory.
 
 ### 4.2 SM-clock unit policy
 
-For the verified `cycle/nsecond` representation:
+P2.4 supports the original `cycle/nsecond` contract and the `hz`
+representation observed in a real pinned-NCU-2025.4 export on GB300. They
+are the complete, closed allowlist after trimming outer whitespace and
+normalizing case:
 
 ```text
-sm_clock_hz = metric_value * 1e9
+cycle/nsecond -> sm_clock_hz = metric_value * 1e9
+hz            -> sm_clock_hz = metric_value
 ```
 
 `evaluate_sm_clock()` requires, for every profiled case, in order: the
 metric resolved at discovery; a present value in that case's own
 `metrics_raw.csv`; a finite value; a strictly positive value; and an exact
-(case/whitespace-normalized) match against `cycle/nsecond`. Any other unit
-is rejected outright -- never rescaled, never guessed. A case failing any
-of these checks is recorded `sm_clock_valid=False` with the specific reason
+(case/outer-whitespace-normalized) match against `cycle/nsecond` or `hz`.
+The raw spelling and raw value remain recorded in the case result. Any other
+unit -- including `GHz`, `kHz`, or another prefixed representation -- is
+rejected outright: no prefix is inferred and no dimensional conversion is
+guessed. A case failing any of these checks is recorded
+`sm_clock_valid=False` with the specific reason
 (`metric_unavailable_at_discovery`, `missing_from_case_evidence`,
-`non_finite`, `non_positive`, or `unknown_unit:<unit>`); raw evidence
-capture for that case still succeeds (section 8).
+`non_finite`, `non_positive`, or `unknown_unit:<unit>`); raw evidence capture
+for that case still succeeds (section 8).
 
 ### 4.3 Container-side bridge
 
@@ -796,13 +803,16 @@ remaining gate items). Phase 3 remains gated on the Phase 2 gate passing.
   labelled as such, never a directly measured whole-device throughput.
 * This document, the five files it describes, and the Make/documentation
   updates around them have not yet been independently *re*-audited or
-  exercised on GB300 hardware. A first independent GPU-free audit found
-  seven defects (strict campaign-provenance binding, the seven-file
+  verified end-to-end on GB300 hardware. A first independent GPU-free audit
+  found seven defects (strict campaign-provenance binding, the seven-file
   per-case profile inventory, the all-24-profiles SM-count extrapolation
   rule, independent P2.3 pilot revalidation, resumable analysis
   publication, the `publishable=false` token in every artifact, and the
-  P2.4 Make gate not executing the P2.1-P2.3 gates); all seven were
-  repaired GPU-free, each with new adversarial regression tests that
-  exercise the originally reproduced failure mode. Every claim of
-  correctness above is a design claim backed by GPU-free
-  synthetic/adversarial self-tests only.
+  P2.4 Make gate not executing the P2.1-P2.3 gates); all seven were repaired
+  GPU-free. Subsequent GB300 attempts exposed two additional integration
+  defects: legitimate empty diagnostic `stderr` files were rejected, and
+  the real NCU export's `hz` unit was not in the original single-unit
+  allowlist. Both reproduced failure modes now have synthetic/adversarial
+  regressions, including a full 24-profile `Hz`/`hz` path. The current unit
+  repair still requires a fresh end-to-end GB300 campaign before any
+  empirical ceiling or P2.4 verification claim can be made.

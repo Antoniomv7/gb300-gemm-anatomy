@@ -269,10 +269,11 @@ configurations, the campaign becomes `INCONCLUSIVE` and no TFLOP/s or
 completed empirical-ceiling claim is emitted anywhere. See
 `src/compute/P2_4_PROTOCOL.md` for the complete frozen contract. P2.4
 introduces no new CUDA kernel and modifies no P2.1/P2.2/P2.3 file. This
-implementation has not yet been independently audited or verified on GB300:
-no P2.4 campaign has been executed, no NCU profiling has run, and no
-empirical ceiling has been measured. Every artifact remains
-`publishable: false` unconditionally.
+revision has not yet been independently audited or verified end-to-end on
+GB300. Earlier GB300 attempts exercised the pilot and profiling paths but
+exposed validator/unit-integration defects and produced no empirical
+ceiling; the repaired revision therefore requires a fresh complete
+campaign. Every artifact remains `publishable: false` unconditionally.
 
 ## Research question
 
