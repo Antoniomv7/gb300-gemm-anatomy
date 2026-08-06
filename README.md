@@ -25,7 +25,9 @@ per-SM ceiling candidate: 16.37244853848296 TFLOP/s/SM; publishable results:
 NONE; Phase 2: CLOSED`. `P3.1 (pinned official CuTe DSL example) —
 implemented; independently audited: YES; verified on GB300: YES; executes an
 exact pinned official NVIDIA example unchanged; publishable results: NONE;
-P3.1: CLOSED. P3.2–P3.5: not implemented.`**
+P3.1: CLOSED`. `P3.2 (one-shape wrapper) — implemented; independently
+audited: YES; verified on GB300: YES; complete-result correctness: PASS;
+publishable results: NONE; P3.2: CLOSED. P3.3–P3.5: not implemented.`**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -299,9 +301,10 @@ checks at `OK`. The empirical per-SM ceiling candidate is
 NCU did not resolve the SM-count metric. Every artifact remains
 `publishable: false` unconditionally. P2.4 and Phase 2 are closed.
 
-## Phase 3 status: P3.1 closed; P3.2 implemented, audit and GB300 pending
+## Phase 3 status: P3.1 and P3.2 closed; P3.3 next
 
-Phase 2 is closed and the Phase 3 gate has passed, so Phase 3 may begin.
+Phase 2 is closed and the Phase 3 gate has passed. With P3.1 and P3.2 closed,
+work may proceed to P3.3.
 
 P3.1, the pinned official CuTe DSL example, is implemented. It executes one
 exact, unmodified, official NVIDIA example — `NVIDIA/cutlass` v4.6.1, commit
@@ -384,11 +387,11 @@ ended with `PASS`. This closes P3.1 as `YES / YES / YES` without creating a
 performance result. See `src/gemm/P3_1_PROTOCOL.md` for the frozen protocol and
 the exact verification commands.
 
-### P3.2 (one-shape wrapper) — implemented; audit and GB300 verification pending
+### P3.2 (one-shape wrapper) — closed (`YES / YES / YES`)
 
-**P3.2 is implemented. Its independent audit is pending, and its verification
-on GB300 is pending** — no GPU execution of this unit has happened yet, and the
-author's own GPU-free checks are not an audit.
+**P3.2 is implemented, independently audited, and functionally verified on
+GB300.** It is closed as `YES / YES / YES` without creating a publishable
+performance result.
 
 P3.2 adds a thin, repository-owned CuTe DSL wrapper
 (`src/gemm/cutedsl_gemm.py`) around the *same* pinned, unmodified official
@@ -451,6 +454,22 @@ frozen 47-field `schema_version=p32.v1` contract produced with Python's `csv`
 module; every human-readable message, including native compiler writes to
 descriptor 1, goes to stderr.
 
+The remediation at Git commit
+`c8b3e2ee57e0297940e0fd5864583ec12dfb23e3` passed an independent technical
+re-audit; the only remaining findings were stale status statements in the
+documentation, corrected by this closure update. Fresh preflight campaign
+`20260806T163806Z` then reported `OVERALL=PASS` on physical GPU index `7`
+(UUID `GPU-40e00845-d89c-1393-2c32-a2dca3ee9442`), an NVIDIA B300 SXM6 AC
+with compute capability 10.3 and driver 610.43.02. The frozen P3.2 smoke ran
+the same clean repository commit, re-checked CUTLASS commit
+`e05f953a5b3d38adc240df2ff928e0421c2abba3` and upstream SHA-256
+`f99bc4cc1e0aea8990e2929d7c703dfc8196d797b7c9f5a889eabcd3c4ff67ec`,
+reported `can_implement: OK`, validated the complete result with
+`max_abs_error=0.0` and `max_rel_error=0.0`, completed two warm-ups and ten
+measured launches, and emitted its one `p32.v1` row with `git_dirty=false` and
+`publishable=false`. All three timing fields were finite and positive; they
+remain non-publishable diagnostics and are not an experimental result.
+
 Two Make targets were added:
 
 ```bash
@@ -463,7 +482,9 @@ make gemm-cutedsl-p32-check   # GPU-free, network-free, unprivileged. Runs the
                               # repository mounted read-only and no GPU exposed.
 
 BLACKWELL_GPU_INDEX=<physical-index> make gemm-cutedsl-p32-smoke
-                              # The only P3.2 GPU target, and NOT YET RUN.
+                              # The only P3.2 GPU target. Verified on B300 on
+                              # 6 August 2026; every rerun still requires an
+                              # explicitly selected idle physical GPU.
                               # Validates the index first, runs exclusively
                               # through scripts/run_container.sh, re-checks the
                               # upstream commit and SHA-256 inside that same
@@ -619,8 +640,9 @@ verified on GB300. Reviewed P2.4 pilot `20260805T102759Z` reached
 candidate described above, so the Phase 2 gate has passed and Phase 3 has
 begun. Of experiment 3, P3.1 (executing the pinned official NVIDIA CuTe DSL
 example unchanged) is implemented, independently audited, and functionally
-verified on GB300; it is closed, while P3.2–P3.5 do not exist yet. The
-repository still contains no
+verified on GB300; P3.2 (the frozen one-shape wrapper) is likewise implemented,
+independently audited, and functionally verified on GB300. Both units are
+closed, while P3.3–P3.5 remain unimplemented. The repository still contains no
 publishable bandwidth, throughput, GEMM-performance, or cuBLASLt-comparison
 result. The pinned CUDA 13.1, CUTLASS v4.6.1, and `sm_103a` contract in
 `VERSIONS.env` remains unchanged and untouched; P3.1's own pins — the exactly

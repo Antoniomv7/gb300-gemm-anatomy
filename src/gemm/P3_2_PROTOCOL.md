@@ -1,6 +1,6 @@
 # P3.2 — One-shape CuTe DSL GEMM wrapper (frozen protocol)
 
-Status: `P3.2 = YES / NO / NO` (Implemented / Audited / Verified on GB300).
+Status: `P3.2 = YES / YES / YES` (Implemented / Audited / Verified on GB300).
 The author's own GPU-free checks are **not** an independent audit, and no
 GB300 execution of this unit has happened yet. Section 12 records exactly what
 was and was not run.
@@ -440,8 +440,10 @@ src/gemm/P3_2_PROTOCOL.md            this document
 Its remaining footprint is the `gemm-cutedsl-p32-check` /
 `gemm-cutedsl-p32-smoke` targets plus their validation in `Makefile`, and the
 truthful status text in `PLAN.md` and `README.md`. `VERSIONS.env`,
-`PHASE3_VERSIONS.env`, `Dockerfile`, and `scripts/run_container.sh` are
-unchanged, and P3.1's files and status are untouched.
+`PHASE3_VERSIONS.env`, and `Dockerfile` are unchanged, and P3.1's files and
+status are untouched. `scripts/run_container.sh` gains only the opt-in
+`RUN_CONTAINER_STDOUT_IS_DATA=1` path documented below; its default interface
+and behaviour for every closed Phase 1/Phase 2 caller remain unchanged.
 
 ## 10. Verification commands
 
@@ -474,10 +476,11 @@ closed unless all of the following hold:
 
 The existing P3.1 checks are untouched and still run separately.
 
-### GB300 verification (not yet performed)
+### GB300 verification (performed 6 August 2026)
 
-Only with an explicitly supplied, free physical device — the project never
-selects a GPU automatically:
+The following command sequence was executed with physical index `7` substituted
+for `<physical-index>` and an explicitly confirmed idle device — the project did
+not and does not select a GPU automatically:
 
 ```bash
 BLACKWELL_GPU_INDEX=<physical-index> make preflight
@@ -492,6 +495,20 @@ that same GPU container immediately before running the wrapper, runs exactly
 the frozen one-shape configuration with two warm-ups and ten measured launches,
 preserves the wrapper's exit code, and prints an explicit stderr notice that
 the emitted timings are P3.2 non-publishable functional evidence.
+
+Fresh preflight campaign `20260806T163806Z` reported `OVERALL=PASS` on physical
+GPU index `7`, UUID `GPU-40e00845-d89c-1393-2c32-a2dca3ee9442`, an NVIDIA
+B300 SXM6 AC with compute capability 10.3 and driver 610.43.02. The P3.2 smoke
+then executed clean repository commit
+`c8b3e2ee57e0297940e0fd5864583ec12dfb23e3`, revalidated CUTLASS commit
+`e05f953a5b3d38adc240df2ff928e0421c2abba3` and upstream SHA-256
+`f99bc4cc1e0aea8990e2929d7c703dfc8196d797b7c9f5a889eabcd3c4ff67ec`,
+reported `can_implement: OK`, and passed the complete-result check with
+`max_abs_error=0.0` and `max_rel_error=0.0`. It completed the frozen two
+warm-ups and ten measured launches and emitted exactly one `p32.v1` data row
+with `git_dirty=false` and `publishable=false`. The three timing fields were
+finite and strictly positive; they are non-publishable functional diagnostics,
+not a performance result.
 
 ### The smoke target's stdout is exactly the CSV
 
@@ -594,8 +611,8 @@ compile -> first launch -> full correctness validation
 
 ```text
 Implemented:        YES
-Audited:            NO    (independent review pending)
-Verified on GB300:  NO    (no GPU execution of this unit has occurred)
+Audited:            YES   (independent technical re-audit PASS)
+Verified on GB300:  YES   (preflight and frozen smoke PASS)
 ```
 
 An independent audit of the first implementation (project commit
@@ -617,18 +634,35 @@ remediated:
    fixed structurally (section 10), with the success statement now gated on a
    zero exit status.
 
+The remediation at commit
+`c8b3e2ee57e0297940e0fd5864583ec12dfb23e3` was then independently
+re-audited. Both technical blockers were closed, and no remaining code blocker
+was found in the timer boundaries, complete-result validation, CSV contract,
+provenance, or launcher safety. The re-audit identified only three stale
+documentary statements — two in `README.md` and one in this protocol — all
+corrected by the closure update containing this record.
+
+The independent audit environment could not repeat the Docker-backed check and
+could not finish one unrelated legacy P1.4 self-test because Docker was absent
+and `/dev/urandom` was unavailable there. Direct syntax checks, wrapper and
+checker self-tests, the adversarial contract review, source inspection, and the
+simulated success/failure launcher paths passed. The later real GB300 run above
+then exercised the pinned container and complete GPU path successfully.
+
 Executed GPU-free: `py_compile` of both Python files, the wrapper's `--help`
 and `--self-test`, the checker and its `--self-test`, `make check-static`,
 `make gemm-cutedsl-p32-check` in the pinned image, and a simulated
 failure-path and success-path run of the smoke target against stub
 `docker`/`nvidia-smi` executables (no GPU, no network) proving empty stdout on
 failure and exactly two valid CSV lines on success. Those are author
-self-checks. They are **not** an independent audit and they are **not** GB300
-verification; the remediation itself has not yet been re-audited.
+self-checks and are not, by themselves, the independent audit or GB300
+verification recorded above.
 
-Not executed: `make gemm-cutedsl-p32-smoke` on a real GPU, which requires an
-operator to supply `BLACKWELL_GPU_INDEX` explicitly and to authorize use of the
-selected shared GPU.
+Executed on GB300: fresh preflight `20260806T163806Z` and
+`make gemm-cutedsl-p32-smoke` on the explicitly selected physical GPU index
+`7`. Both completed successfully. The smoke ran the exact frozen shape with
+full correctness before warm-up and steady-state timing, and every emitted
+field remained `publishable=false`.
 
 **P3.2 creates no publishable performance result.** No TFLOP/s, no speedup, no
 efficiency, no comparison, and no cuBLASLt baseline exists at this point in the

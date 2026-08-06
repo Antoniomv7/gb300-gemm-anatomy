@@ -273,12 +273,12 @@ close P2.4 and Phase 2.
 ## Phase 3 — CuTe DSL GEMM versus cuBLASLt (3–9 August 2026)
 
 Gate: Phase 2 gate passed. P2.1, P2.2, P2.3, and P2.4 are implemented,
-independently audited, and verified on GB300. Phase 3 may begin.
+independently audited, and verified on GB300. Phase 3 is in progress.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
 | P3.1 | Pinned official CuTe DSL example | YES | YES | YES |
-| P3.2 | One-shape wrapper | YES | NO | NO |
+| P3.2 | One-shape wrapper | YES | YES | YES |
 | P3.3 | cuBLASLt baseline | NO | NO | NO |
 | P3.4 | Three execution variants | NO | NO | NO |
 | P3.5 | Five shapes and comparison | NO | NO | NO |
@@ -339,8 +339,8 @@ P3.1 is therefore closed as `YES / YES / YES`; this functional check creates
 no performance result.
 
 P3.2 (`src/gemm/cutedsl_gemm.py`, `scripts/check_cutedsl_gemm_p32.py`,
-`src/gemm/P3_2_PROTOCOL.md`) is now **implemented**; it is **not** audited and
-**not** verified on GB300. It is a thin, repository-owned orchestration wrapper
+`src/gemm/P3_2_PROTOCOL.md`) is **implemented, independently audited, and
+verified on GB300**. It is a thin, repository-owned orchestration wrapper
 around the very same pinned, unmodified upstream example: it loads that file
 read-only and in place from `/opt/cutlass` after revalidating the pinned
 commit, Git blob SHA, and SHA-256, reuses `DenseGemmKernel`, `can_implement()`,
@@ -391,9 +391,24 @@ TFLOP/s, speedup, efficiency, utilization, or bandwidth is computed anywhere,
 no result file or campaign directory is written, and the untimed PyTorch oracle
 is a correctness reference only — it is explicitly not the P3.3 cuBLASLt
 baseline, which does not exist. The GPU-free checks listed in
-`src/gemm/P3_2_PROTOCOL.md` section 10 were run by the author and passed; those
-are self-checks, not an independent audit, and `make gemm-cutedsl-p32-smoke`
-has not been run. P3.3–P3.5 remain unimplemented.
+`src/gemm/P3_2_PROTOCOL.md` section 10 were run by the author and passed. The
+first independent audit of commit
+`ea501d4c43b2cf364ac419ddefa3ae84b564581e` found two blockers: mixed
+PyTorch FP32-control APIs, and contamination plus incorrect success reporting
+in the smoke target. Both were remediated at commit
+`c8b3e2ee57e0297940e0fd5864583ec12dfb23e3`; an independent technical
+re-audit confirmed both fixes and found no remaining code blocker. Its three
+remaining findings were stale documentary statements, corrected by the P3.2
+closure update. Fresh preflight `20260806T163806Z` then reported
+`OVERALL=PASS` on an NVIDIA B300 SXM6 AC at physical index `7` (UUID
+`GPU-40e00845-d89c-1393-2c32-a2dca3ee9442`, compute capability 10.3, driver
+610.43.02). The frozen smoke ran that same clean commit, revalidated the pinned
+CUTLASS commit and example SHA-256, reported `can_implement: OK`, passed the
+complete-result check with zero maximum absolute and relative error, completed
+two warm-ups and ten measured launches, and emitted one `p32.v1` row with
+`publishable=false`. Its three finite positive timings remain non-publishable
+diagnostics, not an experimental result. P3.2 is therefore closed as
+`YES / YES / YES`; P3.3–P3.5 remain unimplemented.
 
 ## Phase 4 — Campaigns and integration (10–15 August 2026)
 
