@@ -343,20 +343,35 @@ BLACKWELL_GPU_INDEX=<physical-index> make gemm-cutedsl-p31-smoke
                               # reference checking enabled.
 ```
 
-The version contract gained the exact auxiliary PyTorch pins
-(`2.10.0+cu130` from the official cu130 index, `torch.version.cuda == 13.0`)
-plus the example's path, blob SHA, and SHA-256. PyTorch is used only by
-NVIDIA's example for allocation, DLPack interoperability, CUDA stream access,
-and the CPU reference; it does **not** replace the pinned CUDA 13.1.0 CuTe DSL
-toolchain, and no existing CUDA, digest, CUTLASS, architecture, or build-job
-pin changed. Two consequences are recorded openly in
-`src/gemm/P3_1_PROTOCOL.md`: the pinned PyTorch build hard-requires
-`cuda-bindings==13.0.3` and so replaces the `cuda-bindings 13.3.1` that the
-CuTe DSL installer had resolved (CuTe DSL is re-verified as `4.6.1`
-afterwards), and the six new `VERSIONS.env` keys are rejected by the closed
-allowlists inside the audited P1.3/P2.3 aggregators, which would fail a
-*future* P1/P2 campaign finalize until that is resolved by an explicit,
-separately audited decision.
+Phase 3 has its own version contract. The global `VERSIONS.env` is unchanged —
+byte-for-byte identical to `main`, as `git diff --exit-code main --
+VERSIONS.env` proves — because the closed, audited P1/P2 aggregators parse it
+against a closed key allowlist and reject any unknown key. Every Phase 3-only
+pin therefore lives in the new root-level `PHASE3_VERSIONS.env`, which extends
+that global contract and redefines nothing in it: the auxiliary PyTorch pins
+(`2.10.0+cu130` from the official cu130 index, `torch.version.cuda == 13.0`),
+the `cuda-python`/`cuda-bindings` pins, and the example's path, blob SHA, and
+SHA-256. PyTorch is used only by NVIDIA's example for allocation, DLPack
+interoperability, CUDA stream access, and the CPU reference; it does **not**
+replace the pinned CUDA 13.1.0 CuTe DSL toolchain, and no existing CUDA,
+digest, CUTLASS, architecture, or build-job pin changed.
+
+The image's Python dependency graph is consistent. `torch 2.10.0+cu130`
+requires `cuda-bindings==13.0.3`, so `cuda-python` and `cuda-bindings` are both
+pinned to `13.0.3` — a combination that also satisfies CuTe DSL 4.6.1's own
+`cuda-python>=12.8` constraint. Nothing is uninstalled, excluded, or
+allowlisted to mask a conflict: `python3 -m pip check` must report
+`No broken requirements found.`, and it is a hard, unsuppressed gate during the
+image build, in `make check-env`, and in `make gemm-cutedsl-p31-check`. The
+same three places verify exact versions: the build gate reads all four pinned
+distributions (`torch`, `cuda-python`, `cuda-bindings`, `nvidia-cutlass-dsl`)
+through `importlib.metadata`, and the two check targets read `cuda-python` and
+`cuda-bindings` through `importlib.metadata` while re-reading
+`torch.__version__`, `torch.version.cuda`, and `cutlass.__version__` at
+runtime. `make check-static` additionally imports both real
+aggregator modules and runs their real `parse_versions_env()` against the
+repository's actual `VERSIONS.env`, so the closed P1/P2 contract cannot regress
+unnoticed.
 
 P3.1's GPU-free checks pass, but those are the author's own checks, not an
 audit: P3.1 is **not** audited and **not** verified on GB300 — no GPU index was
@@ -510,7 +525,8 @@ begun. Of experiment 3, only P3.1 (executing the pinned official NVIDIA CuTe
 DSL example unchanged) is implemented; it is neither audited nor verified on
 GB300, and P3.2–P3.5 do not exist yet. The repository still contains no
 publishable bandwidth, throughput, GEMM-performance, or cuBLASLt-comparison
-result. The pinned CUDA 13.1, CUTLASS v4.6.1, and `sm_103a` contract remains
-unchanged; P3.1 only added the exactly pinned auxiliary PyTorch dependency and
-the upstream example's provenance values. See `PLAN.md` for the remaining
-schedule and `AGENTS.md` for the mandatory shared-cluster rules.
+result. The pinned CUDA 13.1, CUTLASS v4.6.1, and `sm_103a` contract in
+`VERSIONS.env` remains unchanged and untouched; P3.1's own pins — the exactly
+pinned auxiliary Python dependencies and the upstream example's provenance
+values — live in the separate `PHASE3_VERSIONS.env`. See `PLAN.md` for the
+remaining schedule and `AGENTS.md` for the mandatory shared-cluster rules.

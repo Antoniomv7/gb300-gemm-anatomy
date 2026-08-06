@@ -44,7 +44,9 @@ results/raw/
 .claude/
 
 # Secrets: environment files are never committed.
-# VERSIONS.env is the tracked, non-secret version contract (re-included below).
+# VERSIONS.env (global contract) and PHASE3_VERSIONS.env (Phase 3-only
+# extension) are the tracked, non-secret version contracts (re-included below).
 *.env
 .env.*
 !VERSIONS.env
+!PHASE3_VERSIONS.env

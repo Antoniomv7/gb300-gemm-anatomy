@@ -15,7 +15,13 @@
 # No target selects a GPU automatically, elevates privileges, or exceeds two
 # build jobs.
 
+# Two version contracts, never merged: VERSIONS.env is the closed global
+# contract that the audited P1/P2 aggregators parse against their own closed key
+# allowlist (an unknown key there fails a future P1/P2 campaign finalize), so
+# every Phase 3-only pin lives in PHASE3_VERSIONS.env instead. PHASE3_VERSIONS.env
+# extends the global contract and overrides nothing in it.
 include VERSIONS.env
+include PHASE3_VERSIONS.env
 
 IMAGE_TAG ?= gb300-gemm-anatomy:phase0
 
@@ -89,14 +95,16 @@ EXP02_P24_RAW_ROOT := results/raw/exp02_umma_throughput_p24
 
 # P3.1: NVIDIA's own dense GEMM example, executed unmodified from the pinned
 # CUTLASS checkout inside the image. This repository owns no GEMM source: the
-# only P3.1 file it adds is the protocol below. Every provenance value comes
-# from VERSIONS.env (CUTLASS_COMMIT, CUTEDSL_P31_EXAMPLE_PATH,
-# CUTEDSL_P31_EXAMPLE_GIT_BLOB, CUTEDSL_P31_EXAMPLE_SHA256).
+# P3.1 files it adds are the protocol below and PHASE3_VERSIONS.env. Every
+# provenance value comes from a pinned contract: CUTLASS_COMMIT from the global
+# VERSIONS.env, and CUTEDSL_P31_EXAMPLE_PATH, CUTEDSL_P31_EXAMPLE_GIT_BLOB,
+# CUTEDSL_P31_EXAMPLE_SHA256 from PHASE3_VERSIONS.env.
 GEMM_P31_PROTOCOL := src/gemm/P3_1_PROTOCOL.md
 GEMM_P31_EXAMPLE := /opt/cutlass/$(CUTEDSL_P31_EXAMPLE_PATH)
 
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
+	PHASE3_VERSIONS.env \
 	Dockerfile Makefile \
 	scripts/run_container.sh scripts/preflight.sh scripts/check_ldgsts_sass.py \
 	scripts/check_tma_sass.py \
@@ -135,7 +143,8 @@ help:
 	@echo "  make help                     Show this help."
 	@echo "  make check-static             Static validation: no Docker, no GPU, no network."
 	@echo "  make build-image              Build the pinned image ($(IMAGE_TAG)). No GPU."
-	@echo "  make check-env                Check tools/versions inside a GPU-less container."
+	@echo "  make check-env                Check tools, versions, and the Python dependency"
+	@echo "                                graph (pip check) inside a GPU-less container."
 	@echo "  make preflight                Run the single-GPU Phase 0 preflight. Requires"
 	@echo "                                an explicit BLACKWELL_GPU_INDEX=<physical-index>;"
 	@echo "                                never selects a GPU automatically."
@@ -295,8 +304,10 @@ help:
 	@echo "  GPU-free P3.1 provenance/environment gate (no GPU, no network):"
 	@echo "  make gemm-cutedsl-p31-check    Verify /opt/cutlass HEAD, checkout cleanliness,"
 	@echo "                                 the example's regular-file identity, Git blob"
-	@echo "                                 SHA and SHA-256, the CuTe DSL/PyTorch pins, and"
-	@echo "                                 that the example's own --help runs GPU-free."
+	@echo "                                 SHA and SHA-256, the CuTe DSL/PyTorch/cuda-python/"
+	@echo "                                 cuda-bindings pins, a consistent dependency graph"
+	@echo "                                 (pip check), and that the example's own --help"
+	@echo "                                 runs GPU-free."
 	@echo "  GPU-executing (requires BLACKWELL_GPU_INDEX; never selects a GPU automatically):"
 	@echo "  make gemm-cutedsl-p31-smoke    Re-check the upstream commit and SHA-256 inside"
 	@echo "                                 the GPU container, then run the frozen official"
@@ -305,9 +316,11 @@ help:
 	@echo "                                 result; any internally computed timing is"
 	@echo "                                 discarded."
 	@echo ""
-	@echo "Pinned contract (VERSIONS.env): CUDA $(CUDA_VERSION), CUTLASS $(CUTLASS_VERSION),"
-	@echo "arch $(CUDA_ARCH), max build jobs $(MAX_BUILD_JOBS), auxiliary PyTorch"
-	@echo "$(PYTORCH_VERSION) (CUDA $(PYTORCH_CUDA_VERSION))."
+	@echo "Pinned global contract (VERSIONS.env, unchanged since Phase 0 and consumed"
+	@echo "unmodified by the closed P1/P2 aggregators): CUDA $(CUDA_VERSION), CUTLASS"
+	@echo "$(CUTLASS_VERSION), arch $(CUDA_ARCH), max build jobs $(MAX_BUILD_JOBS)."
+	@echo "Phase 3 extension (PHASE3_VERSIONS.env): auxiliary PyTorch $(PYTORCH_VERSION)"
+	@echo "(CUDA $(PYTORCH_CUDA_VERSION)), cuda-python $(CUDA_PYTHON_VERSION), cuda-bindings $(CUDA_BINDINGS_VERSION)."
 
 check-static:
 	@echo "== required files present =="
@@ -330,19 +343,34 @@ check-static:
 	@grep -Eq '^CUTLASS_COMMIT=[0-9a-f]{40}$$' VERSIONS.env
 	@grep -Eq '^CUDA_ARCH=sm_103a$$' VERSIONS.env
 	@grep -Eq '^MAX_BUILD_JOBS=2$$' VERSIONS.env
-	@echo "== P3.1 version contract format (exact, non-floating pins) =="
-	@grep -Eq '^PYTORCH_VERSION=2\.10\.0\+cu130$$' VERSIONS.env
-	@grep -Eq '^PYTORCH_INDEX_URL=https://download\.pytorch\.org/whl/cu130$$' VERSIONS.env
-	@grep -Eq '^PYTORCH_CUDA_VERSION=13\.0$$' VERSIONS.env
-	@grep -Eq '^CUTEDSL_P31_EXAMPLE_PATH=examples/python/CuTeDSL/cute/blackwell/kernel/dense_gemm/dense_gemm\.py$$' VERSIONS.env
-	@grep -Eq '^CUTEDSL_P31_EXAMPLE_GIT_BLOB=[0-9a-f]{40}$$' VERSIONS.env
-	@grep -Eq '^CUTEDSL_P31_EXAMPLE_SHA256=[0-9a-f]{64}$$' VERSIONS.env
-	@echo "== Dockerfile consistent with VERSIONS.env =="
+	@echo "== VERSIONS.env stays the closed global contract (no Phase 3 keys) =="
+	@! grep -nE '^(PYTORCH_|CUDA_PYTHON_VERSION|CUDA_BINDINGS_VERSION|CUTEDSL_P31_)' VERSIONS.env
+	@echo "== the real P1/P2 version parsers accept the real VERSIONS.env =="
+	python3 -c 'import sys; sys.path.insert(0, "scripts"); import aggregate_exp01_memory_paths as p1, aggregate_exp02_umma_throughput as p2; p1.parse_versions_env(); p2.parse_versions_env(); print("P1/P2 VERSIONS.env compatibility: PASS")'
+	@rm -rf scripts/__pycache__
+	@echo "== P3.1 version contract format (PHASE3_VERSIONS.env, exact non-floating pins) =="
+	@grep -Eq '^PYTORCH_VERSION=2\.10\.0\+cu130$$' PHASE3_VERSIONS.env
+	@grep -Eq '^PYTORCH_INDEX_URL=https://download\.pytorch\.org/whl/cu130$$' PHASE3_VERSIONS.env
+	@grep -Eq '^PYTORCH_CUDA_VERSION=13\.0$$' PHASE3_VERSIONS.env
+	@grep -Eq '^CUDA_PYTHON_VERSION=13\.0\.3$$' PHASE3_VERSIONS.env
+	@grep -Eq '^CUDA_BINDINGS_VERSION=13\.0\.3$$' PHASE3_VERSIONS.env
+	@grep -Eq '^CUTEDSL_P31_EXAMPLE_PATH=examples/python/CuTeDSL/cute/blackwell/kernel/dense_gemm/dense_gemm\.py$$' PHASE3_VERSIONS.env
+	@grep -Eq '^CUTEDSL_P31_EXAMPLE_GIT_BLOB=[0-9a-f]{40}$$' PHASE3_VERSIONS.env
+	@grep -Eq '^CUTEDSL_P31_EXAMPLE_SHA256=[0-9a-f]{64}$$' PHASE3_VERSIONS.env
+	@echo "== PHASE3_VERSIONS.env extends, never redefines, the global contract =="
+	@! grep -nE '^(CUDA_VERSION|CUDA_IMAGE|CUDA_IMAGE_DIGEST|CUDA_IMAGE_PLATFORM|CUTLASS_VERSION|CUTLASS_COMMIT|CUDA_ARCH|MAX_BUILD_JOBS)=' PHASE3_VERSIONS.env
+	@echo "== Dockerfile consistent with VERSIONS.env and PHASE3_VERSIONS.env =="
 	@grep -Fq "$(CUDA_IMAGE)@$(CUDA_IMAGE_DIGEST)" Dockerfile
 	@grep -Fq "CUTLASS_COMMIT=$(CUTLASS_COMMIT)" Dockerfile
 	@grep -Fq "PYTORCH_VERSION=$(PYTORCH_VERSION)" Dockerfile
 	@grep -Fq "PYTORCH_INDEX_URL=$(PYTORCH_INDEX_URL)" Dockerfile
 	@grep -Fq "PYTORCH_CUDA_VERSION=$(PYTORCH_CUDA_VERSION)" Dockerfile
+	@grep -Fq "CUDA_PYTHON_VERSION=$(CUDA_PYTHON_VERSION)" Dockerfile
+	@grep -Fq "CUDA_BINDINGS_VERSION=$(CUDA_BINDINGS_VERSION)" Dockerfile
+	@echo "== the image build gates on a consistent dependency graph, unsuppressed =="
+	@grep -Fq 'python3 -m pip check' Dockerfile
+	@! grep -nE 'pip check[^&|]*(\|\||;[[:space:]]*true|\|[[:space:]]*(grep|sed|awk))' Dockerfile Makefile
+	@! grep -nE -- '--no-deps' Dockerfile
 	@echo "== preflight targets pinned architecture =="
 	@grep -Fq -- "-arch=$(CUDA_ARCH)" scripts/preflight.sh
 	@echo "== forbidden patterns absent from scripts, Dockerfile, smoke, memory =="
@@ -705,6 +733,8 @@ build-image:
 		--build-arg PYTORCH_VERSION="$(PYTORCH_VERSION)" \
 		--build-arg PYTORCH_INDEX_URL="$(PYTORCH_INDEX_URL)" \
 		--build-arg PYTORCH_CUDA_VERSION="$(PYTORCH_CUDA_VERSION)" \
+		--build-arg CUDA_PYTHON_VERSION="$(CUDA_PYTHON_VERSION)" \
+		--build-arg CUDA_BINDINGS_VERSION="$(CUDA_BINDINGS_VERSION)" \
 		--tag "$(IMAGE_TAG)" \
 		.
 
@@ -717,6 +747,8 @@ check-env:
 		-e CUTEDSL_VERSION="$(CUTEDSL_VERSION)" \
 		-e PYTORCH_VERSION="$(PYTORCH_VERSION)" \
 		-e PYTORCH_CUDA_VERSION="$(PYTORCH_CUDA_VERSION)" \
+		-e CUDA_PYTHON_VERSION="$(CUDA_PYTHON_VERSION)" \
+		-e CUDA_BINDINGS_VERSION="$(CUDA_BINDINGS_VERSION)" \
 		"$(IMAGE_TAG)" \
 		bash -c 'set -euo pipefail; \
 			for tool in nvcc ptxas cuobjdump nvdisasm ncu python3; do \
@@ -751,6 +783,9 @@ check-env:
 			echo "python3: $$py_v"; \
 			python3 -c "import os, cutlass; v = cutlass.__version__; expected = os.environ[\"CUTEDSL_VERSION\"]; assert v == expected, f\"CuTeDSL {v} != pinned {expected}\"; print(\"cutedsl:\", v)"; \
 			python3 -c "import os, torch; v = torch.__version__; expected = os.environ[\"PYTORCH_VERSION\"]; assert v == expected, f\"torch {v} != pinned {expected}\"; c = torch.version.cuda; expected_cuda = os.environ[\"PYTORCH_CUDA_VERSION\"]; assert c == expected_cuda, f\"torch CUDA {c} != pinned {expected_cuda}\"; print(\"torch:\", v, \"cuda:\", c)"; \
+			python3 -c "import os; from importlib.metadata import version; expected = {\"cuda-python\": os.environ[\"CUDA_PYTHON_VERSION\"], \"cuda-bindings\": os.environ[\"CUDA_BINDINGS_VERSION\"]}; installed = {name: version(name) for name in expected}; assert installed == expected, f\"installed distributions {installed} != pinned {expected}\"; print(\"cuda distributions:\", installed)"; \
+			echo "== pip check: the dependency graph must be consistent =="; \
+			python3 -m pip check; \
 			echo "check-env: OK"'
 
 preflight:
@@ -1364,13 +1399,17 @@ compute-umma-p24-analyze:
 # fails closed unless /opt/cutlass exists, its HEAD is exactly the pinned
 # CUTLASS_COMMIT, the checkout has no tracked or untracked modification, the
 # example is a non-symlink regular file whose Git blob SHA and SHA-256 match
-# the pinned values, CuTe DSL and PyTorch report the pinned versions, and the
-# example's own --help exits successfully -- with every frozen option present
-# -- without a device. Every expected value is passed in from VERSIONS.env;
-# none is duplicated as an unconnected constant here. /opt/cutlass is a
-# root-owned checkout inside the image while the container runs as the invoking
-# user, so each Git query carries an explicit, per-invocation
-# -c safe.directory for that one path; nothing is ever written to the checkout.
+# the pinned values, CuTe DSL and PyTorch report the pinned versions,
+# importlib.metadata reports the pinned cuda-python/cuda-bindings
+# distributions, `python3 -m pip check` finds no broken requirement (never
+# suppressed, filtered, or downgraded to a warning), and the example's own
+# --help exits successfully -- with every frozen option present -- without a
+# device. Every expected value is passed in from VERSIONS.env (global) or
+# PHASE3_VERSIONS.env (Phase 3); none is duplicated as an unconnected constant
+# here. /opt/cutlass is a root-owned checkout inside the image while the
+# container runs as the invoking user, so each Git query carries an explicit,
+# per-invocation -c safe.directory for that one path; nothing is ever written
+# to the checkout.
 #
 # gemm-cutedsl-p31-smoke is the only P3.1 target that executes on GPU. Its
 # first recipe line validates BLACKWELL_GPU_INDEX before Docker, any build, or
@@ -1395,6 +1434,8 @@ gemm-cutedsl-p31-check:
 		-e CUTEDSL_VERSION="$(CUTEDSL_VERSION)" \
 		-e PYTORCH_VERSION="$(PYTORCH_VERSION)" \
 		-e PYTORCH_CUDA_VERSION="$(PYTORCH_CUDA_VERSION)" \
+		-e CUDA_PYTHON_VERSION="$(CUDA_PYTHON_VERSION)" \
+		-e CUDA_BINDINGS_VERSION="$(CUDA_BINDINGS_VERSION)" \
 		-e P31_EXAMPLE="$(GEMM_P31_EXAMPLE)" \
 		-e P31_EXAMPLE_GIT_BLOB="$(CUTEDSL_P31_EXAMPLE_GIT_BLOB)" \
 		-e P31_EXAMPLE_SHA256="$(CUTEDSL_P31_EXAMPLE_SHA256)" \
@@ -1430,6 +1471,14 @@ gemm-cutedsl-p31-check:
 				pc = os.environ[\"PYTORCH_CUDA_VERSION\"]; \
 				assert torch.version.cuda == pc, f\"torch CUDA {torch.version.cuda} != pinned {pc}\"; \
 				print(\"versions OK: cutedsl\", ce, \"torch\", pe, \"torch-cuda\", pc)"; \
+			python3 -c "import os; from importlib.metadata import version; \
+				expected = {\"cuda-python\": os.environ[\"CUDA_PYTHON_VERSION\"], \
+					\"cuda-bindings\": os.environ[\"CUDA_BINDINGS_VERSION\"]}; \
+				installed = {name: version(name) for name in expected}; \
+				assert installed == expected, f\"installed distributions {installed} != pinned {expected}\"; \
+				print(\"cuda distributions OK:\", installed)"; \
+			echo "== pip check: the dependency graph must be consistent =="; \
+			python3 -m pip check; \
 			help_text="$$(python3 "$$P31_EXAMPLE" --help)" \
 				|| fail "the official example --help did not exit successfully"; \
 			for opt in --mnkl --ab_dtype --c_dtype --acc_dtype --a_major --b_major \

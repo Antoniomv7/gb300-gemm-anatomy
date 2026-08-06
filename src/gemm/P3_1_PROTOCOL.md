@@ -36,10 +36,11 @@ License:      BSD-3-Clause (NVIDIA CORPORATION & AFFILIATES)
 URL:          https://github.com/NVIDIA/cutlass/blob/v4.6.1/examples/python/CuTeDSL/cute/blackwell/kernel/dense_gemm/dense_gemm.py
 ```
 
-The same values are pinned in `VERSIONS.env` as `CUTLASS_COMMIT`,
-`CUTEDSL_P31_EXAMPLE_PATH`, `CUTEDSL_P31_EXAMPLE_GIT_BLOB`, and
-`CUTEDSL_P31_EXAMPLE_SHA256`. Every P3.1 check reads them from there; no
-provenance constant is duplicated anywhere else.
+The same values are pinned in the two version contracts: `CUTLASS_COMMIT` in
+the global `VERSIONS.env`, and `CUTEDSL_P31_EXAMPLE_PATH`,
+`CUTEDSL_P31_EXAMPLE_GIT_BLOB`, and `CUTEDSL_P31_EXAMPLE_SHA256` in the
+Phase 3-only `PHASE3_VERSIONS.env` (see section 9). Every P3.1 check reads
+them from there; no provenance constant is duplicated anywhere else.
 
 `dense_gemm_persistent.py` and every other example in that directory are out
 of scope for P3.1. Persistent execution is P3.4.
@@ -173,21 +174,85 @@ must never be cited.
 
 Correctness therefore precedes any timing, as required by `AGENTS.md`.
 
-## 9. Runtime dependency (auxiliary, exactly pinned)
+## 9. Runtime dependencies (auxiliary, exactly pinned) and the two contracts
+
+### 9.0 Where Phase 3 pins live
+
+The global version contract `VERSIONS.env` is **closed and unchanged**. It is
+byte-for-byte identical to the version on `main`, because two audited, closed
+P1/P2 files parse it against a closed key allowlist and reject any unknown
+key:
+
+```text
+scripts/aggregate_exp01_memory_paths.py   parse_versions_env()
+scripts/aggregate_exp02_umma_throughput.py parse_versions_env()
+```
+
+Every Phase 3-only pin therefore lives in a separate root-level file,
+`PHASE3_VERSIONS.env`, which **extends but never alters** the global contract:
+it redefines no CUDA, image, CUTLASS, architecture, or build-job value, and
+those remain defined exclusively in `VERSIONS.env`. Both files use plain
+`KEY=VALUE` syntax and are `include`d by the `Makefile`; the `Dockerfile`
+receives every value as an explicit build argument.
+
+`make check-static` enforces this in both directions: it fails if a Phase 3 key
+appears in `VERSIONS.env` or if a global key is redefined in
+`PHASE3_VERSIONS.env`, and it imports both real aggregator modules and calls
+their real `parse_versions_env()` against the repository's actual
+`VERSIONS.env`, so a future regression is caught GPU-free rather than during a
+P1/P2 campaign finalize.
+
+### 9.1 The pinned Python dependencies
 
 The official example uses PyTorch for allocation, DLPack interoperability,
-CUDA stream access (`torch.cuda.current_stream()`), and the CPU reference. The
-version contract pins it exactly:
+CUDA stream access (`torch.cuda.current_stream()`), and the CPU reference.
+`PHASE3_VERSIONS.env` pins the auxiliary Python dependencies exactly:
 
 ```text
 PYTORCH_VERSION=2.10.0+cu130
 PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
 PYTORCH_CUDA_VERSION=13.0
+CUDA_PYTHON_VERSION=13.0.3
+CUDA_BINDINGS_VERSION=13.0.3
 ```
 
-It is installed into the existing `/opt/venv` virtual environment from the
-official PyTorch index — never `latest`, never an unversioned `pip install
-torch`, never a nightly, never Conda, never a second Python environment.
+They are installed into the existing `/opt/venv` virtual environment, PyTorch
+coming from the official PyTorch index — never `latest`, never an unversioned
+`pip install torch`, never a nightly, never Conda, never a second Python
+environment.
+
+`torch 2.10.0+cu130` requires `cuda-bindings==13.0.3`, whereas the CuTe DSL
+v4.6.1 installer resolves `cuda-python 13.3.1` (which requires
+`cuda-bindings~=13.3.1`). Pinning `cuda-python` to its matching `13.0.3`
+release resolves that dependency graph coherently: `13.0.3` satisfies torch's
+exact requirement and CuTe DSL 4.6.1's own `cuda-python>=12.8` constraint at
+the same time. Nothing is uninstalled, excluded, or allowlisted to hide a
+conflict, and no pin in `VERSIONS.env` is weakened or changed.
+
+The resulting environment must satisfy
+
+```bash
+python3 -m pip check
+```
+
+```text
+No broken requirements found.
+```
+
+and this is a hard, unsuppressed gate in three places: during the image build
+(after every Python package is installed), in `make check-env`, and in
+`make gemm-cutedsl-p31-check`. It is never run as `pip check || true`, never
+filtered, and never downgraded to a warning.
+
+The same three places also verify exact versions. The build gate reads all four
+pinned distributions through `importlib.metadata` (`torch`, `cuda-python`,
+`cuda-bindings`, `nvidia-cutlass-dsl`); `check-env` and
+`gemm-cutedsl-p31-check` read `cuda-python` and `cuda-bindings` through
+`importlib.metadata` and re-read `torch.__version__`, `torch.version.cuda`, and
+`cutlass.__version__` at runtime. In the image, the coherent
+`cuda-python`/`cuda-bindings` pair is installed before the pinned PyTorch
+build, so the environment is never left transiently inconsistent during the
+build either. No GPU is used or required for any of it.
 
 **The `cu130` PyTorch wheel is an auxiliary allocation/reference dependency
 only. It does not replace the pinned CuTe DSL toolchain**, which remains:
@@ -199,59 +264,8 @@ Architecture:       sm_103a
 ```
 
 No existing CUDA, image-digest, CUTLASS, architecture, or build-job pin is
-changed by P3.1.
-
-### 9.1 Recorded dependency consequence (not silent, not a weakened pin)
-
-`torch 2.10.0+cu130` hard-requires `cuda-bindings==13.0.3`. The CuTe DSL v4.6.1
-installer had resolved `cuda-bindings 13.3.1` (via `cuda-python 13.3.1`), so
-installing the pinned PyTorch build **replaces `cuda-bindings 13.3.1` with
-`13.0.3`** inside the image. Afterwards `pip check` reports exactly one
-unsatisfied requirement:
-
-```text
-cuda-python 13.3.1 has requirement cuda-bindings~=13.3.1, but you have cuda-bindings 13.0.3.
-```
-
-This is recorded rather than hidden or worked around:
-
-- no pin in `VERSIONS.env` is weakened, relaxed, or silently changed, and no
-  package version is pinned or unpinned to make the conflict disappear;
-- the image build and `make gemm-cutedsl-p31-check` both re-verify that CuTe
-  DSL still reports exactly `4.6.1` after the PyTorch install, so a broken or
-  downgraded CuTe DSL fails closed;
-- CuTe DSL 4.6.1 itself only requires `cuda-python>=12.8`, so the downgrade
-  does not violate its own declared constraint — but the resulting combination
-  is *not* the one the CuTe DSL installer selected, and that difference is a
-  legitimate audit finding, not a formality;
-- the practical consequence is that the **GB300 verification below is what
-  establishes that the CuTe DSL stack still works under this dependency
-  state**; `make preflight` (which runs the Phase 0 CuTe DSL smoke) and
-  `make gemm-cutedsl-p31-smoke` both exercise it.
-
-An auditor may legitimately decide that this conflict must be resolved
-differently (for example by pinning a PyTorch build compatible with
-`cuda-bindings 13.3.1`, or by re-resolving the CuTe DSL stack). P3.1 does not
-make that decision unilaterally.
-
-### 9.2 Recorded interaction with the P1/P2 version-contract parsers
-
-`scripts/aggregate_exp01_memory_paths.py` and
-`scripts/aggregate_exp02_umma_throughput.py` parse `VERSIONS.env` against a
-closed allowlist (`REQUIRED_VERSION_KEYS`) and reject **any** unknown key. The
-six keys P3.1 adds are therefore rejected by those two audited P1/P2 files:
-a *future* P1.3 or P2.3 campaign `finalize` (and so a future P1.4/P2.4 pilot)
-would fail at its `versions_env` stage.
-
-- Already-completed campaigns, their manifests, and their recorded evidence
-  are unaffected: they are immutable and were finalized before this change.
-- `make check-static` is unaffected: both aggregator self-tests build their own
-  synthetic `VERSIONS.env` fixtures.
-- P3.1 does **not** modify those two files, because extending an audited P1/P2
-  parser is out of this unit's scope and would require its own re-audit.
-
-This is reported as a known cross-unit interaction for the P3.1 audit to rule
-on, not as an accepted defect.
+changed by P3.1, and neither audited P1/P2 aggregator is modified or given an
+extended allowlist: `VERSIONS.env` is simply left alone.
 
 ## 10. Verification commands
 
@@ -259,10 +273,18 @@ GPU-free (no GPU, no network at runtime, no elevated privileges):
 
 ```bash
 git diff --check
+git diff --exit-code main -- VERSIONS.env
 make check-static
 make build-image
 make check-env
 make gemm-cutedsl-p31-check
+```
+
+`make check-static` additionally exercises the two real, unmodified P1/P2
+version parsers against the real global version file:
+
+```bash
+python3 -c 'import sys; sys.path.insert(0, "scripts"); import aggregate_exp01_memory_paths as p1, aggregate_exp02_umma_throughput as p2; p1.parse_versions_env(); p2.parse_versions_env(); print("P1/P2 VERSIONS.env compatibility: PASS")'
 ```
 
 `make gemm-cutedsl-p31-check` fails closed unless all of the following hold:
@@ -277,8 +299,11 @@ make gemm-cutedsl-p31-check
 7. CuTe DSL reports `4.6.1`.
 8. PyTorch reports `2.10.0+cu130`.
 9. `torch.version.cuda` reports `13.0`.
-10. The example's own `--help` exits successfully without touching a GPU.
-11. Every frozen CLI option is present in that help output.
+10. `importlib.metadata` reports `cuda-python 13.0.3` and
+    `cuda-bindings 13.0.3`.
+11. `python3 -m pip check` reports no broken requirements.
+12. The example's own `--help` exits successfully without touching a GPU.
+13. Every frozen CLI option is present in that help output.
 
 GB300 verification (only with an explicitly supplied, free physical device —
 the project never selects a GPU automatically):
@@ -328,12 +353,15 @@ is completed.
 ## 12. Files P3.1 owns
 
 ```text
-src/gemm/P3_1_PROTOCOL.md   this document (the only file P3.1 adds)
+src/gemm/P3_1_PROTOCOL.md   this document
+PHASE3_VERSIONS.env         the Phase 3-only version contract (section 9.0)
 ```
 
 P3.1 adds no source, no runner, no wrapper, no campaign directory, and no
-result file. Its remaining footprint is confined to the pinned dependency and
-provenance values in `VERSIONS.env`, the PyTorch install in `Dockerfile`, the
+result file. Its remaining footprint is confined to the auxiliary-dependency
+installs and their verification in `Dockerfile`, the
 `gemm-cutedsl-p31-check` / `gemm-cutedsl-p31-smoke` targets plus their
 validation in `Makefile`, and the truthful status text in `PLAN.md` and
-`README.md`.
+`README.md`. `VERSIONS.env` is **not** part of that footprint: it is identical
+to the version on `main`, which `git diff --exit-code main -- VERSIONS.env`
+proves.

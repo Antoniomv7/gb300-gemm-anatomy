@@ -306,23 +306,30 @@ before any Docker work, runs exclusively through `scripts/run_container.sh`,
 re-checks the upstream commit and SHA-256 inside that same GPU container, runs
 exactly the frozen command with reference checking enabled, preserves the
 example's exit code, and prints an explicit non-performance notice.
-`VERSIONS.env` gained the exact auxiliary PyTorch pins (`2.10.0+cu130` from
-the official cu130 index, `torch.version.cuda == 13.0`) and the example's
-path/blob/SHA-256; no existing pin changed. The small shape is deliberate:
+The global `VERSIONS.env` is unchanged and byte-for-byte identical to `main`;
+every Phase 3-only pin lives in the new root-level `PHASE3_VERSIONS.env`, which
+extends that contract without redefining anything in it: the exact auxiliary
+PyTorch pins (`2.10.0+cu130` from the official cu130 index,
+`torch.version.cuda == 13.0`), the coherent `cuda-python==13.0.3` /
+`cuda-bindings==13.0.3` pins, and the example's path/blob/SHA-256. No existing
+pin changed. The small shape is deliberate:
 P3.1 is a functional compatibility check, not one of the five final shapes.
 P3.1 introduces no wrapper, no persistent variant, no 2-CTA instruction, no
 cuBLASLt baseline, no sweep, no autotuning, no Nsight Compute, no campaign
 infrastructure, and no result file, and it **produces no experimental result**;
 any timing the example computes internally is discarded and explicitly
-classified as non-publishable functional-smoke output. Two consequences are
-recorded openly in `src/gemm/P3_1_PROTOCOL.md` rather than worked around: the
-pinned PyTorch build hard-requires `cuda-bindings==13.0.3` and therefore
-replaces the `cuda-bindings 13.3.1` the CuTe DSL installer had resolved (CuTe
-DSL is re-verified as `4.6.1` afterwards, at image-build time and in the check
-target), and the six new `VERSIONS.env` keys are rejected by the closed
-allowlists in the audited P1.3/P2.3 aggregators, so a *future* P1/P2 campaign
-finalize would fail there until an explicit, separately audited decision
-extends them. P3.1's GPU-free checks pass, but they are the author's own
+classified as non-publishable functional-smoke output. The image's Python
+dependency graph is coherent rather than merely documented: `torch
+2.10.0+cu130` requires `cuda-bindings==13.0.3`, so `cuda-python` and
+`cuda-bindings` are both pinned to `13.0.3` (which also satisfies CuTe DSL
+4.6.1's own `cuda-python>=12.8` constraint), and `python3 -m pip check` is a
+hard, unsuppressed gate during the image build, in `make check-env`, and in
+`make gemm-cutedsl-p31-check`; CuTe DSL is still re-verified as `4.6.1` in each
+of them. Because the audited P1.3/P2.3 aggregators parse `VERSIONS.env` against
+a closed key allowlist, no Phase 3 key was added there and neither aggregator
+was modified; `make check-static` runs their real `parse_versions_env()`
+against the real `VERSIONS.env` as a regression gate.
+P3.1's GPU-free checks pass, but they are the author's own
 checks: `Audited` stays `NO` pending an independent review, and
 `Verified on GB300` stays `NO` because no GPU index was supplied and no GB300
 run was performed. P3.2–P3.5 remain unimplemented.
