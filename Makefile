@@ -11,7 +11,8 @@
 # compute-umma-2sm-self-test, compute-umma-2sm-smoke, compute-umma-sweep-plan,
 # compute-umma-sweep-check, compute-umma-sweep-smoke, compute-umma-p24-plan,
 # compute-umma-p24-check, compute-umma-p24-pilot, compute-umma-p24-profile,
-# compute-umma-p24-analyze, gemm-cutedsl-p31-check, gemm-cutedsl-p31-smoke.
+# compute-umma-p24-analyze, gemm-cutedsl-p31-check, gemm-cutedsl-p31-smoke,
+# gemm-cutedsl-p32-check, gemm-cutedsl-p32-smoke.
 # No target selects a GPU automatically, elevates privileges, or exceeds two
 # build jobs.
 
@@ -102,6 +103,15 @@ EXP02_P24_RAW_ROOT := results/raw/exp02_umma_throughput_p24
 GEMM_P31_PROTOCOL := src/gemm/P3_1_PROTOCOL.md
 GEMM_P31_EXAMPLE := /opt/cutlass/$(CUTEDSL_P31_EXAMPLE_PATH)
 
+# P3.2: a thin, repository-owned orchestration wrapper around that same pinned
+# example, executing one frozen BF16 shape and separating compile / first-launch
+# / steady-state kernel time. It still vendors no NVIDIA GEMM source and adds no
+# key to either version contract: it reuses P3.1's pins because it executes
+# P3.1's file. See src/gemm/P3_2_PROTOCOL.md.
+GEMM_P32_WRAPPER := src/gemm/cutedsl_gemm.py
+GEMM_P32_CHECKER := scripts/check_cutedsl_gemm_p32.py
+GEMM_P32_PROTOCOL := src/gemm/P3_2_PROTOCOL.md
+
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
 	PHASE3_VERSIONS.env \
@@ -119,7 +129,8 @@ REQUIRED_FILES := \
 	$(EXP02_RUNNER) $(EXP02_AGGREGATOR) $(EXP02_PROTOCOL) \
 	$(EXP02_P24_RUNNER) $(EXP02_P24_ANALYZER) $(EXP02_P24_SAFE_CAPTURE) $(EXP02_P24_NCU_BRIDGE) \
 	$(EXP02_P24_PROTOCOL) \
-	$(GEMM_P31_PROTOCOL)
+	$(GEMM_P31_PROTOCOL) \
+	$(GEMM_P32_WRAPPER) $(GEMM_P32_CHECKER) $(GEMM_P32_PROTOCOL)
 
 .DEFAULT_GOAL := help
 .PHONY: help check-static build-image check-env preflight \
@@ -135,7 +146,8 @@ REQUIRED_FILES := \
 	compute-umma-p24-plan compute-umma-p24-check compute-umma-p24-pilot \
 	compute-umma-p24-profile compute-umma-p24-analyze \
 	compute-umma-sweep-plan compute-umma-sweep-check compute-umma-sweep-smoke \
-	gemm-cutedsl-p31-check gemm-cutedsl-p31-smoke
+	gemm-cutedsl-p31-check gemm-cutedsl-p31-smoke \
+	gemm-cutedsl-p32-check gemm-cutedsl-p32-smoke
 
 help:
 	@echo "gb300-gemm-anatomy — Phase 0 + P1.1 (LDGSTS) + P1.2 (TMA) + P1.3 (sweep) targets"
@@ -315,6 +327,28 @@ help:
 	@echo "                                 Functional smoke check only, NOT a performance"
 	@echo "                                 result; any internally computed timing is"
 	@echo "                                 discarded."
+	@echo ""
+	@echo "  -- P3.2 one-shape wrapper (see src/gemm/P3_2_PROTOCOL.md; implemented,"
+	@echo "     independent audit PENDING, GB300 verification PENDING. Drives the same"
+	@echo "     pinned NVIDIA example through a repository-owned wrapper at the frozen"
+	@echo "     BF16 shape (M,N,K,L)=(4096,4096,4096,1), non-persistent, 1-CTA MMA group,"
+	@echo "     mma tiler (128,128), cluster (1,1), TMA store, seed 1111, and separates"
+	@echo "     compile_time_ms / first_launch_ms / kernel_time_ms. Correctness is"
+	@echo "     mandatory and always precedes any timing. Every emitted row is"
+	@echo "     publishable=false: P3.2 produces NO experimental result and NO"
+	@echo "     cuBLASLt comparison.) --"
+	@echo "  GPU-free P3.2 contract gate (no GPU, no network; runs the P3.1 gate first):"
+	@echo "  make gemm-cutedsl-p32-check    Re-verify the upstream commit, blob, SHA-256,"
+	@echo "                                 installed versions and dependency consistency,"
+	@echo "                                 then compile both P3.2 files and run the"
+	@echo "                                 wrapper's GPU-free --help and --self-test plus"
+	@echo "                                 the checker and its own self-test."
+	@echo "  GPU-executing (requires BLACKWELL_GPU_INDEX; never selects a GPU automatically):"
+	@echo "  make gemm-cutedsl-p32-smoke    Re-check the upstream commit and SHA-256 inside"
+	@echo "                                 the GPU container, then run the frozen one-shape"
+	@echo "                                 wrapper with 2 warm-ups and 10 measured launches."
+	@echo "                                 Emits one non-publishable CSV row of functional"
+	@echo "                                 evidence, NOT an experimental result."
 	@echo ""
 	@echo "Pinned global contract (VERSIONS.env, unchanged since Phase 0 and consumed"
 	@echo "unmodified by the closed P1/P2 aggregators): CUDA $(CUDA_VERSION), CUTLASS"
@@ -711,7 +745,6 @@ check-static:
 	@grep -Fq 'scripts/run_container.sh' Makefile
 	@echo "== truthful P3.1 status assertions =="
 	@grep -Fq 'P3.1 | Pinned official CuTe DSL example | YES | YES | YES |' PLAN.md
-	@grep -Fq 'P3.2 | One-shape wrapper | NO | NO | NO |' PLAN.md
 	@grep -Fq 'P3.3 | cuBLASLt baseline | NO | NO | NO |' PLAN.md
 	@grep -Fq 'P3.4 | Three execution variants | NO | NO | NO |' PLAN.md
 	@grep -Fq 'P3.5 | Five shapes and comparison | NO | NO | NO |' PLAN.md
@@ -720,6 +753,71 @@ check-static:
 	@grep -Fq 'non-persistent' $(GEMM_P31_PROTOCOL)
 	@grep -Fq 'P3.1 (pinned official CuTe DSL example)' README.md
 	@! grep -nF 'P3.1 | Pinned official CuTe DSL example | YES | NO | NO |' PLAN.md
+	@echo "== P3.2 files present, executable, and still vendoring no NVIDIA GEMM source =="
+	@test -f $(GEMM_P32_WRAPPER)
+	@test -f $(GEMM_P32_CHECKER)
+	@test -f $(GEMM_P32_PROTOCOL)
+	@test -x $(GEMM_P32_WRAPPER)
+	@test -x $(GEMM_P32_CHECKER)
+	@! grep -nE '^(import|from|def|class) ' $(GEMM_P32_PROTOCOL)
+	@echo "== P3.2 python syntax, GPU-free self-tests, and the full contract check =="
+	python3 -m py_compile $(GEMM_P32_WRAPPER) $(GEMM_P32_CHECKER)
+	python3 $(GEMM_P32_WRAPPER) --self-test
+	python3 $(GEMM_P32_CHECKER) --self-test
+	python3 $(GEMM_P32_CHECKER) .
+	@rm -rf src/gemm/__pycache__ scripts/__pycache__
+	@echo "== P3.2 frozen one-shape configuration cannot silently change =="
+	@grep -Eq '^FROZEN_M = 4096$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^FROZEN_N = 4096$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^FROZEN_K = 4096$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^FROZEN_L = 1$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^FROZEN_AB_DTYPE = "BFloat16"$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^FROZEN_ACC_DTYPE = "Float32"$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^FROZEN_C_DTYPE = "Float32"$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^FROZEN_A_MAJOR = "k"$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^FROZEN_B_MAJOR = "k"$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^FROZEN_C_MAJOR = "n"$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^FROZEN_MMA_TILER_MN = \(128, 128\)$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^FROZEN_CLUSTER_SHAPE_MN = \(1, 1\)$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^FROZEN_USE_2CTA_INSTRS = False$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^FROZEN_USE_TMA_STORE = True$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^FROZEN_SEED = 1111$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^SCHEMA_VERSION = "p32.v1"$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^RUN_KIND = "smoke"$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^VARIANT = "nonpersistent_1cta"$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^REFERENCE = "torch_cuda_fp32_ieee"$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^CACHE_MODE = "hot"$$' $(GEMM_P32_WRAPPER)
+	@grep -Eq '^PUBLISHABLE = "false"$$' $(GEMM_P32_WRAPPER)
+	@echo "== P3.2 exposes no shape/variant control and can never skip the reference check =="
+	@pat='--mnkl|--ab'; \
+	pat="$$pat""_dtype|--c_dtype|--acc_dtype|--a_major|--b_major|--c_major"; \
+	pat="$$pat|--mma_tiler|--cluster_shape|--tolerance|--use_tma_store"; \
+	pat="$$pat|--skip-ref""-check|--skip_ref""_check|--use_2cta""_instrs|--use_cold""_l2"; \
+	pat="$$pat|--use-cold""-l2|--persistent|dense_gemm""_persistent"; \
+	! grep -nE -- "$$pat" $(GEMM_P32_WRAPPER)
+	@echo "   (the checker names those spellings on purpose, in order to ban them)"
+	@echo "== P3.2 writes no result file and creates no campaign directory =="
+	@! grep -nE 'results/raw|results/preflight' $(GEMM_P32_WRAPPER)
+	@echo "   (the tokenized identifier ban for TFLOP/s, speedup, cuBLASLt, Nsight"
+	@echo "    Compute, autotuning, and campaign trees lives in $(GEMM_P32_CHECKER))"
+	@echo "== P3.2 adds no key to either version contract =="
+	@! grep -nE '^CUTEDSL_P32_' PHASE3_VERSIONS.env VERSIONS.env
+	@echo "== P3.2 reuses the audited launcher and never invokes Docker for GPU work =="
+	@grep -Eq '^gemm-cutedsl-p32-smoke:$$' Makefile
+	@grep -Fq 'scripts/run_container.sh' Makefile
+	@echo "== P3.2 GPU-free gate actually executes the existing P3.1 gate =="
+	@grep -Eq '^gemm-cutedsl-p32-check: gemm-cutedsl-p31-check$$' Makefile
+	@echo "== P3.2 smoke runs exactly the frozen non-publishable iteration counts =="
+	@grep -Fq -- '--warmup-iterations 2 \' Makefile
+	@grep -Fq -- '--iterations 10' Makefile
+	@echo "== truthful P3.2 status assertions =="
+	@grep -Fq 'P3.2 | One-shape wrapper | YES | NO | NO |' PLAN.md
+	@grep -Fq 'P3.2 = YES / NO / NO' $(GEMM_P32_PROTOCOL)
+	@grep -Fq 'P3.2 creates no publishable performance result' $(GEMM_P32_PROTOCOL)
+	@grep -Fq 'P3.2 (one-shape wrapper)' README.md
+	@! grep -nF 'P3.2 | One-shape wrapper | NO | NO | NO |' PLAN.md
+	@! grep -nE 'P3\.2 \| One-shape wrapper \| YES \| (YES|NO) \| YES \|' PLAN.md
+	@! grep -nF 'P3.2 | One-shape wrapper | YES | YES | NO |' PLAN.md
 	@echo "check-static: OK"
 
 build-image:
@@ -1522,4 +1620,149 @@ gemm-cutedsl-p31-smoke:
 	echo "Any timing the example computed internally is discarded: P3.1 emits no"; \
 	echo "TFLOP/s, no comparison, no cuBLASLt baseline, and no publishable result."; \
 	echo "=============================================================================="; \
+	exit $$status
+
+# --- P3.2: one-shape CuTe DSL GEMM wrapper ----------------------------------
+# P3.2 adds a thin, repository-owned orchestration wrapper around the very same
+# pinned upstream example, executing one frozen BF16 shape and separating
+# compile_time_ms, first_launch_ms, and kernel_time_ms -- which the upstream
+# run() function fuses into a single number and therefore cannot provide. It
+# still vendors no NVIDIA GEMM source, adds no key to either version contract,
+# introduces no cuBLASLt baseline, no persistent scheduler, no 2-CTA MMA group,
+# no other shape, no sweep, no autotuning, no Nsight Compute, no campaign
+# directory, and no result file; see src/gemm/P3_2_PROTOCOL.md.
+#
+# gemm-cutedsl-p32-check never touches a GPU, the network, or elevated
+# privileges. It runs the existing P3.1 gate first (also GPU-free and
+# network-free, and left completely intact), then runs inside the pinned image
+# with --network none, --cap-drop ALL, no-new-privileges, the invoking UID/GID,
+# no --gpus, and the repository mounted READ-ONLY -- a checker must not be able
+# to modify what it checks, which is also why PYTHONPYCACHEPREFIX sends every
+# byte-compilation artefact to the container's own /tmp. Inside, it re-verifies
+# the upstream commit, checkout cleanliness, regular-file identity, Git blob
+# SHA, SHA-256, the CuTe DSL/PyTorch/cuda-python/cuda-bindings pins and a
+# consistent dependency graph, then compiles both P3.2 files and runs the
+# wrapper's GPU-free --help and --self-test plus the checker and its own
+# self-test. Every expected value is passed in from VERSIONS.env (global) or
+# PHASE3_VERSIONS.env (Phase 3); none is duplicated as an unconnected constant.
+#
+# gemm-cutedsl-p32-smoke is the only P3.2 target that executes on GPU. Its
+# first recipe line validates BLACKWELL_GPU_INDEX before Docker, any build, or
+# any check can start, which is why it deliberately has no Make prerequisite
+# (same audited reasoning as gemm-cutedsl-p31-smoke). It then goes exclusively
+# through scripts/run_container.sh, which alone owns GPU selection, UUID
+# resolution, and the idle-device proof -- this target never calls Docker or
+# --gpus itself. Inside that same GPU container it re-checks the upstream commit
+# and source SHA-256 immediately before exec'ing the wrapper, runs exactly the
+# frozen one-shape configuration, preserves the wrapper's exit code, and prints
+# an explicit stderr notice that the emitted timings are non-publishable
+# functional evidence. Correctness is mandatory and cannot be disabled: the
+# wrapper has no option for it and emits no row unless the full check passed.
+
+gemm-cutedsl-p32-check: gemm-cutedsl-p31-check
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-e PYTHONPYCACHEPREFIX=/tmp/p32-pycache \
+		-e CUTLASS_COMMIT="$(CUTLASS_COMMIT)" \
+		-e CUTEDSL_VERSION="$(CUTEDSL_VERSION)" \
+		-e PYTORCH_VERSION="$(PYTORCH_VERSION)" \
+		-e PYTORCH_CUDA_VERSION="$(PYTORCH_CUDA_VERSION)" \
+		-e CUDA_PYTHON_VERSION="$(CUDA_PYTHON_VERSION)" \
+		-e CUDA_BINDINGS_VERSION="$(CUDA_BINDINGS_VERSION)" \
+		-e P31_EXAMPLE="$(GEMM_P31_EXAMPLE)" \
+		-e P31_EXAMPLE_GIT_BLOB="$(CUTEDSL_P31_EXAMPLE_GIT_BLOB)" \
+		-e P31_EXAMPLE_SHA256="$(CUTEDSL_P31_EXAMPLE_SHA256)" \
+		-e P32_WRAPPER="$(GEMM_P32_WRAPPER)" \
+		-e P32_CHECKER="$(GEMM_P32_CHECKER)" \
+		-v "$(CURDIR):/workspace:ro" \
+		-w /workspace \
+		"$(IMAGE_TAG)" \
+		bash -c 'set -euo pipefail; \
+			fail() { echo "gemm-cutedsl-p32-check: FAIL: $$*" >&2; exit 1; }; \
+			[ -d /opt/cutlass ] || fail "/opt/cutlass is missing"; \
+			head_commit="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass rev-parse HEAD)" \
+				|| fail "cannot read the /opt/cutlass HEAD commit"; \
+			[ "$$head_commit" = "$$CUTLASS_COMMIT" ] \
+				|| fail "/opt/cutlass HEAD $$head_commit != pinned $$CUTLASS_COMMIT"; \
+			dirty="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass status --porcelain --untracked-files=all)" \
+				|| fail "cannot read the /opt/cutlass working tree status"; \
+			[ -z "$$dirty" ] || fail "/opt/cutlass has tracked or untracked modifications"; \
+			[ ! -L "$$P31_EXAMPLE" ] || fail "$$P31_EXAMPLE is a symlink"; \
+			[ -f "$$P31_EXAMPLE" ] || fail "$$P31_EXAMPLE is not a regular file"; \
+			blob="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass hash-object -- "$$P31_EXAMPLE")" \
+				|| fail "cannot compute the Git blob SHA of $$P31_EXAMPLE"; \
+			[ "$$blob" = "$$P31_EXAMPLE_GIT_BLOB" ] \
+				|| fail "Git blob $$blob != pinned $$P31_EXAMPLE_GIT_BLOB"; \
+			sha="$$(sha256sum "$$P31_EXAMPLE" | cut -d" " -f1)" \
+				|| fail "cannot compute the SHA-256 of $$P31_EXAMPLE"; \
+			[ "$$sha" = "$$P31_EXAMPLE_SHA256" ] \
+				|| fail "SHA-256 $$sha != pinned $$P31_EXAMPLE_SHA256"; \
+			echo "upstream provenance OK: commit $$head_commit"; \
+			echo "                       blob   $$blob"; \
+			echo "                       sha256 $$sha"; \
+			python3 -c "import os, cutlass, torch; \
+				ce = os.environ[\"CUTEDSL_VERSION\"]; \
+				assert cutlass.__version__ == ce, f\"CuTeDSL {cutlass.__version__} != pinned {ce}\"; \
+				pe = os.environ[\"PYTORCH_VERSION\"]; \
+				assert torch.__version__ == pe, f\"torch {torch.__version__} != pinned {pe}\"; \
+				pc = os.environ[\"PYTORCH_CUDA_VERSION\"]; \
+				assert torch.version.cuda == pc, f\"torch CUDA {torch.version.cuda} != pinned {pc}\"; \
+				print(\"versions OK: cutedsl\", ce, \"torch\", pe, \"torch-cuda\", pc)"; \
+			python3 -c "import os; from importlib.metadata import version; \
+				expected = {\"cuda-python\": os.environ[\"CUDA_PYTHON_VERSION\"], \
+					\"cuda-bindings\": os.environ[\"CUDA_BINDINGS_VERSION\"]}; \
+				installed = {name: version(name) for name in expected}; \
+				assert installed == expected, f\"installed distributions {installed} != pinned {expected}\"; \
+				print(\"cuda distributions OK:\", installed)"; \
+			echo "== pip check: the dependency graph must be consistent =="; \
+			python3 -m pip check; \
+			echo "== P3.2 python syntax =="; \
+			python3 -m py_compile "$$P32_WRAPPER" "$$P32_CHECKER"; \
+			echo "== P3.2 wrapper --help and --self-test are GPU-free =="; \
+			python3 "$$P32_WRAPPER" --help > /dev/null \
+				|| fail "the wrapper --help did not exit successfully"; \
+			python3 "$$P32_WRAPPER" --self-test \
+				|| fail "the wrapper GPU-free self-test failed"; \
+			echo "== P3.2 checker self-test and full frozen-contract check =="; \
+			python3 "$$P32_CHECKER" --self-test \
+				|| fail "the checker self-test failed"; \
+			python3 "$$P32_CHECKER" /workspace \
+				|| fail "the P3.2 frozen-contract check failed"; \
+			echo "P3.2 GPU-free contract OK (no GPU was used or required)"'
+	@echo "gemm-cutedsl-p32-check: OK"
+
+gemm-cutedsl-p32-smoke:
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make gemm-cutedsl-p32-smoke"; \
+		echo "       This project never selects a GPU automatically."; \
+		exit 2; \
+	fi
+	status=0; \
+	scripts/run_container.sh bash -c 'set -euo pipefail; \
+		head_commit="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass rev-parse HEAD)"; \
+		[ "$$head_commit" = "$(CUTLASS_COMMIT)" ] \
+			|| { echo "gemm-cutedsl-p32-smoke: FAIL: /opt/cutlass HEAD $$head_commit != pinned $(CUTLASS_COMMIT)" >&2; exit 1; }; \
+		sha="$$(sha256sum "$(GEMM_P31_EXAMPLE)" | cut -d" " -f1)"; \
+		[ "$$sha" = "$(CUTEDSL_P31_EXAMPLE_SHA256)" ] \
+			|| { echo "gemm-cutedsl-p32-smoke: FAIL: SHA-256 $$sha != pinned $(CUTEDSL_P31_EXAMPLE_SHA256)" >&2; exit 1; }; \
+		echo "gemm-cutedsl-p32-smoke: upstream re-checked in this GPU container: commit $$head_commit sha256 $$sha" >&2; \
+		exec python3 $(GEMM_P32_WRAPPER) \
+			--warmup-iterations 2 \
+			--iterations 10' || status=$$?; \
+	echo "==============================================================================" >&2; \
+	echo "P3.2 FUNCTIONAL VERIFICATION ONLY -- NOT AN EXPERIMENTAL RESULT." >&2; \
+	echo "The CSV row above (if any) is P3.2 infrastructure evidence: one frozen shape," >&2; \
+	echo "(M,N,K,L)=(4096,4096,4096,1), 2 warm-ups and 10 measured launches, with hot" >&2; \
+	echo "reused operands. compile_time_ms, first_launch_ms, and kernel_time_ms are" >&2; \
+	echo "NON-PUBLISHABLE diagnostic fields; every row carries publishable=false." >&2; \
+	echo "P3.2 computes no TFLOP/s, no speedup, no efficiency, and no comparison, and" >&2; \
+	echo "no cuBLASLt baseline exists yet. Correctness passed before any timing ran." >&2; \
+	echo "Note: stdout also carries the two device-selection lines that the audited," >&2; \
+	echo "unmodified scripts/run_container.sh prints before the container starts." >&2; \
+	echo "==============================================================================" >&2; \
 	exit $$status

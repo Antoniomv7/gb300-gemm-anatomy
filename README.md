@@ -299,7 +299,7 @@ checks at `OK`. The empirical per-SM ceiling candidate is
 NCU did not resolve the SM-count metric. Every artifact remains
 `publishable: false` unconditionally. P2.4 and Phase 2 are closed.
 
-## Phase 3 status: P3.1 closed; P3.2 may begin
+## Phase 3 status: P3.1 closed; P3.2 implemented, audit and GB300 pending
 
 Phase 2 is closed and the Phase 3 gate has passed, so Phase 3 may begin.
 
@@ -381,10 +381,91 @@ preflight campaign `20260806T101657Z` reported `OVERALL=PASS` on physical GPU
 index `3` (UUID `GPU-90fb226c-3937-2448-1052-2e12282a61b9`); the frozen smoke
 then re-checked the upstream provenance, kept reference checking enabled, and
 ended with `PASS`. This closes P3.1 as `YES / YES / YES` without creating a
-performance result. P3.2 (one-shape wrapper), P3.3 (cuBLASLt baseline), P3.4
-(three execution variants), and P3.5 (five shapes and comparison) remain
-unimplemented. See `src/gemm/P3_1_PROTOCOL.md` for the
-frozen protocol and the exact verification commands.
+performance result. See `src/gemm/P3_1_PROTOCOL.md` for the frozen protocol and
+the exact verification commands.
+
+### P3.2 (one-shape wrapper) — implemented; audit and GB300 verification pending
+
+**P3.2 is implemented. Its independent audit is pending, and its verification
+on GB300 is pending** — no GPU execution of this unit has happened yet, and the
+author's own GPU-free checks are not an audit.
+
+P3.2 adds a thin, repository-owned CuTe DSL wrapper
+(`src/gemm/cutedsl_gemm.py`) around the *same* pinned, unmodified official
+NVIDIA example that P3.1 froze. It loads that file read-only and in place from
+the pinned `/opt/cutlass` checkout after revalidating the pinned commit, Git
+blob SHA, and SHA-256, and reuses `DenseGemmKernel`, `can_implement()`, and the
+upstream deterministic tensor factory. It never calls the upstream `run()`,
+because that function fuses compilation, the first launch, correctness, and
+benchmarking into a single returned number and so cannot provide the separation
+this unit exists to establish. Nothing is copied, vendored, forked, reformatted,
+or patched, `/opt/cutlass` is never written to, and no key is added to
+`VERSIONS.env` or `PHASE3_VERSIONS.env`: P3.2 executes P3.1's file and reuses
+P3.1's pins, reading every provenance value from those two contracts at run
+time.
+
+Exactly one frozen configuration exists — BF16 × BF16 → FP32 with FP32
+accumulation in TMEM at `(M,N,K,L) = (4096,4096,4096,1)` (the first of the five
+final shapes), `a_major=k`, `b_major=k`, `c_major=n`, MMA tiler `(128,128)`,
+cluster `(1,1)`, one-CTA MMA group, non-persistent, TMA loads, TMA store, seed
+`1111`, hot reused operands, `sm_103a` — and none of it is reachable from the
+command line. The only runtime controls are `--warmup-iterations`,
+`--iterations`, `--self-test`, and `--help`, all bounded, and the reference
+check cannot be skipped.
+
+The wrapper separates three costs and validates correctness before timing any
+of the steady state:
+
+```text
+compile_time_ms    monotonic host clock around cute.compile alone
+first_launch_ms    the same clock around the first launch, whose output is
+                   the tensor that gets validated
+kernel_time_ms     CUDA events on the kernel's own stream after warm-up,
+                   divided by the iteration count
+```
+
+Correctness compares the complete result against an untimed PyTorch CUDA oracle
+with TF32 and every other reduced-precision FP32 matmul mode disabled and
+verified off (`atol=1e-1`, `rtol=1e-5`). A failure exits non-zero with a stderr
+diagnostic and emits no CSV at all, and no warm-up or steady-state timing runs.
+
+**These three timings are non-publishable diagnostic fields, not a result.**
+Every emitted row carries `publishable=false`; no TFLOP/s, speedup, efficiency,
+utilization, or bandwidth is computed anywhere; no result file or campaign
+directory is written; and **no cuBLASLt comparison and no Phase 3 experimental
+result exists yet**. The untimed PyTorch oracle is a correctness reference only
+— it is explicitly *not* the P3.3 baseline. Nothing here says or implies that a
+CuTe DSL GEMM approaches cuBLASLt.
+
+Successful runs write exactly one CSV header and one data row to stdout under a
+frozen 47-field `schema_version=p32.v1` contract produced with Python's `csv`
+module; every human-readable message, including native compiler writes to
+descriptor 1, goes to stderr.
+
+Two Make targets were added:
+
+```bash
+make gemm-cutedsl-p32-check   # GPU-free, network-free, unprivileged. Runs the
+                              # existing P3.1 gate first, then re-verifies the
+                              # upstream identity, the pinned versions and
+                              # dependency consistency, and runs the wrapper's
+                              # --help/--self-test plus the checker and its own
+                              # self-test inside the pinned image with the
+                              # repository mounted read-only and no GPU exposed.
+
+BLACKWELL_GPU_INDEX=<physical-index> make gemm-cutedsl-p32-smoke
+                              # The only P3.2 GPU target, and NOT YET RUN.
+                              # Validates the index first, runs exclusively
+                              # through scripts/run_container.sh, re-checks the
+                              # upstream commit and SHA-256 inside that same
+                              # container, then runs the frozen one-shape
+                              # configuration with 2 warm-ups and 10 measured
+                              # launches.
+```
+
+P3.3 (cuBLASLt baseline), P3.4 (three execution variants), and P3.5 (five
+shapes and comparison) remain unimplemented. See `src/gemm/P3_2_PROTOCOL.md`
+for the frozen protocol, the exact CSV schema, and the verification commands.
 
 ## Research question
 
