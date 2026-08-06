@@ -296,7 +296,7 @@ help:
 	@echo "                                 configuration, INCONCLUSIVE (no TFLOP/s emitted)."
 	@echo ""
 	@echo "  -- P3.1 pinned official CuTe DSL example (see src/gemm/P3_1_PROTOCOL.md;"
-	@echo "     implemented; pending independent audit and GB300 verification. Executes"
+	@echo "     implemented, independently audited, and verified on GB300; closed. Executes"
 	@echo "     NVIDIA's own unmodified dense_gemm.py from the pinned /opt/cutlass"
 	@echo "     checkout: BF16 x BF16 -> FP32, (M,N,K,L)=(256,256,512,1), non-persistent,"
 	@echo "     1-CTA MMA group, mma tiler (128,128), cluster (1,1), TMA store. This"
@@ -710,16 +710,16 @@ check-static:
 	@grep -Eq '^gemm-cutedsl-p31-smoke:$$' Makefile
 	@grep -Fq 'scripts/run_container.sh' Makefile
 	@echo "== truthful P3.1 status assertions =="
-	@grep -Fq 'P3.1 | Pinned official CuTe DSL example | YES | NO | NO |' PLAN.md
+	@grep -Fq 'P3.1 | Pinned official CuTe DSL example | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P3.2 | One-shape wrapper | NO | NO | NO |' PLAN.md
 	@grep -Fq 'P3.3 | cuBLASLt baseline | NO | NO | NO |' PLAN.md
 	@grep -Fq 'P3.4 | Three execution variants | NO | NO | NO |' PLAN.md
 	@grep -Fq 'P3.5 | Five shapes and comparison | NO | NO | NO |' PLAN.md
-	@grep -Fq 'P3.1 = YES / NO / NO' $(GEMM_P31_PROTOCOL)
+	@grep -Fq 'P3.1 = YES / YES / YES' $(GEMM_P31_PROTOCOL)
 	@grep -Fq 'P3.1 produces no experimental result' $(GEMM_P31_PROTOCOL)
 	@grep -Fq 'non-persistent' $(GEMM_P31_PROTOCOL)
 	@grep -Fq 'P3.1 (pinned official CuTe DSL example)' README.md
-	@! grep -nF 'P3.1 | Pinned official CuTe DSL example | YES | YES' PLAN.md
+	@! grep -nF 'P3.1 | Pinned official CuTe DSL example | YES | NO | NO |' PLAN.md
 	@echo "check-static: OK"
 
 build-image:

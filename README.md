@@ -23,9 +23,9 @@ implemented; independently audited: YES; verified on GB300: YES; campaign
 executed: YES; 24/24 profiles validated; analysis: ANALYZED; empirical
 per-SM ceiling candidate: 16.37244853848296 TFLOP/s/SM; publishable results:
 NONE; Phase 2: CLOSED`. `P3.1 (pinned official CuTe DSL example) —
-implemented; independently audited: NO; verified on GB300: NO; executes an
-exact pinned official NVIDIA example unchanged; publishable results: NONE.
-P3.2–P3.5: not implemented.`**
+implemented; independently audited: YES; verified on GB300: YES; executes an
+exact pinned official NVIDIA example unchanged; publishable results: NONE;
+P3.1: CLOSED. P3.2–P3.5: not implemented.`**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -299,7 +299,7 @@ checks at `OK`. The empirical per-SM ceiling candidate is
 NCU did not resolve the SM-count metric. Every artifact remains
 `publishable: false` unconditionally. P2.4 and Phase 2 are closed.
 
-## Phase 3 status: P3.1 implemented, pending audit and GB300 verification
+## Phase 3 status: P3.1 closed; P3.2 may begin
 
 Phase 2 is closed and the Phase 3 gate has passed, so Phase 3 may begin.
 
@@ -310,8 +310,9 @@ exact, unmodified, official NVIDIA example — `NVIDIA/cutlass` v4.6.1, commit
 BSD-3-Clause — in place from the pinned `/opt/cutlass` checkout inside the
 image, checked against the upstream commit, Git blob SHA, and SHA-256. That
 file is never copied, vendored, forked, reformatted, or patched into this
-repository; P3.1 adds no GEMM source of its own, and the only file it creates
-is `src/gemm/P3_1_PROTOCOL.md`. The frozen functional configuration is
+repository; P3.1 adds no GEMM source of its own. The two files it creates are
+`src/gemm/P3_1_PROTOCOL.md` and `PHASE3_VERSIONS.env`. The frozen functional
+configuration is
 BF16 × BF16 → FP32 with FP32 accumulation at `(M,N,K,L) = (256,256,512,1)`,
 non-persistent, 1-CTA MMA group, MMA tiler `(128,128)`, cluster `(1,1)`, TMA
 loads, TMA store, and mandatory reference validation performed by the unchanged
@@ -373,11 +374,16 @@ aggregator modules and runs their real `parse_versions_env()` against the
 repository's actual `VERSIONS.env`, so the closed P1/P2 contract cannot regress
 unnoticed.
 
-P3.1's GPU-free checks pass, but those are the author's own checks, not an
-audit: P3.1 is **not** audited and **not** verified on GB300 — no GPU index was
-supplied and no GB300 run was performed. P3.2 (one-shape wrapper), P3.3
-(cuBLASLt baseline), P3.4 (three execution variants), and P3.5 (five shapes and
-comparison) remain unimplemented. See `src/gemm/P3_1_PROTOCOL.md` for the
+The remediated implementation at Git commit
+`f34cb33a9456ba011feb0a5a35910bbd00f9a9e6` passed an independent audit and
+was functionally verified on a physical NVIDIA B300 on 6 August 2026. Fresh
+preflight campaign `20260806T101657Z` reported `OVERALL=PASS` on physical GPU
+index `3` (UUID `GPU-90fb226c-3937-2448-1052-2e12282a61b9`); the frozen smoke
+then re-checked the upstream provenance, kept reference checking enabled, and
+ended with `PASS`. This closes P3.1 as `YES / YES / YES` without creating a
+performance result. P3.2 (one-shape wrapper), P3.3 (cuBLASLt baseline), P3.4
+(three execution variants), and P3.5 (five shapes and comparison) remain
+unimplemented. See `src/gemm/P3_1_PROTOCOL.md` for the
 frozen protocol and the exact verification commands.
 
 ## Research question
@@ -521,9 +527,10 @@ P2.1, P2.2, P2.3, and P2.4 are implemented, independently audited, and
 verified on GB300. Reviewed P2.4 pilot `20260805T102759Z` reached
 `ANALYZED` and established the non-publishable empirical per-SM ceiling
 candidate described above, so the Phase 2 gate has passed and Phase 3 has
-begun. Of experiment 3, only P3.1 (executing the pinned official NVIDIA CuTe
-DSL example unchanged) is implemented; it is neither audited nor verified on
-GB300, and P3.2–P3.5 do not exist yet. The repository still contains no
+begun. Of experiment 3, P3.1 (executing the pinned official NVIDIA CuTe DSL
+example unchanged) is implemented, independently audited, and functionally
+verified on GB300; it is closed, while P3.2–P3.5 do not exist yet. The
+repository still contains no
 publishable bandwidth, throughput, GEMM-performance, or cuBLASLt-comparison
 result. The pinned CUDA 13.1, CUTLASS v4.6.1, and `sm_103a` contract in
 `VERSIONS.env` remains unchanged and untouched; P3.1's own pins — the exactly

@@ -1,7 +1,8 @@
 # P3.1 — Pinned official CuTe DSL example (frozen protocol)
 
-Status: `P3.1 = YES / NO / NO` (Implemented / Audited / Verified on GB300).
-The author's own GPU-free checks are **not** an independent audit.
+Status: `P3.1 = YES / YES / YES` (Implemented / Audited / Verified on GB300).
+The independent audit and physical verification record are in section 11;
+the author's own GPU-free checks alone are **not** an independent audit.
 
 ## 1. Objective
 
@@ -334,21 +335,64 @@ not a performance result.
 
 ```text
 Implemented:        YES
-Audited:            NO   (requires an independent reviewer; static self-checks
-                          by the author are not an audit)
-Verified on GB300:  NOT RUN
+Audited:            YES   (independent review: PASS)
+Verified on GB300:  YES
 ```
 
-No genuine GB300 execution of `make gemm-cutedsl-p31-smoke` has been performed
-for P3.1. No operator GPU index was supplied during implementation, so no GPU
-command was run, and this section must stay `NOT RUN` until a real run on a
-physical B300/GB300 with an explicitly supplied `BLACKWELL_GPU_INDEX`
-succeeds. When that happens, record here: the UTC timestamp, the Git commit,
-the preflight campaign identifier and status, the physical GPU index and UUID,
-the observed configuration lines, and the final `PASS`.
+The remediated implementation at project Git commit
+`f34cb33a9456ba011feb0a5a35910bbd00f9a9e6` passed an independent audit before
+the physical verification. The published branch still pointed to that exact
+commit when this closing record was prepared.
 
-Even after a successful run, `Audited` stays `NO` until an independent review
-is completed.
+At `2026-08-06T10:16:57Z`, the operator ran
+
+```bash
+BLACKWELL_GPU_INDEX=3 make preflight
+```
+
+on an explicitly selected physical `NVIDIA B300 SXM6 AC`. The safe launcher
+resolved physical index `3` to UUID
+`GPU-90fb226c-3937-2448-1052-2e12282a61b9`, reported driver `610.43.02`, and
+proved that the device had no active compute processes before exposing it to
+the container. The container reported CUDA `13.1.0`. Preflight campaign
+`20260806T101657Z`, recorded under
+`results/preflight/20260806T101657Z/summary.json`, passed all six checks:
+`gpu_visibility`, `tool_versions`, `cuda_smoke_compile`,
+`cuda_smoke_run`, `cutedsl_smoke`, and `ncu_profile`; its final status was
+`OVERALL=PASS`.
+
+Immediately afterwards, on the same explicitly selected device, the operator
+ran
+
+```bash
+BLACKWELL_GPU_INDEX=3 make gemm-cutedsl-p31-smoke
+```
+
+The GPU container re-checked upstream CUTLASS commit
+`e05f953a5b3d38adc240df2ff928e0421c2abba3` and example SHA-256
+`f99bc4cc1e0aea8990e2929d7c703dfc8196d797b7c9f5a889eabcd3c4ff67ec`.
+The unchanged official example reported the frozen configuration:
+
+```text
+mnkl: (256, 256, 512, 1)
+AB dtype: BFloat16, C dtype: Float32, Acc dtype: Float32
+Mma Tiler (M, N): (128, 128), Cluster Shape (M, N): (1, 1)
+2CTA MMA instructions: False
+Use TMA Store: True
+Warmup iterations: 0
+Iterations: 1
+Skip reference checking: False
+Use cold L2: False
+PASS
+```
+
+The command exited successfully. The warnings emitted by the unchanged
+upstream example were non-fatal API deprecation/named-barrier warnings and did
+not disable reference validation or alter the final `PASS`.
+
+This closes P3.1 as `YES / YES / YES`. It remains a functional compatibility
+check only: no timing is retained, no TFLOP/s is computed, no cuBLASLt baseline
+exists, and no publishable performance result is created.
 
 ## 12. Files P3.1 owns
 

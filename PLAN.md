@@ -277,7 +277,7 @@ independently audited, and verified on GB300. Phase 3 may begin.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
-| P3.1 | Pinned official CuTe DSL example | YES | NO | NO |
+| P3.1 | Pinned official CuTe DSL example | YES | YES | YES |
 | P3.2 | One-shape wrapper | NO | NO | NO |
 | P3.3 | cuBLASLt baseline | NO | NO | NO |
 | P3.4 | Three execution variants | NO | NO | NO |
@@ -329,10 +329,14 @@ of them. Because the audited P1.3/P2.3 aggregators parse `VERSIONS.env` against
 a closed key allowlist, no Phase 3 key was added there and neither aggregator
 was modified; `make check-static` runs their real `parse_versions_env()`
 against the real `VERSIONS.env` as a regression gate.
-P3.1's GPU-free checks pass, but they are the author's own
-checks: `Audited` stays `NO` pending an independent review, and
-`Verified on GB300` stays `NO` because no GPU index was supplied and no GB300
-run was performed. P3.2–P3.5 remain unimplemented.
+The remediated P3.1 implementation at Git commit
+`f34cb33a9456ba011feb0a5a35910bbd00f9a9e6` passed an independent audit. It
+was then functionally verified on a physical NVIDIA B300 on 6 August 2026:
+fresh preflight campaign `20260806T101657Z` reported `OVERALL=PASS` on physical
+GPU index `3` (UUID `GPU-90fb226c-3937-2448-1052-2e12282a61b9`), and the frozen
+official-example smoke retained reference validation and ended with `PASS`.
+P3.1 is therefore closed as `YES / YES / YES`; this functional check creates
+no performance result. P3.2–P3.5 remain unimplemented.
 
 ## Phase 4 — Campaigns and integration (10–15 August 2026)
 
