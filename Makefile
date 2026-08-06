@@ -1737,13 +1737,13 @@ gemm-cutedsl-p32-check: gemm-cutedsl-p31-check
 
 gemm-cutedsl-p32-smoke:
 	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
-		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index."; \
-		echo "       Example: BLACKWELL_GPU_INDEX=3 make gemm-cutedsl-p32-smoke"; \
-		echo "       This project never selects a GPU automatically."; \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index." >&2; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make gemm-cutedsl-p32-smoke" >&2; \
+		echo "       This project never selects a GPU automatically." >&2; \
 		exit 2; \
 	fi
-	status=0; \
-	scripts/run_container.sh bash -c 'set -euo pipefail; \
+	@status=0; \
+	RUN_CONTAINER_STDOUT_IS_DATA=1 scripts/run_container.sh bash -c 'set -euo pipefail; \
 		head_commit="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass rev-parse HEAD)"; \
 		[ "$$head_commit" = "$(CUTLASS_COMMIT)" ] \
 			|| { echo "gemm-cutedsl-p32-smoke: FAIL: /opt/cutlass HEAD $$head_commit != pinned $(CUTLASS_COMMIT)" >&2; exit 1; }; \
@@ -1756,13 +1756,17 @@ gemm-cutedsl-p32-smoke:
 			--iterations 10' || status=$$?; \
 	echo "==============================================================================" >&2; \
 	echo "P3.2 FUNCTIONAL VERIFICATION ONLY -- NOT AN EXPERIMENTAL RESULT." >&2; \
-	echo "The CSV row above (if any) is P3.2 infrastructure evidence: one frozen shape," >&2; \
+	echo "Any CSV row on stdout is P3.2 infrastructure evidence: one frozen shape," >&2; \
 	echo "(M,N,K,L)=(4096,4096,4096,1), 2 warm-ups and 10 measured launches, with hot" >&2; \
 	echo "reused operands. compile_time_ms, first_launch_ms, and kernel_time_ms are" >&2; \
 	echo "NON-PUBLISHABLE diagnostic fields; every row carries publishable=false." >&2; \
 	echo "P3.2 computes no TFLOP/s, no speedup, no efficiency, and no comparison, and" >&2; \
-	echo "no cuBLASLt baseline exists yet. Correctness passed before any timing ran." >&2; \
-	echo "Note: stdout also carries the two device-selection lines that the audited," >&2; \
-	echo "unmodified scripts/run_container.sh prints before the container starts." >&2; \
+	echo "no cuBLASLt baseline exists yet." >&2; \
+	if [ "$$status" -eq 0 ]; then \
+		echo "P3.2 smoke completed: correctness passed before warm-up and steady-state timing." >&2; \
+	else \
+		echo "P3.2 smoke FAILED with exit status $$status: no CSV header and no CSV row" >&2; \
+		echo "were emitted, and no result may be read from this run." >&2; \
+	fi; \
 	echo "==============================================================================" >&2; \
 	exit $$status

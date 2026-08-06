@@ -42,10 +42,12 @@ synthetic-test failure, and 2 on a usage error.
 import csv
 import io
 import math
+import os
 import re
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 # --- Independent frozen expectations ----------------------------------------
@@ -260,8 +262,38 @@ _RE_COMPUTE_CAPABILITY = re.compile(r"\A[0-9]+\.[0-9]+\Z")
 _RE_POSITIVE_INT = re.compile(r"\A[1-9][0-9]*\Z")
 _RE_ENV_LINE = re.compile(r"\A([A-Z][A-Z0-9_]*)=(\S*)\Z")
 
+# P3.2 uses exclusively the PyTorch 2.10 fp32_precision API for the CUDA
+# matmul FP32 policy of its correctness oracle. In 2.10 the legacy allow_tf32
+# property is an alias of the same setting, mixing the two is unsupported, and
+# the last write silently wins, so any appearance of the legacy spellings - or
+# of an overlapping global precision API - is a contract failure.
+FORBIDDEN_FP32_API_SPELLINGS = (
+    "allow_tf32",
+    "set_float32_matmul_precision",
+    "get_float32_matmul_precision",
+    "cudnn",
+)
+REQUIRED_FP32_API_SPELLINGS = ("fp32_precision",)
+FP32_PRECISION_IEEE = "ieee"
+# The unset default. It proves nothing about IEEE behaviour and must never be
+# accepted as evidence of it.
+FP32_PRECISION_UNSET = "none"
+
+# Constructs that would let the smoke target silently drop unexpected stdout
+# instead of letting it surface as a contract violation.
+FORBIDDEN_SMOKE_FILTERS = ("grep -v", "| sed", "| tail", "| head", "| awk", "| grep")
+
+SMOKE_TARGET = "gemm-cutedsl-p32-smoke"
+CHECK_TARGET = "gemm-cutedsl-p32-check"
+LAUNCHER_RELATIVE_PATH = "scripts/run_container.sh"
+# The opt-in launcher mode that keeps stdout a pure data stream.
+LAUNCHER_DATA_MODE_VARIABLE = "RUN_CONTAINER_STDOUT_IS_DATA"
+SMOKE_SUCCESS_SENTENCE = (
+    "P3.2 smoke completed: correctness passed before warm-up and steady-state timing."
+)
+
 # The subprocess guard: any import of the GPU stack aborts the child.
-GPU_FREE_GUARD = """
+_GUARD_PRELUDE = """
 import sys
 
 _BLOCKED = {blocked!r}
@@ -275,11 +307,39 @@ class _ImportGuard:
 
 
 sys.meta_path.insert(0, _ImportGuard())
+"""
+
+GPU_FREE_GUARD = (
+    _GUARD_PRELUDE
+    + """
 sys.argv = [{argv0!r}] + {argv!r}
 import runpy
 
 runpy.run_path({wrapper!r}, run_name="__main__")
 """
+)
+
+# Drives the real main() with execute_measurement replaced by a correctness
+# failure, proving the no-CSV contract through the real descriptor plumbing.
+CORRECTNESS_FAILURE_PROBE = (
+    _GUARD_PRELUDE
+    + """
+import importlib.util
+
+spec = importlib.util.spec_from_file_location("p32_probe", {wrapper!r})
+module = importlib.util.module_from_spec(spec)
+sys.modules["p32_probe"] = module
+spec.loader.exec_module(module)
+
+
+def _raise_correctness_failure(*args, **kwargs):
+    raise module.CorrectnessError("synthetic mismatch: 1 element exceeds atol/rtol")
+
+
+module.execute_measurement = _raise_correctness_failure
+sys.exit(module.main([]))
+"""
+)
 
 
 # --- Pure validators ---------------------------------------------------------
@@ -478,6 +538,160 @@ def validate_source(source) -> list:
     return errors
 
 
+def validate_fp32_precision_policy(source) -> list:
+    """Check that only the PyTorch 2.10 fp32_precision API controls FP32.
+
+    Scans Python NAME tokens (which is how attribute access such as
+    ``matmul.allow_tf32`` appears) plus string literals whose whole content is
+    a forbidden spelling (which is how ``getattr(matmul, "allow_tf32")``
+    appears). Prose in docstrings and comments is exempt, so the wrapper may
+    explain why the legacy API is never used.
+    """
+    import tokenize
+
+    errors = []
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
+        return [f"the FP32 policy could not be tokenized: {exc}"]
+
+    names = {token.string for token in tokens if token.type == tokenize.NAME}
+    literals = set()
+    for token in tokens:
+        if token.type != tokenize.STRING:
+            continue
+        text = token.string.strip()
+        for quote in ('"""', "'''", '"', "'"):
+            if text.startswith(quote) and text.endswith(quote) and len(text) >= 2 * len(quote):
+                literals.add(text[len(quote):-len(quote)])
+                break
+
+    for spelling in FORBIDDEN_FP32_API_SPELLINGS:
+        if spelling in names or spelling in literals:
+            errors.append(
+                f"the legacy/overlapping FP32 API {spelling!r} appears in production code; "
+                "P3.2 uses only torch.backends.cuda.matmul.fp32_precision"
+            )
+    for spelling in REQUIRED_FP32_API_SPELLINGS:
+        if spelling not in names:
+            errors.append(f"the FP32 policy does not use {spelling!r}")
+    if FP32_PRECISION_IEEE not in literals:
+        errors.append(f"the FP32 policy never names the required {FP32_PRECISION_IEEE!r} value")
+    return errors
+
+
+def extract_make_recipe(makefile_text, target) -> list:
+    """Return the recipe lines of one Make target, without the target line."""
+    lines = makefile_text.splitlines()
+    recipe = []
+    collecting = False
+    for line in lines:
+        if line.startswith(f"{target}:"):
+            collecting = True
+            continue
+        if collecting:
+            if line.startswith("\t"):
+                recipe.append(line)
+                continue
+            if line.strip() == "":
+                continue
+            break
+    return recipe
+
+
+def validate_smoke_recipe(recipe) -> list:
+    """Check the smoke target's stdout, exit-status, and reporting contract."""
+    errors = []
+    if not recipe:
+        return [f"the {SMOKE_TARGET} recipe is empty or was not found"]
+
+    joined = "\n".join(recipe)
+
+    # 1. Make must not echo the recipe onto stdout. Only the first physical
+    #    line of each logical line carries the @ prefix; a physical line that
+    #    continues the previous one (backslash continuation) is part of it.
+    logical_starts = []
+    continuing = False
+    for line in recipe:
+        if not continuing:
+            logical_starts.append(line)
+        continuing = line.rstrip("\n").endswith("\\")
+    for start in logical_starts:
+        body = start.lstrip("\t")
+        if not body.startswith("@"):
+            errors.append(f"recipe line is not quiet (missing @): {body[:70]!r}")
+    if not logical_starts:
+        errors.append("no recipe line starts with @; Make would echo the whole recipe")
+
+    # 2. Every human-readable echo goes to stderr.
+    for line in recipe:
+        for match in re.finditer(r"\becho\b", line):
+            tail = line[match.end():]
+            if ">&2" not in tail:
+                errors.append(f"an echo is not redirected to stderr: {line.strip()[:70]!r}")
+                break
+
+    # 3. The launcher runs in its opt-in data-stream mode, through the audited
+    #    launcher, and never through Docker directly.
+    if f"{LAUNCHER_DATA_MODE_VARIABLE}=1" not in joined:
+        errors.append(
+            f"the smoke target does not set {LAUNCHER_DATA_MODE_VARIABLE}=1, so launcher "
+            "and entrypoint text would contaminate stdout"
+        )
+    if LAUNCHER_RELATIVE_PATH not in joined:
+        errors.append(f"the smoke target does not go through {LAUNCHER_RELATIVE_PATH}")
+    if re.search(r"(?<![\w/-])docker\s+run\b", joined):
+        errors.append("the smoke target invokes Docker directly")
+
+    # 4. The exit status is captured and preserved.
+    if "|| status=$$?" not in joined:
+        errors.append("the smoke target does not capture the launcher exit status")
+    if not joined.rstrip().endswith("exit $$status"):
+        errors.append("the smoke target does not end by preserving the exit status")
+
+    # 5. No unconditional success claim.
+    if SMOKE_SUCCESS_SENTENCE not in joined:
+        errors.append("the smoke target never reports success accurately")
+    else:
+        guard = re.search(r'if \[ "\$\$status" -eq 0 \]; then', joined)
+        if guard is None:
+            errors.append("the success statement is not guarded by a zero exit status")
+        elif joined.index(SMOKE_SUCCESS_SENTENCE) < guard.end():
+            errors.append("the success statement is printed before the exit-status guard")
+    for claim in ("Correctness passed before any timing ran", "compilation succeeded"):
+        if claim in joined:
+            errors.append(f"the smoke target makes the unconditional claim {claim!r}")
+
+    # 6. No filtering that could silently swallow unexpected stdout.
+    for construct in FORBIDDEN_SMOKE_FILTERS:
+        if construct in joined:
+            errors.append(
+                f"the smoke target filters its output with {construct!r}; unexpected stdout "
+                "must surface, not be discarded"
+            )
+    return errors
+
+
+def validate_launcher_data_mode(source) -> list:
+    """Check the launcher's opt-in mode without changing its default."""
+    errors = []
+    if LAUNCHER_DATA_MODE_VARIABLE not in source:
+        errors.append(f"{LAUNCHER_RELATIVE_PATH} has no {LAUNCHER_DATA_MODE_VARIABLE} mode")
+        return errors
+    if "--entrypoint" not in source:
+        errors.append(
+            "the launcher never bypasses the image entrypoint, whose banner would "
+            "contaminate a data stream on stdout"
+        )
+    # The two informational lines must be emitted through the mode-aware helper
+    # rather than an unconditional echo to stdout.
+    for marker in ("run_container: selected index=", "run_container: GPU "):
+        for line in source.splitlines():
+            if marker in line and line.strip().startswith("echo "):
+                errors.append(f"launcher line {marker!r} still echoes unconditionally to stdout")
+    return errors
+
+
 def validate_provenance_linkage(source, wrapper_contract, parsed_contract) -> list:
     """Prove provenance is read from the pinned contracts, not redefined."""
     errors = []
@@ -537,6 +751,281 @@ def parse_env_file(path) -> dict:
 
 
 # --- Checks against the real wrapper -----------------------------------------
+
+
+class _FakeMatmulBackend:
+    """Stand-in for torch.backends.cuda.matmul: no torch, no CUDA, no GPU.
+
+    Any access to the legacy allow_tf32 property raises, so a single mixed-API
+    read or write in production code fails this checker loudly.
+    """
+
+    def __init__(self, initial=FP32_PRECISION_UNSET, readback=None, reject=False):
+        object.__setattr__(self, "_stored", initial)
+        object.__setattr__(self, "_readback", readback)
+        object.__setattr__(self, "_reject", reject)
+        object.__setattr__(self, "writes", [])
+
+    @property
+    def fp32_precision(self):
+        readback = object.__getattribute__(self, "_readback")
+        if readback is not None:
+            return readback
+        return object.__getattribute__(self, "_stored")
+
+    def __setattr__(self, name, value):
+        if name == "allow_tf32":
+            raise AssertionError("production code wrote the legacy allow_tf32 API")
+        if name == "fp32_precision":
+            if object.__getattribute__(self, "_reject"):
+                raise RuntimeError(f"Unknown precision: {value}")
+            object.__getattribute__(self, "writes").append(value)
+            object.__setattr__(self, "_stored", value)
+            return
+        object.__setattr__(self, name, value)
+
+    def __getattr__(self, name):
+        if name == "allow_tf32":
+            raise AssertionError("production code read the legacy allow_tf32 API")
+        raise AttributeError(name)
+
+
+class _FakeMatmulBackendWithoutApi:
+    """A PyTorch too old to expose the fp32_precision API."""
+
+    def __getattr__(self, name):
+        if name == "allow_tf32":
+            raise AssertionError("production code touched the legacy allow_tf32 API")
+        raise AttributeError(name)
+
+
+class _FakeTorch:
+    """Minimal torch stand-in exposing only backends.cuda.matmul."""
+
+    def __init__(self, matmul):
+        if matmul is not None:
+            cuda = types.SimpleNamespace(matmul=matmul)
+        else:
+            cuda = types.SimpleNamespace()
+        object.__setattr__(self, "backends", types.SimpleNamespace(cuda=cuda))
+
+    def __getattr__(self, name):
+        if name in ("set_float32_matmul_precision", "get_float32_matmul_precision"):
+            raise AssertionError(f"production code used the overlapping API torch.{name}")
+        raise AttributeError(name)
+
+
+def check_ieee_fp32_guard(module) -> list:
+    """Drive the wrapper's IEEE FP32 guard with GPU-free mocks."""
+    errors = []
+    p32_error = getattr(module, "P32Error", None)
+    guard = getattr(module, "ieee_fp32_matmul", None)
+    require = getattr(module, "require_ieee_fp32_matmul_api", None)
+    if guard is None or require is None or p32_error is None:
+        return ["the wrapper does not expose the IEEE FP32 guard"]
+
+    def expect_rejection(name, matmul):
+        fake = _FakeTorch(matmul)
+        try:
+            with guard(fake):
+                errors.append(f"the IEEE guard accepted {name}")
+        except p32_error:
+            return
+        except AssertionError as exc:
+            errors.append(f"{name}: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{name}: unexpected {type(exc).__name__}: {exc}")
+
+    # Accepts only an exact "ieee" readback, and restores the previous value.
+    backend = _FakeMatmulBackend(initial="tf32")
+    fake_torch = _FakeTorch(backend)
+    try:
+        with guard(fake_torch):
+            if backend.fp32_precision != FP32_PRECISION_IEEE:
+                errors.append("the IEEE guard did not establish fp32_precision='ieee'")
+        if backend.fp32_precision != "tf32":
+            errors.append(
+                f"the IEEE guard did not restore the previous setting "
+                f"(left {backend.fp32_precision!r})"
+            )
+        if FP32_PRECISION_IEEE not in backend.writes:
+            errors.append("the IEEE guard never wrote fp32_precision='ieee'")
+    except AssertionError as exc:
+        errors.append(f"the IEEE guard touched a forbidden API: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"the IEEE guard rejected a valid backend: {type(exc).__name__}: {exc}")
+
+    # The unset default proves nothing and must be rejected.
+    expect_rejection(
+        f"a {FP32_PRECISION_UNSET!r} readback",
+        _FakeMatmulBackend(readback=FP32_PRECISION_UNSET),
+    )
+    expect_rejection("a 'tf32' readback", _FakeMatmulBackend(readback="tf32"))
+    expect_rejection("an empty readback", _FakeMatmulBackend(readback=""))
+    expect_rejection("a 'highest' readback", _FakeMatmulBackend(readback="highest"))
+    expect_rejection("a rejected assignment", _FakeMatmulBackend(reject=True))
+    expect_rejection("a PyTorch without the API", _FakeMatmulBackendWithoutApi())
+    expect_rejection("a PyTorch without backends.cuda.matmul", None)
+
+    # The same rejections must also come from the up-front requirement check.
+    for name, matmul in (
+        ("a PyTorch without the API", _FakeMatmulBackendWithoutApi()),
+        ("a PyTorch without backends.cuda.matmul", None),
+    ):
+        try:
+            require(_FakeTorch(matmul))
+        except p32_error:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"require_ieee_fp32_matmul_api({name}): {type(exc).__name__}: {exc}")
+        else:
+            errors.append(f"require_ieee_fp32_matmul_api accepted {name}")
+    return errors
+
+
+def _write_launcher_fakes(directory, payload_path):
+    """Create GPU-free, network-free fake docker/nvidia-smi executables."""
+    binary_dir = directory / "bin"
+    binary_dir.mkdir(parents=True, exist_ok=True)
+
+    nvidia_smi = binary_dir / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *--query-compute-apps=pid*) exit 0 ;;\n"
+        "  *--query-gpu=driver_version*) echo '999.99.99'; exit 0 ;;\n"
+        "  *--query-gpu=index,uuid,name*)\n"
+        "    echo '0, GPU-11111111-2222-3333-4444-555555555555, FAKE TEST DEVICE'; exit 0 ;;\n"
+        "esac\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    nvidia_smi.chmod(0o755)
+
+    # Simulates the NGC entrypoint banner on stdout unless the entrypoint was
+    # overridden, then emits the simulated wrapper payload.
+    docker = binary_dir / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$@" > "${FAKE_DOCKER_ARGV_FILE}"\n'
+        'case " $* " in\n'
+        '  *" --entrypoint "*) ;;\n'
+        '  *) echo "== CUDA =="; echo "Container image Copyright (c) NVIDIA"; echo ;;\n'
+        "esac\n"
+        'echo "fake docker: simulated container started" >&2\n'
+        f'if [ -n "${{FAKE_DOCKER_EMIT_PAYLOAD}}" ]; then cat "{payload_path}"; fi\n'
+        'if [ -n "${FAKE_DOCKER_EXTRA_STDOUT}" ]; then echo "${FAKE_DOCKER_EXTRA_STDOUT}"; fi\n'
+        'exit "${FAKE_DOCKER_EXIT:-0}"\n',
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+    return binary_dir
+
+
+def _run_simulated_launcher(root, binary_dir, argv_file, environment):
+    base = dict(os.environ)
+    base["PATH"] = f"{binary_dir}{os.pathsep}{base.get('PATH', '')}"
+    base["BLACKWELL_GPU_INDEX"] = "0"
+    base["FAKE_DOCKER_ARGV_FILE"] = str(argv_file)
+    base.pop("FAKE_DOCKER_EMIT_PAYLOAD", None)
+    base.pop("FAKE_DOCKER_EXTRA_STDOUT", None)
+    base.pop("FAKE_DOCKER_EXIT", None)
+    base.pop(LAUNCHER_DATA_MODE_VARIABLE, None)
+    base.update(environment)
+    return subprocess.run(
+        [str(root / LAUNCHER_RELATIVE_PATH), "bash", "-c", "true"],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+        env=base,
+    )
+
+
+def check_simulated_launcher(root) -> list:
+    """Prove the smoke stdout contract with the real launcher and fake tools.
+
+    No GPU, no network, no Docker: only the repository's own launcher script
+    plus two stub executables. It exercises the real quiet-mode logic rather
+    than a re-implementation of it.
+    """
+    errors = []
+    root = Path(root).resolve()
+    launcher = root / LAUNCHER_RELATIVE_PATH
+    if not launcher.is_file():
+        return [f"missing {LAUNCHER_RELATIVE_PATH}"]
+
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        payload = workspace / "payload.csv"
+        payload.write_text(_serialize(_good_row()), encoding="utf-8")
+        expected_csv = payload.read_text(encoding="utf-8")
+        binary_dir = _write_launcher_fakes(workspace, payload)
+        argv_file = workspace / "argv.txt"
+
+        # 1. Data-stream mode, successful run: stdout is exactly the CSV.
+        run = _run_simulated_launcher(
+            root,
+            binary_dir,
+            argv_file,
+            {LAUNCHER_DATA_MODE_VARIABLE: "1", "FAKE_DOCKER_EMIT_PAYLOAD": "1"},
+        )
+        if run.returncode != 0:
+            errors.append(f"simulated data-mode run exited {run.returncode}")
+        if run.stdout != expected_csv:
+            errors.append(
+                "data-mode stdout is not exactly the payload CSV; it contained "
+                f"{len(run.stdout.splitlines())} line(s)"
+            )
+        errors.extend(
+            f"data-mode stdout: {error}" for error in validate_serialized_output(run.stdout)
+        )
+        if "run_container: selected index=" not in run.stderr:
+            errors.append("data-mode launcher diagnostics did not reach stderr")
+        argv = argv_file.read_text(encoding="utf-8").splitlines()
+        if "--entrypoint" not in argv:
+            errors.append("data mode did not bypass the image entrypoint")
+        if "== CUDA ==" in run.stdout:
+            errors.append("the simulated entrypoint banner reached stdout in data mode")
+
+        # 2. Data-stream mode, failing run: no stdout at all, status preserved.
+        run = _run_simulated_launcher(
+            root, binary_dir, argv_file, {LAUNCHER_DATA_MODE_VARIABLE: "1", "FAKE_DOCKER_EXIT": "7"}
+        )
+        if run.returncode != 7:
+            errors.append(f"a failing run returned {run.returncode}, not the inner status 7")
+        if run.stdout != "":
+            errors.append(f"a failing run wrote {run.stdout!r} to stdout; it must be empty")
+
+        # 3. Unexpected extra stdout must surface, never be silently discarded.
+        run = _run_simulated_launcher(
+            root,
+            binary_dir,
+            argv_file,
+            {
+                LAUNCHER_DATA_MODE_VARIABLE: "1",
+                "FAKE_DOCKER_EMIT_PAYLOAD": "1",
+                "FAKE_DOCKER_EXTRA_STDOUT": "unexpected trailing line",
+            },
+        )
+        if "unexpected trailing line" not in run.stdout:
+            errors.append("unexpected stdout was silently discarded instead of surfacing")
+        if not validate_serialized_output(run.stdout):
+            errors.append("contaminated stdout was accepted as a valid P3.2 payload")
+
+        # 4. The default mode is unchanged, which the closed P1/P2 callers rely on.
+        run = _run_simulated_launcher(root, binary_dir, argv_file, {"FAKE_DOCKER_EMIT_PAYLOAD": "1"})
+        if run.returncode != 0:
+            errors.append(f"simulated default-mode run exited {run.returncode}")
+        if "run_container: selected index=" not in run.stdout:
+            errors.append(
+                "the default mode no longer prints its banner lines to stdout; the closed "
+                "Phase 1/Phase 2 callers depend on that behaviour"
+            )
+        argv = argv_file.read_text(encoding="utf-8").splitlines()
+        if "--entrypoint" in argv:
+            errors.append("the default mode changed the image entrypoint")
+    return errors
 
 
 def _load_wrapper_module(wrapper_path):
@@ -689,8 +1178,10 @@ def check_wrapper(repo_root) -> list:
     help_text = parser.format_help()
     errors.extend(validate_cli_options(set(re.findall(r"--[a-z0-9][a-z0-9-]*", help_text))))
 
-    # 8. Source scan.
+    # 8. Source scan, including the FP32 policy.
     errors.extend(validate_source(source))
+    errors.extend(validate_fp32_precision_policy(source))
+    errors.extend(check_ieee_fp32_guard(module))
 
     # 9. Provenance is read from the pinned contracts.
     parsed = {}
@@ -742,6 +1233,40 @@ def check_wrapper(repo_root) -> list:
         errors.append("--self-test wrote to stdout; only the CSV row may appear there")
     if "SELF-TEST: PASS" not in self_test_run.stderr:
         errors.append("--self-test did not report SELF-TEST: PASS")
+
+    # 11. A correctness failure emits no CSV, through the real main() plumbing.
+    failure_run = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            CORRECTNESS_FAILURE_PROBE.format(
+                blocked=set(GPU_STACK_MODULES), wrapper=str(wrapper_path)
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    if failure_run.returncode != 1:
+        errors.append(f"a correctness failure exited {failure_run.returncode}, expected 1")
+    if failure_run.stdout != "":
+        errors.append(
+            f"a correctness failure wrote {failure_run.stdout!r} to stdout; it must emit no CSV"
+        )
+    if "CORRECTNESS FAILED" not in failure_run.stderr:
+        errors.append("a correctness failure printed no stderr diagnostic")
+    if "no warm-up or steady-state timing ran" not in failure_run.stderr:
+        errors.append("a correctness failure did not state that no timing ran")
+
+    # 12. The smoke target's stdout, exit-status, and reporting contract.
+    makefile_text = (root / "Makefile").read_text(encoding="utf-8")
+    errors.extend(validate_smoke_recipe(extract_make_recipe(makefile_text, SMOKE_TARGET)))
+    errors.extend(
+        validate_launcher_data_mode((root / LAUNCHER_RELATIVE_PATH).read_text(encoding="utf-8"))
+    )
+    errors.extend(check_simulated_launcher(root))
 
     return errors
 
@@ -1109,6 +1634,159 @@ def run_self_test() -> int:
             {"CUTLASS_COMMIT": "e" * 40, "CUDA_ARCH": "sm_90a"},
         ),
         "P3.2 targets",
+    )
+
+    # FP32 precision policy.
+    good_fp32 = (
+        'MATMUL = torch.backends.cuda.matmul\n'
+        'MATMUL.fp32_precision = "ieee"\n'
+    )
+    accepts("an exclusive fp32_precision policy is accepted", validate_fp32_precision_policy(good_fp32))
+    rejects(
+        "the legacy allow_tf32 API is rejected",
+        validate_fp32_precision_policy(good_fp32 + "MATMUL.allow_tf32 = False\n"),
+        "allow_tf32",
+    )
+    rejects(
+        "an overlapping global precision API is rejected",
+        validate_fp32_precision_policy(good_fp32 + 'torch.set_float32_matmul_precision("highest")\n'),
+        "set_float32_matmul_precision",
+    )
+    rejects(
+        "the legacy cuDNN TF32 property is rejected",
+        validate_fp32_precision_policy(good_fp32 + "torch.backends.cudnn.allow_tf32 = False\n"),
+        "cudnn",
+    )
+    rejects(
+        "a getattr-spelled legacy API is rejected",
+        validate_fp32_precision_policy(good_fp32 + 'X = getattr(MATMUL, "allow_tf32")\n'),
+        "allow_tf32",
+    )
+    accepts(
+        "prose explaining why the legacy API is unused is allowed",
+        validate_fp32_precision_policy(
+            '"""P3.2 never reads allow_tf32 and never calls set_float32_matmul_precision."""\n'
+            "# allow_tf32 is deliberately untouched.\n" + good_fp32
+        ),
+    )
+    rejects(
+        "a policy that never names ieee is rejected",
+        validate_fp32_precision_policy("MATMUL = torch.backends.cuda.matmul\nMATMUL.fp32_precision = X\n"),
+        "never names",
+    )
+    rejects(
+        "a policy that does not use the new API is rejected",
+        validate_fp32_precision_policy('X = "ieee"\n'),
+        "fp32_precision",
+    )
+
+    # Smoke recipe.
+    good_recipe = [
+        "\t@if [ -z \"$${BLACKWELL_GPU_INDEX:-}\" ]; then \\",
+        "\t\techo \"ERROR: set it\" >&2; \\",
+        "\t\texit 2; \\",
+        "\tfi",
+        "\t@status=0; \\",
+        "\tRUN_CONTAINER_STDOUT_IS_DATA=1 scripts/run_container.sh bash -c 'true' || status=$$?; \\",
+        "\techo \"warning\" >&2; \\",
+        "\tif [ \"$$status\" -eq 0 ]; then \\",
+        f"\t\techo \"{SMOKE_SUCCESS_SENTENCE}\" >&2; \\",
+        "\telse \\",
+        "\t\techo \"failed\" >&2; \\",
+        "\tfi; \\",
+        "\texit $$status",
+    ]
+    accepts("a correct smoke recipe is accepted", validate_smoke_recipe(good_recipe))
+    rejects("an empty smoke recipe is rejected", validate_smoke_recipe([]), "empty")
+    rejects(
+        "a non-quiet recipe line is rejected",
+        validate_smoke_recipe([line.replace("\t@status=0", "\tstatus=0") for line in good_recipe]),
+        "not quiet",
+    )
+    rejects(
+        "an echo on stdout is rejected",
+        validate_smoke_recipe([line.replace('echo "warning" >&2', 'echo "warning"') for line in good_recipe]),
+        "not redirected to stderr",
+    )
+    rejects(
+        "a recipe without the launcher data mode is rejected",
+        validate_smoke_recipe(
+            [line.replace(f"{LAUNCHER_DATA_MODE_VARIABLE}=1 ", "") for line in good_recipe]
+        ),
+        LAUNCHER_DATA_MODE_VARIABLE,
+    )
+    rejects(
+        "a recipe that calls Docker directly is rejected",
+        validate_smoke_recipe(
+            [line.replace("scripts/run_container.sh bash", "docker run --gpus all bash") for line in good_recipe]
+        ),
+        "invokes Docker directly",
+    )
+    rejects(
+        "a recipe that drops the exit status is rejected",
+        validate_smoke_recipe([line for line in good_recipe if line.strip() != "exit $$status"]),
+        "preserving the exit status",
+    )
+    rejects(
+        "a recipe that does not capture the launcher status is rejected",
+        validate_smoke_recipe([line.replace(" || status=$$?", "") for line in good_recipe]),
+        "capture the launcher exit status",
+    )
+    rejects(
+        "an unconditional success message is rejected",
+        validate_smoke_recipe(
+            [line for line in good_recipe if 'if [ "$$status" -eq 0 ]' not in line]
+        ),
+        "not guarded by a zero exit status",
+    )
+    rejects(
+        "a stale unconditional correctness claim is rejected",
+        validate_smoke_recipe(
+            [line.replace('echo "warning" >&2', 'echo "Correctness passed before any timing ran" >&2')
+             for line in good_recipe]
+        ),
+        "unconditional claim",
+    )
+    rejects(
+        "an output filter is rejected",
+        validate_smoke_recipe(
+            [line.replace("|| status=$$?", "| grep -v run_container || status=$$?") for line in good_recipe]
+        ),
+        "filters its output",
+    )
+
+    # Launcher data mode.
+    good_launcher = (
+        f'STDOUT_IS_DATA=0\n[ "${{{LAUNCHER_DATA_MODE_VARIABLE}:-0}}" = "1" ] && STDOUT_IS_DATA=1\n'
+        'info "run_container: selected index=1"\n'
+        'info "run_container: GPU x has no active compute processes"\n'
+        "entrypoint_args=(--entrypoint /bin/bash)\n"
+    )
+    accepts("a launcher with the opt-in data mode is accepted", validate_launcher_data_mode(good_launcher))
+    rejects(
+        "a launcher without the opt-in mode is rejected",
+        validate_launcher_data_mode('echo "run_container: selected index=1"\n'),
+        "no RUN_CONTAINER_STDOUT_IS_DATA mode",
+    )
+    rejects(
+        "a launcher that never bypasses the entrypoint is rejected",
+        validate_launcher_data_mode(good_launcher.replace("entrypoint_args=(--entrypoint /bin/bash)\n", "")),
+        "never bypasses the image entrypoint",
+    )
+    rejects(
+        "a launcher that still echoes to stdout is rejected",
+        validate_launcher_data_mode(
+            good_launcher.replace('info "run_container: selected', 'echo "run_container: selected')
+        ),
+        "echoes unconditionally to stdout",
+    )
+
+    # Make recipe extraction.
+    synthetic_makefile = "other:\n\t@true\n\ngemm-cutedsl-p32-smoke:\n\t@echo one >&2\n\t@exit 0\n\nnext:\n\t@true\n"
+    extracted = extract_make_recipe(synthetic_makefile, SMOKE_TARGET)
+    accepts(
+        "a Make recipe is extracted exactly",
+        [] if extracted == ["\t@echo one >&2", "\t@exit 0"] else [f"extracted {extracted!r}"],
     )
 
     # Contract parsing.

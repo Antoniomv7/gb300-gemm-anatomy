@@ -61,6 +61,7 @@ emitted, 1 on any contract, provenance, correctness, or execution failure, and
 """
 
 import argparse
+import contextlib
 import csv
 import hashlib
 import io
@@ -114,6 +115,11 @@ FROZEN_USE_TMA_STORE = True
 FROZEN_SEED = 1111
 FROZEN_ATOL = 1e-1
 FROZEN_RTOL = 1e-5
+
+# The only CUDA matmul FP32 policy P3.2 accepts for its correctness oracle,
+# via the PyTorch 2.10 fp32_precision API and nothing else. The unset default
+# is "none", which proves nothing and is rejected.
+FP32_PRECISION_IEEE = "ieee"
 
 # Safe denominator for the reported relative error. The reported
 # ``max_rel_error`` is max(|c - ref| / max(|ref|, REL_ERROR_DENOMINATOR_FLOOR)),
@@ -625,34 +631,72 @@ def require_single_cuda_device(torch) -> None:
         raise P32Error(f"the selected CUDA device must be logical device 0, got {current}")
 
 
-def disable_reduced_precision_fp32(torch) -> None:
-    """Force the correctness oracle onto IEEE FP32 and prove it took effect.
+def require_ieee_fp32_matmul_api(torch):
+    """Return the CUDA matmul backend, failing closed without the 2.10 API.
 
-    TF32 and every other reduced-precision FP32 matmul mode is disabled so the
-    untimed PyTorch reference is a true FP32 computation rather than a
-    lower-precision approximation of one.
+    P3.2 uses **exclusively** the PyTorch 2.10 ``fp32_precision`` API for CUDA
+    matrix multiplication. The legacy ``allow_tf32`` property is never read and
+    never written: in 2.10 the two are aliases of one setting, mixing them is
+    unsupported, and the last write silently wins - setting ``allow_tf32``
+    after ``fp32_precision`` rewrites the policy to ``tf32`` without any error.
+    ``torch.set_float32_matmul_precision()`` is likewise never combined with it.
     """
-    torch.backends.cuda.matmul.allow_tf32 = False
-    try:
-        torch.backends.cuda.matmul.fp32_precision = "ieee"
-    except (AttributeError, RuntimeError, ValueError):
-        # Older builds expose only allow_tf32; that flag alone is authoritative
-        # there and is verified below.
-        pass
-    try:
-        torch.backends.cudnn.allow_tf32 = False
-    except (AttributeError, RuntimeError, ValueError):
-        pass
-    torch.set_float32_matmul_precision("highest")
+    backends = getattr(torch, "backends", None)
+    cuda_backend = getattr(backends, "cuda", None) if backends is not None else None
+    matmul = getattr(cuda_backend, "matmul", None) if cuda_backend is not None else None
+    if matmul is None:
+        raise P32Error(
+            "this PyTorch does not expose torch.backends.cuda.matmul; the IEEE FP32 "
+            "reference cannot be guaranteed"
+        )
+    if not hasattr(matmul, "fp32_precision"):
+        raise P32Error(
+            "this PyTorch does not support torch.backends.cuda.matmul.fp32_precision; "
+            "P3.2 requires that API and never falls back to the legacy TF32 flag"
+        )
+    return matmul
 
-    if torch.backends.cuda.matmul.allow_tf32 is not False:
-        raise P32Error("TF32 matmul could not be disabled for the FP32 reference")
-    precision = torch.get_float32_matmul_precision()
-    if precision != "highest":
-        raise P32Error(f"FP32 matmul precision is {precision!r}, expected 'highest'")
-    fp32_precision = getattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
-    if fp32_precision not in ("ieee", "none"):
-        raise P32Error(f"FP32 matmul mode is {fp32_precision!r}, expected an IEEE FP32 mode")
+
+@contextlib.contextmanager
+def ieee_fp32_matmul(torch):
+    """Guarantee IEEE FP32 CUDA matmul for the untimed correctness oracle.
+
+    Sets ``torch.backends.cuda.matmul.fp32_precision`` to ``ieee``, reads the
+    property back, and requires it to be exactly that string. ``none`` is the
+    unset default and proves nothing, so it is rejected like any other value;
+    an unavailable, malformed, or rejected setting fails closed *before* the
+    reference is computed. The previous value of the same new API is restored
+    on the way out; no legacy setting is ever read or restored.
+    """
+    matmul = require_ieee_fp32_matmul_api(torch)
+    previous = matmul.fp32_precision
+    try:
+        matmul.fp32_precision = FP32_PRECISION_IEEE
+    except Exception as exc:  # noqa: BLE001 - any rejection is fail-closed
+        raise P32Error(
+            f"torch.backends.cuda.matmul.fp32_precision={FP32_PRECISION_IEEE!r} was "
+            f"rejected: {exc}"
+        ) from exc
+
+    effective = matmul.fp32_precision
+    if effective != FP32_PRECISION_IEEE:
+        _restore_fp32_precision(matmul, previous)
+        raise P32Error(
+            f"torch.backends.cuda.matmul.fp32_precision read back as {effective!r}, "
+            f"not {FP32_PRECISION_IEEE!r}; the FP32 reference cannot be trusted"
+        )
+    try:
+        yield
+    finally:
+        _restore_fp32_precision(matmul, previous)
+
+
+def _restore_fp32_precision(matmul, previous) -> None:
+    """Restore the previous new-API setting, reporting a failure to stderr."""
+    try:
+        matmul.fp32_precision = previous
+    except Exception as exc:  # noqa: BLE001 - never mask the original failure
+        log(f"WARNING: could not restore fp32_precision to {previous!r}: {exc}")
 
 
 def collect_provenance(contract: dict, torch, cutlass) -> dict:
@@ -920,9 +964,12 @@ def execute_measurement(warmup_iterations: int, iterations: int) -> str:
     import cutlass.cute as cute
     import torch
 
-    # (6.1) Environment and provenance, before any tensor exists.
+    # (6.1) Environment and provenance, before any tensor exists. The IEEE FP32
+    # API is required up front so a PyTorch that cannot guarantee a trustworthy
+    # correctness verdict fails closed before a JIT compilation is spent on it;
+    # the setting itself is established and verified around the reference.
     log("collecting environment and provenance")
-    disable_reduced_precision_fp32(torch)
+    require_ieee_fp32_matmul_api(torch)
     provenance = collect_provenance(contract, torch, cutlass)
 
     # (6.1.4) Revalidate the checkout and file identity, and require the two
@@ -1073,12 +1120,17 @@ def validate_result(torch, a_torch_cpu, b_torch_cpu, c_torch_gpu):
     The oracle is the pinned PyTorch installation used purely as a correctness
     reference. It is never timed, never compared against, and is not a cuBLASLt
     baseline: P3.3 owns that and does not exist yet.
+
+    The reference is computed under the IEEE FP32 guard, which fails closed
+    unless ``fp32_precision`` reads back as exactly ``ieee``. There is no
+    fallback reference, no CPU reference, and no reduced-precision path.
     """
-    reference = torch.einsum(
-        "mkl,nkl->mnl",
-        a_torch_cpu.to(device="cuda", dtype=torch.float32),
-        b_torch_cpu.to(device="cuda", dtype=torch.float32),
-    )
+    with ieee_fp32_matmul(torch):
+        reference = torch.einsum(
+            "mkl,nkl->mnl",
+            a_torch_cpu.to(device="cuda", dtype=torch.float32),
+            b_torch_cpu.to(device="cuda", dtype=torch.float32),
+        )
     result = c_torch_gpu.to(dtype=torch.float32)
 
     if tuple(result.shape) != tuple(reference.shape):

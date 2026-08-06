@@ -424,10 +424,19 @@ kernel_time_ms     CUDA events on the kernel's own stream after warm-up,
                    divided by the iteration count
 ```
 
-Correctness compares the complete result against an untimed PyTorch CUDA oracle
-with TF32 and every other reduced-precision FP32 matmul mode disabled and
-verified off (`atol=1e-1`, `rtol=1e-5`). A failure exits non-zero with a stderr
-diagnostic and emits no CSV at all, and no warm-up or steady-state timing runs.
+Correctness compares the complete result against an untimed PyTorch CUDA
+oracle (`atol=1e-1`, `rtol=1e-5`). Its FP32 policy is set through the PyTorch
+2.10 `torch.backends.cuda.matmul.fp32_precision` API and nothing else — the
+legacy `allow_tf32` flag and `set_float32_matmul_precision()` are never touched,
+because in 2.10 those are views of the same setting and mixing them is
+unsupported — and the property must read back as exactly `ieee`; the unset
+`none` default is rejected, and an unavailable API fails closed with no
+fallback. A failure exits non-zero with a stderr diagnostic and emits no CSV at
+all, and no warm-up or steady-state timing runs.
+
+On a successful run the smoke target's entire stdout is one CSV header and one
+data row; on a failure it is empty. Every launcher line, Make diagnostic, and
+progress message goes to stderr.
 
 **These three timings are non-publishable diagnostic fields, not a result.**
 Every emitted row carries `publishable=false`; no TFLOP/s, speedup, efficiency,

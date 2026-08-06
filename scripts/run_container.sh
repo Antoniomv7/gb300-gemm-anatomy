@@ -13,6 +13,24 @@
 #   - No privileged mode, host PID, added capabilities, or Docker socket.
 #   - Preserves the inner command's exit code.
 #   - Logs only allowlisted device data (index, UUID, name, driver version).
+#
+# Opt-in data-stream mode (RUN_CONTAINER_STDOUT_IS_DATA=1):
+#   Callers whose inner command writes a machine-readable stream to stdout can
+#   set RUN_CONTAINER_STDOUT_IS_DATA=1. It changes exactly two things, and only
+#   when set to that literal value:
+#     1. this launcher's own two informational lines go to stderr instead of
+#        stdout;
+#     2. the image's own entrypoint is bypassed with /bin/bash, because the NGC
+#        entrypoint unconditionally writes a copyright/licence banner to stdout
+#        before the command starts. Those entrypoint parts are purely
+#        informational; the only side effect any of them has is exporting
+#        NVIDIA_CPU_ONLY=1 when no NVIDIA driver is present, which is a state
+#        this launcher already refuses (the in-container guard below requires
+#        exactly one visible GPU). The command actually executed, the guard,
+#        the GPU selection, the idle-device proof, every security flag, and the
+#        preserved exit code are identical in both modes.
+#   Unset, or set to anything else, the behaviour is byte-for-byte the default
+#   that the closed Phase 1/Phase 2 callers already rely on.
 
 set -Eeuo pipefail
 
@@ -24,6 +42,19 @@ usage() {
 fail() {
     echo "run_container: ERROR: $*" >&2
     exit 2
+}
+
+# Informational output: stdout by default (unchanged for every existing
+# caller), stderr only in the opt-in data-stream mode described above.
+STDOUT_IS_DATA=0
+[ "${RUN_CONTAINER_STDOUT_IS_DATA:-0}" = "1" ] && STDOUT_IS_DATA=1
+
+info() {
+    if [ "${STDOUT_IS_DATA}" = "1" ]; then
+        echo "$*" >&2
+    else
+        echo "$*"
+    fi
 }
 
 [ "$#" -ge 1 ] || { usage; fail "no command given"; }
@@ -59,7 +90,7 @@ GPU_NAME="$(awk -F', *' '{print $3}' <<<"${row}")"
 DRIVER_VERSION="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader -i "${GPU_UUID}")" \
     || fail "driver version query failed for ${GPU_UUID}"
 
-echo "run_container: selected index=${BLACKWELL_GPU_INDEX} uuid=${GPU_UUID} name='${GPU_NAME}' driver=${DRIVER_VERSION}"
+info "run_container: selected index=${BLACKWELL_GPU_INDEX} uuid=${GPU_UUID} name='${GPU_NAME}' driver=${DRIVER_VERSION}"
 
 # --- Prove the device is idle immediately before launch (fail closed) -------
 # Any query failure, permission gap, or unexpected content counts as
@@ -75,25 +106,13 @@ if [ -n "${apps//[[:space:]]/}" ]; then
     n_procs="$(grep -c . <<<"${apps}")"
     fail "GPU ${GPU_UUID} has ${n_procs} active compute process(es); refusing to run"
 fi
-echo "run_container: GPU ${GPU_UUID} has no active compute processes"
+info "run_container: GPU ${GPU_UUID} has no active compute processes"
 
 # --- Launch: only this UUID visible, unprivileged, repo-only mount ----------
 # The in-container guard re-verifies that exactly one GPU is visible and that
 # it is the requested UUID (as CUDA logical device 0) before exec'ing the
 # inner command; 'exec' everywhere preserves the inner exit code.
-exec docker run \
-    --rm \
-    --gpus "device=${GPU_UUID}" \
-    --user "$(id -u):$(id -g)" \
-    --network none \
-    --security-opt no-new-privileges \
-    --cap-drop ALL \
-    -e HOME=/tmp \
-    -e EXPECTED_GPU_UUID="${GPU_UUID}" \
-    -v "${REPO_ROOT}:/workspace" \
-    -w /workspace \
-    "${IMAGE_TAG}" \
-    bash -c '
+CONTAINER_GUARD='
         set -euo pipefail
         mapfile -t uuids < <(nvidia-smi --query-gpu=uuid --format=csv,noheader)
         if [ "${#uuids[@]}" -ne 1 ]; then
@@ -105,4 +124,29 @@ exec docker run \
             exit 66
         fi
         exec "$@"
-    ' guard "$@"
+    '
+
+# The guard script and its arguments are identical in both modes; only the
+# entrypoint differs (see the data-stream note in the header).
+if [ "${STDOUT_IS_DATA}" = "1" ]; then
+    entrypoint_args=(--entrypoint /bin/bash)
+    command_args=(-c "${CONTAINER_GUARD}" guard "$@")
+else
+    entrypoint_args=()
+    command_args=(bash -c "${CONTAINER_GUARD}" guard "$@")
+fi
+
+exec docker run \
+    --rm \
+    --gpus "device=${GPU_UUID}" \
+    --user "$(id -u):$(id -g)" \
+    --network none \
+    --security-opt no-new-privileges \
+    --cap-drop ALL \
+    -e HOME=/tmp \
+    -e EXPECTED_GPU_UUID="${GPU_UUID}" \
+    -v "${REPO_ROOT}:/workspace" \
+    -w /workspace \
+    ${entrypoint_args[@]+"${entrypoint_args[@]}"} \
+    "${IMAGE_TAG}" \
+    "${command_args[@]}"

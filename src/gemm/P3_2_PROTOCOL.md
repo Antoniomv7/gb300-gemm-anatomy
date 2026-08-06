@@ -232,11 +232,43 @@ validated:
 7. compare the **entire** result, before any warm-up or steady-state timing.
 
 The reference is the pinned PyTorch installation used purely as an untimed
-correctness oracle, evaluated on the GPU in IEEE FP32. TF32 and every other
-reduced-precision FP32 matmul mode is explicitly disabled and the setting is
-read back and verified, so the oracle is a true FP32 computation. This is why
-the CSV records `reference=torch_cuda_fp32_ieee`. It is never timed and never
-reported as a competing method.
+correctness oracle, evaluated on the GPU in IEEE FP32. This is why the CSV
+records `reference=torch_cuda_fp32_ieee`. It is never timed and never reported
+as a competing method.
+
+#### The IEEE FP32 guarantee (PyTorch 2.10 API only)
+
+The FP32 policy for CUDA matrix multiplication is established through the
+PyTorch 2.10 API and **nothing else**:
+
+```text
+torch.backends.cuda.matmul.fp32_precision = "ieee"
+```
+
+The property is then **read back, and must be exactly the string `ieee`**.
+
+* The legacy `torch.backends.cuda.matmul.allow_tf32` property is never read and
+  never written, and neither is the legacy cuDNN TF32 property. In PyTorch 2.10
+  the legacy flag and `fp32_precision` are two views of one setting, mixing the
+  two APIs is unsupported, and the last write silently wins — writing
+  `allow_tf32 = True` after `fp32_precision = "ieee"` rewrites the policy to
+  `tf32` with no error at all. Mixing is therefore forbidden outright.
+* `torch.set_float32_matmul_precision()` and any other overlapping
+  precision-control API are likewise never combined with it.
+* The API must exist. A PyTorch without `torch.backends.cuda.matmul` or without
+  `fp32_precision` fails closed **before** the reference is computed; there is
+  no fallback.
+* `none` — the unset default — is **rejected**. It records that no explicit
+  policy was chosen and proves nothing about IEEE behaviour. So are an empty
+  value, an absent attribute, and every other alternative.
+* A rejected assignment, or any readback that is not exactly `ieee`, produces a
+  clear stderr diagnostic and **no CSV**.
+* The previous value of the same new API is restored afterwards. No legacy
+  setting is ever read or restored.
+
+The requirement is checked twice: once up front, so a PyTorch that cannot
+guarantee a trustworthy verdict fails before a JIT compilation is spent on it,
+and once as the guard that wraps the reference computation itself.
 
 Tolerances:
 
@@ -461,12 +493,59 @@ the frozen one-shape configuration with two warm-ups and ten measured launches,
 preserves the wrapper's exit code, and prints an explicit stderr notice that
 the emitted timings are P3.2 non-publishable functional evidence.
 
-Note on stdout: the wrapper's own stdout is exactly the two CSV lines. The
-audited `scripts/run_container.sh` additionally prints two allowlisted
-device-selection lines to stdout before it execs the container, and it is
-deliberately **not** modified for P3.2. When a machine-readable row is wanted
-out of the Make target, take the header line and the line after it; the wrapper
-invoked directly inside the container emits nothing else.
+### The smoke target's stdout is exactly the CSV
+
+On a successful run, the **whole stdout of `make gemm-cutedsl-p32-smoke`** is
+exactly one CSV header line and one CSV data row — nothing else, from any
+source. On a failed run, its stdout is **empty**. Every launcher line, Make
+diagnostic, container message, wrapper progress line, and compiler warning goes
+to stderr.
+
+Three contamination sources are closed structurally, never by filtering:
+
+1. **Make echoing the recipe.** Every recipe line of the target is quiet (`@`).
+2. **The launcher's own informational lines.** `scripts/run_container.sh` gains
+   one opt-in mode, `RUN_CONTAINER_STDOUT_IS_DATA=1`, which sends its two
+   allowlisted device-selection lines to stderr. The smoke target is its only
+   user. Unset — as in every closed Phase 1/Phase 2 caller — the launcher's
+   behaviour is byte-for-byte unchanged, which those callers depend on.
+3. **The image entrypoint banner.** The NGC entrypoint unconditionally writes a
+   copyright/licence banner to stdout before the command starts. In the same
+   opt-in mode the launcher bypasses it with `--entrypoint /bin/bash`. The
+   entrypoint parts are purely informational; the only side effect any of them
+   has is exporting `NVIDIA_CPU_ONLY=1` when no NVIDIA driver is present, a
+   state this launcher already refuses. The executed command, the in-container
+   guard, GPU selection, the idle-device proof, every security flag, and the
+   preserved exit status are identical in both modes.
+
+Nothing greps, deletes, or rewrites lines: unexpected stdout is meant to
+surface as a contract violation, not to be silently discarded, and the checker
+tests exactly that.
+
+### Exit status and success reporting
+
+The launcher's exit status is captured and re-raised by the recipe, so a
+failure at provenance validation, launcher setup, container startup, import,
+compilation, first launch, correctness, warm-up, or timing returns non-zero.
+(GNU Make itself then exits `2` for the failed target, as it does for every
+target in this repository, and reports the recipe's own status in its
+`Error <status>` line.)
+
+The non-publishable warning is always printed to stderr. The success
+statement —
+
+```text
+P3.2 smoke completed: correctness passed before warm-up and steady-state timing.
+```
+
+— is printed **only after a zero exit status**, and claims nothing about the
+order beyond what actually holds. A failing run instead states that no CSV
+header and no CSV row were emitted. The real order is always:
+
+```text
+compile -> first launch -> full correctness validation
+        -> warm-up -> steady-state timing -> CSV
+```
 
 ## 11. Expected successful evidence
 
@@ -476,12 +555,13 @@ invoked directly inside the container emits nothing else.
   container, immediately before execution;
 * stderr shows provenance collection, `can_implement: OK`, compilation, the
   first launch, `correctness: PASS`, warm-up, and steady state, in that order;
-* stdout carries exactly one CSV header and one data row with
-  `correctness=PASS`, `run_kind=smoke`, `variant=nonpersistent_1cta`,
+* stdout carries exactly one CSV header and one data row — and nothing else —
+  with `correctness=PASS`, `run_kind=smoke`, `variant=nonpersistent_1cta`,
   `m=n=k=4096`, `l=1`, `use_2cta_instrs=false`, `use_tma_store=true`,
   `cache_mode=hot`, and `publishable=false`;
 * all three timings are finite, strictly positive, and separated;
-* the command exits `0`.
+* the command exits `0`, and only then is the success statement printed to
+  stderr.
 
 ## 12. Failure behaviour
 
@@ -491,6 +571,7 @@ invoked directly inside the container emits nothing else.
 | Wrong compute capability, toolkit, torch, or CuTe DSL version | abort, exit 1 |
 | Missing/dirty `/opt/cutlass`, wrong HEAD, blob, or SHA-256 | abort before import, exit 1 |
 | `can_implement()` false | abort, exit 1, no fallback configuration |
+| `fp32_precision` unavailable, rejected, or not read back as exactly `ieee` | stderr diagnostic, exit 1, **no CSV**, no fallback reference |
 | Correctness mismatch | stderr diagnostic, exit 1, **no CSV**, no warm-up, no steady state |
 | A timing not finite and strictly positive | abort, exit 1, no row |
 | Any row-contract violation | abort, exit 1, no row |
@@ -517,15 +598,37 @@ Audited:            NO    (independent review pending)
 Verified on GB300:  NO    (no GPU execution of this unit has occurred)
 ```
 
-Executed GPU-free during implementation: `py_compile` of both Python files, the
-wrapper's `--self-test`, the checker and its `--self-test`, `make check-static`,
-and `make gemm-cutedsl-p32-check` in the pinned image. Those are author
-self-checks. They are **not** an independent audit and they are **not** GB300
-verification.
+An independent audit of the first implementation (project commit
+`ea501d4c43b2cf364ac419ddefa3ae84b564581e`) found two blockers, both since
+remediated:
 
-Not executed: `make gemm-cutedsl-p32-smoke`, which requires an operator to
-supply `BLACKWELL_GPU_INDEX` explicitly and to authorize use of the selected
-shared GPU.
+1. **Mixed PyTorch FP32/TF32 control APIs.** The original guard set the legacy
+   `allow_tf32` flag, the new `fp32_precision` property, *and*
+   `set_float32_matmul_precision()`, then accepted a readback of `none` as if
+   it proved IEEE FP32. In PyTorch 2.10 those APIs are views of one setting,
+   mixing them is unsupported and order-dependent, and `none` is merely the
+   unset default. The guard now uses the new API exclusively, requires an exact
+   `ieee` readback, rejects `none`, fails closed when the API is absent, and
+   restores only the new-API value (section 6.4).
+2. **Contaminated smoke stdout and an unconditional success claim.** The target
+   echoed its own recipe, the launcher wrote two lines to stdout, the NGC
+   entrypoint banner went to stdout, and a "correctness passed" line was
+   printed even when the run failed before the wrapper started. All four are
+   fixed structurally (section 10), with the success statement now gated on a
+   zero exit status.
+
+Executed GPU-free: `py_compile` of both Python files, the wrapper's `--help`
+and `--self-test`, the checker and its `--self-test`, `make check-static`,
+`make gemm-cutedsl-p32-check` in the pinned image, and a simulated
+failure-path and success-path run of the smoke target against stub
+`docker`/`nvidia-smi` executables (no GPU, no network) proving empty stdout on
+failure and exactly two valid CSV lines on success. Those are author
+self-checks. They are **not** an independent audit and they are **not** GB300
+verification; the remediation itself has not yet been re-audited.
+
+Not executed: `make gemm-cutedsl-p32-smoke` on a real GPU, which requires an
+operator to supply `BLACKWELL_GPU_INDEX` explicitly and to authorize use of the
+selected shared GPU.
 
 **P3.2 creates no publishable performance result.** No TFLOP/s, no speedup, no
 efficiency, no comparison, and no cuBLASLt baseline exists at this point in the

@@ -363,8 +363,12 @@ clock around `cute.compile` alone), `first_launch_ms` (the same clock around the
 first launch, whose output is the tensor that gets validated), and
 `kernel_time_ms` (CUDA events on the kernel's own stream after warm-up, divided
 by the iteration count), validates the complete result against an untimed
-PyTorch CUDA oracle with TF32 and every other reduced-precision FP32 matmul mode
-disabled and verified off (`atol=1e-1`, `rtol=1e-5`), and only then runs warm-up
+PyTorch CUDA oracle (`atol=1e-1`, `rtol=1e-5`) whose FP32 policy is set through
+the PyTorch 2.10 `torch.backends.cuda.matmul.fp32_precision` API exclusively —
+never the legacy `allow_tf32` flag or `set_float32_matmul_precision()`, which in
+2.10 are views of the same setting that must not be mixed — and which must read
+back as exactly `ieee`, with the unset `none` default rejected and an absent API
+failing closed, and only then runs warm-up
 and steady state. A correctness failure exits non-zero with a stderr diagnostic
 and emits no CSV row at all, and a row can only be constructed through a
 function that refuses any `correctness` value other than `PASS`. Successful
