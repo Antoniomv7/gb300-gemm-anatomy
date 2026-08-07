@@ -279,7 +279,7 @@ independently audited, and verified on GB300. Phase 3 is in progress.
 |------|-------------|-------------|---------|-------------------|
 | P3.1 | Pinned official CuTe DSL example | YES | YES | YES |
 | P3.2 | One-shape wrapper | YES | YES | YES |
-| P3.3 | cuBLASLt baseline | NO | NO | NO |
+| P3.3 | cuBLASLt baseline | YES | NO | NO |
 | P3.4 | Three execution variants | NO | NO | NO |
 | P3.5 | Five shapes and comparison | NO | NO | NO |
 
@@ -390,7 +390,9 @@ publishable performance result**: every row carries `publishable=false`, no
 TFLOP/s, speedup, efficiency, utilization, or bandwidth is computed anywhere,
 no result file or campaign directory is written, and the untimed PyTorch oracle
 is a correctness reference only — it is explicitly not the P3.3 cuBLASLt
-baseline, which does not exist. The GPU-free checks listed in
+baseline, which is a separate unit (`src/gemm/P3_3_PROTOCOL.md`). No
+P3.2-versus-P3.3 comparison exists anywhere; that comparison belongs to P3.5,
+which is unimplemented. The GPU-free checks listed in
 `src/gemm/P3_2_PROTOCOL.md` section 10 were run by the author and passed. The
 first independent audit of commit
 `ea501d4c43b2cf364ac419ddefa3ae84b564581e` found two blockers: mixed
@@ -408,7 +410,76 @@ complete-result check with zero maximum absolute and relative error, completed
 two warm-ups and ten measured launches, and emitted one `p32.v1` row with
 `publishable=false`. Its three finite positive timings remain non-publishable
 diagnostics, not an experimental result. P3.2 is therefore closed as
-`YES / YES / YES`; P3.3–P3.5 remain unimplemented.
+`YES / YES / YES`.
+
+P3.3 (`src/gemm/cublaslt_gemm.py`, `src/gemm/cublaslt_bridge.cu`,
+`scripts/check_cublaslt_gemm_p33.py`, `src/gemm/P3_3_PROTOCOL.md`) is now
+**implemented**; it is **not** audited and **not** verified on GB300. It is the
+vendor-library counterpart of P3.2: the same frozen BF16 geometry,
+`(M,N,K,L) = (4096,4096,4096,1)` computing `C = A × Bᵀ` with FP32 accumulation,
+on the same operand bytes, issued through a direct, explicit `cublasLtMatmul`
+call. cuBLASLt already ships inside the pinned CUDA 13.1 development image, so
+P3.3 adds no package, does not change `Dockerfile`, and adds no key to
+`VERSIONS.env` or `PHASE3_VERSIONS.env`; the library's runtime version is read
+with `cublasLtGetVersion()` and recorded rather than pinned. No NVIDIA GEMM
+implementation is copied, forked, patched, or vendored: the small C-ABI bridge
+calls only the public cuBLASLt API of the pinned headers, defines no CUDA
+kernel of its own, prints nothing, and lets no C++ exception cross the C
+boundary. The explicit descriptor contract is A row-major `M × K` with
+`lda = K`, B row-major `N × K` with `ldb = K`, C and D row-major `M × N` with
+`ldc = ldd = N`, `transa = CUBLAS_OP_N`, `transb = CUBLAS_OP_T`, `CUDA_R_16BF`
+inputs, `CUDA_R_32F` output, `CUBLAS_COMPUTE_32F`, `CUDA_R_32F` scale,
+`CUBLASLT_POINTER_MODE_HOST`, `CUBLASLT_EPILOGUE_DEFAULT`, `alpha = 1`,
+`beta = 0`, no bias, seed `1111`, hot reused operands — and nothing is silently
+transposed, relaid out, retyped, or diverted to another GEMM interface.
+Operand equivalence with P3.2 is structural rather than asserted: P3.3
+replicates the pinned upstream `create_tensors()` sequence call for call — the
+same `cutlass.torch.matrix` factory, the same seed applied once, the same A/B/C
+call order that fixes the RNG stream, the same dtypes and strides — because the
+upstream factory discards the device tensors for A and B while P3.3 must retain
+every allocation to hand its pointer to cuBLASLt, and a parser over the
+verified upstream file fails the run if that factory ever diverges from what
+P3.3 replicates. The algorithm policy is fixed and never autotuned: a
+`67,108,864`-byte (64 MiB) workspace limit, exactly 32 requested heuristic
+results, `CUBLASLT_SEARCH_BEST_FIT`, the first entry whose state is
+`CUBLAS_STATUS_SUCCESS`, re-validated with `cublasLtMatmulAlgoCheck()`,
+rejected if it needs more workspace than the limit, given exactly the workspace
+it requires (a null pointer only when that is zero), and executed alone; no
+candidate is ever benchmarked, and the bridge contains exactly one
+`cublasLtMatmul` call site and no timing facility at all. The selected
+algorithm's ID, tile, stages, split-K, reduction scheme, CTA swizzling, custom
+option, inner shape, cluster shape, waves count, required workspace, heuristic
+counts and index, and the four real pointer alignments are all recorded. The
+wrapper separates `setup_time_ms` (a monotonic host clock around plan creation
+alone), `first_launch_ms` (the same clock around one `cublasLtMatmul`, whose
+output is the tensor that gets validated), and `kernel_time_ms` (CUDA events on
+the same stream after warm-up, divided by the iteration count); `setup_time_ms`
+is deliberately not `compile_time_ms`, because nothing is compiled at run time
+and the P3.2 field name is never reused. Correctness uses the identical untimed
+PyTorch CUDA oracle P3.2 uses, with the same PyTorch 2.10
+`fp32_precision`-only policy that must read back as exactly `ieee`, the same
+`atol = 1e-1` / `rtol = 1e-5`, and the same complete-result criterion; a
+failure exits non-zero, emits no CSV at all, and runs neither warm-up nor
+steady state. Successful runs write exactly one CSV header and one data row on
+stdout under a new frozen 77-field `schema_version=p33.v1` contract — the P3.2
+`p32.v1` schema is neither modified nor reinterpreted — with everything else on
+stderr. Two Make targets were added: GPU-free, network-free
+`gemm-cublaslt-p33-check` (which runs the existing, unmodified P3.2 gate first,
+then compiles the bridge for `sm_103a` into container-private `/tmp` and
+inspects its ELF symbols to prove the measured path references
+`cublasLtMatmul` and references no fallback GEMM entry point) and
+`gemm-cublaslt-p33-smoke`, which validates `BLACKWELL_GPU_INDEX` in its first
+recipe step before any Docker work, runs exclusively through
+`scripts/run_container.sh`, and executes the frozen configuration with two
+warm-ups and ten measured launches. **P3.3 produces no publishable performance
+result**: every row carries `publishable=false`, no TFLOP/s, speedup,
+efficiency, utilization, bandwidth, or winner label is computed anywhere, no
+result file or campaign directory is written, and **no CuTe-versus-cuBLASLt
+comparison exists** — that comparison is P3.5's and P3.5 is unimplemented. The
+GPU-free checks listed in `src/gemm/P3_3_PROTOCOL.md` section 13 were run by the
+author and passed; those are self-checks, not an independent audit, and
+`make gemm-cublaslt-p33-smoke` has not been run, so no P3.3 GPU result of any
+kind exists. P3.4 and P3.5 remain unimplemented.
 
 ## Phase 4 — Campaigns and integration (10–15 August 2026)
 

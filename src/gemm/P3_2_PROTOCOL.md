@@ -44,7 +44,9 @@ introduced. No pinned version and no closed Phase 1 / Phase 2 interface changes.
 
 The untimed PyTorch FP32 oracle in section 6 is a **correctness reference
 only**. It is never timed, never reported as a competing method, and it is
-explicitly **not** the P3.3 cuBLASLt baseline, which does not exist yet.
+explicitly **not** the P3.3 cuBLASLt baseline, which is a separate unit
+(`src/gemm/P3_3_PROTOCOL.md`). No P3.2-versus-P3.3 comparison exists anywhere;
+that comparison belongs to P3.5, which is unimplemented.
 
 ## 3. Exact frozen configuration
 

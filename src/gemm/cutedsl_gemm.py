@@ -1119,7 +1119,8 @@ def validate_result(torch, a_torch_cpu, b_torch_cpu, c_torch_gpu):
 
     The oracle is the pinned PyTorch installation used purely as a correctness
     reference. It is never timed, never compared against, and is not a cuBLASLt
-    baseline: P3.3 owns that and does not exist yet.
+    baseline: P3.3 owns that, as a separate unit, and P3.5 owns the comparison
+    between the two, which does not exist.
 
     The reference is computed under the IEEE FP32 guard, which fails closed
     unless ``fp32_precision`` reads back as exactly ``ieee``. There is no

@@ -12,7 +12,8 @@
 # compute-umma-sweep-check, compute-umma-sweep-smoke, compute-umma-p24-plan,
 # compute-umma-p24-check, compute-umma-p24-pilot, compute-umma-p24-profile,
 # compute-umma-p24-analyze, gemm-cutedsl-p31-check, gemm-cutedsl-p31-smoke,
-# gemm-cutedsl-p32-check, gemm-cutedsl-p32-smoke.
+# gemm-cutedsl-p32-check, gemm-cutedsl-p32-smoke, gemm-cublaslt-p33-check,
+# gemm-cublaslt-p33-smoke.
 # No target selects a GPU automatically, elevates privileges, or exceeds two
 # build jobs.
 
@@ -112,6 +113,29 @@ GEMM_P32_WRAPPER := src/gemm/cutedsl_gemm.py
 GEMM_P32_CHECKER := scripts/check_cutedsl_gemm_p32.py
 GEMM_P32_PROTOCOL := src/gemm/P3_2_PROTOCOL.md
 
+# P3.3: the equivalent cuBLASLt baseline for exactly the same geometry and the
+# same operands, issued through a direct cublasLtMatmul call. cuBLASLt already
+# ships inside the pinned CUDA 13.1 image, so P3.3 adds no package, no image
+# change, and no key to either version contract; the library's own runtime
+# version is read with cublasLtGetVersion() instead of being pinned. The bridge
+# owns no GEMM kernel and no NVIDIA source is copied, forked, patched, or
+# vendored. See src/gemm/P3_3_PROTOCOL.md.
+GEMM_P33_WRAPPER := src/gemm/cublaslt_gemm.py
+GEMM_P33_BRIDGE := src/gemm/cublaslt_bridge.cu
+GEMM_P33_CHECKER := scripts/check_cublaslt_gemm_p33.py
+GEMM_P33_PROTOCOL := src/gemm/P3_3_PROTOCOL.md
+# Container-private build output only: the repository is mounted read-only in
+# the gate, and the wrapper looks the library up at exactly this fixed path
+# (BRIDGE_LIBRARY_PATH), which is a constant and not a runtime control.
+GEMM_P33_BRIDGE_DIR := /tmp/p33-bridge
+GEMM_P33_BRIDGE_LIB := $(GEMM_P33_BRIDGE_DIR)/libp33_cublaslt_bridge.so
+# Same pinned-toolchain requirement as P2.1/P2.2 (see COMPUTE_UMMA_1SM_ARCH_FLAGS
+# above): nvcc's single-flag "-arch=sm_103a" shorthand does not propagate the
+# "a" suffix to ptxas on this pinned CUDA 13.1.80 toolchain, so the explicit
+# virtual/real split derived from the same pinned CUDA_ARCH value is used here
+# too, unchanged and for the same reason.
+GEMM_P33_ARCH_FLAGS := -arch=compute_$(patsubst sm_%,%,$(CUDA_ARCH)) -code=$(CUDA_ARCH)
+
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
 	PHASE3_VERSIONS.env \
@@ -130,7 +154,8 @@ REQUIRED_FILES := \
 	$(EXP02_P24_RUNNER) $(EXP02_P24_ANALYZER) $(EXP02_P24_SAFE_CAPTURE) $(EXP02_P24_NCU_BRIDGE) \
 	$(EXP02_P24_PROTOCOL) \
 	$(GEMM_P31_PROTOCOL) \
-	$(GEMM_P32_WRAPPER) $(GEMM_P32_CHECKER) $(GEMM_P32_PROTOCOL)
+	$(GEMM_P32_WRAPPER) $(GEMM_P32_CHECKER) $(GEMM_P32_PROTOCOL) \
+	$(GEMM_P33_WRAPPER) $(GEMM_P33_BRIDGE) $(GEMM_P33_CHECKER) $(GEMM_P33_PROTOCOL)
 
 .DEFAULT_GOAL := help
 .PHONY: help check-static build-image check-env preflight \
@@ -147,7 +172,8 @@ REQUIRED_FILES := \
 	compute-umma-p24-profile compute-umma-p24-analyze \
 	compute-umma-sweep-plan compute-umma-sweep-check compute-umma-sweep-smoke \
 	gemm-cutedsl-p31-check gemm-cutedsl-p31-smoke \
-	gemm-cutedsl-p32-check gemm-cutedsl-p32-smoke
+	gemm-cutedsl-p32-check gemm-cutedsl-p32-smoke \
+	gemm-cublaslt-p33-check gemm-cublaslt-p33-smoke
 
 help:
 	@echo "gb300-gemm-anatomy — Phase 0 + P1.1 (LDGSTS) + P1.2 (TMA) + P1.3 (sweep) targets"
@@ -349,6 +375,37 @@ help:
 	@echo "                                 wrapper with 2 warm-ups and 10 measured launches."
 	@echo "                                 Emits one non-publishable CSV row of functional"
 	@echo "                                 evidence, NOT an experimental result."
+	@echo ""
+	@echo "  -- P3.3 cuBLASLt baseline (see src/gemm/P3_3_PROTOCOL.md; implemented,"
+	@echo "     independent audit PENDING, GB300 verification PENDING. Runs the SAME frozen"
+	@echo "     BF16 geometry as P3.2 -- (M,N,K,L)=(4096,4096,4096,1), C = A x B^T, seed"
+	@echo "     1111, hot reused operands -- on the SAME operands, through a direct"
+	@echo "     cublasLtMatmul call: A row-major MxK lda=K, B row-major NxK ldb=K, C/D"
+	@echo "     row-major MxN ldc=ldd=N, OP_N/OP_T, CUDA_R_16BF in, CUDA_R_32F out,"
+	@echo "     CUBLAS_COMPUTE_32F, host pointer mode, default identity epilogue, alpha=1,"
+	@echo "     beta=0. Fixed non-autotuned policy: 64 MiB workspace limit, 32 heuristic"
+	@echo "     results requested, CUBLASLT_SEARCH_BEST_FIT, first supported result taken"
+	@echo "     and re-validated with cublasLtMatmulAlgoCheck; no candidate is ever"
+	@echo "     benchmarked. Correctness is mandatory and always precedes any timing."
+	@echo "     Separates setup_time_ms / first_launch_ms / kernel_time_ms -- setup is NOT"
+	@echo "     compilation and the P3.2 field name is never reused. Every emitted row is"
+	@echo "     publishable=false: P3.3 produces NO experimental result and NO CuTe-versus-"
+	@echo "     cuBLASLt comparison, which belongs to P3.5.) --"
+	@echo "  GPU-free P3.3 contract gate (no GPU, no network; runs the P3.2 gate first):"
+	@echo "  make gemm-cublaslt-p33-check   Compile the C-ABI cuBLASLt bridge for $(CUDA_ARCH)"
+	@echo "                                 into container-private /tmp, inspect its ELF"
+	@echo "                                 symbols to prove the measured path references"
+	@echo "                                 cublasLtMatmul and no fallback GEMM API, then run"
+	@echo "                                 the wrapper's GPU-free --help and --self-test"
+	@echo "                                 plus the checker and its own self-test."
+	@echo "  GPU-executing (requires BLACKWELL_GPU_INDEX; never selects a GPU automatically):"
+	@echo "  make gemm-cublaslt-p33-smoke   Compile the bridge inside the already-selected"
+	@echo "                                 GPU container, re-check the upstream commit and"
+	@echo "                                 SHA-256 there, then run the frozen cuBLASLt"
+	@echo "                                 baseline with 2 warm-ups and 10 measured"
+	@echo "                                 launches. Emits one non-publishable CSV row of"
+	@echo "                                 functional evidence, NOT an experimental result"
+	@echo "                                 and NOT a performance comparison."
 	@echo ""
 	@echo "Pinned global contract (VERSIONS.env, unchanged since Phase 0 and consumed"
 	@echo "unmodified by the closed P1/P2 aggregators): CUDA $(CUDA_VERSION), CUTLASS"
@@ -745,7 +802,6 @@ check-static:
 	@grep -Fq 'scripts/run_container.sh' Makefile
 	@echo "== truthful P3.1 status assertions =="
 	@grep -Fq 'P3.1 | Pinned official CuTe DSL example | YES | YES | YES |' PLAN.md
-	@grep -Fq 'P3.3 | cuBLASLt baseline | NO | NO | NO |' PLAN.md
 	@grep -Fq 'P3.4 | Three execution variants | NO | NO | NO |' PLAN.md
 	@grep -Fq 'P3.5 | Five shapes and comparison | NO | NO | NO |' PLAN.md
 	@grep -Fq 'P3.1 = YES / YES / YES' $(GEMM_P31_PROTOCOL)
@@ -818,6 +874,116 @@ check-static:
 	@! grep -nF 'P3.2 | One-shape wrapper | NO | NO | NO |' PLAN.md
 	@! grep -nE 'P3\.2 \| One-shape wrapper \| YES \| (YES|NO) \| YES \|' PLAN.md
 	@! grep -nF 'P3.2 | One-shape wrapper | YES | YES | NO |' PLAN.md
+	@echo "== P3.3 files present, executable, and still vendoring no NVIDIA GEMM source =="
+	@test -f $(GEMM_P33_WRAPPER)
+	@test -f $(GEMM_P33_BRIDGE)
+	@test -f $(GEMM_P33_CHECKER)
+	@test -f $(GEMM_P33_PROTOCOL)
+	@test -x $(GEMM_P33_WRAPPER)
+	@test -x $(GEMM_P33_CHECKER)
+	@! grep -nE '^(import|from|def|class) ' $(GEMM_P33_PROTOCOL)
+	@echo "== P3.3 python syntax, GPU-free self-tests, and the full contract check =="
+	python3 -m py_compile $(GEMM_P33_WRAPPER) $(GEMM_P33_CHECKER)
+	python3 $(GEMM_P33_WRAPPER) --self-test
+	python3 $(GEMM_P33_CHECKER) --self-test
+	python3 $(GEMM_P33_CHECKER) .
+	@rm -rf src/gemm/__pycache__ scripts/__pycache__
+	@echo "== P3.3 frozen geometry and descriptor contract cannot silently change =="
+	@grep -Eq '^FROZEN_M = 4096$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_N = 4096$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_K = 4096$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_L = 1$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_AB_DTYPE = "BFloat16"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_ACC_DTYPE = "Float32"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_C_DTYPE = "Float32"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_A_MAJOR = "k"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_B_MAJOR = "k"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_C_MAJOR = "n"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_LDA = FROZEN_K$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_LDB = FROZEN_K$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_LDC = FROZEN_N$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_LDD = FROZEN_N$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_TRANSA = "CUBLAS_OP_N"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_TRANSB = "CUBLAS_OP_T"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_ORDER = "CUBLASLT_ORDER_ROW"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_AB_CUDA_TYPE = "CUDA_R_16BF"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_CD_CUDA_TYPE = "CUDA_R_32F"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_COMPUTE_TYPE = "CUBLAS_COMPUTE_32F"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_SCALE_TYPE = "CUDA_R_32F"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_POINTER_MODE = "CUBLASLT_POINTER_MODE_HOST"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_EPILOGUE = "CUBLASLT_EPILOGUE_DEFAULT"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_ALPHA = 1\.0$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_BETA = 0\.0$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_SEED = 1111$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^SCHEMA_VERSION = "p33.v1"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^RUN_KIND = "smoke"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^METHOD = "cublaslt"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^VARIANT = "heuristic_first_supported"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^REFERENCE = "torch_cuda_fp32_ieee"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^CACHE_MODE = "hot"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^PUBLISHABLE = "false"$$' $(GEMM_P33_WRAPPER)
+	@echo "== P3.3 algorithm policy is fixed, never autotuned, never benchmarked =="
+	@grep -Eq '^FROZEN_WORKSPACE_LIMIT_BYTES = 67108864$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_HEURISTIC_REQUESTED = 32$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^FROZEN_SEARCH_MODE = "CUBLASLT_SEARCH_BEST_FIT"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^static const uint64_t P33_WORKSPACE_LIMIT_BYTES = 67108864ULL;$$' $(GEMM_P33_BRIDGE)
+	@grep -Eq '^static const int P33_HEURISTIC_REQUESTED = 32;$$' $(GEMM_P33_BRIDGE)
+	@echo "== P3.3 reuses no P3.2 schema field and never calls setup compilation =="
+	@# Structural, not substring: the wrapper deliberately NAMES compile_time_ms
+	@# and p32.v1 in prose and in negative self-test assertions that prove both
+	@# are rejected. What must not exist is a schema entry or a schema version.
+	@! grep -nE '^[[:space:]]+"compile_time_ms",$$' $(GEMM_P33_WRAPPER)
+	@! grep -nE '^SCHEMA_VERSION = "p32\.v1"$$' $(GEMM_P33_WRAPPER)
+	@grep -Eq '^[[:space:]]+"setup_time_ms",$$' $(GEMM_P33_WRAPPER)
+	@echo "== the P3.3 measured path is cublasLtMatmul, with no fallback GEMM API =="
+	@grep -Eq 'cublasLtMatmul[[:space:]]*\(' $(GEMM_P33_BRIDGE)
+	@# Call sites, not bare names: both files deliberately NAME the forbidden
+	@# entry points in prose that explains they are never used. The rigorous
+	@# comment-stripped scan lives in $(GEMM_P33_CHECKER).
+	@pat='cublasGemmEx|cublasGemmStridedBatchedEx|cublasGemmBatchedEx'; \
+	pat="$$pat|cublasSgemm|cublasHgemm|cublasLtMatmulAlgoGetIds|cublasLtMatmulAlgoInit"; \
+	! grep -nE -- "($$pat)[[:space:]]*\(" $(GEMM_P33_WRAPPER) $(GEMM_P33_BRIDGE)
+	@echo "   (the checker names those spellings on purpose, in order to ban them)"
+	@echo "== the P3.3 bridge owns no GEMM kernel and prints nothing =="
+	@! grep -nE '__global__|__device__' $(GEMM_P33_BRIDGE)
+	@! grep -nE '(^|[^a-zA-Z0-9_])(printf|puts|fputs)[[:space:]]*\(' $(GEMM_P33_BRIDGE)
+	@! grep -nE 'std::(cout|cerr|clog)' $(GEMM_P33_BRIDGE)
+	@! grep -nE 'cudaEventRecord|cudaEventElapsedTime|std::chrono' $(GEMM_P33_BRIDGE)
+	@grep -Fq 'extern "C"' $(GEMM_P33_BRIDGE)
+	@grep -Fq 'catch (...)' $(GEMM_P33_BRIDGE)
+	@echo "== P3.3 exposes no descriptor/policy control and can never skip the reference check =="
+	@pat='--mnkl|--shape|--lda|--ldb|--ldc|--ldd|--transa|--transb|--alpha|--beta'; \
+	pat="$$pat|--epilogue|--workspace|--heuristic|--algo|--tile|--stages|--split"; \
+	pat="$$pat|--cluster|--order|--autotune|--search|--cache-mode|--publish"; \
+	pat="$$pat|--skip-ref""-check|--skip_ref""_check|--use_cold""_l2|--persistent"; \
+	! grep -nE -- "$$pat" $(GEMM_P33_WRAPPER)
+	@echo "== P3.3 writes no result file and creates no campaign directory =="
+	@! grep -nE 'results/raw|results/preflight' $(GEMM_P33_WRAPPER)
+	@echo "== P3.3 adds no key to either version contract =="
+	@! grep -nE '^(CUBLAS|CUBLASLT|P33_)' PHASE3_VERSIONS.env VERSIONS.env
+	@echo "== P3.3 reuses the audited launcher and never invokes Docker for GPU work =="
+	@grep -Eq '^gemm-cublaslt-p33-smoke:$$' Makefile
+	@grep -Fq 'scripts/run_container.sh' Makefile
+	@echo "== P3.3 GPU-free gate actually executes the existing P3.2 gate =="
+	@grep -Eq '^gemm-cublaslt-p33-check: gemm-cutedsl-p32-check$$' Makefile
+	@echo "== P3.3 smoke runs exactly the frozen non-publishable iteration counts =="
+	@grep -Fq -- '--warmup-iterations 2 \' Makefile
+	@grep -Fq -- '--iterations 10' Makefile
+	@echo "== truthful P3.3 status assertions =="
+	@grep -Fq 'P3.3 | cuBLASLt baseline | YES | NO | NO |' PLAN.md
+	@grep -Fq 'P3.3 = YES / NO / NO' $(GEMM_P33_PROTOCOL)
+	@grep -Fq 'P3.3 creates no publishable performance result' $(GEMM_P33_PROTOCOL)
+	@grep -Fq 'P3.3 (cuBLASLt baseline)' README.md
+	@! grep -nF 'P3.3 | cuBLASLt baseline | NO | NO | NO |' PLAN.md
+	@! grep -nE 'P3\.3 \| cuBLASLt baseline \| YES \| (YES|NO) \| YES \|' PLAN.md
+	@! grep -nF 'P3.3 | cuBLASLt baseline | YES | YES | NO |' PLAN.md
+	@echo "== P3.3 introduces no P3.4/P3.5 functionality and no comparison =="
+	@! grep -nE '^(P34|P35)_' $(GEMM_P33_WRAPPER)
+	@! grep -nE '^(FROZEN_)?(USE_2CTA|PERSISTENT|SWEEP|COMPARISON)' $(GEMM_P33_WRAPPER)
+	@echo "   (the tokenized identifier ban for TFLOP/s, speedup, efficiency, bandwidth,"
+	@echo "    utilization, winner labels, Nsight Compute, autotuning, and campaign trees"
+	@echo "    lives in $(GEMM_P33_CHECKER), which scans Python NAME tokens so that prose"
+	@echo "    explaining what P3.3 does NOT compute stays legal while code does not)"
 	@echo "check-static: OK"
 
 build-image:
@@ -1760,12 +1926,199 @@ gemm-cutedsl-p32-smoke:
 	echo "(M,N,K,L)=(4096,4096,4096,1), 2 warm-ups and 10 measured launches, with hot" >&2; \
 	echo "reused operands. compile_time_ms, first_launch_ms, and kernel_time_ms are" >&2; \
 	echo "NON-PUBLISHABLE diagnostic fields; every row carries publishable=false." >&2; \
-	echo "P3.2 computes no TFLOP/s, no speedup, no efficiency, and no comparison, and" >&2; \
-	echo "no cuBLASLt baseline exists yet." >&2; \
+	echo "P3.2 computes no TFLOP/s, no speedup, no efficiency, and no comparison. The" >&2; \
+	echo "P3.3 cuBLASLt baseline now exists but is a separate unit: no P3.2-versus-P3.3" >&2; \
+	echo "comparison exists anywhere, and P3.5 owns that comparison." >&2; \
 	if [ "$$status" -eq 0 ]; then \
 		echo "P3.2 smoke completed: correctness passed before warm-up and steady-state timing." >&2; \
 	else \
 		echo "P3.2 smoke FAILED with exit status $$status: no CSV header and no CSV row" >&2; \
+		echo "were emitted, and no result may be read from this run." >&2; \
+	fi; \
+	echo "==============================================================================" >&2; \
+	exit $$status
+
+# --- P3.3: equivalent cuBLASLt baseline --------------------------------------
+# P3.3 answers exactly one question that P3.2 cannot: what does the vendor
+# library do with the very same problem, on the very same bytes? It runs the
+# same frozen BF16 geometry, built by the same pinned cutlass.torch.matrix
+# factory with the same seed and the same call order, through a direct
+# cublasLtMatmul call issued by a small repository-owned C-ABI bridge. The
+# bridge owns no GEMM kernel, copies no NVIDIA source, prints nothing, and lets
+# no C++ exception cross the ABI; cuBLASLt itself already ships inside the
+# pinned CUDA 13.1 image, so no package is added, no image changes, and no key
+# is added to either version contract -- the library's own runtime version is
+# read with cublasLtGetVersion().
+#
+# The algorithm policy is fixed and never autotuned: a 64 MiB workspace limit,
+# 32 requested heuristic results, CUBLASLT_SEARCH_BEST_FIT, the first result
+# whose state is CUBLAS_STATUS_SUCCESS, re-validated with
+# cublasLtMatmulAlgoCheck, rejected if it needs more than the fixed limit, and
+# given exactly the workspace it asks for. No candidate is ever executed for
+# comparison, and there is no retry with another layout, type, compute mode,
+# workspace limit, or API: an unsupported configuration fails with a
+# diagnostic and emits no CSV.
+#
+# P3.3 introduces no persistent scheduler, no 2-CTA MMA group, no additional
+# shape, no sweep, no autotuning, no Nsight Compute, no SASS analysis of
+# proprietary kernels, no campaign directory, and no result file, and it makes
+# no CuTe-versus-cuBLASLt comparison of any kind -- that is P3.5's job. See
+# src/gemm/P3_3_PROTOCOL.md.
+#
+# gemm-cublaslt-p33-check never touches a GPU, the network, or elevated
+# privileges. It runs the existing P3.2 gate first (which itself runs the P3.1
+# gate, both GPU-free and network-free, and both left completely intact), then
+# runs inside the pinned image with --network none, --cap-drop ALL,
+# no-new-privileges, the invoking UID/GID, no --gpus, and the repository mounted
+# READ-ONLY -- a checker must not be able to modify what it checks, which is why
+# PYTHONPYCACHEPREFIX and the bridge build output both go to the container's own
+# /tmp. Inside, it compiles the bridge with the pinned toolchain, inspects the
+# resulting shared object with nm/readelf to prove the measured path references
+# cublasLtMatmul and references no fallback GEMM entry point, and runs both
+# GPU-free self-tests plus the full contract check.
+#
+# gemm-cublaslt-p33-smoke is the only P3.3 target that executes on GPU. Its
+# first recipe line validates BLACKWELL_GPU_INDEX before Docker, any
+# compilation, or any other work can start, which is why it deliberately has no
+# Make prerequisite (same audited reasoning as gemm-cutedsl-p31-smoke and
+# gemm-cutedsl-p32-smoke). It then goes exclusively through
+# scripts/run_container.sh, which alone owns GPU selection, UUID resolution, and
+# the idle-device proof -- this target never calls Docker or --gpus itself.
+# Inside that same GPU container it compiles the bridge into private /tmp,
+# re-checks the upstream commit and source SHA-256, runs exactly the frozen
+# configuration, preserves the wrapper's exit code, and prints an explicit
+# stderr notice. Correctness is mandatory and cannot be disabled: the wrapper
+# has no option for it and emits no row unless the full check passed.
+
+gemm-cublaslt-p33-check: gemm-cutedsl-p32-check
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-e PYTHONPYCACHEPREFIX=/tmp/p33-pycache \
+		-e CUTLASS_COMMIT="$(CUTLASS_COMMIT)" \
+		-e CUDA_SHORT_VERSION="$(CUDA_SHORT_VERSION)" \
+		-e P31_EXAMPLE="$(GEMM_P31_EXAMPLE)" \
+		-e P31_EXAMPLE_SHA256="$(CUTEDSL_P31_EXAMPLE_SHA256)" \
+		-e P33_WRAPPER="$(GEMM_P33_WRAPPER)" \
+		-e P33_BRIDGE="$(GEMM_P33_BRIDGE)" \
+		-e P33_CHECKER="$(GEMM_P33_CHECKER)" \
+		-e P33_BRIDGE_DIR="$(GEMM_P33_BRIDGE_DIR)" \
+		-e P33_BRIDGE_LIB="$(GEMM_P33_BRIDGE_LIB)" \
+		-e P33_ARCH_FLAGS="$(GEMM_P33_ARCH_FLAGS)" \
+		-v "$(CURDIR):/workspace:ro" \
+		-w /workspace \
+		"$(IMAGE_TAG)" \
+		bash -c 'set -euo pipefail; \
+			fail() { echo "gemm-cublaslt-p33-check: FAIL: $$*" >&2; exit 1; }; \
+			echo "== the pinned CUDA toolkit that must supply cuBLASLt =="; \
+			nvcc_version="$$(nvcc --version | sed -n "s/.*release \([0-9.]*\).*/\1/p")"; \
+			[ "$$nvcc_version" = "$$CUDA_SHORT_VERSION" ] \
+				|| fail "nvcc reports CUDA $$nvcc_version, pinned is $$CUDA_SHORT_VERSION"; \
+			echo "nvcc CUDA $$nvcc_version (cuBLASLt ships with it; no package is added)"; \
+			echo "== upstream provenance is still the pinned P3.1 file =="; \
+			head_commit="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass rev-parse HEAD)" \
+				|| fail "cannot read the /opt/cutlass HEAD commit"; \
+			[ "$$head_commit" = "$$CUTLASS_COMMIT" ] \
+				|| fail "/opt/cutlass HEAD $$head_commit != pinned $$CUTLASS_COMMIT"; \
+			sha="$$(sha256sum "$$P31_EXAMPLE" | cut -d" " -f1)" \
+				|| fail "cannot compute the SHA-256 of $$P31_EXAMPLE"; \
+			[ "$$sha" = "$$P31_EXAMPLE_SHA256" ] \
+				|| fail "SHA-256 $$sha != pinned $$P31_EXAMPLE_SHA256"; \
+			echo "upstream provenance OK: commit $$head_commit sha256 $$sha"; \
+			echo "== compile the C-ABI cuBLASLt bridge into container-private /tmp =="; \
+			mkdir -p "$$P33_BRIDGE_DIR"; \
+			nvcc -std=c++17 -O3 -lineinfo \
+				-Xcompiler -fPIC -shared \
+				$$P33_ARCH_FLAGS \
+				-o "$$P33_BRIDGE_LIB" "$$P33_BRIDGE" \
+				-lcublasLt -lcudart \
+				|| fail "the cuBLASLt bridge did not compile"; \
+			echo "bridge compiled: $$P33_BRIDGE_LIB"; \
+			echo "== the shared object must call cublasLtMatmul and no fallback GEMM API =="; \
+			nm -D --defined-only "$$P33_BRIDGE_LIB" > /tmp/p33-defined.txt \
+				|| fail "cannot read the defined symbols of the bridge"; \
+			nm -D -u "$$P33_BRIDGE_LIB" > /tmp/p33-undefined.txt \
+				|| fail "cannot read the undefined symbols of the bridge"; \
+			readelf -d "$$P33_BRIDGE_LIB" > /tmp/p33-dynamic.txt \
+				|| fail "cannot read the dynamic section of the bridge"; \
+			grep -qw "cublasLtMatmul" /tmp/p33-undefined.txt \
+				|| fail "the measured path does not reference cublasLtMatmul"; \
+			grep -qw "cublasLtMatmulAlgoCheck" /tmp/p33-undefined.txt \
+				|| fail "the bridge never validates the selected algorithm"; \
+			grep -qw "cublasLtMatmulAlgoGetHeuristic" /tmp/p33-undefined.txt \
+				|| fail "the bridge never queries the vendor heuristic"; \
+			for symbol in p33_plan_create p33_plan_execute p33_plan_destroy \
+					p33_cublaslt_version p33_plan_info_size p33_bridge_abi_version; do \
+				grep -qw "$$symbol" /tmp/p33-defined.txt \
+					|| fail "the bridge does not export $$symbol"; \
+			done; \
+			for forbidden in cublasGemmEx cublasGemmStridedBatchedEx cublasGemmBatchedEx \
+					cublasSgemm cublasHgemm cublasLtMatmulAlgoGetIds cublasLtMatmulAlgoInit; do \
+				if grep -qw "$$forbidden" /tmp/p33-defined.txt /tmp/p33-undefined.txt; then \
+					fail "the bridge references the forbidden fallback API $$forbidden"; \
+				fi; \
+			done; \
+			grep -q "libcublasLt.so" /tmp/p33-dynamic.txt \
+				|| fail "the bridge is not linked against libcublasLt"; \
+			grep -q "libcudart.so" /tmp/p33-dynamic.txt \
+				|| fail "the bridge is not linked against libcudart"; \
+			echo "ELF inspection OK: cublasLtMatmul present, no fallback GEMM API present"; \
+			echo "== P3.3 python syntax =="; \
+			python3 -m py_compile "$$P33_WRAPPER" "$$P33_CHECKER"; \
+			echo "== P3.3 wrapper --help and --self-test are GPU-free =="; \
+			python3 "$$P33_WRAPPER" --help > /dev/null \
+				|| fail "the wrapper --help did not exit successfully"; \
+			python3 "$$P33_WRAPPER" --self-test \
+				|| fail "the wrapper GPU-free self-test failed"; \
+			echo "== P3.3 checker self-test and full frozen-contract check =="; \
+			python3 "$$P33_CHECKER" --self-test \
+				|| fail "the checker self-test failed"; \
+			python3 "$$P33_CHECKER" /workspace \
+				|| fail "the P3.3 frozen-contract check failed"; \
+			echo "P3.3 GPU-free contract OK (no GPU was used or required)"'
+	@echo "gemm-cublaslt-p33-check: OK"
+
+gemm-cublaslt-p33-smoke:
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index." >&2; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make gemm-cublaslt-p33-smoke" >&2; \
+		echo "       This project never selects a GPU automatically." >&2; \
+		exit 2; \
+	fi
+	@status=0; \
+	RUN_CONTAINER_STDOUT_IS_DATA=1 scripts/run_container.sh bash -c 'set -euo pipefail; \
+		head_commit="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass rev-parse HEAD)"; \
+		[ "$$head_commit" = "$(CUTLASS_COMMIT)" ] \
+			|| { echo "gemm-cublaslt-p33-smoke: FAIL: /opt/cutlass HEAD $$head_commit != pinned $(CUTLASS_COMMIT)" >&2; exit 1; }; \
+		sha="$$(sha256sum "$(GEMM_P31_EXAMPLE)" | cut -d" " -f1)"; \
+		[ "$$sha" = "$(CUTEDSL_P31_EXAMPLE_SHA256)" ] \
+			|| { echo "gemm-cublaslt-p33-smoke: FAIL: SHA-256 $$sha != pinned $(CUTEDSL_P31_EXAMPLE_SHA256)" >&2; exit 1; }; \
+		echo "gemm-cublaslt-p33-smoke: upstream re-checked in this GPU container: commit $$head_commit sha256 $$sha" >&2; \
+		mkdir -p $(GEMM_P33_BRIDGE_DIR); \
+		nvcc -std=c++17 -O3 -lineinfo -Xcompiler -fPIC -shared \
+			$(GEMM_P33_ARCH_FLAGS) \
+			-o $(GEMM_P33_BRIDGE_LIB) $(GEMM_P33_BRIDGE) \
+			-lcublasLt -lcudart >&2; \
+		echo "gemm-cublaslt-p33-smoke: bridge compiled into container-private $(GEMM_P33_BRIDGE_LIB)" >&2; \
+		exec python3 $(GEMM_P33_WRAPPER) \
+			--warmup-iterations 2 \
+			--iterations 10' || status=$$?; \
+	echo "==============================================================================" >&2; \
+	echo "P3.3 FUNCTIONAL VERIFICATION ONLY -- NOT AN EXPERIMENTAL RESULT AND" >&2; \
+	echo "NOT A PERFORMANCE COMPARISON." >&2; \
+	echo "Any CSV row on stdout is P3.3 infrastructure evidence: one frozen shape," >&2; \
+	echo "(M,N,K,L)=(4096,4096,4096,1), 2 warm-ups and 10 measured launches, with hot" >&2; \
+	echo "reused operands. setup_time_ms, first_launch_ms, and kernel_time_ms are" >&2; \
+	echo "NON-PUBLISHABLE diagnostic fields; every row carries publishable=false." >&2; \
+	echo "P3.3 computes no TFLOP/s, no speedup, no efficiency, and no comparison against" >&2; \
+	echo "the P3.2 CuTe DSL wrapper. That comparison is P3.5 and does not exist." >&2; \
+	if [ "$$status" -eq 0 ]; then \
+		echo "P3.3 smoke completed: correctness passed before warm-up and steady-state timing." >&2; \
+	else \
+		echo "P3.3 smoke FAILED with exit status $$status: no CSV header and no CSV row" >&2; \
 		echo "were emitted, and no result may be read from this run." >&2; \
 	fi; \
 	echo "==============================================================================" >&2; \
