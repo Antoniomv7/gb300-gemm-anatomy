@@ -1433,12 +1433,26 @@ def validate_status_documents(plan_text, protocol_text, readme_text) -> list:
     ):
         if stale in plan_text:
             errors.append(f"PLAN.md records a stale P3.3 status: {stale!r}")
-    for later in (
-        "P3.4 | Three execution variants | NO | NO | NO |",
-        "P3.5 | Five shapes and comparison | NO | NO | NO |",
-    ):
+    # P3.5 genuinely does not exist yet, so its row must stay untouched. P3.4,
+    # however, is a later unit that is allowed to progress on its own: pinning
+    # it to NO | NO | NO would make this closed check fail the moment P3.4 is
+    # truthfully implemented, which is not what this guard is for. The real
+    # invariant P3.3 cares about is that no later unit is ever claimed COMPLETE
+    # (audited AND GB300-verified) while P3.3 is the closed frontier.
+    for later in ("P3.5 | Five shapes and comparison | NO | NO | NO |",):
         if later not in plan_text:
             errors.append(f"PLAN.md no longer records {later!r}")
+    if "P3.4 | Three execution variants |" not in plan_text:
+        errors.append("PLAN.md no longer records a P3.4 status row")
+    for closed_later in (
+        "P3.4 | Three execution variants | YES | YES | YES |",
+        "P3.5 | Five shapes and comparison | YES | YES | YES |",
+    ):
+        if closed_later in plan_text:
+            errors.append(
+                f"PLAN.md claims a later unit is closed while P3.3 is the frontier: "
+                f"{closed_later!r}"
+            )
 
     if "P3.3 = YES / YES / YES" not in protocol_text:
         errors.append(f"{PROTOCOL_RELATIVE_PATH} does not state P3.3 = YES / YES / YES")
@@ -2295,6 +2309,27 @@ def run_self_test() -> int:
                 good_plan,
                 good_protocol.replace("P3.3 creates no publishable performance result.", ""),
                 good_readme), "no publishable result")
+    # A later unit may progress on its own, but may never be claimed closed
+    # while P3.3 is the frontier.
+    check("an implemented but unclosed P3.4 is accepted",
+          validate_status_documents(
+              good_plan.replace("| P3.4 | Three execution variants | NO | NO | NO |",
+                                "| P3.4 | Three execution variants | YES | NO | NO |"),
+              good_protocol, good_readme) == [])
+    rejects("a PLAN.md claiming P3.4 is closed is rejected",
+            validate_status_documents(
+                good_plan.replace("| P3.4 | Three execution variants | NO | NO | NO |",
+                                  "| P3.4 | Three execution variants | YES | YES | YES |"),
+                good_protocol, good_readme), "later unit is closed")
+    rejects("a PLAN.md that drops the P3.4 row is rejected",
+            validate_status_documents(
+                good_plan.replace("| P3.4 | Three execution variants | NO | NO | NO |\n", ""),
+                good_protocol, good_readme), "P3.4 status row")
+    rejects("a PLAN.md that weakens the P3.5 row is rejected",
+            validate_status_documents(
+                good_plan.replace("| P3.5 | Five shapes and comparison | NO | NO | NO |",
+                                  "| P3.5 | Five shapes and comparison | YES | NO | NO |"),
+                good_protocol, good_readme), "no longer records")
 
     # Launcher.
     check("the audited launcher shape is accepted",

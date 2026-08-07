@@ -280,7 +280,7 @@ independently audited, and verified on GB300. Phase 3 is in progress.
 | P3.1 | Pinned official CuTe DSL example | YES | YES | YES |
 | P3.2 | One-shape wrapper | YES | YES | YES |
 | P3.3 | cuBLASLt baseline | YES | YES | YES |
-| P3.4 | Three execution variants | NO | NO | NO |
+| P3.4 | Three execution variants | YES | NO | NO |
 | P3.5 | Five shapes and comparison | NO | NO | NO |
 
 P3.1 (`src/gemm/P3_1_PROTOCOL.md`) is implemented: it executes one pinned,
@@ -501,8 +501,81 @@ passed the complete-result check with zero maximum absolute and relative error,
 completed two warm-ups and ten measured launches, and emitted exactly one
 77-field `p33.v1` row with `git_dirty=false` and `publishable=false`. Its three
 finite positive timings remain non-publishable diagnostics, not an experimental
-result. P3.3 is therefore closed as `YES / YES / YES`. P3.4 and P3.5 remain
-unimplemented, so Phase 3 remains in progress.
+result. P3.3 is therefore closed as `YES / YES / YES`.
+
+P3.4 (`src/gemm/cutedsl_variants.py`, `scripts/check_cutedsl_variants_p34.py`,
+`src/gemm/P3_4_PROTOCOL.md`) is now **implemented**; it is **not** audited and
+**not** verified on GB300. It adds the two remaining frozen CuTe DSL execution
+variants alongside the one P3.2 established, so that all three exist under one
+identical operand set, one identical correctness oracle, and one identical
+timing discipline, at the same single shape `(M,N,K,L) = (4096,4096,4096,1)`:
+`nonpersistent_1cta` (`DenseGemmKernel`, non-persistent, MMA tiler `(128,128)`,
+cluster `(1,1)`, `use_2cta_instrs=false`), `persistent_1cta`
+(`PersistentDenseGemmKernel`, static persistent, tiler `(128,128)`, cluster
+`(1,1)`, `use_2cta_instrs=false`), and `persistent_2cta`
+(`PersistentDenseGemmKernel`, static persistent, tiler `(256,128)`, cluster
+`(2,1)`, `use_2cta_instrs=true`). The 2-CTA row deliberately uses an M tile of
+256 so each of the two participating CTAs keeps a local M extent of 128 —
+P2.2's two-SM geometry, and the shape NVIDIA's own persistent example documents
+for `use_2cta_instrs=True`; the checker rejects any table whose 2-CTA row does
+not satisfy `tiler_M / cluster_M == 128`. Exactly three fixed candidates run,
+always in that order, with no autotuning, no candidate search, no fourth
+candidate, and no additional shape. This repository still owns no GEMM kernel:
+the non-persistent variant keeps using P3.1's pinned example and the two
+persistent variants use the official static-persistent example
+`dense_gemm_persistent.py` from the **same** already pinned CUTLASS commit
+(BSD-3-Clause, Git blob `10d62d239457748372a522488ee23bc3df5f346d`, SHA-256
+`d59344faf902cb215a2cee3f2ae6415a14589c6ad8f93e5e74e2612c1e6a0810`), both
+loaded read-only and in place from `/opt/cutlass` under private module names
+after HEAD, checkout cleanliness, regular-file identity, Git blob, and SHA-256
+are verified for each file — and neither upstream `run()` nor either upstream
+benchmarking helper is ever called, because they fuse compilation, first
+launch, correctness, and benchmarking into one number. The only new pins are
+the three `CUTEDSL_P34_*` keys in `PHASE3_VERSIONS.env`; `VERSIONS.env`, the
+`Dockerfile`, and every closed P3.1/P3.2/P3.3 interface are untouched, and the
+checker re-runs both closed P1/P2 aggregator parsers to prove `VERSIONS.env`
+still satisfies their allowlist. All three variants consume byte-identical A
+and B: the operands are built once by the pinned non-persistent example's own
+`create_tensors()` — same factory, same seed `1111`, same A/B/C order, same
+dtypes and strides as P3.2 and P3.3 — and are never mutated; the persistent
+example's independent tensor path is deliberately unused. Only C is reset
+between candidates, to NaN, outside every timer, so an element a kernel fails to
+write stays non-finite and is rejected instead of surviving as a stale value.
+`max_active_clusters` comes from the official pinned hardware helper
+(`cutlass.utils.HardwareInfo().get_max_active_clusters`) for each variant's own
+cluster size, is required to be a finite positive integer, and is recorded; the
+non-persistent row records the canonical `not_applicable`. Per variant the
+wrapper separates `compile_time_ms` (a monotonic host clock around
+`cute.compile` alone), `first_launch_ms` (the same clock around the first
+launch, whose output is validated), and `kernel_time_ms` (CUDA events on the
+kernel's own stream after warm-up, divided by the iteration count), validates
+the complete result against the identical untimed PyTorch CUDA oracle P3.2 and
+P3.3 use (`fp32_precision` only, read back as exactly `ieee`, `atol=1e-1`,
+`rtol=1e-5`), and only then runs that variant's warm-up and steady state. The
+whole output is buffered: successful runs write exactly one CSV header and
+exactly three rows — four lines — under a new frozen 51-field
+`schema_version=p34.v1` contract, and a failure in **any** of the three
+positions emits no CSV at all, including no rows from variants that already
+passed. Two Make targets were added: GPU-free, network-free
+`gemm-cutedsl-p34-check` (which runs the existing, unmodified P3.3 gate first,
+then revalidates the checkout and both official sources, asserts the persistent
+file really carries `StaticPersistentTileScheduler` and `CtaGroup.TWO`, checks
+the pinned package versions and `pip check`, and runs both GPU-free self-tests
+plus the full contract check) and `gemm-cutedsl-p34-smoke`, which rejects a
+missing or non-numeric `BLACKWELL_GPU_INDEX` in its first recipe action before
+any Docker work, runs exclusively through `scripts/run_container.sh`,
+revalidates both sources inside that same GPU container, and runs all three
+variants with two warm-ups and ten measured launches each. **P3.4 produces no
+publishable performance result**: every row carries `publishable=false`, no
+TFLOP/s, speedup, efficiency, utilization, bandwidth, ranking, or winner is
+computed anywhere, no result file or campaign directory is written, and **no
+variant-versus-variant and no CuTe-versus-cuBLASLt comparison exists** — that
+comparison is P3.5's. The GPU-free acceptance commands listed in
+`src/gemm/P3_4_PROTOCOL.md` section 12 were run by the author and passed; those
+are self-checks, not an independent audit, and GPU-free checks are not GB300
+verification: `make gemm-cutedsl-p34-smoke` has not been run, so no P3.4 GPU
+result of any kind exists. P3.5 remains unimplemented, so Phase 3 remains in
+progress.
 
 ## Phase 4 — Campaigns and integration (10–15 August 2026)
 

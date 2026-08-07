@@ -13,7 +13,7 @@
 # compute-umma-p24-check, compute-umma-p24-pilot, compute-umma-p24-profile,
 # compute-umma-p24-analyze, gemm-cutedsl-p31-check, gemm-cutedsl-p31-smoke,
 # gemm-cutedsl-p32-check, gemm-cutedsl-p32-smoke, gemm-cublaslt-p33-check,
-# gemm-cublaslt-p33-smoke.
+# gemm-cublaslt-p33-smoke, gemm-cutedsl-p34-check, gemm-cutedsl-p34-smoke.
 # No target selects a GPU automatically, elevates privileges, or exceeds two
 # build jobs.
 
@@ -136,6 +136,19 @@ GEMM_P33_BRIDGE_LIB := $(GEMM_P33_BRIDGE_DIR)/libp33_cublaslt_bridge.so
 # too, unchanged and for the same reason.
 GEMM_P33_ARCH_FLAGS := -arch=compute_$(patsubst sm_%,%,$(CUDA_ARCH)) -code=$(CUDA_ARCH)
 
+# P3.4: the three frozen CuTe DSL execution variants at the same single shape.
+# It reuses P3.1's pinned non-persistent example for the non-persistent variant
+# and adds the official static-persistent example from the SAME pinned CUTLASS
+# commit for the two persistent variants, so PHASE3_VERSIONS.env grows by
+# exactly the three CUTEDSL_P34_* keys and VERSIONS.env is untouched. No NVIDIA
+# GEMM source is copied, vendored, forked, or patched, no package or image
+# changes, and no comparison of any kind is produced: P3.5 owns that. See
+# src/gemm/P3_4_PROTOCOL.md.
+GEMM_P34_WRAPPER := src/gemm/cutedsl_variants.py
+GEMM_P34_CHECKER := scripts/check_cutedsl_variants_p34.py
+GEMM_P34_PROTOCOL := src/gemm/P3_4_PROTOCOL.md
+GEMM_P34_PERSISTENT_EXAMPLE := /opt/cutlass/$(CUTEDSL_P34_PERSISTENT_EXAMPLE_PATH)
+
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
 	PHASE3_VERSIONS.env \
@@ -155,7 +168,8 @@ REQUIRED_FILES := \
 	$(EXP02_P24_PROTOCOL) \
 	$(GEMM_P31_PROTOCOL) \
 	$(GEMM_P32_WRAPPER) $(GEMM_P32_CHECKER) $(GEMM_P32_PROTOCOL) \
-	$(GEMM_P33_WRAPPER) $(GEMM_P33_BRIDGE) $(GEMM_P33_CHECKER) $(GEMM_P33_PROTOCOL)
+	$(GEMM_P33_WRAPPER) $(GEMM_P33_BRIDGE) $(GEMM_P33_CHECKER) $(GEMM_P33_PROTOCOL) \
+	$(GEMM_P34_WRAPPER) $(GEMM_P34_CHECKER) $(GEMM_P34_PROTOCOL)
 
 .DEFAULT_GOAL := help
 .PHONY: help check-static build-image check-env preflight \
@@ -173,7 +187,8 @@ REQUIRED_FILES := \
 	compute-umma-sweep-plan compute-umma-sweep-check compute-umma-sweep-smoke \
 	gemm-cutedsl-p31-check gemm-cutedsl-p31-smoke \
 	gemm-cutedsl-p32-check gemm-cutedsl-p32-smoke \
-	gemm-cublaslt-p33-check gemm-cublaslt-p33-smoke
+	gemm-cublaslt-p33-check gemm-cublaslt-p33-smoke \
+	gemm-cutedsl-p34-check gemm-cutedsl-p34-smoke
 
 help:
 	@echo "gb300-gemm-anatomy — Phase 0 + P1.1 (LDGSTS) + P1.2 (TMA) + P1.3 (sweep) targets"
@@ -406,6 +421,35 @@ help:
 	@echo "                                 launches. Emits one non-publishable CSV row of"
 	@echo "                                 functional evidence, NOT an experimental result"
 	@echo "                                 and NOT a performance comparison."
+	@echo ""
+	@echo "  -- P3.4 three execution variants (see src/gemm/P3_4_PROTOCOL.md; implemented,"
+	@echo "     independent audit PENDING, GB300 verification PENDING. Runs exactly three"
+	@echo "     frozen candidates at the SAME single shape (M,N,K,L)=(4096,4096,4096,1) on"
+	@echo "     ONE shared, immutable operand set and one shared untimed FP32 oracle:"
+	@echo "       nonpersistent_1cta  DenseGemmKernel            tiler (128,128) cluster (1,1)"
+	@echo "       persistent_1cta     PersistentDenseGemmKernel  tiler (128,128) cluster (1,1)"
+	@echo "       persistent_2cta     PersistentDenseGemmKernel  tiler (256,128) cluster (2,1)"
+	@echo "     The 2-CTA row uses an M tile of 256 so each participating CTA keeps a local"
+	@echo "     M extent of 128, matching P2.2's two-SM geometry. Both kernels come from"
+	@echo "     pinned unmodified official NVIDIA examples in the same pinned CUTLASS"
+	@echo "     commit; max_active_clusters comes from the official hardware helper and is"
+	@echo "     never guessed. Correctness is mandatory and precedes every timing, per"
+	@echo "     variant, and the four output lines appear only if ALL THREE variants pass."
+	@echo "     Every row is publishable=false: P3.4 produces NO experimental result, NO"
+	@echo "     ranking, and NO variant or cuBLASLt comparison, which belong to P3.5.) --"
+	@echo "  GPU-free P3.4 contract gate (no GPU, no network; runs the P3.3 gate first):"
+	@echo "  make gemm-cutedsl-p34-check    Revalidate the CUTLASS checkout and BOTH pinned"
+	@echo "                                 official sources, verify the pinned package"
+	@echo "                                 versions and dependency graph, then compile the"
+	@echo "                                 P3.4 files and run the wrapper's GPU-free --help"
+	@echo "                                 and --self-test plus the checker and its own"
+	@echo "                                 self-test."
+	@echo "  GPU-executing (requires BLACKWELL_GPU_INDEX; never selects a GPU automatically):"
+	@echo "  make gemm-cutedsl-p34-smoke    Re-check both upstream sources inside the GPU"
+	@echo "                                 container, then run all three frozen variants"
+	@echo "                                 with 2 warm-ups and 10 measured launches each."
+	@echo "                                 Emits four CSV lines of functional evidence, NOT"
+	@echo "                                 an experimental result and NOT a comparison."
 	@echo ""
 	@echo "Pinned global contract (VERSIONS.env, unchanged since Phase 0 and consumed"
 	@echo "unmodified by the closed P1/P2 aggregators): CUDA $(CUDA_VERSION), CUTLASS"
@@ -795,15 +839,31 @@ check-static:
 	@grep -Fq -- '--warmup_iterations 0 --iterations 1' Makefile
 	@echo "== P3.1 never adds 2-CTA instructions, skips reference checking, uses cold L2,"
 	@echo "   or executes the persistent example (those are later units) =="
-	@pat='--use_2cta'; pat="$$pat""_instrs|--skip_ref""_check|--use_cold""_l2|dense_gemm""_persistent"; \
+	@# These option spellings must not appear anywhere in the Makefile at all.
+	@pat='--use_2cta'; pat="$$pat""_instrs|--skip_ref""_check|--use_cold""_l2"; \
 	! grep -nE -- "$$pat" Makefile
+	@# The persistent example, however, IS legitimately referenced now that P3.4
+	@# exists, so the invariant is scoped to P3.1 itself: P3.1's pinned path and
+	@# its derived Make variable must never name the persistent file. A
+	@# whole-file ban would have failed the moment a later unit landed.
+	@# (These three patterns are anchored at column 0, so none of them can match
+	@#  the tab-indented recipe lines that contain them.)
+	@! grep -nE '^CUTEDSL_P31_EXAMPLE_PATH=.*persistent' PHASE3_VERSIONS.env
+	@! grep -nE '^GEMM_P31_EXAMPLE[[:space:]]*:=.*persistent' Makefile
+	@! grep -nE '^gemm-cutedsl-p31-(check|smoke):.*persistent' Makefile
+	@grep -Eq '^CUTEDSL_P31_EXAMPLE_PATH=.*/dense_gemm\.py$$' PHASE3_VERSIONS.env
 	@echo "== P3.1 smoke validates BLACKWELL_GPU_INDEX before any Docker prerequisite =="
 	@grep -Eq '^gemm-cutedsl-p31-smoke:$$' Makefile
 	@grep -Fq 'scripts/run_container.sh' Makefile
 	@echo "== truthful P3.1 status assertions =="
 	@grep -Fq 'P3.1 | Pinned official CuTe DSL example | YES | YES | YES |' PLAN.md
-	@grep -Fq 'P3.4 | Three execution variants | NO | NO | NO |' PLAN.md
+	@# P3.5 genuinely does not exist yet, so its row must stay untouched. P3.4 is
+	@# a later unit that may progress on its own, so it is checked for existence
+	@# and for not being overstated rather than pinned to NO | NO | NO, which
+	@# would fail the moment P3.4 is truthfully implemented.
 	@grep -Fq 'P3.5 | Five shapes and comparison | NO | NO | NO |' PLAN.md
+	@grep -Fq 'P3.4 | Three execution variants |' PLAN.md
+	@! grep -nF 'P3.4 | Three execution variants | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P3.1 = YES / YES / YES' $(GEMM_P31_PROTOCOL)
 	@grep -Fq 'P3.1 produces no experimental result' $(GEMM_P31_PROTOCOL)
 	@grep -Fq 'non-persistent' $(GEMM_P31_PROTOCOL)
@@ -986,6 +1046,87 @@ check-static:
 	@echo "    utilization, winner labels, Nsight Compute, autotuning, and campaign trees"
 	@echo "    lives in $(GEMM_P33_CHECKER), which scans Python NAME tokens so that prose"
 	@echo "    explaining what P3.3 does NOT compute stays legal while code does not)"
+	@echo "== P3.4 files present, executable, and still vendoring no NVIDIA GEMM source =="
+	@test -f $(GEMM_P34_WRAPPER)
+	@test -f $(GEMM_P34_CHECKER)
+	@test -f $(GEMM_P34_PROTOCOL)
+	@test -x $(GEMM_P34_WRAPPER)
+	@test -x $(GEMM_P34_CHECKER)
+	@! grep -nE '^(import|from|def|class) ' $(GEMM_P34_PROTOCOL)
+	@echo "== P3.4 python syntax, GPU-free self-tests, and the full contract check =="
+	python3 -m py_compile $(GEMM_P34_WRAPPER) $(GEMM_P34_CHECKER)
+	python3 $(GEMM_P34_WRAPPER) --self-test
+	python3 $(GEMM_P34_CHECKER) --self-test
+	python3 $(GEMM_P34_CHECKER) .
+	@rm -rf src/gemm/__pycache__ scripts/__pycache__
+	@echo "== P3.4 frozen single shape and scientific contract cannot silently change =="
+	@grep -Eq '^FROZEN_M = 4096$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^FROZEN_N = 4096$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^FROZEN_K = 4096$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^FROZEN_L = 1$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^FROZEN_AB_DTYPE = "BFloat16"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^FROZEN_ACC_DTYPE = "Float32"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^FROZEN_C_DTYPE = "Float32"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^FROZEN_A_MAJOR = "k"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^FROZEN_B_MAJOR = "k"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^FROZEN_C_MAJOR = "n"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^FROZEN_USE_TMA_STORE = True$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^FROZEN_SEED = 1111$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^SCHEMA_VERSION = "p34.v1"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^RUN_KIND = "smoke"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^METHOD = "cutedsl"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^REFERENCE = "torch_cuda_fp32_ieee"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^CACHE_MODE = "hot"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^PUBLISHABLE = "false"$$' $(GEMM_P34_WRAPPER)
+	@echo "== P3.4 declares exactly the three frozen variants, with the frozen geometry =="
+	@grep -Eq '^VARIANT_NONPERSISTENT_1CTA = "nonpersistent_1cta"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^VARIANT_PERSISTENT_1CTA = "persistent_1cta"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^VARIANT_PERSISTENT_2CTA = "persistent_2cta"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^SCHEDULER_NONPERSISTENT = "nonpersistent"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^SCHEDULER_STATIC_PERSISTENT = "static_persistent"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^UPSTREAM_CLASS_NONPERSISTENT = "DenseGemmKernel"$$' $(GEMM_P34_WRAPPER)
+	@grep -Eq '^UPSTREAM_CLASS_PERSISTENT = "PersistentDenseGemmKernel"$$' $(GEMM_P34_WRAPPER)
+	@grep -Fq '"mma_tiler_mn": (128, 128),' $(GEMM_P34_WRAPPER)
+	@grep -Fq '"mma_tiler_mn": (256, 128),' $(GEMM_P34_WRAPPER)
+	@grep -Fq '"cluster_shape_mn": (2, 1),' $(GEMM_P34_WRAPPER)
+	@echo "   (the exact per-variant class/scheduler/tiler/cluster/2-CTA mapping and the"
+	@echo "    256/2=128 per-CTA M extent are enforced structurally by $(GEMM_P34_CHECKER))"
+	@echo "== P3.4 pins the second official source in PHASE3_VERSIONS.env, not VERSIONS.env =="
+	@grep -Eq '^CUTEDSL_P34_PERSISTENT_EXAMPLE_PATH=' PHASE3_VERSIONS.env
+	@grep -Eq '^CUTEDSL_P34_PERSISTENT_EXAMPLE_GIT_BLOB=[0-9a-f]{40}$$' PHASE3_VERSIONS.env
+	@grep -Eq '^CUTEDSL_P34_PERSISTENT_EXAMPLE_SHA256=[0-9a-f]{64}$$' PHASE3_VERSIONS.env
+	@grep -Fq 'dense_gemm_persistent.py' PHASE3_VERSIONS.env
+	@! grep -nE '^CUTEDSL_P3[0-9]' VERSIONS.env
+	@echo "== P3.4 exposes no frozen scientific parameter and can never skip correctness =="
+	@pat='--mnkl|--shape|--variant|--scheduler|--persistent|--nonpersistent'; \
+	pat="$$pat|--mma_tiler|--mma-tiler|--cluster_shape|--cluster-shape|--use_2cta|--use-2cta"; \
+	pat="$$pat|--ab_dtype|--c_dtype|--acc_dtype|--a_major|--b_major|--c_major"; \
+	pat="$$pat|--use_tma_store|--use-tma-store|--seed|--tolerance|--atol|--rtol"; \
+	pat="$$pat|--skip-ref""-check|--skip_ref""_check|--use_cold""_l2|--example|--source-path"; \
+	! grep -nE -- "$$pat" $(GEMM_P34_WRAPPER)
+	@echo "   (the checker names those spellings on purpose, in order to ban them)"
+	@echo "== P3.4 writes no result file and creates no campaign directory =="
+	@! grep -nE 'results/raw|results/preflight' $(GEMM_P34_WRAPPER)
+	@echo "== P3.4 reuses the audited launcher and never invokes Docker for GPU work =="
+	@grep -Eq '^gemm-cutedsl-p34-smoke:$$' Makefile
+	@grep -Fq 'scripts/run_container.sh' Makefile
+	@echo "== P3.4 GPU-free gate actually executes the existing P3.3 gate =="
+	@grep -Eq '^gemm-cutedsl-p34-check: gemm-cublaslt-p33-check$$' Makefile
+	@echo "== P3.4 smoke runs exactly the frozen non-publishable iteration counts =="
+	@grep -Fq -- '--warmup-iterations 2 \' Makefile
+	@grep -Fq -- '--iterations 10' Makefile
+	@echo "== truthful P3.4 status assertions =="
+	@grep -Fq 'P3.4 | Three execution variants | YES | NO | NO |' PLAN.md
+	@grep -Fq 'P3.4 = YES / NO / NO' $(GEMM_P34_PROTOCOL)
+	@grep -Fq 'P3.4 creates no publishable performance result' $(GEMM_P34_PROTOCOL)
+	@grep -Fq 'P3.4 (three execution variants)' README.md
+	@! grep -nF 'P3.4 | Three execution variants | NO | NO | NO |' PLAN.md
+	@! grep -nF 'P3.4 | Three execution variants | YES | YES | NO |' PLAN.md
+	@! grep -nF 'P3.4 | Three execution variants | YES | NO | YES |' PLAN.md
+	@! grep -nF 'P3.4 | Three execution variants | YES | YES | YES |' PLAN.md
+	@echo "== P3.4 introduces no P3.5 functionality, no comparison, and no extra shape =="
+	@grep -Fq 'P3.5 | Five shapes and comparison | NO | NO | NO |' PLAN.md
+	@! grep -nE '^(P35)_' $(GEMM_P34_WRAPPER)
 	@echo "check-static: OK"
 
 build-image:
@@ -2122,6 +2263,199 @@ gemm-cublaslt-p33-smoke:
 	else \
 		echo "P3.3 smoke FAILED with exit status $$status: no CSV header and no CSV row" >&2; \
 		echo "were emitted, and no result may be read from this run." >&2; \
+	fi; \
+	echo "==============================================================================" >&2; \
+	exit $$status
+
+# --- P3.4: three CuTe DSL execution variants ---------------------------------
+# P3.2 established one CuTe DSL execution variant at the first final shape and
+# P3.3 established the cuBLASLt baseline for the same geometry. P3.4 adds the
+# two remaining execution variants the plan froze, so all three exist under one
+# identical operand set, one identical correctness oracle, and one identical
+# timing discipline:
+#
+#   nonpersistent_1cta   DenseGemmKernel            tiler (128,128) cluster (1,1)
+#   persistent_1cta      PersistentDenseGemmKernel  tiler (128,128) cluster (1,1)
+#   persistent_2cta      PersistentDenseGemmKernel  tiler (256,128) cluster (2,1)
+#
+# The 2-CTA row deliberately uses an M tile of 256 so each of the two
+# participating CTAs keeps a local M extent of 128 -- the same two-SM geometry
+# P2.2 measured, and the shape NVIDIA's own persistent example documents for
+# use_2cta_instrs=True. No other tiler or cluster is ever substituted.
+#
+# This repository still owns no GEMM kernel. The non-persistent variant keeps
+# using P3.1's pinned example and the two persistent variants use the official
+# static-persistent example from the SAME pinned CUTLASS commit, both loaded
+# read-only and in place from /opt/cutlass after their commit, blob, and
+# SHA-256 are verified. Neither upstream run() is ever called and neither
+# upstream benchmarking helper is used: P3.4 owns every timer. The only new
+# pins are the three CUTEDSL_P34_* keys in PHASE3_VERSIONS.env; VERSIONS.env,
+# the Dockerfile, and every closed P3.1/P3.2/P3.3 interface are untouched.
+#
+# P3.4 introduces no additional shape, no autotuning, no fourth candidate, no
+# ranking, no TFLOP/s, no cuBLASLt execution or comparison, no campaign
+# directory, and no result file. Comparing the three variants against each
+# other or against P3.3 is P3.5's job. See src/gemm/P3_4_PROTOCOL.md.
+#
+# gemm-cutedsl-p34-check never touches a GPU, the network, or elevated
+# privileges. It runs the existing P3.3 gate first (which itself runs the P3.2
+# and P3.1 gates, all GPU-free and network-free, and all left completely
+# intact), then runs inside the pinned image with --network none, --cap-drop
+# ALL, no-new-privileges, the invoking UID/GID, no --gpus, and the repository
+# mounted READ-ONLY, with PYTHONPYCACHEPREFIX and every temporary file under the
+# container's own /tmp.
+#
+# gemm-cutedsl-p34-smoke is the only P3.4 target that executes on GPU. Its
+# first recipe line validates BLACKWELL_GPU_INDEX before Docker, any build, or
+# any check can start, which is why it deliberately has no Make prerequisite
+# (same audited reasoning as the P3.1/P3.2/P3.3 smoke targets). It then goes
+# exclusively through scripts/run_container.sh, which alone owns GPU selection,
+# UUID resolution, and the idle-device proof.
+
+gemm-cutedsl-p34-check: gemm-cublaslt-p33-check
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-e TMPDIR=/tmp \
+		-e PYTHONPYCACHEPREFIX=/tmp/p34-pycache \
+		-e CUTLASS_COMMIT="$(CUTLASS_COMMIT)" \
+		-e CUTEDSL_VERSION="$(CUTEDSL_VERSION)" \
+		-e PYTORCH_VERSION="$(PYTORCH_VERSION)" \
+		-e PYTORCH_CUDA_VERSION="$(PYTORCH_CUDA_VERSION)" \
+		-e CUDA_PYTHON_VERSION="$(CUDA_PYTHON_VERSION)" \
+		-e CUDA_BINDINGS_VERSION="$(CUDA_BINDINGS_VERSION)" \
+		-e P31_EXAMPLE="$(GEMM_P31_EXAMPLE)" \
+		-e P31_EXAMPLE_GIT_BLOB="$(CUTEDSL_P31_EXAMPLE_GIT_BLOB)" \
+		-e P31_EXAMPLE_SHA256="$(CUTEDSL_P31_EXAMPLE_SHA256)" \
+		-e P34_EXAMPLE="$(GEMM_P34_PERSISTENT_EXAMPLE)" \
+		-e P34_EXAMPLE_GIT_BLOB="$(CUTEDSL_P34_PERSISTENT_EXAMPLE_GIT_BLOB)" \
+		-e P34_EXAMPLE_SHA256="$(CUTEDSL_P34_PERSISTENT_EXAMPLE_SHA256)" \
+		-e P34_WRAPPER="$(GEMM_P34_WRAPPER)" \
+		-e P34_CHECKER="$(GEMM_P34_CHECKER)" \
+		-v "$(CURDIR):/workspace:ro" \
+		-w /workspace \
+		"$(IMAGE_TAG)" \
+		bash -c 'set -euo pipefail; \
+			fail() { echo "gemm-cutedsl-p34-check: FAIL: $$*" >&2; exit 1; }; \
+			echo "== the pinned CUTLASS checkout =="; \
+			[ -d /opt/cutlass ] || fail "/opt/cutlass is missing"; \
+			head_commit="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass rev-parse HEAD)" \
+				|| fail "cannot read the /opt/cutlass HEAD commit"; \
+			[ "$$head_commit" = "$$CUTLASS_COMMIT" ] \
+				|| fail "/opt/cutlass HEAD $$head_commit != pinned $$CUTLASS_COMMIT"; \
+			dirty="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass status --porcelain --untracked-files=all)" \
+				|| fail "cannot read the /opt/cutlass working tree status"; \
+			[ -z "$$dirty" ] || fail "/opt/cutlass has tracked or untracked modifications"; \
+			echo "checkout OK: commit $$head_commit"; \
+			echo "== BOTH pinned official sources, verified independently =="; \
+			for pair in "$$P31_EXAMPLE|$$P31_EXAMPLE_GIT_BLOB|$$P31_EXAMPLE_SHA256" \
+					"$$P34_EXAMPLE|$$P34_EXAMPLE_GIT_BLOB|$$P34_EXAMPLE_SHA256"; do \
+				file="$${pair%%|*}"; rest="$${pair#*|}"; \
+				want_blob="$${rest%%|*}"; want_sha="$${rest#*|}"; \
+				[ ! -L "$$file" ] || fail "$$file is a symlink"; \
+				[ -f "$$file" ] || fail "$$file is not a regular file"; \
+				blob="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass hash-object -- "$$file")" \
+					|| fail "cannot compute the Git blob SHA of $$file"; \
+				[ "$$blob" = "$$want_blob" ] \
+					|| fail "$$file Git blob $$blob != pinned $$want_blob"; \
+				sha="$$(sha256sum "$$file" | cut -d" " -f1)" \
+					|| fail "cannot compute the SHA-256 of $$file"; \
+				[ "$$sha" = "$$want_sha" ] \
+					|| fail "$$file SHA-256 $$sha != pinned $$want_sha"; \
+				echo "source OK: $$file"; \
+				echo "           blob   $$blob"; \
+				echo "           sha256 $$sha"; \
+			done; \
+			[ "$$P31_EXAMPLE" != "$$P34_EXAMPLE" ] \
+				|| fail "the two pinned sources are the same file"; \
+			echo "== the persistent source really carries the official static persistent path =="; \
+			grep -q "StaticPersistentTileScheduler" "$$P34_EXAMPLE" \
+				|| fail "the pinned persistent example has no StaticPersistentTileScheduler"; \
+			grep -q "CtaGroup.TWO" "$$P34_EXAMPLE" \
+				|| fail "the pinned persistent example has no CtaGroup.TWO selection path"; \
+			grep -q "class PersistentDenseGemmKernel" "$$P34_EXAMPLE" \
+				|| fail "the pinned persistent example does not define PersistentDenseGemmKernel"; \
+			grep -q "class DenseGemmKernel" "$$P31_EXAMPLE" \
+				|| fail "the pinned non-persistent example does not define DenseGemmKernel"; \
+			echo "persistent scheduler and 2-CTA selection paths present"; \
+			python3 -c "import os, cutlass, torch; \
+				ce = os.environ[\"CUTEDSL_VERSION\"]; \
+				assert cutlass.__version__ == ce, f\"CuTeDSL {cutlass.__version__} != pinned {ce}\"; \
+				pe = os.environ[\"PYTORCH_VERSION\"]; \
+				assert torch.__version__ == pe, f\"torch {torch.__version__} != pinned {pe}\"; \
+				pc = os.environ[\"PYTORCH_CUDA_VERSION\"]; \
+				assert torch.version.cuda == pc, f\"torch CUDA {torch.version.cuda} != pinned {pc}\"; \
+				print(\"versions OK: cutedsl\", ce, \"torch\", pe, \"torch-cuda\", pc)"; \
+			python3 -c "import os; from importlib.metadata import version; \
+				expected = {\"cuda-python\": os.environ[\"CUDA_PYTHON_VERSION\"], \
+					\"cuda-bindings\": os.environ[\"CUDA_BINDINGS_VERSION\"]}; \
+				installed = {name: version(name) for name in expected}; \
+				assert installed == expected, f\"installed distributions {installed} != pinned {expected}\"; \
+				print(\"cuda distributions OK:\", installed)"; \
+			echo "== pip check: the dependency graph must be consistent =="; \
+			python3 -m pip check; \
+			echo "== P3.4 python syntax =="; \
+			python3 -m py_compile "$$P34_WRAPPER" "$$P34_CHECKER"; \
+			echo "== P3.4 wrapper --help and --self-test are GPU-free =="; \
+			python3 "$$P34_WRAPPER" --help > /dev/null \
+				|| fail "the wrapper --help did not exit successfully"; \
+			python3 "$$P34_WRAPPER" --self-test \
+				|| fail "the wrapper GPU-free self-test failed"; \
+			echo "== P3.4 checker self-test and full frozen-contract check =="; \
+			python3 "$$P34_CHECKER" --self-test \
+				|| fail "the checker self-test failed"; \
+			python3 "$$P34_CHECKER" /workspace \
+				|| fail "the P3.4 frozen-contract check failed"; \
+			echo "P3.4 GPU-free contract OK (no GPU was used or required)"'
+	@echo "gemm-cutedsl-p34-check: OK"
+
+gemm-cutedsl-p34-smoke:
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index." >&2; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make gemm-cutedsl-p34-smoke" >&2; \
+		echo "       This project never selects a GPU automatically." >&2; \
+		exit 2; \
+	fi
+	@case "$${BLACKWELL_GPU_INDEX}" in \
+		'' | *[!0-9]*) \
+			echo "ERROR: BLACKWELL_GPU_INDEX must be a non-negative integer, got '$${BLACKWELL_GPU_INDEX}'." >&2; \
+			exit 2; ;; \
+	esac
+	@status=0; \
+	RUN_CONTAINER_STDOUT_IS_DATA=1 scripts/run_container.sh bash -c 'set -euo pipefail; \
+		head_commit="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass rev-parse HEAD)"; \
+		[ "$$head_commit" = "$(CUTLASS_COMMIT)" ] \
+			|| { echo "gemm-cutedsl-p34-smoke: FAIL: /opt/cutlass HEAD $$head_commit != pinned $(CUTLASS_COMMIT)" >&2; exit 1; }; \
+		sha_nonpersistent="$$(sha256sum "$(GEMM_P31_EXAMPLE)" | cut -d" " -f1)"; \
+		[ "$$sha_nonpersistent" = "$(CUTEDSL_P31_EXAMPLE_SHA256)" ] \
+			|| { echo "gemm-cutedsl-p34-smoke: FAIL: non-persistent SHA-256 $$sha_nonpersistent != pinned $(CUTEDSL_P31_EXAMPLE_SHA256)" >&2; exit 1; }; \
+		sha_persistent="$$(sha256sum "$(GEMM_P34_PERSISTENT_EXAMPLE)" | cut -d" " -f1)"; \
+		[ "$$sha_persistent" = "$(CUTEDSL_P34_PERSISTENT_EXAMPLE_SHA256)" ] \
+			|| { echo "gemm-cutedsl-p34-smoke: FAIL: persistent SHA-256 $$sha_persistent != pinned $(CUTEDSL_P34_PERSISTENT_EXAMPLE_SHA256)" >&2; exit 1; }; \
+		echo "gemm-cutedsl-p34-smoke: both upstream sources re-checked in this GPU container:" >&2; \
+		echo "gemm-cutedsl-p34-smoke:   commit          $$head_commit" >&2; \
+		echo "gemm-cutedsl-p34-smoke:   non-persistent  $$sha_nonpersistent" >&2; \
+		echo "gemm-cutedsl-p34-smoke:   persistent      $$sha_persistent" >&2; \
+		exec python3 $(GEMM_P34_WRAPPER) \
+			--warmup-iterations 2 \
+			--iterations 10' || status=$$?; \
+	echo "==============================================================================" >&2; \
+	echo "P3.4 FUNCTIONAL VERIFICATION ONLY -- NOT AN EXPERIMENTAL RESULT." >&2; \
+	echo "Any CSV on stdout is P3.4 infrastructure evidence: three frozen execution" >&2; \
+	echo "variants at ONE frozen shape, (M,N,K,L)=(4096,4096,4096,1), 2 warm-ups and 10" >&2; \
+	echo "measured launches each, with hot reused operands. ALL TIMINGS ARE" >&2; \
+	echo "NON-PUBLISHABLE diagnostic fields; every row carries publishable=false." >&2; \
+	echo "P3.4 computes no TFLOP/s, no speedup, no efficiency, and no ranking, and NO" >&2; \
+	echo "variant-versus-variant or CuTe-versus-cuBLASLt COMPARISON has been performed." >&2; \
+	echo "That comparison is P3.5 and does not exist." >&2; \
+	if [ "$$status" -eq 0 ]; then \
+		echo "P3.4 smoke completed: every variant passed correctness before its warm-up and steady-state timing." >&2; \
+	else \
+		echo "P3.4 smoke FAILED with exit status $$status: no CSV header and no CSV row" >&2; \
+		echo "were emitted for ANY variant, and no result may be read from this run." >&2; \
 	fi; \
 	echo "==============================================================================" >&2; \
 	exit $$status
