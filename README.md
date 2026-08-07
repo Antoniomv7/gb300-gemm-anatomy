@@ -28,9 +28,9 @@ exact pinned official NVIDIA example unchanged; publishable results: NONE;
 P3.1: CLOSED`. `P3.2 (one-shape CuTe DSL wrapper) — implemented;
 independently audited: YES; verified on GB300: YES; complete-result
 correctness: PASS; publishable results: NONE; P3.2: CLOSED. P3.3 (cuBLASLt
-baseline) — implemented; independently audited: NO; verified on GB300: NO;
-publishable results: NONE; no CuTe-versus-cuBLASLt comparison exists.
-P3.4–P3.5: not implemented.`**
+baseline) — implemented; independently audited: YES; verified on GB300: YES;
+complete-result correctness: PASS; publishable results: NONE; P3.3: CLOSED;
+no CuTe-versus-cuBLASLt comparison exists. P3.4–P3.5: not implemented.`**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -304,10 +304,11 @@ checks at `OK`. The empirical per-SM ceiling candidate is
 NCU did not resolve the SM-count metric. Every artifact remains
 `publishable: false` unconditionally. P2.4 and Phase 2 are closed.
 
-## Phase 3 status: P3.1 and P3.2 closed; P3.3 implemented, audit and GB300 pending
+## Phase 3 status: P3.1–P3.3 closed; P3.4 next
 
-Phase 2 is closed and the Phase 3 gate has passed. With P3.1 and P3.2 closed,
-work may proceed to P3.3.
+Phase 2 is closed and the Phase 3 gate has passed. With P3.1, P3.2, and P3.3
+closed, work may proceed to P3.4. Phase 3 itself remains in progress because
+P3.4 and P3.5 are not implemented.
 
 P3.1, the pinned official CuTe DSL example, is implemented. It executes one
 exact, unmodified, official NVIDIA example — `NVIDIA/cutlass` v4.6.1, commit
@@ -499,12 +500,11 @@ BLACKWELL_GPU_INDEX=<physical-index> make gemm-cutedsl-p32-smoke
 See `src/gemm/P3_2_PROTOCOL.md` for the frozen protocol, the exact CSV schema,
 and the verification commands.
 
-### P3.3 (cuBLASLt baseline) — implemented; audit and GB300 verification pending
+### P3.3 (cuBLASLt baseline) — closed (`YES / YES / YES`)
 
-**P3.3 is implemented. Its independent audit is pending, and its verification
-on GB300 is pending: `make gemm-cublaslt-p33-smoke` has never been run, so no
-P3.3 GPU result of any kind exists. There is no CuTe-versus-cuBLASLt
-performance comparison anywhere in this repository, and no publishable result.**
+**P3.3 is implemented, independently audited, and functionally verified on
+GB300.** It is closed as `YES / YES / YES` without creating a publishable
+result or a CuTe-versus-cuBLASLt performance comparison.
 
 P3.3 is the vendor-library counterpart of P3.2: the same frozen BF16 geometry,
 `(M,N,K,L) = (4096,4096,4096,1)` computing `C = A × Bᵀ` with FP32 accumulation,
@@ -571,7 +571,9 @@ make gemm-cublaslt-p33-check  # GPU-free, network-free, unprivileged. Runs the
                               # read-only and no GPU exposed.
 
 BLACKWELL_GPU_INDEX=<physical-index> make gemm-cublaslt-p33-smoke
-                              # The only P3.3 GPU target, and NOT YET RUN.
+                              # The only P3.3 GPU target. Verified on B300 on
+                              # 7 August 2026; every rerun still requires an
+                              # explicitly selected idle physical GPU.
                               # Validates the index first, runs exclusively
                               # through scripts/run_container.sh, compiles the
                               # bridge and re-checks the upstream commit and
@@ -579,6 +581,35 @@ BLACKWELL_GPU_INDEX=<physical-index> make gemm-cublaslt-p33-smoke
                               # the frozen configuration with 2 warm-ups and
                               # 10 measured launches.
 ```
+
+The first independent audit of implementation commit
+`bb66e3275d2f5bf1addbd14c84596b1edede977f` found two blockers. The wrapper
+rejected the valid cuBLASLt `split_k=0` value and read `SPLITK_NUM` with a
+signed width instead of the documented `uint32_t`; separately, an obsolete
+P3.2 status assertion caused `make check-static` to fail. Remediation commit
+`1c3ade8a39ae1e19882514e2b06094a418eb70bf` fixed both findings, added
+adversarial regression coverage, and corrected the associated stale P3.2
+documentation. The remediated tree passed `make check-static`, the audit
+findings were rechecked with no remaining blocker, and the operator confirmed
+that the Docker-backed `make gemm-cublaslt-p33-check` gate passed on the same
+clean commit.
+
+Fresh preflight campaign `20260807T144123Z` then reported `OVERALL=PASS` on
+physical GPU index `7`, UUID `GPU-40e00845-d89c-1393-2c32-a2dca3ee9442`, an
+NVIDIA B300 SXM6 AC with compute capability 10.3 and driver 610.43.02. An
+initial invocation with an unset GPU-index variable exited with status 2 before
+using a GPU, demonstrating the fail-closed launcher path; it is not the smoke
+evidence. The valid rerun with `BLACKWELL_GPU_INDEX=7` executed clean commit
+`1c3ade8a39ae1e19882514e2b06094a418eb70bf`, revalidated the upstream
+CUTLASS provenance, compiled the bridge in the selected GPU container, called
+`cublasLtMatmul` directly, and passed complete-result correctness with
+`max_abs_error=0.0` and `max_rel_error=0.0`. The heuristic returned eight
+supported entries from 32 requested and selected index 0 (`algo_id=66`,
+`tile_id=23`, `stages_id=35`, `split_k=1`, workspace 0 bytes). The frozen two
+warm-ups and ten measured launches completed, and stdout contained exactly one
+77-field `p33.v1` row with `git_dirty=false` and `publishable=false`. Its three
+finite positive timing fields are non-publishable diagnostics, not an
+experimental result.
 
 **Every emitted row carries `publishable=false`.** No TFLOP/s, speedup,
 efficiency, utilization, bandwidth, or winner label is computed anywhere, no
@@ -737,9 +768,10 @@ candidate described above, so the Phase 2 gate has passed and Phase 3 has
 begun. Of experiment 3, P3.1 (executing the pinned official NVIDIA CuTe DSL
 example unchanged) is implemented, independently audited, and functionally
 verified on GB300; P3.2 (the frozen one-shape wrapper) is likewise implemented,
-independently audited, and functionally verified on GB300. Both units are
-closed. P3.3 (the equivalent cuBLASLt baseline) is implemented but is not
-independently audited or verified on GB300. P3.4–P3.5 do not exist yet.
+independently audited, and functionally verified on GB300. P3.3 (the equivalent
+cuBLASLt baseline) is also implemented, independently audited, and functionally
+verified on GB300. All three units are closed; P3.4–P3.5 do not exist yet, so
+Phase 3 remains in progress.
 The repository still contains no
 publishable bandwidth, throughput, GEMM-performance, or cuBLASLt-comparison
 result. The pinned CUDA 13.1, CUTLASS v4.6.1, and `sm_103a` contract in

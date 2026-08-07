@@ -1,9 +1,10 @@
 # P3.3 — Equivalent cuBLASLt BF16 GEMM baseline (frozen protocol)
 
-Status: `P3.3 = YES / NO / NO` (Implemented / Audited / Verified on GB300).
-The author's own GPU-free checks are **not** an independent audit, and no
-GB300 execution of this unit has happened yet. Section 13 records exactly what
-was and was not run.
+Status: `P3.3 = YES / YES / YES` (Implemented / Audited / Verified on GB300).
+P3.3 is independently audited and verified on GB300. The author's own GPU-free
+checks are **not** the independent audit. The audit, remediation, Docker-backed
+gate, and successful GB300 functional verification are recorded separately in
+section 13. P3.3 is closed without creating a publishable performance result.
 
 ## 1. Objective
 
@@ -476,7 +477,7 @@ already exists and P3.3 only opts into it.
 
 ## 13. What was and was not run
 
-### 13.1 GPU-free checks performed by the author
+### 13.1 GPU-free checks and independent audit
 
 All of the following were executed on the development host and passed:
 
@@ -495,29 +496,64 @@ The bridge was additionally compiled inside the pinned image with the pinned
 toolchain, and its ELF symbols were inspected, as part of
 `make gemm-cublaslt-p33-check`.
 
-**These are the author's own self-checks. They are not an independent audit.**
+**These commands are the author's own self-checks. By themselves, they are not
+an independent audit.**
 
-### 13.2 GB300 commands not yet performed
+An independent audit of implementation commit
+`bb66e3275d2f5bf1addbd14c84596b1edede977f` found two blockers:
 
-Neither of the following has been run, and no P3.3 GPU result of any kind
-exists:
+1. the wrapper and schema rejected the valid cuBLASLt `split_k=0` value, and
+   the bridge read `CUBLASLT_ALGO_CONFIG_SPLITK_NUM` as `int32_t` instead of
+   the API's documented `uint32_t`;
+2. an obsolete P3.2 status assertion in `Makefile` made the repository-wide
+   `make check-static` gate fail.
+
+Remediation commit `1c3ade8a39ae1e19882514e2b06094a418eb70bf` accepts zero as
+the disabled split-K case while still rejecting negative wrapper metadata,
+uses the correct unsigned width, adds adversarial regression coverage, updates
+the status assertion, and removes the associated stale P3.2 documentary
+statement. The remediated tree passed the wrapper and checker self-tests,
+`git diff --check`, and `make check-static`. Both audit findings were then
+rechecked with no remaining blocker. The operator subsequently confirmed that
+the full Docker-backed `make gemm-cublaslt-p33-check` gate passed on the same
+clean commit, including compilation for `sm_103a` and ELF-symbol inspection.
+
+### 13.2 GB300 verification performed 7 August 2026
+
+The following sequence was executed with the explicitly selected physical GPU
+index `7`; the project did not select a GPU automatically:
 
 ```bash
 BLACKWELL_GPU_INDEX=<operator-supplied-index> make preflight
 BLACKWELL_GPU_INDEX=<operator-supplied-index> make gemm-cublaslt-p33-smoke
 ```
 
-Consequently the following remain unproven on hardware and must be treated as
-open until an explicitly authorized GB300 run closes them:
+Fresh preflight campaign `20260807T144123Z` reported `OVERALL=PASS` on an
+NVIDIA B300 SXM6 AC, UUID `GPU-40e00845-d89c-1393-2c32-a2dca3ee9442`, compute
+capability 10.3, driver 610.43.02. Before the valid smoke, one invocation used
+an unset shell variable for the required index; the target exited with status
+2 before exposing or using any GPU and emitted no CSV. That fail-closed attempt
+is not the verification evidence.
 
-* that `cublasLtMatmulAlgoGetHeuristic` returns at least one supported
-  algorithm for this exact row-major BF16 descriptor contract on `sm_103a`
-  (P3.3 fails closed with a diagnostic and emits no CSV if it does not, and
-  never retries with a different layout, type, compute mode, or API);
-* the actual selected-algorithm metadata, workspace requirement, waves count,
-  and pointer alignments;
-* that correctness passes against the untimed IEEE-FP32 oracle;
-* the three timings.
+The valid rerun used `BLACKWELL_GPU_INDEX=7` and clean repository commit
+`1c3ade8a39ae1e19882514e2b06094a418eb70bf`. It revalidated CUTLASS commit
+`e05f953a5b3d38adc240df2ff928e0421c2abba3` and upstream SHA-256
+`f99bc4cc1e0aea8990e2929d7c703dfc8196d797b7c9f5a889eabcd3c4ff67ec`,
+compiled the bridge inside the selected GPU container, and executed the direct
+`cublasLtMatmul` path. The cuBLASLt runtime version was `130200`. The heuristic
+returned eight supported entries from 32 requested and selected index 0 with
+`algo_id=66`, `tile_id=23`, `stages_id=35`, `split_k=1`, reduction scheme 0,
+CTA swizzling 0, custom option 3, inner-shape ID 0, cluster-shape ID 6,
+`waves_count=3.459460`, zero required workspace, and 256-byte alignment for all
+four pointers.
+
+The complete result passed the untimed IEEE-FP32 oracle with
+`max_abs_error=0.0` and `max_rel_error=0.0` before the frozen two warm-ups and
+ten measured launches. Stdout contained exactly one header and one 77-field
+`p33.v1` row; it recorded `git_dirty=false`, `publishable=false`, and three
+finite positive diagnostic timings. No result file or campaign directory was
+created. These timings are functional evidence only and make no performance
+claim. P3.3 is therefore closed as `YES / YES / YES`.
 
 ### 13.3 Separation from P3.4, P3.5, and Phase 4
 

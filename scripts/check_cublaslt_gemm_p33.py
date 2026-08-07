@@ -1423,16 +1423,16 @@ def parse_env_file(path) -> dict:
 def validate_status_documents(plan_text, protocol_text, readme_text) -> list:
     """Require truthful, non-overstated P3.3 status claims."""
     errors = []
-    if "P3.3 | cuBLASLt baseline | YES | NO | NO |" not in plan_text:
-        errors.append("PLAN.md does not record P3.3 as YES / NO / NO")
-    for overstated in (
-        "P3.3 | cuBLASLt baseline | YES | YES | YES |",
+    if "P3.3 | cuBLASLt baseline | YES | YES | YES |" not in plan_text:
+        errors.append("PLAN.md does not record P3.3 as YES / YES / YES")
+    for stale in (
         "P3.3 | cuBLASLt baseline | YES | YES | NO |",
         "P3.3 | cuBLASLt baseline | YES | NO | YES |",
+        "P3.3 | cuBLASLt baseline | YES | NO | NO |",
         "P3.3 | cuBLASLt baseline | NO | NO | NO |",
     ):
-        if overstated in plan_text:
-            errors.append(f"PLAN.md records an untruthful P3.3 status: {overstated!r}")
+        if stale in plan_text:
+            errors.append(f"PLAN.md records a stale P3.3 status: {stale!r}")
     for later in (
         "P3.4 | Three execution variants | NO | NO | NO |",
         "P3.5 | Five shapes and comparison | NO | NO | NO |",
@@ -1440,22 +1440,19 @@ def validate_status_documents(plan_text, protocol_text, readme_text) -> list:
         if later not in plan_text:
             errors.append(f"PLAN.md no longer records {later!r}")
 
-    if "P3.3 = YES / NO / NO" not in protocol_text:
-        errors.append(f"{PROTOCOL_RELATIVE_PATH} does not state P3.3 = YES / NO / NO")
+    if "P3.3 = YES / YES / YES" not in protocol_text:
+        errors.append(f"{PROTOCOL_RELATIVE_PATH} does not state P3.3 = YES / YES / YES")
     if "P3.3 creates no publishable performance result" not in protocol_text:
         errors.append(
             f"{PROTOCOL_RELATIVE_PATH} does not state that P3.3 creates no publishable result"
         )
-    for forbidden in ("independently audited", "verified on GB300"):
-        for line in protocol_text.splitlines():
-            stripped = line.strip().lower()
-            if forbidden in stripped and "not" not in stripped and "pending" not in stripped:
-                errors.append(
-                    f"{PROTOCOL_RELATIVE_PATH} claims {forbidden!r} without qualification: "
-                    f"{line.strip()[:80]!r}"
-                )
-    if "P3.3 (cuBLASLt baseline)" not in readme_text:
-        errors.append("README.md does not describe P3.3")
+    for required in ("independently audited", "verified on GB300"):
+        if required.lower() not in protocol_text.lower():
+            errors.append(
+                f"{PROTOCOL_RELATIVE_PATH} does not record that P3.3 is {required}"
+            )
+    if "P3.3: CLOSED" not in readme_text:
+        errors.append("README.md does not record P3.3 as CLOSED")
     return errors
 
 
@@ -2274,25 +2271,25 @@ def run_self_test() -> int:
 
     # Status documents.
     good_plan = (
-        "| P3.3 | cuBLASLt baseline | YES | NO | NO |\n"
+        "| P3.3 | cuBLASLt baseline | YES | YES | YES |\n"
         "| P3.4 | Three execution variants | NO | NO | NO |\n"
         "| P3.5 | Five shapes and comparison | NO | NO | NO |\n"
     )
     good_protocol = (
-        "Status: `P3.3 = YES / NO / NO`.\n"
+        "Status: `P3.3 = YES / YES / YES`.\n"
         "P3.3 creates no publishable performance result.\n"
-        "An independent audit is pending and this unit is not verified on GB300.\n"
+        "P3.3 is independently audited and verified on GB300.\n"
     )
-    good_readme = "P3.3 (cuBLASLt baseline) is implemented; audit pending.\n"
+    good_readme = "P3.3 (cuBLASLt baseline); P3.3: CLOSED.\n"
     check("truthful status documents are accepted",
           validate_status_documents(good_plan, good_protocol, good_readme) == [],
           str(validate_status_documents(good_plan, good_protocol, good_readme)))
-    rejects("an overstated PLAN.md status is rejected",
+    rejects("a stale PLAN.md status is rejected",
             validate_status_documents(
-                good_plan.replace("YES | NO | NO", "YES | YES | YES"),
-                good_protocol, good_readme), "untruthful")
+                good_plan.replace("YES | YES | YES", "YES | NO | NO"),
+                good_protocol, good_readme), "stale")
     rejects("a PLAN.md that never records P3.3 is rejected",
-            validate_status_documents("", good_protocol, good_readme), "YES / NO / NO")
+            validate_status_documents("", good_protocol, good_readme), "YES / YES / YES")
     rejects("a protocol without the non-publishable statement is rejected",
             validate_status_documents(
                 good_plan,

@@ -279,7 +279,7 @@ independently audited, and verified on GB300. Phase 3 is in progress.
 |------|-------------|-------------|---------|-------------------|
 | P3.1 | Pinned official CuTe DSL example | YES | YES | YES |
 | P3.2 | One-shape wrapper | YES | YES | YES |
-| P3.3 | cuBLASLt baseline | YES | NO | NO |
+| P3.3 | cuBLASLt baseline | YES | YES | YES |
 | P3.4 | Three execution variants | NO | NO | NO |
 | P3.5 | Five shapes and comparison | NO | NO | NO |
 
@@ -413,8 +413,8 @@ diagnostics, not an experimental result. P3.2 is therefore closed as
 `YES / YES / YES`.
 
 P3.3 (`src/gemm/cublaslt_gemm.py`, `src/gemm/cublaslt_bridge.cu`,
-`scripts/check_cublaslt_gemm_p33.py`, `src/gemm/P3_3_PROTOCOL.md`) is now
-**implemented**; it is **not** audited and **not** verified on GB300. It is the
+`scripts/check_cublaslt_gemm_p33.py`, `src/gemm/P3_3_PROTOCOL.md`) is
+**implemented, independently audited, and verified on GB300**. It is the
 vendor-library counterpart of P3.2: the same frozen BF16 geometry,
 `(M,N,K,L) = (4096,4096,4096,1)` computing `C = A × Bᵀ` with FP32 accumulation,
 on the same operand bytes, issued through a direct, explicit `cublasLtMatmul`
@@ -477,13 +477,36 @@ efficiency, utilization, bandwidth, or winner label is computed anywhere, no
 result file or campaign directory is written, and **no CuTe-versus-cuBLASLt
 comparison exists** — that comparison is P3.5's and P3.5 is unimplemented. The
 GPU-free checks listed in `src/gemm/P3_3_PROTOCOL.md` section 13 were run by the
-author and passed; those are self-checks, not an independent audit, and
-`make gemm-cublaslt-p33-smoke` has not been run, so no P3.3 GPU result of any
-kind exists. P3.4 and P3.5 remain unimplemented.
+author and passed. An independent audit of implementation commit
+`bb66e3275d2f5bf1addbd14c84596b1edede977f` found two blockers: valid
+`split_k=0` metadata was rejected and read with the wrong signed width, and an
+obsolete P3.2 status assertion made `make check-static` fail. Remediation
+commit `1c3ade8a39ae1e19882514e2b06094a418eb70bf` corrected both findings,
+added adversarial regression coverage, and removed the associated stale P3.2
+documentation. The remediated tree passed `make check-static`; the audit
+findings were then rechecked with no remaining blocker, and the operator
+confirmed the Docker-backed `make gemm-cublaslt-p33-check` gate also passed on
+that clean commit.
+
+Fresh preflight campaign `20260807T144123Z` reported `OVERALL=PASS` on an
+NVIDIA B300 SXM6 AC at physical index `7` (UUID
+`GPU-40e00845-d89c-1393-2c32-a2dca3ee9442`, compute capability 10.3, driver
+610.43.02). An initial smoke invocation with an unset operator variable exited
+with status 2 before exposing or using a GPU, as required. The valid rerun with
+`BLACKWELL_GPU_INDEX=7` executed the same clean remediation commit through
+direct `cublasLtMatmul`, revalidated the pinned upstream identity, returned
+eight supported heuristic entries from 32 requested, selected index 0
+(`algo_id=66`, `tile_id=23`, `stages_id=35`, `split_k=1`, zero workspace),
+passed the complete-result check with zero maximum absolute and relative error,
+completed two warm-ups and ten measured launches, and emitted exactly one
+77-field `p33.v1` row with `git_dirty=false` and `publishable=false`. Its three
+finite positive timings remain non-publishable diagnostics, not an experimental
+result. P3.3 is therefore closed as `YES / YES / YES`. P3.4 and P3.5 remain
+unimplemented, so Phase 3 remains in progress.
 
 ## Phase 4 — Campaigns and integration (10–15 August 2026)
 
-Gate: Phase 3 gate passed.
+Gate: Phase 3 gate remains pending until P3.4 and P3.5 close.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|

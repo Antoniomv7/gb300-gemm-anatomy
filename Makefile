@@ -355,7 +355,7 @@ help:
 	@echo "                                 discarded."
 	@echo ""
 	@echo "  -- P3.2 one-shape wrapper (see src/gemm/P3_2_PROTOCOL.md; implemented,"
-	@echo "     independent audit PENDING, GB300 verification PENDING. Drives the same"
+	@echo "     independently audited and verified on GB300; closed. Drives the same"
 	@echo "     pinned NVIDIA example through a repository-owned wrapper at the frozen"
 	@echo "     BF16 shape (M,N,K,L)=(4096,4096,4096,1), non-persistent, 1-CTA MMA group,"
 	@echo "     mma tiler (128,128), cluster (1,1), TMA store, seed 1111, and separates"
@@ -377,7 +377,7 @@ help:
 	@echo "                                 evidence, NOT an experimental result."
 	@echo ""
 	@echo "  -- P3.3 cuBLASLt baseline (see src/gemm/P3_3_PROTOCOL.md; implemented,"
-	@echo "     independent audit PENDING, GB300 verification PENDING. Runs the SAME frozen"
+	@echo "     independently audited and verified on GB300; closed. Runs the SAME frozen"
 	@echo "     BF16 geometry as P3.2 -- (M,N,K,L)=(4096,4096,4096,1), C = A x B^T, seed"
 	@echo "     1111, hot reused operands -- on the SAME operands, through a direct"
 	@echo "     cublasLtMatmul call: A row-major MxK lda=K, B row-major NxK ldb=K, C/D"
@@ -971,12 +971,13 @@ check-static:
 	@grep -Fq -- '--warmup-iterations 2 \' Makefile
 	@grep -Fq -- '--iterations 10' Makefile
 	@echo "== truthful P3.3 status assertions =="
-	@grep -Fq 'P3.3 | cuBLASLt baseline | YES | NO | NO |' PLAN.md
-	@grep -Fq 'P3.3 = YES / NO / NO' $(GEMM_P33_PROTOCOL)
+	@grep -Fq 'P3.3 | cuBLASLt baseline | YES | YES | YES |' PLAN.md
+	@grep -Fq 'P3.3 = YES / YES / YES' $(GEMM_P33_PROTOCOL)
 	@grep -Fq 'P3.3 creates no publishable performance result' $(GEMM_P33_PROTOCOL)
-	@grep -Fq 'P3.3 (cuBLASLt baseline)' README.md
+	@grep -Fq 'P3.3: CLOSED' README.md
 	@! grep -nF 'P3.3 | cuBLASLt baseline | NO | NO | NO |' PLAN.md
-	@! grep -nE 'P3\.3 \| cuBLASLt baseline \| YES \| (YES|NO) \| YES \|' PLAN.md
+	@! grep -nF 'P3.3 | cuBLASLt baseline | YES | NO | NO |' PLAN.md
+	@! grep -nF 'P3.3 | cuBLASLt baseline | YES | NO | YES |' PLAN.md
 	@! grep -nF 'P3.3 | cuBLASLt baseline | YES | YES | NO |' PLAN.md
 	@echo "== P3.3 introduces no P3.4/P3.5 functionality and no comparison =="
 	@! grep -nE '^(P34|P35)_' $(GEMM_P33_WRAPPER)
