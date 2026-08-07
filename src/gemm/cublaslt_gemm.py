@@ -381,6 +381,7 @@ CSV_NONNEGATIVE_INT_FIELDS = (
     "algo_id",
     "tile_id",
     "stages_id",
+    "split_k",
     "reduction_scheme",
     "cta_swizzling",
     "custom_option",
@@ -395,7 +396,6 @@ CSV_POSITIVE_INT_FIELDS = (
     "alignment_c_bytes",
     "alignment_d_bytes",
     "heuristic_returned",
-    "split_k",
 )
 
 BOOL_TRUE = "true"
@@ -1256,8 +1256,8 @@ def validate_plan_info(info) -> dict:
         raise BridgeError(f"waves_count={waves!r} must be finite and non-negative")
 
     split_k = int(info.split_k)
-    if split_k < 1:
-        raise BridgeError(f"split_k={split_k} must be at least 1")
+    if split_k < 0:
+        raise BridgeError(f"split_k={split_k} must be non-negative")
 
     for field in ("algo_id", "tile_id", "stages_id", "reduction_scheme", "cta_swizzling",
                   "custom_option", "inner_shape_id", "cluster_shape_id"):
@@ -1909,7 +1909,7 @@ def _synthetic_plan() -> dict:
         "algo_id": "21",
         "tile_id": "27",
         "stages_id": "15",
-        "split_k": "1",
+        "split_k": "0",
         "reduction_scheme": "0",
         "cta_swizzling": "0",
         "custom_option": "0",
@@ -1979,7 +1979,7 @@ class _SyntheticPlanInfo:
             "algo_id": 21,
             "tile_id": 27,
             "stages_id": 15,
-            "split_k": 1,
+            "split_k": 0,
             "reduction_scheme": 0,
             "cta_swizzling": 0,
             "custom_option": 0,
@@ -2101,6 +2101,7 @@ def run_self_test() -> int:
     check("the workspace limit is serialized exactly",
           row["workspace_limit_bytes"] == "67108864")
     check("the heuristic request is serialized exactly", row["heuristic_requested"] == "32")
+    check("the documented non-split split_k=0 is accepted", row["split_k"] == "0")
     check("the row is not publishable", row["publishable"] == BOOL_FALSE)
     check("no field uses exponent notation",
           not any("e" in value.lower() and field not in ("gpu_name",)
@@ -2249,7 +2250,7 @@ def run_self_test() -> int:
     )
     rejects(
         "a negative split_k is rejected",
-        lambda: validate_row({**row, "split_k": "0"}),
+        lambda: validate_row({**row, "split_k": "-1"}),
         "split_k",
     )
     rejects(
@@ -2348,6 +2349,11 @@ def run_self_test() -> int:
         "invalid algorithm metadata is rejected",
         lambda: validate_plan_info(_SyntheticPlanInfo(algo_id=-1)),
         "algo_id",
+    )
+    rejects(
+        "a negative split_k from the bridge is rejected",
+        lambda: validate_plan_info(_SyntheticPlanInfo(split_k=-1)),
+        "split_k",
     )
 
     # Upstream operand-equivalence proof, exercised on synthetic sources.

@@ -1,9 +1,9 @@
 # P3.2 — One-shape CuTe DSL GEMM wrapper (frozen protocol)
 
 Status: `P3.2 = YES / YES / YES` (Implemented / Audited / Verified on GB300).
-The author's own GPU-free checks are **not** an independent audit, and no
-GB300 execution of this unit has happened yet. Section 12 records exactly what
-was and was not run.
+The author's own GPU-free checks alone are **not** an independent audit or a
+GB300 verification; the completed independent audit and GB300 execution that
+support this closed status are recorded in section 14.
 
 ## 1. Objective
 

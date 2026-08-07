@@ -261,6 +261,7 @@ NONNEGATIVE_INT_FIELDS = (
     "algo_id",
     "tile_id",
     "stages_id",
+    "split_k",
     "reduction_scheme",
     "cta_swizzling",
     "custom_option",
@@ -274,7 +275,6 @@ POSITIVE_INT_FIELDS = (
     "alignment_c_bytes",
     "alignment_d_bytes",
     "heuristic_returned",
-    "split_k",
 )
 ALIGNMENT_FIELDS = (
     "alignment_a_bytes",
@@ -462,6 +462,17 @@ REQUIRED_ALGO_CONFIG_ATTRIBUTES = (
     "CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID",
     "CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID",
 )
+REQUIRED_ALGO_CONFIG_WIDTHS = {
+    "CUBLASLT_ALGO_CONFIG_ID": "int32_t",
+    "CUBLASLT_ALGO_CONFIG_TILE_ID": "uint32_t",
+    "CUBLASLT_ALGO_CONFIG_STAGES_ID": "uint32_t",
+    "CUBLASLT_ALGO_CONFIG_SPLITK_NUM": "uint32_t",
+    "CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME": "uint32_t",
+    "CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING": "uint32_t",
+    "CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION": "uint32_t",
+    "CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID": "uint16_t",
+    "CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID": "uint16_t",
+}
 
 # The four minimum-alignment preferences that must be derived from the real
 # device pointers.
@@ -1022,6 +1033,15 @@ def validate_bridge_source(source) -> list:
     for attribute in REQUIRED_ALGO_CONFIG_ATTRIBUTES:
         if attribute not in code:
             errors.append(f"the bridge never records the algorithm attribute {attribute}")
+    for attribute, width in REQUIRED_ALGO_CONFIG_WIDTHS.items():
+        pattern = (
+            rf"p33_read_algo_config\s*<\s*{re.escape(width)}\s*>\s*\("
+            rf"\s*[^,\n]+\s*,\s*{re.escape(attribute)}\b"
+        )
+        if not re.search(pattern, code):
+            errors.append(
+                f"the bridge does not read {attribute} at its documented {width} width"
+            )
     for preference in REQUIRED_ALIGNMENT_PREFERENCES:
         if preference not in code:
             errors.append(f"the bridge never sets {preference}")
@@ -1725,7 +1745,7 @@ def _good_row() -> dict:
             "algo_id": "21",
             "tile_id": "27",
             "stages_id": "15",
-            "split_k": "1",
+            "split_k": "0",
             "reduction_scheme": "0",
             "cta_swizzling": "0",
             "custom_option": "0",
@@ -1810,6 +1830,15 @@ int setup(void) {
     cublasLtMatmulAlgoConfigGetAttribute(0, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, 0, 0, 0);
     cublasLtMatmulAlgoConfigGetAttribute(0, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, 0, 0, 0);
     cublasLtMatmulAlgoConfigGetAttribute(0, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, 0, 0, 0);
+    p33_read_algo_config<int32_t>(0, CUBLASLT_ALGO_CONFIG_ID, "ID", 0);
+    p33_read_algo_config<uint32_t>(0, CUBLASLT_ALGO_CONFIG_TILE_ID, "TILE_ID", 0);
+    p33_read_algo_config<uint32_t>(0, CUBLASLT_ALGO_CONFIG_STAGES_ID, "STAGES_ID", 0);
+    p33_read_algo_config<uint32_t>(0, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, "SPLITK_NUM", 0);
+    p33_read_algo_config<uint32_t>(0, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, "REDUCTION_SCHEME", 0);
+    p33_read_algo_config<uint32_t>(0, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, "CTA_SWIZZLING", 0);
+    p33_read_algo_config<uint32_t>(0, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, "CUSTOM_OPTION", 0);
+    p33_read_algo_config<uint16_t>(0, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, "INNER_SHAPE_ID", 0);
+    p33_read_algo_config<uint16_t>(0, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, "CLUSTER_SHAPE_ID", 0);
     cublasLtGetVersion();
     cublasLtDestroy(0);
   } catch (...) {
@@ -1923,6 +1952,7 @@ def run_self_test() -> int:
     row = _good_row()
     check("a well-formed row is accepted", validate_row_mapping(row) == [],
           str(validate_row_mapping(row)))
+    check("the documented non-split split_k=0 is accepted", row["split_k"] == "0")
     check("a well-formed row serializes to two lines",
           validate_serialized_output(_serialize(row)) == [])
     for description, override in sorted({
@@ -1955,7 +1985,7 @@ def run_self_test() -> int:
         "a malformed GPU UUID": {"gpu_uuid": "0000"},
         "a malformed digest": {"upstream_example_sha256": "abc"},
         "an out-of-range iteration count": {"iterations": "101"},
-        "a zero split_k": {"split_k": "0"},
+        "a negative split_k": {"split_k": "-1"},
     }.items()):
         rejects(f"a row with {description} is rejected",
                 validate_row_mapping({**row, **override}))
@@ -2135,8 +2165,21 @@ def run_self_test() -> int:
             "catch-all")
     rejects("a bridge missing an algorithm attribute is rejected",
             validate_bridge_source(
-                _GOOD_BRIDGE.replace("CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, 0, 0, 0);", ");")
+                _GOOD_BRIDGE.replace(
+                    "CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID",
+                    "CUBLASLT_ALGO_CONFIG_UNKNOWN",
+                )
             ), "CLUSTER_SHAPE_ID")
+    rejects(
+        "a bridge reading split_k with the wrong signed width is rejected",
+        validate_bridge_source(
+            _GOOD_BRIDGE.replace(
+                "p33_read_algo_config<uint32_t>(0, CUBLASLT_ALGO_CONFIG_SPLITK_NUM",
+                "p33_read_algo_config<int32_t>(0, CUBLASLT_ALGO_CONFIG_SPLITK_NUM",
+            )
+        ),
+        "SPLITK_NUM",
+    )
     rejects("a bridge missing an alignment preference is rejected",
             validate_bridge_source(
                 _GOOD_BRIDGE.replace("CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES", "0")

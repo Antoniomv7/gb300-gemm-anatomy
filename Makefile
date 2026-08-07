@@ -867,13 +867,14 @@ check-static:
 	@grep -Fq -- '--warmup-iterations 2 \' Makefile
 	@grep -Fq -- '--iterations 10' Makefile
 	@echo "== truthful P3.2 status assertions =="
-	@grep -Fq 'P3.2 | One-shape wrapper | YES | NO | NO |' PLAN.md
-	@grep -Fq 'P3.2 = YES / NO / NO' $(GEMM_P32_PROTOCOL)
+	@grep -Fq 'P3.2 | One-shape wrapper | YES | YES | YES |' PLAN.md
+	@grep -Fq 'P3.2 = YES / YES / YES' $(GEMM_P32_PROTOCOL)
 	@grep -Fq 'P3.2 creates no publishable performance result' $(GEMM_P32_PROTOCOL)
 	@grep -Fq 'P3.2 (one-shape wrapper)' README.md
 	@! grep -nF 'P3.2 | One-shape wrapper | NO | NO | NO |' PLAN.md
-	@! grep -nE 'P3\.2 \| One-shape wrapper \| YES \| (YES|NO) \| YES \|' PLAN.md
+	@! grep -nF 'P3.2 | One-shape wrapper | YES | NO | NO |' PLAN.md
 	@! grep -nF 'P3.2 | One-shape wrapper | YES | YES | NO |' PLAN.md
+	@! grep -nF 'P3.2 | One-shape wrapper | YES | NO | YES |' PLAN.md
 	@echo "== P3.3 files present, executable, and still vendoring no NVIDIA GEMM source =="
 	@test -f $(GEMM_P33_WRAPPER)
 	@test -f $(GEMM_P33_BRIDGE)

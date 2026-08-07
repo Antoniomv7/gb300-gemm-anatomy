@@ -248,7 +248,9 @@ Every value below is read from the library at run time and serialized:
   `cublasLtMatmulAlgoConfigGetAttribute` at its documented width:
   `CUBLASLT_ALGO_CONFIG_ID` (algorithm ID, `int32_t`),
   `TILE_ID` (`uint32_t`), `STAGES_ID` (`uint32_t`),
-  `SPLITK_NUM` (split-K count, `int32_t`),
+  `SPLITK_NUM` (number of K splits, `uint32_t`; `0` is the explicit non-split
+  setting used by NVIDIA's cuBLASLt sample, while only values greater than one
+  activate parallel split-K),
   `REDUCTION_SCHEME` (`uint32_t`), `CTA_SWIZZLING` (`uint32_t`),
   `CUSTOM_OPTION` (`uint32_t`), `INNER_SHAPE_ID` (`uint16_t`), and
   `CLUSTER_SHAPE_ID` (`uint16_t`).
@@ -388,6 +390,8 @@ upstream_example_sha256,git_commit,git_dirty,publishable
 * `waves_count`: fixed-point with exactly six fractional digits, finite and
   non-negative;
 * integer and enum metadata: canonical decimal strings (no leading zeros);
+* `split_k`: a canonical non-negative integer; `0` is valid and records that
+  split-K is disabled;
 * setup, first-launch, and kernel timings: finite and strictly positive;
 * a row may only be constructed when correctness is exactly `PASS`.
 

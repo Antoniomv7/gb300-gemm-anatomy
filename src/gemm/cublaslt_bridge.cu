@@ -604,8 +604,8 @@ int p33_plan_create(const void* a,
                                            &tile_id) != 0 ||
             p33_read_algo_config<uint32_t>(&plan->algo, CUBLASLT_ALGO_CONFIG_STAGES_ID,
                                            "STAGES_ID", &stages_id) != 0 ||
-            p33_read_algo_config<int32_t>(&plan->algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
-                                          "SPLITK_NUM", &split_k) != 0 ||
+            p33_read_algo_config<uint32_t>(&plan->algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                                           "SPLITK_NUM", &split_k) != 0 ||
             p33_read_algo_config<uint32_t>(&plan->algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
                                            "REDUCTION_SCHEME", &reduction_scheme) != 0 ||
             p33_read_algo_config<uint32_t>(&plan->algo, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING,
