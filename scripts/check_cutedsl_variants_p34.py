@@ -1188,24 +1188,24 @@ def parse_env_file(path) -> dict:
 
 
 def validate_status_documents(plan_text, protocol_text, readme_text) -> list:
-    """Require truthful, non-overstated P3.4 status and untouched closed units."""
+    """Require the audited/verified P3.4 closure and untouched closed units."""
     errors = []
-    if "| P3.4 | Three execution variants | YES | NO | NO |" not in plan_text:
-        errors.append("PLAN.md does not record P3.4 as YES / NO / NO")
-    for overstated in (
-        "| P3.4 | Three execution variants | YES | YES | YES |",
+    if "| P3.4 | Three execution variants | YES | YES | YES |" not in plan_text:
+        errors.append("PLAN.md does not record P3.4 as YES / YES / YES")
+    for stale_or_invalid in (
         "| P3.4 | Three execution variants | YES | YES | NO |",
         "| P3.4 | Three execution variants | YES | NO | YES |",
+        "| P3.4 | Three execution variants | YES | NO | NO |",
         "| P3.4 | Three execution variants | NO | NO | NO |",
     ):
-        if overstated in plan_text:
-            errors.append(f"PLAN.md records an untruthful P3.4 status: {overstated!r}")
+        if stale_or_invalid in plan_text:
+            errors.append(f"PLAN.md records a stale or invalid P3.4 status: {stale_or_invalid!r}")
     for closed in CLOSED_STATUS_LINES:
         if closed not in plan_text:
             errors.append(f"PLAN.md no longer records {closed!r}")
 
-    if "P3.4 = YES / NO / NO" not in protocol_text:
-        errors.append(f"{PROTOCOL_RELATIVE_PATH} does not state P3.4 = YES / NO / NO")
+    if "P3.4 = YES / YES / YES" not in protocol_text:
+        errors.append(f"{PROTOCOL_RELATIVE_PATH} does not state P3.4 = YES / YES / YES")
     if "P3.4 creates no publishable performance result" not in protocol_text:
         errors.append(
             f"{PROTOCOL_RELATIVE_PATH} does not state that P3.4 creates no publishable result"
@@ -1972,23 +1972,25 @@ def run_self_test() -> int:
         "| P3.1 | Pinned official CuTe DSL example | YES | YES | YES |\n"
         "| P3.2 | One-shape wrapper | YES | YES | YES |\n"
         "| P3.3 | cuBLASLt baseline | YES | YES | YES |\n"
-        "| P3.4 | Three execution variants | YES | NO | NO |\n"
+        "| P3.4 | Three execution variants | YES | YES | YES |\n"
         "| P3.5 | Five shapes and comparison | NO | NO | NO |\n"
     )
     good_protocol = (
-        "Status: `P3.4 = YES / NO / NO`.\n"
+        "Status: `P3.4 = YES / YES / YES`.\n"
         "P3.4 creates no publishable performance result.\n"
     )
-    good_readme = "P3.4 (three execution variants) is implemented; audit pending.\n"
-    check("truthful status documents are accepted",
+    good_readme = "P3.4 (three execution variants) is closed as YES / YES / YES.\n"
+    check("closed status documents are accepted",
           validate_status_documents(good_plan, good_protocol, good_readme) == [],
           str(validate_status_documents(good_plan, good_protocol, good_readme)))
-    rejects("an overstated PLAN.md status is rejected",
+    rejects("a stale pre-audit PLAN.md status is rejected",
             validate_status_documents(
-                good_plan.replace("YES | NO | NO", "YES | YES | YES"),
-                good_protocol, good_readme), "untruthful")
+                good_plan.replace(
+                    "| P3.4 | Three execution variants | YES | YES | YES |",
+                    "| P3.4 | Three execution variants | YES | NO | NO |"),
+                good_protocol, good_readme), "stale or invalid")
     rejects("a PLAN.md that never records P3.4 is rejected",
-            validate_status_documents("", good_protocol, good_readme), "YES / NO / NO")
+            validate_status_documents("", good_protocol, good_readme), "YES / YES / YES")
     rejects("a PLAN.md that weakens a closed unit is rejected",
             validate_status_documents(
                 good_plan.replace("| P3.2 | One-shape wrapper | YES | YES | YES |",

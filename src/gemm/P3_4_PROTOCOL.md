@@ -1,9 +1,8 @@
 # P3.4 — Three CuTe DSL execution variants (frozen protocol)
 
-Status: `P3.4 = YES / NO / NO` (Implemented / Audited / Verified on GB300).
-The author's own GPU-free checks are **not** an independent audit, and no
-GB300 execution of this unit has happened yet. Section 12 records exactly what
-was and was not run.
+Status: `P3.4 = YES / YES / YES` (Implemented / Audited / Verified on GB300).
+The author's own GPU-free checks were not treated as an independent audit.
+Section 12 records the later independent audit and GB300 functional evidence.
 
 ## 1. Purpose and scope
 
@@ -446,28 +445,30 @@ make gemm-cutedsl-p34-check
 **These are the author's own self-checks. They are not an independent audit,
 and GPU-free checks are not GB300 verification.**
 
-### 12.2 GB300 commands not yet performed
+### 12.2 Independent audit and GB300 verification
 
-Neither of the following has been run, and no P3.4 GPU result of any kind
-exists:
+An independent technical audit of implementation commit `bb8cdc5b` found no
+blocking defect and approved the unit for GB300 execution. On 7 August 2026,
+the operator selected an idle physical NVIDIA B300 at index 4 and ran:
 
 ```bash
-BLACKWELL_GPU_INDEX=<physical-index> make preflight
-BLACKWELL_GPU_INDEX=<same-physical-index> make gemm-cutedsl-p34-smoke
+BLACKWELL_GPU_INDEX=4 make preflight
+BLACKWELL_GPU_INDEX=4 make gemm-cutedsl-p34-smoke
 ```
 
-The following therefore remain unproven on hardware and must be treated as open
-until an explicitly authorized GB300 run closes them:
+The fresh preflight passed. The smoke revalidated both pinned official sources
+and all three frozen configurations passed `can_implement()`, compiled, and
+launched on `sm_103a`. The official helper returned
+`max_active_clusters=148` for `persistent_1cta` and `74` for
+`persistent_2cta`. Every candidate passed complete-result correctness with
+`max_abs_error=0.0` and `max_rel_error=0.0`, then completed two warm-ups and ten
+measured launches. Stdout contained exactly one header and three rows in the
+frozen order; every row recorded `correctness=PASS` and `publishable=false`.
 
-* that all three variants compile and launch on `sm_103a`, in particular that
-  `PersistentDenseGemmKernel.can_implement()` accepts the `(256,128)` tiler
-  with the `(2,1)` cluster at this shape;
-* the value the official helper returns for `max_active_clusters` at cluster
-  sizes 1 and 2;
-* that the compiled persistent callable really takes the dynamic-only
-  `(a, b, c, stream)` signature (section 7.1);
-* that every variant passes the complete-result correctness check;
-* all nine timings.
+The CUTLASS/CuTe DSL `NamedBarrier ID 0 is used by sync_threads` warning was
+non-fatal and did not affect compilation, execution, or correctness. The nine
+timings are retained only as functional diagnostics and are not publishable
+performance results. This evidence closes P3.4 as `YES / YES / YES`.
 
 ## 13. Non-goals and publication policy
 

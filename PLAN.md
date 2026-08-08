@@ -280,7 +280,7 @@ independently audited, and verified on GB300. Phase 3 is in progress.
 | P3.1 | Pinned official CuTe DSL example | YES | YES | YES |
 | P3.2 | One-shape wrapper | YES | YES | YES |
 | P3.3 | cuBLASLt baseline | YES | YES | YES |
-| P3.4 | Three execution variants | YES | NO | NO |
+| P3.4 | Three execution variants | YES | YES | YES |
 | P3.5 | Five shapes and comparison | NO | NO | NO |
 
 P3.1 (`src/gemm/P3_1_PROTOCOL.md`) is implemented: it executes one pinned,
@@ -504,8 +504,8 @@ finite positive timings remain non-publishable diagnostics, not an experimental
 result. P3.3 is therefore closed as `YES / YES / YES`.
 
 P3.4 (`src/gemm/cutedsl_variants.py`, `scripts/check_cutedsl_variants_p34.py`,
-`src/gemm/P3_4_PROTOCOL.md`) is now **implemented**; it is **not** audited and
-**not** verified on GB300. It adds the two remaining frozen CuTe DSL execution
+`src/gemm/P3_4_PROTOCOL.md`) is **implemented, independently audited, and
+verified on GB300**. It adds the two remaining frozen CuTe DSL execution
 variants alongside the one P3.2 established, so that all three exist under one
 identical operand set, one identical correctness oracle, and one identical
 timing discipline, at the same single shape `(M,N,K,L) = (4096,4096,4096,1)`:
@@ -570,12 +570,19 @@ publishable performance result**: every row carries `publishable=false`, no
 TFLOP/s, speedup, efficiency, utilization, bandwidth, ranking, or winner is
 computed anywhere, no result file or campaign directory is written, and **no
 variant-versus-variant and no CuTe-versus-cuBLASLt comparison exists** — that
-comparison is P3.5's. The GPU-free acceptance commands listed in
-`src/gemm/P3_4_PROTOCOL.md` section 12 were run by the author and passed; those
-are self-checks, not an independent audit, and GPU-free checks are not GB300
-verification: `make gemm-cutedsl-p34-smoke` has not been run, so no P3.4 GPU
-result of any kind exists. P3.5 remains unimplemented, so Phase 3 remains in
-progress.
+comparison is P3.5's. An independent technical audit of implementation commit
+`bb8cdc5b` found no blocking defect and approved the unit for GB300 execution.
+On 7 August 2026, the operator ran a fresh passing preflight and the frozen
+`gemm-cutedsl-p34-smoke` on an explicitly selected idle physical NVIDIA B300
+at index 4. Both pinned upstream sources were revalidated; all three variants
+passed `can_implement()`, compiled, launched, completed two warm-ups and ten
+measured launches, and passed complete-result correctness with zero maximum
+absolute and relative error. The official occupancy helper returned 148 active
+clusters for `persistent_1cta` and 74 for `persistent_2cta`. The smoke emitted
+exactly the required four CSV lines in frozen order, with every row marked
+`correctness=PASS` and `publishable=false`; its timings remain functional,
+non-publishable diagnostics. P3.4 is therefore closed as `YES / YES / YES`.
+P3.5 remains unimplemented, so Phase 3 remains in progress.
 
 ## Phase 4 — Campaigns and integration (10–15 August 2026)
 
