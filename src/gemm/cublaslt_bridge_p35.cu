@@ -241,33 +241,121 @@ struct P35Plan {
     cudaStream_t stream;
 };
 
-static void p35_plan_release(P35Plan* plan) {
-    if (plan == nullptr) {
+static void p35_note_cublaslt_cleanup_failure(const char* what,
+                                              cublasStatus_t status,
+                                              bool preserve_original_error,
+                                              int* failed) {
+    if (status == CUBLAS_STATUS_SUCCESS) {
         return;
     }
+    if (*failed == 0 && !preserve_original_error) {
+        p35_set_error_status(what, status);
+    }
+    *failed = 1;
+}
+
+static void p35_note_cuda_cleanup_failure(const char* what,
+                                          cudaError_t status,
+                                          bool preserve_original_error,
+                                          int* failed) {
+    if (status == cudaSuccess) {
+        return;
+    }
+    if (*failed == 0 && !preserve_original_error) {
+        p35_set_error_cuda(what, status);
+    }
+    *failed = 1;
+}
+
+// Attempt every release even after one fails. When cleanup follows a primary
+// creation or execution error, retain that diagnostic; when cleanup is the
+// only failure, record the first release error and return non-zero.
+static int p35_plan_release(P35Plan* plan, bool preserve_existing_error) {
+    if (plan == nullptr) {
+        return 0;
+    }
+
+    char original_error[sizeof(g_last_error)] = {0};
+    const bool preserve_original_error =
+        preserve_existing_error && g_last_error[0] != '\0';
+    if (preserve_original_error) {
+        std::snprintf(original_error, sizeof(original_error), "%s", g_last_error);
+    }
+
+    int failed = 0;
     if (plan->workspace != nullptr) {
-        cudaFree(plan->workspace);
+        const cudaError_t status = cudaFree(plan->workspace);
+        p35_note_cuda_cleanup_failure(
+            "cudaFree(cuBLASLt workspace)", status, preserve_original_error, &failed);
         plan->workspace = nullptr;
     }
     if (plan->layout_d != nullptr) {
-        cublasLtMatrixLayoutDestroy(plan->layout_d);
+        const cublasStatus_t status = cublasLtMatrixLayoutDestroy(plan->layout_d);
+        p35_note_cublaslt_cleanup_failure(
+            "cublasLtMatrixLayoutDestroy(D)", status, preserve_original_error, &failed);
+        plan->layout_d = nullptr;
     }
     if (plan->layout_c != nullptr) {
-        cublasLtMatrixLayoutDestroy(plan->layout_c);
+        const cublasStatus_t status = cublasLtMatrixLayoutDestroy(plan->layout_c);
+        p35_note_cublaslt_cleanup_failure(
+            "cublasLtMatrixLayoutDestroy(C)", status, preserve_original_error, &failed);
+        plan->layout_c = nullptr;
     }
     if (plan->layout_b != nullptr) {
-        cublasLtMatrixLayoutDestroy(plan->layout_b);
+        const cublasStatus_t status = cublasLtMatrixLayoutDestroy(plan->layout_b);
+        p35_note_cublaslt_cleanup_failure(
+            "cublasLtMatrixLayoutDestroy(B)", status, preserve_original_error, &failed);
+        plan->layout_b = nullptr;
     }
     if (plan->layout_a != nullptr) {
-        cublasLtMatrixLayoutDestroy(plan->layout_a);
+        const cublasStatus_t status = cublasLtMatrixLayoutDestroy(plan->layout_a);
+        p35_note_cublaslt_cleanup_failure(
+            "cublasLtMatrixLayoutDestroy(A)", status, preserve_original_error, &failed);
+        plan->layout_a = nullptr;
     }
     if (plan->operation != nullptr) {
-        cublasLtMatmulDescDestroy(plan->operation);
+        const cublasStatus_t status = cublasLtMatmulDescDestroy(plan->operation);
+        p35_note_cublaslt_cleanup_failure(
+            "cublasLtMatmulDescDestroy", status, preserve_original_error, &failed);
+        plan->operation = nullptr;
     }
     if (plan->handle != nullptr) {
-        cublasLtDestroy(plan->handle);
+        const cublasStatus_t status = cublasLtDestroy(plan->handle);
+        p35_note_cublaslt_cleanup_failure(
+            "cublasLtDestroy", status, preserve_original_error, &failed);
+        plan->handle = nullptr;
     }
     delete plan;
+
+    if (preserve_original_error) {
+        p35_set_error(original_error);
+    }
+    return failed;
+}
+
+static int p35_preference_release(cublasLtMatmulPreference_t* preference,
+                                  bool preserve_existing_error) {
+    if (preference == nullptr || *preference == nullptr) {
+        return 0;
+    }
+
+    char original_error[sizeof(g_last_error)] = {0};
+    const bool preserve_original_error =
+        preserve_existing_error && g_last_error[0] != '\0';
+    if (preserve_original_error) {
+        std::snprintf(original_error, sizeof(original_error), "%s", g_last_error);
+    }
+
+    const cublasLtMatmulPreference_t owned = *preference;
+    *preference = nullptr;
+    const cublasStatus_t status = cublasLtMatmulPreferenceDestroy(owned);
+    int failed = 0;
+    p35_note_cublaslt_cleanup_failure(
+        "cublasLtMatmulPreferenceDestroy", status, preserve_original_error, &failed);
+    if (preserve_original_error) {
+        p35_set_error(original_error);
+    }
+    return failed;
 }
 
 // The largest power of two, capped at P35_MAX_ALIGNMENT_BYTES, that divides
@@ -523,6 +611,7 @@ int p35_plan_create(int64_t m,
     const int64_t ldd = n;
 
     P35Plan* plan = nullptr;
+    cublasLtMatmulPreference_t preference = nullptr;
     try {
         plan = new (std::nothrow) P35Plan();
         if (plan == nullptr) {
@@ -539,14 +628,14 @@ int p35_plan_create(int64_t m,
         cublasStatus_t status = cublasLtCreate(&plan->handle);
         if (status != CUBLAS_STATUS_SUCCESS) {
             p35_set_error_status("cublasLtCreate", status);
-            p35_plan_release(plan);
+            (void)p35_plan_release(plan, true);
             return 1;
         }
 
         status = cublasLtMatmulDescCreate(&plan->operation, P35_COMPUTE_TYPE, P35_SCALE_TYPE);
         if (status != CUBLAS_STATUS_SUCCESS) {
             p35_set_error_status("cublasLtMatmulDescCreate", status);
-            p35_plan_release(plan);
+            (void)p35_plan_release(plan, true);
             return 1;
         }
 
@@ -555,7 +644,7 @@ int p35_plan_create(int64_t m,
                                                 &transa, sizeof(transa));
         if (status != CUBLAS_STATUS_SUCCESS) {
             p35_set_error_status("cublasLtMatmulDescSetAttribute(TRANSA)", status);
-            p35_plan_release(plan);
+            (void)p35_plan_release(plan, true);
             return 1;
         }
 
@@ -564,7 +653,7 @@ int p35_plan_create(int64_t m,
                                                 &transb, sizeof(transb));
         if (status != CUBLAS_STATUS_SUCCESS) {
             p35_set_error_status("cublasLtMatmulDescSetAttribute(TRANSB)", status);
-            p35_plan_release(plan);
+            (void)p35_plan_release(plan, true);
             return 1;
         }
 
@@ -573,7 +662,7 @@ int p35_plan_create(int64_t m,
                                                 &pointer_mode, sizeof(pointer_mode));
         if (status != CUBLAS_STATUS_SUCCESS) {
             p35_set_error_status("cublasLtMatmulDescSetAttribute(POINTER_MODE)", status);
-            p35_plan_release(plan);
+            (void)p35_plan_release(plan, true);
             return 1;
         }
 
@@ -585,7 +674,7 @@ int p35_plan_create(int64_t m,
                                                 &epilogue, sizeof(epilogue));
         if (status != CUBLAS_STATUS_SUCCESS) {
             p35_set_error_status("cublasLtMatmulDescSetAttribute(EPILOGUE)", status);
-            p35_plan_release(plan);
+            (void)p35_plan_release(plan, true);
             return 1;
         }
 
@@ -597,7 +686,7 @@ int p35_plan_create(int64_t m,
                               static_cast<uint64_t>(n), ldc, "C") != 0 ||
             p35_create_layout(&plan->layout_d, P35_CD_TYPE, static_cast<uint64_t>(m),
                               static_cast<uint64_t>(n), ldd, "D") != 0) {
-            p35_plan_release(plan);
+            (void)p35_plan_release(plan, true);
             return 1;
         }
 
@@ -606,11 +695,10 @@ int p35_plan_create(int64_t m,
         const uint32_t alignment_c = p35_pointer_alignment(c);
         const uint32_t alignment_d = p35_pointer_alignment(d);
 
-        cublasLtMatmulPreference_t preference = nullptr;
         status = cublasLtMatmulPreferenceCreate(&preference);
         if (status != CUBLAS_STATUS_SUCCESS) {
             p35_set_error_status("cublasLtMatmulPreferenceCreate", status);
-            p35_plan_release(plan);
+            (void)p35_plan_release(plan, true);
             return 1;
         }
 
@@ -645,8 +733,8 @@ int p35_plan_create(int64_t m,
                 std::snprintf(what, sizeof(what), "cublasLtMatmulPreferenceSetAttribute(%s)",
                               setting.name);
                 p35_set_error_status(what, status);
-                cublasLtMatmulPreferenceDestroy(preference);
-                p35_plan_release(plan);
+                (void)p35_preference_release(&preference, true);
+                (void)p35_plan_release(plan, true);
                 return 1;
             }
         }
@@ -658,10 +746,14 @@ int p35_plan_create(int64_t m,
                                                 plan->layout_b, plan->layout_c, plan->layout_d,
                                                 preference, P35_HEURISTIC_REQUESTED, results,
                                                 &returned);
-        cublasLtMatmulPreferenceDestroy(preference);
         if (status != CUBLAS_STATUS_SUCCESS) {
             p35_set_error_status("cublasLtMatmulAlgoGetHeuristic", status);
-            p35_plan_release(plan);
+            (void)p35_preference_release(&preference, true);
+            (void)p35_plan_release(plan, true);
+            return 1;
+        }
+        if (p35_preference_release(&preference, false) != 0) {
+            (void)p35_plan_release(plan, true);
             return 1;
         }
         if (returned <= 0 || returned > P35_HEURISTIC_REQUESTED) {
@@ -672,7 +764,7 @@ int p35_plan_create(int64_t m,
                           "workspace limit, or API",
                           returned, shape_index, static_cast<long long>(m),
                           static_cast<long long>(n), static_cast<long long>(k));
-            p35_plan_release(plan);
+            (void)p35_plan_release(plan, true);
             return 1;
         }
 
@@ -692,7 +784,7 @@ int p35_plan_create(int64_t m,
                           "none of the %d heuristic results reported CUBLAS_STATUS_SUCCESS for "
                           "frozen P3.5 shape %d",
                           returned, shape_index);
-            p35_plan_release(plan);
+            (void)p35_plan_release(plan, true);
             return 1;
         }
 
@@ -702,7 +794,7 @@ int p35_plan_create(int64_t m,
                           "of %llu",
                           selected, results[selected].workspaceSize,
                           static_cast<unsigned long long>(P35_WORKSPACE_LIMIT_BYTES));
-            p35_plan_release(plan);
+            (void)p35_plan_release(plan, true);
             return 1;
         }
 
@@ -717,7 +809,7 @@ int p35_plan_create(int64_t m,
                                          &plan->algo, &checked);
         if (status != CUBLAS_STATUS_SUCCESS) {
             p35_set_error_status("cublasLtMatmulAlgoCheck", status);
-            p35_plan_release(plan);
+            (void)p35_plan_release(plan, true);
             return 1;
         }
         if (checked.state != CUBLAS_STATUS_SUCCESS) {
@@ -725,7 +817,7 @@ int p35_plan_create(int64_t m,
                           "cublasLtMatmulAlgoCheck rejected heuristic result %d with "
                           "cublasStatus_t=%d",
                           selected, static_cast<int>(checked.state));
-            p35_plan_release(plan);
+            (void)p35_plan_release(plan, true);
             return 1;
         }
         if (static_cast<uint64_t>(checked.workspaceSize) > P35_WORKSPACE_LIMIT_BYTES) {
@@ -734,7 +826,7 @@ int p35_plan_create(int64_t m,
                           "limit of %llu",
                           checked.workspaceSize,
                           static_cast<unsigned long long>(P35_WORKSPACE_LIMIT_BYTES));
-            p35_plan_release(plan);
+            (void)p35_plan_release(plan, true);
             return 1;
         }
 
@@ -746,7 +838,7 @@ int p35_plan_create(int64_t m,
             if (allocated != cudaSuccess) {
                 plan->workspace = nullptr;
                 p35_set_error_cuda("cudaMalloc(cuBLASLt workspace)", allocated);
-                p35_plan_release(plan);
+                (void)p35_plan_release(plan, true);
                 return 1;
             }
         } else {
@@ -780,7 +872,7 @@ int p35_plan_create(int64_t m,
                                            "INNER_SHAPE_ID", &inner_shape_id) != 0 ||
             p35_read_algo_config<uint16_t>(&plan->algo, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID,
                                            "CLUSTER_SHAPE_ID", &cluster_shape_id) != 0) {
-            p35_plan_release(plan);
+            (void)p35_plan_release(plan, true);
             return 1;
         }
 
@@ -844,7 +936,8 @@ int p35_plan_create(int64_t m,
         return 0;
     } catch (...) {
         p35_set_error("p35_plan_create: an unexpected C++ exception was caught at the C boundary");
-        p35_plan_release(plan);
+        (void)p35_preference_release(&preference, true);
+        (void)p35_plan_release(plan, true);
         return 1;
     }
 }
@@ -915,8 +1008,7 @@ int p35_stream_synchronize(P35Plan* plan) {
 int p35_plan_destroy(P35Plan* plan) {
     p35_clear_error();
     try {
-        p35_plan_release(plan);
-        return 0;
+        return p35_plan_release(plan, false);
     } catch (...) {
         p35_set_error("p35_plan_destroy: an unexpected C++ exception was caught at the C boundary");
         return 1;

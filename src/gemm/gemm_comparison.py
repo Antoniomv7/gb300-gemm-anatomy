@@ -59,9 +59,11 @@ Output contract:
   the real stdout is restored only to emit the twenty-one lines.
 * stderr receives every human-readable message: progress, warnings, compiler
   output, library output, and diagnostics.
-* Any failure exits non-zero, prints a diagnostic to stderr, and emits no CSV
-  header and no CSV row; the failing candidate runs no warm-up and no
-  steady-state timing.
+* Any failure, including cleanup after otherwise successful work, exits
+  non-zero, prints a diagnostic to stderr, and emits no CSV header and no CSV
+  row; the failing candidate runs no warm-up and no steady-state timing. A
+  cleanup failure encountered while another operation is already failing is
+  diagnosed without replacing that primary error.
 
 Usage:
   gemm_comparison.py [--warmup-iterations N] [--iterations N]
@@ -650,6 +652,27 @@ class ComparisonError(P35Error):
 def log(message: str) -> None:
     """Write one human-readable progress/diagnostic line to stderr."""
     print(f"gemm_comparison: {message}", file=sys.stderr, flush=True)
+
+
+def _cleanup_preserving_primary(cleanup, description: str) -> None:
+    """Fail on cleanup after success without masking an active primary error.
+
+    Python replaces an exception raised in a ``try`` block when its ``finally``
+    block raises another one. P3.5 needs both halves of a stricter contract: a
+    cleanup failure after otherwise successful work invalidates the run, while
+    a cleanup failure during an already failing operation is reported without
+    hiding the operation's original diagnostic.
+    """
+    primary_error_active = sys.exc_info()[0] is not None
+    try:
+        cleanup()
+    except BaseException as cleanup_error:  # noqa: BLE001 - preserve the active primary error
+        if not primary_error_active:
+            raise
+        log(
+            f"WARNING: {description} also failed while preserving the original error: "
+            f"{cleanup_error}"
+        )
 
 
 # --- Version contracts -------------------------------------------------------
@@ -1433,7 +1456,7 @@ class CublasLtBridge:
             return
         plan, self._plan = self._plan, None
         if self._lib.p35_plan_destroy(plan) != 0:
-            log(f"WARNING: releasing the cuBLASLt plan failed: {self._error()}")
+            raise BridgeError(f"releasing the cuBLASLt plan failed: {self._error()}")
 
 
 def require_bridge_shape_allowlist(bridge) -> None:
@@ -3013,8 +3036,9 @@ def _measure_cublaslt_candidate(
         )
     finally:
         # The plan, its workspace, and every descriptor are shape-owned and are
-        # released before the next shape begins.
-        bridge.destroy()
+        # released before the next shape begins. A cleanup error invalidates an
+        # otherwise successful candidate, but never masks its primary failure.
+        _cleanup_preserving_primary(bridge.destroy, f"releasing the cuBLASLt plan for {label}")
 
     return {
         "compile_time_ms": None,
@@ -3219,14 +3243,18 @@ def _measure_shape(
         return shape_rows
     finally:
         # Shape-owned tensors are released before the next shape begins, so the
-        # five shapes never hold their operands simultaneously.
+        # five shapes never hold their operands simultaneously. Synchronization
+        # or allocator-cleanup failure invalidates an otherwise successful shape.
         del reference
         del operands
-        try:
+
+        def release_shape_memory():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
-        except Exception as exc:  # noqa: BLE001 - never mask the original failure
-            log(f"WARNING: could not release shape {label} device memory: {exc}")
+
+        _cleanup_preserving_primary(
+            release_shape_memory, f"releasing shape {label} device memory"
+        )
 
 
 # --- Command line ------------------------------------------------------------
@@ -3499,6 +3527,51 @@ def run_self_test() -> int:
             check(name, False, "no error was raised")
 
     print("gemm_comparison --self-test (GPU-free)", file=sys.stderr)
+
+    # --- Fail-closed cleanup --------------------------------------------------
+    cleanup_error = BridgeError("synthetic cleanup failure")
+
+    def fail_cleanup():
+        raise cleanup_error
+
+    rejects(
+        "cleanup failure after success is propagated",
+        lambda: _cleanup_preserving_primary(fail_cleanup, "synthetic successful operation"),
+        "synthetic cleanup failure",
+    )
+    primary_error = CorrectnessError("synthetic primary failure")
+    try:
+        raise primary_error
+    except CorrectnessError:
+        try:
+            _cleanup_preserving_primary(fail_cleanup, "synthetic failed operation")
+        except BaseException as exc:  # noqa: BLE001
+            check("cleanup never masks an active primary error", False, repr(exc))
+        else:
+            check(
+                "cleanup never masks an active primary error",
+                sys.exc_info()[1] is primary_error,
+                repr(sys.exc_info()[1]),
+            )
+
+    class FailingDestroyLibrary:
+        @staticmethod
+        def p35_plan_destroy(_plan):
+            return 1
+
+        @staticmethod
+        def p35_last_error():
+            return b"synthetic native plan-release failure"
+
+    failing_bridge = object.__new__(CublasLtBridge)
+    failing_bridge._plan = object()
+    failing_bridge._lib = FailingDestroyLibrary()
+    rejects(
+        "native plan-release failure is propagated",
+        failing_bridge.destroy,
+        "synthetic native plan-release failure",
+    )
+    check("a failed native plan handle is not reused", failing_bridge._plan is None)
 
     # --- Frozen schema -------------------------------------------------------
     check("schema has 100 fields", len(CSV_FIELDS) == 100, str(len(CSV_FIELDS)))

@@ -30,11 +30,13 @@ What it validates:
 * correctness-before-timing, and that a row can exist only for a passed check;
 * ``publishable=false`` everywhere;
 * all-or-nothing stdout: a synthetic failure at any candidate position of an
-  early, a middle, and the final shape produces no CSV at all, and a native
-  write to descriptor 1 during the measurement cannot contaminate it;
+  early, a middle, and the final shape produces no CSV at all; a cleanup failure
+  after all twenty rows are prepared also produces no CSV; and a native write
+  to descriptor 1 during the measurement cannot contaminate it;
 * the absence of forbidden CLI controls;
 * the absence of alternative algorithms and of any fallback GEMM API in the
-  P3.5 bridge, plus its single ``cublasLtMatmul`` call site;
+  P3.5 bridge, plus its single ``cublasLtMatmul`` call site and checked release
+  status for every native resource;
 * the unchanged P3.1-P3.4 contracts, files, targets, schemas, and status.
 
 Usage:
@@ -383,6 +385,13 @@ REQUIRED_BRIDGE_CALLS = (
     "cublasLtMatmul",
     "cublasLtDestroy",
 )
+REQUIRED_BRIDGE_RELEASE_CALLS = (
+    "cudaFree",
+    "cublasLtMatrixLayoutDestroy",
+    "cublasLtMatmulDescDestroy",
+    "cublasLtMatmulPreferenceDestroy",
+    "cublasLtDestroy",
+)
 # Any of these in the measured translation unit means a fallback GEMM API or an
 # alternative algorithm-enumeration path exists.
 FORBIDDEN_GEMM_ENTRY_POINTS = (
@@ -612,6 +621,27 @@ def _fake_execute(warmup_iterations, iterations):
     print("CONTAMINATION-FROM-PYTHON")
     sys.stdout.flush()
     return module.serialize_rows(module._synthetic_rows())
+
+
+module.execute_measurement = _fake_execute
+sys.exit(module.main([]))
+    """
+)
+
+# A cleanup error after all twenty synthetic rows have been prepared is still a
+# failed run: the real main() must emit neither the buffered header nor any row.
+CLEANUP_FAILURE_PROBE = (
+    _GUARD_PRELUDE
+    + _PROBE_PRELUDE
+    + """
+def _fake_execute(warmup_iterations, iterations):
+    rows = module._synthetic_rows()
+
+    def _fail_cleanup():
+        raise module.BridgeError("synthetic cleanup failure after twenty prepared rows")
+
+    module._cleanup_preserving_primary(_fail_cleanup, "synthetic final cleanup")
+    return module.serialize_rows(rows)
 
 
 module.execute_measurement = _fake_execute
@@ -1402,6 +1432,103 @@ def validate_source(source) -> list:
     return errors
 
 
+def validate_cleanup_source(source) -> list:
+    """Require both real cleanup paths to use the fail-closed exception policy."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        return [f"the wrapper is not syntactically valid: {exc}"]
+
+    errors = []
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    helper = functions.get("_cleanup_preserving_primary")
+    if helper is None:
+        errors.append(
+            "the wrapper has no _cleanup_preserving_primary helper; cleanup cannot be "
+            "fail-closed without masking an active primary error"
+        )
+
+    bridge_destroy = None
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name != "CublasLtBridge":
+            continue
+        bridge_destroy = next(
+            (
+                child
+                for child in node.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and child.name == "destroy"
+            ),
+            None,
+        )
+        break
+    if bridge_destroy is None:
+        errors.append("CublasLtBridge.destroy() is missing")
+    elif not any(
+        isinstance(node, ast.Raise)
+        and isinstance(node.exc, ast.Call)
+        and isinstance(node.exc.func, ast.Name)
+        and node.exc.func.id == "BridgeError"
+        for node in ast.walk(bridge_destroy)
+    ):
+        errors.append(
+            "CublasLtBridge.destroy() does not raise BridgeError when native plan release fails"
+        )
+
+    for function_name, cleanup_argument in (
+        ("_measure_cublaslt_candidate", "destroy"),
+        ("_measure_shape", "release_shape_memory"),
+    ):
+        function = functions.get(function_name)
+        if function is None:
+            errors.append(f"the wrapper is missing {function_name}()")
+            continue
+        protected = False
+        for node in ast.walk(function):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_cleanup_preserving_primary"
+                and node.args
+            ):
+                continue
+            first = node.args[0]
+            if cleanup_argument == "destroy":
+                protected = (
+                    isinstance(first, ast.Attribute)
+                    and isinstance(first.value, ast.Name)
+                    and first.value.id == "bridge"
+                    and first.attr == "destroy"
+                )
+            else:
+                protected = isinstance(first, ast.Name) and first.id == cleanup_argument
+            if protected:
+                break
+        if not protected:
+            errors.append(
+                f"{function_name}() does not route {cleanup_argument} through "
+                "_cleanup_preserving_primary()"
+            )
+
+    shape_function = functions.get("_measure_shape")
+    if shape_function is not None:
+        called_attributes = {
+            node.func.attr
+            for node in ast.walk(shape_function)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        for required in ("synchronize", "empty_cache"):
+            if required not in called_attributes:
+                errors.append(
+                    f"_measure_shape() no longer performs the required {required} cleanup"
+                )
+    return errors
+
+
 def validate_no_framework_matmul(source) -> list:
     """Reject a framework matmul as a measured path, structurally."""
     errors = []
@@ -1633,6 +1760,39 @@ def validate_bridge_source(source) -> list:
     for call in REQUIRED_BRIDGE_CALLS:
         if not re.search(rf"(?<![A-Za-z0-9_]){re.escape(call)}\s*\(", code):
             errors.append(f"the bridge never calls {call}()")
+
+    for call in REQUIRED_BRIDGE_RELEASE_CALLS:
+        if not re.search(rf"(?<![A-Za-z0-9_]){re.escape(call)}\s*\(", code):
+            errors.append(f"the bridge never releases resources with {call}()")
+        if re.search(rf"(?m)^[ \t]*{re.escape(call)}\s*\(", code):
+            errors.append(
+                f"the bridge discards the return status of {call}(); every release failure "
+                "must invalidate an otherwise successful run"
+            )
+
+    if not re.search(
+        r"static\s+int\s+p35_plan_release\s*\([^)]*bool\s+preserve_existing_error",
+        code,
+    ):
+        errors.append(
+            "p35_plan_release() is not a status-returning cleanup that can preserve a primary "
+            "diagnostic"
+        )
+    if "p35_preference_release" not in code:
+        errors.append(
+            "the bridge has no checked release path for its temporary cuBLASLt preference"
+        )
+    elif not re.search(r"static\s+int\s+p35_preference_release\s*\(", code):
+        errors.append("p35_preference_release() does not return a checked status")
+    for helper in ("p35_plan_release", "p35_preference_release"):
+        if re.search(rf"(?m)^[ \t]*{helper}\s*\(", code):
+            errors.append(
+                f"the bridge discards the aggregate status of {helper}()"
+            )
+    if not re.search(r"return\s+p35_plan_release\s*\(\s*plan\s*,\s*false\s*\)\s*;", code):
+        errors.append(
+            "p35_plan_destroy() does not propagate the native plan-release status"
+        )
 
     matmul_calls = re.findall(
         rf"(?<![A-Za-z0-9_]){re.escape(REQUIRED_BRIDGE_CALL)}\s*\(", code
@@ -2069,6 +2229,66 @@ def _tool_runner(command):
     return completed.stdout
 
 
+def validate_cleanup_runtime(module) -> list:
+    """Adversarially exercise cleanup success/failure semantics without a GPU."""
+    errors = []
+
+    class FailingDestroyLibrary:
+        @staticmethod
+        def p35_plan_destroy(_plan):
+            return 1
+
+        @staticmethod
+        def p35_last_error():
+            return b"synthetic native plan-release failure"
+
+    bridge = object.__new__(module.CublasLtBridge)
+    bridge._plan = object()
+    bridge._lib = FailingDestroyLibrary()
+    try:
+        bridge.destroy()
+    except module.BridgeError as exc:
+        if "synthetic native plan-release failure" not in str(exc):
+            errors.append(
+                f"CublasLtBridge.destroy() raised the wrong diagnostic: {str(exc)!r}"
+            )
+    except BaseException as exc:  # noqa: BLE001
+        errors.append(f"CublasLtBridge.destroy() raised the wrong exception type: {exc!r}")
+    else:
+        errors.append("CublasLtBridge.destroy() accepted a synthetic native release failure")
+    if bridge._plan is not None:
+        errors.append("CublasLtBridge.destroy() retained a failed native plan handle")
+
+    cleanup_error = module.BridgeError("synthetic cleanup failure after success")
+
+    def fail_cleanup():
+        raise cleanup_error
+
+    try:
+        module._cleanup_preserving_primary(fail_cleanup, "synthetic successful operation")
+    except BaseException as exc:  # noqa: BLE001
+        if exc is not cleanup_error:
+            errors.append(f"cleanup after success raised the wrong exception: {exc!r}")
+    else:
+        errors.append("cleanup after success did not fail closed")
+
+    primary_error = module.CorrectnessError("synthetic primary correctness failure")
+    original_log = module.log
+    module.log = lambda _message: None
+    try:
+        try:
+            raise primary_error
+        except module.CorrectnessError:
+            module._cleanup_preserving_primary(fail_cleanup, "synthetic failed operation")
+            if sys.exc_info()[1] is not primary_error:
+                errors.append("cleanup replaced the active primary exception state")
+    except BaseException as exc:  # noqa: BLE001
+        errors.append(f"cleanup masked the active primary exception with {exc!r}")
+    finally:
+        module.log = original_log
+    return errors
+
+
 def check_wrapper(repo_root) -> list:
     """Run the whole contract check against the real repository."""
     errors = []
@@ -2173,6 +2393,8 @@ def check_wrapper(repo_root) -> list:
 
     # 6. Source-level structure and the FP32 oracle policy.
     errors.extend(validate_source(wrapper_source))
+    errors.extend(validate_cleanup_source(wrapper_source))
+    errors.extend(validate_cleanup_runtime(module))
     errors.extend(validate_fp32_precision_policy(wrapper_source))
     errors.extend(validate_bridge_source(bridge_source))
 
@@ -2281,6 +2503,18 @@ def check_wrapper(repo_root) -> list:
                 "contract is not protected against native output"
             )
         errors.extend(validate_serialized_output(completed.stdout))
+    completed = _run_probe(
+        CLEANUP_FAILURE_PROBE.format(
+            blocked=list(GPU_STACK_MODULES), wrapper=str(wrapper_path)
+        )
+    )
+    if completed.returncode == 0:
+        errors.append("a synthetic cleanup failure produced a successful exit status")
+    if completed.stdout:
+        errors.append(
+            "a synthetic cleanup failure after twenty prepared rows still emitted "
+            f"{len(completed.stdout)} byte(s) to stdout"
+        )
 
     # 12. The compiled bridge, when the GPU-free gate has already built it.
     library_path = Path(getattr(module, "BRIDGE_LIBRARY_PATH", "/nonexistent"))
@@ -2715,6 +2949,7 @@ _GOOD_SMOKE_RECIPE = [
 
 _GOOD_BRIDGE_SOURCE = """
 #include <cublasLt.h>
+#include <cuda_runtime.h>
 #include <cstdint>
 #define P35_ABI_VERSION 1
 static const int64_t P35_SHAPES[][3] = {
@@ -2742,6 +2977,22 @@ static const cublasLtMatmulSearch_t P35_SEARCH_MODE = CUBLASLT_SEARCH_BEST_FIT;
 static const uint32_t P35_MAX_ALIGNMENT_BYTES = 256u;
 static int p35_shape_index_of(int64_t m, int64_t n, int64_t k) { return 0; }
 static int guard(int64_t a, int64_t b) { return a > INT64_MAX / b || (size_t)a > SIZE_MAX; }
+static int p35_plan_release(void* plan, bool preserve_existing_error) {
+    int failed = 0;
+    const cudaError_t cuda_status = cudaFree(0);
+    if (cuda_status != cudaSuccess) { failed = 1; }
+    cublasStatus_t status = cublasLtMatrixLayoutDestroy(0);
+    if (status != CUBLAS_STATUS_SUCCESS) { failed = 1; }
+    status = cublasLtMatmulDescDestroy(0);
+    if (status != CUBLAS_STATUS_SUCCESS) { failed = 1; }
+    status = cublasLtDestroy(0);
+    if (status != CUBLAS_STATUS_SUCCESS) { failed = 1; }
+    return failed;
+}
+static int p35_preference_release(void) {
+    const cublasStatus_t status = cublasLtMatmulPreferenceDestroy(0);
+    return status == CUBLAS_STATUS_SUCCESS ? 0 : 1;
+}
 extern "C" {
 int p35_bridge_abi_version(void) { return P35_ABI_VERSION; }
 size_t p35_plan_info_size(void) { return 8; }
@@ -2771,14 +3022,49 @@ int p35_plan_create(void) {
         cublasLtMatmulAlgoConfigGetAttribute(0, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, 0, 0, 0);
         cublasLtMatmulAlgoConfigGetAttribute(0, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, 0, 0, 0);
         cublasLtMatmulAlgoConfigGetAttribute(0, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, 0, 0, 0);
-        cublasLtDestroy(0);
+        if (p35_preference_release() != 0) { return 1; }
         return 0;
     } catch (...) { return 1; }
 }
 int p35_plan_execute(void) { cublasLtMatmul(0); return 0; }
 int p35_stream_synchronize(void) { return 0; }
-int p35_plan_destroy(void) { return 0; }
+int p35_plan_destroy(void* plan) { return p35_plan_release(plan, false); }
 }
+"""
+
+_GOOD_CLEANUP_SOURCE = """
+import sys
+
+class BridgeError(Exception):
+    pass
+
+def _cleanup_preserving_primary(cleanup, description):
+    primary_error_active = sys.exc_info()[0] is not None
+    try:
+        cleanup()
+    except BaseException:
+        if not primary_error_active:
+            raise
+
+class CublasLtBridge:
+    def destroy(self):
+        if self.failed:
+            raise BridgeError("release failed")
+
+def _measure_cublaslt_candidate(bridge):
+    try:
+        return 1
+    finally:
+        _cleanup_preserving_primary(bridge.destroy, "plan release")
+
+def _measure_shape(torch):
+    try:
+        return 1
+    finally:
+        def release_shape_memory():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        _cleanup_preserving_primary(release_shape_memory, "shape release")
 """
 
 
@@ -3071,6 +3357,32 @@ def run_self_test() -> int:
     check("subprocess.run is not mistaken for an upstream helper",
           validate_no_upstream_helpers("import subprocess\nsubprocess.run(['git'])\n") == [])
 
+    # --- Fail-closed cleanup --------------------------------------------------
+    check("the complete cleanup policy is accepted",
+          validate_cleanup_source(_GOOD_CLEANUP_SOURCE) == [],
+          str(validate_cleanup_source(_GOOD_CLEANUP_SOURCE)))
+    rejects("a bridge destroy method that suppresses release failure is rejected",
+            validate_cleanup_source(
+                _GOOD_CLEANUP_SOURCE.replace(
+                    'raise BridgeError("release failed")', "return")),
+            "does not raise BridgeError")
+    rejects("an unprotected cuBLASLt plan cleanup is rejected",
+            validate_cleanup_source(
+                _GOOD_CLEANUP_SOURCE.replace(
+                    '_cleanup_preserving_primary(bridge.destroy, "plan release")',
+                    "bridge.destroy()")),
+            "_measure_cublaslt_candidate")
+    rejects("an unprotected shape-memory cleanup is rejected",
+            validate_cleanup_source(
+                _GOOD_CLEANUP_SOURCE.replace(
+                    '_cleanup_preserving_primary(release_shape_memory, "shape release")',
+                    "release_shape_memory()")),
+            "_measure_shape")
+    rejects("shape cleanup without empty_cache is rejected",
+            validate_cleanup_source(
+                _GOOD_CLEANUP_SOURCE.replace("torch.cuda.empty_cache()", "pass")),
+            "empty_cache")
+
     # --- FP32 policy ----------------------------------------------------------
     check("the required FP32 policy is accepted",
           validate_fp32_precision_policy(
@@ -3163,6 +3475,47 @@ def run_self_test() -> int:
             validate_bridge_source(
                 _GOOD_BRIDGE_SOURCE.replace("int p35_shape_at(", "int renamed_shape_at(")),
             "p35_shape_at")
+    for release_call, checked_line, unchecked_line in (
+        ("cudaFree", "const cudaError_t cuda_status = cudaFree(0);", "cudaFree(0);"),
+        (
+            "cublasLtMatrixLayoutDestroy",
+            "cublasStatus_t status = cublasLtMatrixLayoutDestroy(0);",
+            "cublasLtMatrixLayoutDestroy(0); cublasStatus_t status = CUBLAS_STATUS_SUCCESS;",
+        ),
+        (
+            "cublasLtMatmulDescDestroy",
+            "status = cublasLtMatmulDescDestroy(0);",
+            "cublasLtMatmulDescDestroy(0);",
+        ),
+        (
+            "cublasLtMatmulPreferenceDestroy",
+            "const cublasStatus_t status = cublasLtMatmulPreferenceDestroy(0);",
+            "cublasLtMatmulPreferenceDestroy(0); const cublasStatus_t status = "
+            "CUBLAS_STATUS_SUCCESS;",
+        ),
+        (
+            "cublasLtDestroy",
+            "status = cublasLtDestroy(0);",
+            "cublasLtDestroy(0);",
+        ),
+    ):
+        rejects(
+            f"a bridge discarding {release_call} status is rejected",
+            validate_bridge_source(_GOOD_BRIDGE_SOURCE.replace(checked_line, unchecked_line)),
+            "discards the return status",
+        )
+    rejects("p35_plan_destroy dropping the aggregate cleanup status is rejected",
+            validate_bridge_source(
+                _GOOD_BRIDGE_SOURCE.replace(
+                    "return p35_plan_release(plan, false);",
+                    "p35_plan_release(plan, false); return 0;")),
+            "does not propagate")
+    rejects("plan creation dropping the aggregate preference-release status is rejected",
+            validate_bridge_source(
+                _GOOD_BRIDGE_SOURCE.replace(
+                    "if (p35_preference_release() != 0) { return 1; }",
+                    "p35_preference_release();")),
+            "discards the aggregate status")
 
     # --- Compiled shared object ----------------------------------------------
     def _fake_tools(defined, undefined, dynamic):

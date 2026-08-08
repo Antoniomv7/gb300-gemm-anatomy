@@ -166,7 +166,11 @@ Per shape, in this order and entirely outside every timer:
    stays non-finite and is rejected instead of surviving as a stale value.
 6. The complete output of every candidate is validated.
 7. Shape-owned tensors, the cuBLASLt plan, its workspace, and every descriptor
-   are released before the next shape begins.
+   are released before the next shape begins. Every native release status
+   (`cudaFree` and every cuBLASLt destructor), final device synchronization, and
+   allocator cleanup is checked. A cleanup failure after successful work fails
+   the whole run; if candidate execution was already failing, cleanup is still
+   attempted and diagnosed but never replaces the primary error.
 
 ### 6.1 How cuBLASLt receives byte-identical operands
 
@@ -418,8 +422,12 @@ The output is **all-or-nothing**. Any failure at any shape or candidate:
 
 The checker proves this by injecting a synthetic failure at each of the four
 candidate positions of an early shape (1), a middle shape (3), and the final
-shape (5), and by writing directly to descriptor 1 during a successful
-measurement.
+shape (5); by injecting a cleanup failure after all twenty rows have been
+prepared; by exercising native plan-destruction failure and primary-error
+preservation without a GPU; and by writing directly to descriptor 1 during a
+successful measurement. Its bridge-source regressions additionally reject an
+unchecked `cudaFree`, matrix-layout destructor, matmul-descriptor destructor,
+preference destructor, handle destructor, or aggregate plan-release status.
 
 ## 10. Command line
 

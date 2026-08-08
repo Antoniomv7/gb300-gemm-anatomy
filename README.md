@@ -621,8 +621,9 @@ experimental result.
 **Every emitted row carries `publishable=false`.** No TFLOP/s, speedup,
 efficiency, utilization, bandwidth, or winner label is computed anywhere, no
 result file or campaign directory is written, and P3.3 makes no comparison
-against P3.2 — that comparison is P3.5's and P3.5 is unimplemented. The
-GPU-free checks listed in `src/gemm/P3_3_PROTOCOL.md` section 13 were run by
+against P3.2 — that comparison is P3.5's, which is implemented but remains
+unaudited and unverified on GB300. The GPU-free checks listed in
+`src/gemm/P3_3_PROTOCOL.md` section 13 were run by
 the author and passed; those are the author's own self-checks, **not** an
 independent audit. See `src/gemm/P3_3_PROTOCOL.md` for the frozen protocol, the
 exact CSV schema, the recorded algorithm metadata, and the verification
@@ -713,8 +714,9 @@ BLACKWELL_GPU_INDEX=<physical-index> make gemm-cutedsl-p34-smoke
 efficiency, utilization, bandwidth, ranking, or winner label is computed
 anywhere, no result file or campaign directory is written, and P3.4 compares
 nothing — neither the variants against each other nor against the P3.3 cuBLASLt
-baseline. That comparison is P3.5's, and P3.5 is unimplemented. The GPU-free
-acceptance commands listed in `src/gemm/P3_4_PROTOCOL.md` section 12 were run by
+baseline. That comparison is P3.5's, which is implemented but remains unaudited
+and unverified on GB300. The GPU-free acceptance commands listed in
+`src/gemm/P3_4_PROTOCOL.md` section 12 were run by
 the author and passed; those are the author's own self-checks, **not** an
 independent audit, and GPU-free checks are **not** GB300 verification. An
 independent audit of implementation commit `bb8cdc5b` found no blocking defect.

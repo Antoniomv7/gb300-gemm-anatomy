@@ -394,7 +394,8 @@ no result file or campaign directory is written, and the untimed PyTorch oracle
 is a correctness reference only — it is explicitly not the P3.3 cuBLASLt
 baseline, which is a separate unit (`src/gemm/P3_3_PROTOCOL.md`). No
 P3.2-versus-P3.3 comparison exists anywhere; that comparison belongs to P3.5,
-which is unimplemented. The GPU-free checks listed in
+which is implemented but remains unaudited and unverified on GB300. The
+GPU-free checks listed in
 `src/gemm/P3_2_PROTOCOL.md` section 10 were run by the author and passed. The
 first independent audit of commit
 `ea501d4c43b2cf364ac419ddefa3ae84b564581e` found two blockers: mixed
@@ -477,8 +478,9 @@ warm-ups and ten measured launches. **P3.3 produces no publishable performance
 result**: every row carries `publishable=false`, no TFLOP/s, speedup,
 efficiency, utilization, bandwidth, or winner label is computed anywhere, no
 result file or campaign directory is written, and **no CuTe-versus-cuBLASLt
-comparison exists** — that comparison is P3.5's and P3.5 is unimplemented. The
-GPU-free checks listed in `src/gemm/P3_3_PROTOCOL.md` section 13 were run by the
+comparison exists** — that comparison is P3.5's, which is implemented but
+remains unaudited and unverified on GB300. The GPU-free checks listed in
+`src/gemm/P3_3_PROTOCOL.md` section 13 were run by the
 author and passed. An independent audit of implementation commit
 `bb66e3275d2f5bf1addbd14c84596b1edede977f` found two blockers: valid
 `split_k=0` metadata was rejected and read with the wrong signed width, and an
