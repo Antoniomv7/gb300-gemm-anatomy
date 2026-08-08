@@ -512,13 +512,13 @@ CLOSED_STATUS_LINES = (
     "| P3.3 | cuBLASLt baseline | YES | YES | YES |",
     "| P3.4 | Three execution variants | YES | YES | YES |",
 )
-# P3.5 itself is implemented but neither audited nor GB300-verified.
-EXPECTED_P35_STATUS_LINE = "| P3.5 | Five shapes and comparison | YES | NO | NO |"
+# P3.5 itself is implemented, independently audited, and GB300-verified.
+EXPECTED_P35_STATUS_LINE = "| P3.5 | Five shapes and comparison | YES | YES | YES |"
 FORBIDDEN_P35_STATUS_LINES = (
     "| P3.5 | Five shapes and comparison | NO | NO | NO |",
     "| P3.5 | Five shapes and comparison | YES | YES | NO |",
     "| P3.5 | Five shapes and comparison | YES | NO | YES |",
-    "| P3.5 | Five shapes and comparison | YES | YES | YES |",
+    "| P3.5 | Five shapes and comparison | YES | NO | NO |",
 )
 # Phase 4 must stay unimplemented.
 PHASE4_STATUS_LINES = (
@@ -2133,16 +2133,16 @@ def parse_env_file(path) -> dict:
 
 
 def validate_status_documents(plan_text, protocol_text, readme_text) -> list:
-    """Require the truthful P3.5 status and untouched closed units."""
+    """Require the closed P3.5/Phase 3 status and untouched closed units."""
     errors = []
     if EXPECTED_P35_STATUS_LINE not in plan_text:
         errors.append(
-            f"PLAN.md does not record P3.5 as implemented but unaudited and unverified "
+            f"PLAN.md does not record P3.5 as implemented, audited, and verified "
             f"({EXPECTED_P35_STATUS_LINE!r})"
         )
     for wrong in FORBIDDEN_P35_STATUS_LINES:
         if wrong in plan_text:
-            errors.append(f"PLAN.md records an untruthful P3.5 status: {wrong!r}")
+            errors.append(f"PLAN.md records a stale or invalid P3.5 status: {wrong!r}")
     for closed in CLOSED_STATUS_LINES:
         if closed not in plan_text:
             errors.append(f"PLAN.md no longer records {closed!r}")
@@ -2150,37 +2150,34 @@ def validate_status_documents(plan_text, protocol_text, readme_text) -> list:
         if phase4 not in plan_text:
             errors.append(f"PLAN.md no longer records the unimplemented {phase4!r}")
 
-    if "P3.5 = YES / NO / NO" not in protocol_text:
-        errors.append(f"{PROTOCOL_RELATIVE_PATH} does not state P3.5 = YES / NO / NO")
+    if "P3.5 = YES / YES / YES" not in protocol_text:
+        errors.append(f"{PROTOCOL_RELATIVE_PATH} does not state P3.5 = YES / YES / YES")
     if "P3.5 creates no publishable performance result" not in protocol_text:
         errors.append(
             f"{PROTOCOL_RELATIVE_PATH} does not state that P3.5 creates no publishable result"
         )
-    if "No independent audit of P3.5 has been performed" not in protocol_text:
-        errors.append(
-            f"{PROTOCOL_RELATIVE_PATH} does not state that no independent audit of P3.5 has "
-            "been performed"
-        )
-    # These are claims of accomplished fact. A conditional sentence such as
-    # "Phase 3 remains open until P3.5 is independently audited" is truthful and
-    # must stay legal, so only the fact-claim spellings are banned.
-    for forbidden in (
-        "P3.5 = YES / YES / YES",
-        "P3.5 has been independently audited",
+    for required in (
         "P3.5 was independently audited",
-        "P3.5 has been verified on GB300",
         "P3.5 was verified on GB300",
         "P3.5 is closed",
         "Phase 3 is closed",
-        "Phase 3: CLOSED",
     ):
-        if forbidden in protocol_text:
-            errors.append(f"{PROTOCOL_RELATIVE_PATH} overstates P3.5: {forbidden!r}")
+        if required not in protocol_text:
+            errors.append(f"{PROTOCOL_RELATIVE_PATH} omits the closure fact {required!r}")
+    for stale in (
+        "P3.5 = YES / NO / NO",
+        "No independent audit of P3.5 has been performed",
+        "no GB300 run of P3.5 exists",
+        "Phase 3 remains open",
+        "Phase 3: OPEN",
+    ):
+        if stale in protocol_text:
+            errors.append(f"{PROTOCOL_RELATIVE_PATH} retains stale status: {stale!r}")
     if "P3.5 (five shapes and comparison)" not in readme_text:
         errors.append("README.md does not describe P3.5")
-    for forbidden in ("P3.5: CLOSED", "Phase 3: CLOSED"):
-        if forbidden in readme_text:
-            errors.append(f"README.md overstates the status: {forbidden!r}")
+    for required in ("P3.5: CLOSED", "Phase 3: CLOSED"):
+        if required not in readme_text:
+            errors.append(f"README.md omits the closure status: {required!r}")
     return errors
 
 
@@ -3618,19 +3615,23 @@ def run_self_test() -> int:
         "| P3.2 | One-shape wrapper | YES | YES | YES |\n"
         "| P3.3 | cuBLASLt baseline | YES | YES | YES |\n"
         "| P3.4 | Three execution variants | YES | YES | YES |\n"
-        "| P3.5 | Five shapes and comparison | YES | NO | NO |\n"
+        "| P3.5 | Five shapes and comparison | YES | YES | YES |\n"
         "| P4.1 | Orchestrator | NO | NO | NO |\n"
         "| P4.2 | Pilot plus three final campaigns | NO | NO | NO |\n"
         "| P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |\n"
     )
     good_protocol = (
-        "Status: `P3.5 = YES / NO / NO`.\n"
+        "Status: `P3.5 = YES / YES / YES`.\n"
         "P3.5 creates no publishable performance result.\n"
-        "No independent audit of P3.5 has been performed.\n"
-        "Phase 3 remains open until P3.5 is independently audited.\n"
+        "P3.5 was independently audited after remediation.\n"
+        "P3.5 was verified on GB300.\n"
+        "P3.5 is closed. Phase 3 is closed.\n"
     )
-    good_readme = "P3.5 (five shapes and comparison) is implemented; audit pending.\n"
-    check("truthful status documents are accepted",
+    good_readme = (
+        "P3.5 (five shapes and comparison) is closed. "
+        "P3.5: CLOSED; Phase 3: CLOSED.\n"
+    )
+    check("closed status documents are accepted",
           validate_status_documents(good_plan, good_protocol, good_readme) == [],
           str(validate_status_documents(good_plan, good_protocol, good_readme)))
     for wrong in FORBIDDEN_P35_STATUS_LINES:
@@ -3648,35 +3649,43 @@ def run_self_test() -> int:
                 good_plan.replace("| P4.1 | Orchestrator | NO | NO | NO |",
                                   "| P4.1 | Orchestrator | YES | NO | NO |"),
                 good_protocol, good_readme), "unimplemented")
-    rejects("a protocol claiming P3.5 is closed is rejected",
+    rejects("a stale pre-closure protocol status is rejected",
             validate_status_documents(
                 good_plan,
-                good_protocol.replace("P3.5 = YES / NO / NO", "P3.5 = YES / YES / YES"),
-                good_readme))
-    check("a conditional 'until P3.5 is independently audited' stays legal",
-          validate_status_documents(good_plan, good_protocol, good_readme) == [])
-    for claim in ("P3.5 has been independently audited.", "P3.5 was independently audited.",
-                  "P3.5 has been verified on GB300.", "P3.5 is closed.",
-                  "Phase 3 is closed."):
-        rejects(f"a protocol claiming {claim!r} is rejected",
-                validate_status_documents(good_plan, good_protocol + claim + "\n", good_readme),
-                "overstates")
-    rejects("a protocol that never states the audit is outstanding is rejected",
+                good_protocol.replace("P3.5 = YES / YES / YES", "P3.5 = YES / NO / NO"),
+                good_readme), "stale status")
+    for claim, fragment in (
+        ("P3.5 was independently audited after remediation.\n", "independently audited"),
+        ("P3.5 was verified on GB300.\n", "verified on GB300"),
+        ("P3.5 is closed. ", "P3.5 is closed"),
+        ("Phase 3 is closed.\n", "Phase 3 is closed"),
+    ):
+        rejects(f"a protocol omitting {fragment!r} is rejected",
+                validate_status_documents(
+                    good_plan, good_protocol.replace(claim, ""), good_readme),
+                "closure fact")
+    rejects("a protocol retaining the pre-audit claim is rejected",
             validate_status_documents(
                 good_plan,
-                good_protocol.replace(
-                    "No independent audit of P3.5 has been performed.\n", ""),
+                good_protocol + "No independent audit of P3.5 has been performed.\n",
                 good_readme),
-            "no independent audit")
+            "stale status")
     rejects("a protocol without the non-publishable statement is rejected",
             validate_status_documents(
                 good_plan,
                 good_protocol.replace(
                     "P3.5 creates no publishable performance result.", ""),
                 good_readme), "no publishable result")
-    rejects("a README claiming Phase 3 is closed is rejected",
+    rejects("a README that omits the Phase 3 closure is rejected",
             validate_status_documents(
-                good_plan, good_protocol, good_readme + "Phase 3: CLOSED\n"), "overstates")
+                good_plan, good_protocol,
+                good_readme.replace("Phase 3: CLOSED", "Phase 3: OPEN")),
+            "closure status")
+    rejects("a README that omits the P3.5 closure is rejected",
+            validate_status_documents(
+                good_plan, good_protocol,
+                good_readme.replace("P3.5: CLOSED", "P3.5: OPEN")),
+            "closure status")
     rejects("a README that never describes P3.5 is rejected",
             validate_status_documents(good_plan, good_protocol, ""), "does not describe P3.5")
 

@@ -30,13 +30,14 @@ independently audited: YES; verified on GB300: YES; complete-result
 correctness: PASS; publishable results: NONE; P3.2: CLOSED. P3.3 (cuBLASLt
 baseline) — implemented; independently audited: YES; verified on GB300: YES;
 complete-result correctness: PASS; publishable results: NONE; P3.3: CLOSED;
-no CuTe-versus-cuBLASLt comparison exists. P3.4 (three CuTe DSL execution
+P3.3 itself produces no CuTe-versus-cuBLASLt comparison. P3.4 (three CuTe DSL execution
 variants) — implemented; independently audited: YES; verified on GB300: YES;
 complete-result correctness: PASS for all three variants; publishable results:
-NONE; P3.4: CLOSED; no variant or cuBLASLt comparison exists.
-P3.5 (five shapes and comparison) — implemented; independently audited: NO
-(PENDING); verified on GB300: NO (PENDING); publishable results: NONE; Phase 3:
-OPEN.`**
+NONE; P3.4: CLOSED; P3.4 itself produces no variant or cuBLASLt comparison.
+P3.5 (five shapes and comparison) — implemented; independently audited: YES;
+verified on GB300: YES; complete-result correctness: PASS for all 20
+shape/candidate rows; publishable results: NONE; P3.5: CLOSED; Phase 3:
+CLOSED.`**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -310,12 +311,13 @@ checks at `OK`. The empirical per-SM ceiling candidate is
 NCU did not resolve the SM-count metric. Every artifact remains
 `publishable: false` unconditionally. P2.4 and Phase 2 are closed.
 
-## Phase 3 status: P3.1–P3.4 closed; P3.5 implemented, audit and GB300 pending
+## Phase 3 status: CLOSED — P3.1–P3.5 are YES / YES / YES
 
 Phase 2 is closed and the Phase 3 gate has passed. P3.1, P3.2, P3.3, and P3.4
-are closed as `YES / YES / YES`. P3.5 is **implemented** but has **not** been
-independently audited and has **not** been verified on GB300, so Phase 3 itself
-remains in progress and no publishable Experiment 3 result exists.
+are closed as `YES / YES / YES`. P3.5 is also implemented, independently
+audited, and functionally verified on GB300, so P3.5 and Phase 3 are closed.
+No publishable Experiment 3 result exists; the P3.5 smoke remains functional
+comparison evidence only. Status flags: P3.5: CLOSED; Phase 3: CLOSED.
 
 P3.1, the pinned official CuTe DSL example, is implemented. It executes one
 exact, unmodified, official NVIDIA example — `NVIDIA/cutlass` v4.6.1, commit
@@ -621,8 +623,8 @@ experimental result.
 **Every emitted row carries `publishable=false`.** No TFLOP/s, speedup,
 efficiency, utilization, bandwidth, or winner label is computed anywhere, no
 result file or campaign directory is written, and P3.3 makes no comparison
-against P3.2 — that comparison is P3.5's, which is implemented but remains
-unaudited and unverified on GB300. The GPU-free checks listed in
+against P3.2 — that comparison is P3.5's. P3.5 is now closed, but its smoke
+remains non-publishable functional comparison evidence. The GPU-free checks listed in
 `src/gemm/P3_3_PROTOCOL.md` section 13 were run by
 the author and passed; those are the author's own self-checks, **not** an
 independent audit. See `src/gemm/P3_3_PROTOCOL.md` for the frozen protocol, the
@@ -714,8 +716,8 @@ BLACKWELL_GPU_INDEX=<physical-index> make gemm-cutedsl-p34-smoke
 efficiency, utilization, bandwidth, ranking, or winner label is computed
 anywhere, no result file or campaign directory is written, and P3.4 compares
 nothing — neither the variants against each other nor against the P3.3 cuBLASLt
-baseline. That comparison is P3.5's, which is implemented but remains unaudited
-and unverified on GB300. The GPU-free acceptance commands listed in
+baseline. That comparison is P3.5's. P3.5 is now closed, but its smoke remains
+non-publishable functional comparison evidence. The GPU-free acceptance commands listed in
 `src/gemm/P3_4_PROTOCOL.md` section 12 were run by
 the author and passed; those are the author's own self-checks, **not** an
 independent audit, and GPU-free checks are **not** GB300 verification. An
@@ -730,12 +732,12 @@ four-line `p34.v1` CSV contained the three variants in frozen order with
 `correctness=PASS` and `publishable=false` throughout. Those timings remain
 functional diagnostics only.
 
-### P3.5 (five shapes and comparison) — implemented; audit and GB300 pending
+### P3.5 (five shapes and comparison) — closed as YES / YES / YES
 
-**P3.5 is implemented. It has NOT been independently audited and it has NOT
-been verified on GB300. No P3.5 measurement of any kind exists in this
-repository, no P3.5 result is publishable, and nothing here claims that any
-CuTe DSL variant approaches or beats cuBLASLt.**
+**P3.5 is implemented, independently audited, and functionally verified on
+GB300. All five shapes and all four candidates passed complete-result
+correctness. P3.5 creates no publishable result, and nothing here claims that
+any CuTe DSL variant approaches or beats cuBLASLt.**
 
 P3.5 extends the already verified P3.3/P3.4 infrastructure to all five final
 Experiment 3 shapes and performs the first explicit, purely **descriptive**
@@ -841,7 +843,8 @@ make gemm-comparison-p35-check   # GPU-free, network-free, unprivileged. Runs th
                                  # repository mounted read-only and no GPU exposed.
 
 BLACKWELL_GPU_INDEX=<physical-index> make gemm-comparison-p35-smoke
-                                 # The only P3.5 GPU target. NOT YET RUN.
+                                 # The only P3.5 GPU target. Verified on B300 on
+                                 # 8 August 2026.
                                  # Validates the index first, runs exclusively
                                  # through scripts/run_container.sh, re-checks both
                                  # upstream sources and compiles the bridge inside
@@ -850,11 +853,33 @@ BLACKWELL_GPU_INDEX=<physical-index> make gemm-comparison-p35-smoke
                                  # launches each.
 ```
 
-The GPU-free acceptance commands listed in `src/gemm/P3_5_PROTOCOL.md` section 12
-were run by the author and passed; **those are the author's own self-checks, not
-an independent audit, and GPU-free checks are not GB300 verification.** No
-independent audit of P3.5 has been performed and no GB300 run of P3.5 exists, so
-Phase 3 remains open.
+The first independent technical audit of implementation commit `61d17845`
+found two fail-closed cleanup paths that could warn and continue after native
+plan-destruction or shape-resource cleanup failure. Remediation commit
+`b76c774473b85a498d8e8872296594cae472d498` propagated those failures, checked
+all native destructor statuses, preserved an existing primary exception, and
+added adversarial regression coverage. Post-remediation review found no
+remaining blocker. The full GPU-free, network-free
+`make gemm-comparison-p35-check` gate then passed on the corrected tree: both
+pinned sources and the dependency graph were revalidated, the bridge compiled
+in private `/tmp`, and ELF inspection confirmed `cublasLtMatmul` with no
+fallback GEMM API. These checks support the audit but are not themselves an
+independent audit or GB300 verification.
+
+On 8 August 2026, the operator ran a fresh passing preflight and the frozen
+smoke on an explicitly selected idle physical NVIDIA B300 at index 4 (UUID
+`GPU-4ae7e013-1aac-31d8-8b8e-c27530f1c6ed`, driver `610.43.02`). The run used
+the clean corrected commit `b76c774473b85a498d8e8872296594cae472d498`,
+revalidated both pinned upstream sources, compiled the bridge in private
+`/tmp`, and executed all five shapes × four candidates with two warm-ups and
+ten measured launches each. All 20 complete-result checks passed with zero
+maximum absolute and relative error. Stdout contained exactly one 100-field
+header and 20 rows in frozen shape-major order; every row recorded
+`git_dirty=false`, `correctness=PASS`, and `publishable=false`. The comparison
+fields remain arithmetic, non-publishable smoke diagnostics: no final campaign,
+statistical conclusion, Nsight Compute analysis, or Phase 4 interpretation was
+performed. The `NamedBarrier ID 0` warning was non-fatal. P3.5 and Phase 3 are
+therefore closed as `YES / YES / YES`.
 
 Implementing P3.5 also required correcting three stale frontier guards that the
 P3.4 closure had already superseded: the `Makefile` and
@@ -864,10 +889,11 @@ the `Makefile`, `scripts/check_cublaslt_gemm_p33.py`, and
 `P3.5 | Five shapes and comparison | NO | NO | NO`, which structurally forbade
 P3.5 from ever being implemented. At the P3.5 baseline commit `b50dca3` both
 `make check-static` and `python3 scripts/check_cublaslt_gemm_p33.py .` therefore
-already failed, before any P3.5 file existed. All three guards were advanced to
-the truthful state — P3.4 closed, P3.5 implemented but neither audited nor
-GB300-verified — and none was weakened: each still rejects an overstated status.
-See `src/gemm/P3_5_PROTOCOL.md` section 12.3.
+already failed, before any P3.5 file existed. At implementation time all three
+guards were advanced to the then-truthful state — P3.4 closed and P3.5
+implemented but not yet audited or verified. This closure advances the
+P3.5-owned status guard to `YES / YES / YES`; none is weakened, and all still
+reject impossible partial states. See `src/gemm/P3_5_PROTOCOL.md` section 12.3.
 
 ## Research question
 
@@ -1010,16 +1036,16 @@ P2.1, P2.2, P2.3, and P2.4 are implemented, independently audited, and
 verified on GB300. Reviewed P2.4 pilot `20260805T102759Z` reached
 `ANALYZED` and established the non-publishable empirical per-SM ceiling
 candidate described above, so the Phase 2 gate has passed and Phase 3 has
-begun. Of experiment 3, P3.1 (executing the pinned official NVIDIA CuTe DSL
+completed. Of experiment 3, P3.1 (executing the pinned official NVIDIA CuTe DSL
 example unchanged) is implemented, independently audited, and functionally
 verified on GB300; P3.2 (the frozen one-shape wrapper) is likewise implemented,
 independently audited, and functionally verified on GB300. P3.3 (the equivalent
 cuBLASLt baseline) is also implemented, independently audited, and functionally
 verified on GB300. P3.4 (the three frozen CuTe DSL execution variants) is also
-implemented, independently audited, and functionally verified on GB300. Those
-four units are closed. P3.5 (the five final shapes and the first descriptive
-four-candidate comparison) is implemented, but it has **not** been independently
-audited and has **not** been verified on GB300, so Phase 3 remains in progress.
+implemented, independently audited, and functionally verified on GB300. P3.5
+(the five final shapes and the first descriptive four-candidate comparison) is
+also implemented, independently audited, and functionally verified on GB300.
+All five units and Phase 3 are closed.
 The repository still contains no
 publishable bandwidth, throughput, GEMM-performance, or cuBLASLt-comparison
 result. The pinned CUDA 13.1, CUTLASS v4.6.1, and `sm_103a` contract in

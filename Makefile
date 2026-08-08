@@ -482,9 +482,10 @@ help:
 	@echo "                                 Emits four CSV lines of functional evidence, NOT"
 	@echo "                                 an experimental result and NOT a comparison."
 	@echo ""
-	@echo "  -- P3.5 five shapes and comparison (see src/gemm/P3_5_PROTOCOL.md; implemented,"
-	@echo "     independent audit PENDING, GB300 verification PENDING. Runs the SAME four"
-	@echo "     frozen candidates on EACH of the five frozen final shapes, always in"
+	@echo "  -- P3.5 five shapes and comparison (see src/gemm/P3_5_PROTOCOL.md; closed as"
+	@echo "     YES / YES / YES after independent audit and GB300 verification."
+	@echo "     Runs the SAME four frozen candidates on EACH of the five frozen final"
+	@echo "     shapes, always in"
 	@echo "     shape-major order, on one shared immutable operand set and one untimed FP32"
 	@echo "     oracle per shape:"
 	@echo "       shapes      (4096,4096,4096,1) (8192,8192,8192,1) (16384,512,4096,1)"
@@ -1304,16 +1305,16 @@ check-static:
 	@grep -Fq -- '--warmup-iterations 2 \' Makefile
 	@grep -Fq -- '--iterations 10' Makefile
 	@echo "== truthful P3.5 status assertions =="
-	@grep -Fq 'P3.5 | Five shapes and comparison | YES | NO | NO |' PLAN.md
-	@grep -Fq 'P3.5 = YES / NO / NO' $(GEMM_P35_PROTOCOL)
+	@grep -Fq 'P3.5 | Five shapes and comparison | YES | YES | YES |' PLAN.md
+	@grep -Fq 'P3.5 = YES / YES / YES' $(GEMM_P35_PROTOCOL)
 	@grep -Fq 'P3.5 creates no publishable performance result' $(GEMM_P35_PROTOCOL)
 	@grep -Fq 'P3.5 (five shapes and comparison)' README.md
 	@! grep -nF 'P3.5 | Five shapes and comparison | NO | NO | NO |' PLAN.md
 	@! grep -nF 'P3.5 | Five shapes and comparison | YES | YES | NO |' PLAN.md
 	@! grep -nF 'P3.5 | Five shapes and comparison | YES | NO | YES |' PLAN.md
-	@! grep -nF 'P3.5 | Five shapes and comparison | YES | YES | YES |' PLAN.md
-	@! grep -nF 'P3.5: CLOSED' README.md
-	@! grep -nF 'Phase 3: CLOSED' README.md
+	@! grep -nF 'P3.5 | Five shapes and comparison | YES | NO | NO |' PLAN.md
+	@grep -Fq 'P3.5: CLOSED' README.md
+	@grep -Fq 'Phase 3: CLOSED' README.md
 	@echo "== P3.5 introduces no Phase 4 functionality and no statistical treatment =="
 	@grep -Fq 'P4.1 | Orchestrator | NO | NO | NO |' PLAN.md
 	@grep -Fq 'P4.2 | Pilot plus three final campaigns | NO | NO | NO |' PLAN.md

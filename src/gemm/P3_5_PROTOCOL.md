@@ -1,9 +1,10 @@
 # P3.5 — Five shapes and comparison (frozen protocol)
 
-Status: `P3.5 = YES / NO / NO` (Implemented / Audited / Verified on GB300).
-The author's own GPU-free checks are **not** an independent audit, and GPU-free
-checks are **not** GB300 verification. Section 12 records exactly what was and
-was not run.
+Status: `P3.5 = YES / YES / YES` (Implemented / Audited / Verified on GB300).
+The author's own GPU-free checks were not treated as an independent audit, and
+GPU-free checks were not treated as GB300 verification. Section 12 records the
+independent audit, remediation, hardened container gate, and later GB300
+functional evidence.
 
 ## 1. Purpose and scope
 
@@ -511,21 +512,55 @@ make gemm-comparison-p35-check
 **These are the author's own self-checks. They are not an independent audit, and
 GPU-free checks are not GB300 verification.**
 
-### 12.2 Not run
+### 12.2 Independent audit, hardened gate, and GB300 verification
 
-`make preflight` and `make gemm-comparison-p35-smoke` were **not** run: they
-require later, operator-controlled GB300 execution on an explicitly selected
-idle physical GPU:
+The first independent technical audit of implementation commit `61d17845`
+found two blocking fail-closed cleanup paths: native plan-destruction failure
+and shape-resource cleanup failure could be logged and ignored after rows were
+already prepared. Remediation commit
+`b76c774473b85a498d8e8872296594cae472d498` propagates cleanup failure when no
+earlier failure exists, preserves the original primary exception when cleanup
+also fails, checks every native destructor status, and adds adversarial tests
+for both routes. Post-remediation review found no remaining blocker.
+P3.5 was independently audited.
+
+On the corrected tree the operator ran the Docker-backed, GPU-free and
+network-free gate:
 
 ```bash
-BLACKWELL_GPU_INDEX=<idle-physical-index> make preflight
-BLACKWELL_GPU_INDEX=<same-idle-physical-index> make gemm-comparison-p35-smoke
+make gemm-comparison-p35-check
 ```
 
-No independent audit of P3.5 has been performed, no GB300 run of P3.5 exists,
-and no P3.5 measurement of any kind exists in this repository.
+It revalidated the pinned checkout, both official sources, package versions,
+and dependency graph; compiled the bridge into container-private `/tmp`;
+inspected its ELF symbols and dynamic dependencies; proved it references
+`cublasLtMatmul` and no fallback GEMM API; and completed both self-tests and the
+full frozen-contract checker at `OK`.
 
-### 12.3 Two stale frontier guards this unit necessarily corrected
+On 8 August 2026 the operator then selected an idle physical NVIDIA B300 at
+index 4 (UUID `GPU-4ae7e013-1aac-31d8-8b8e-c27530f1c6ed`, driver `610.43.02`)
+and ran:
+
+```bash
+BLACKWELL_GPU_INDEX=4 make preflight
+BLACKWELL_GPU_INDEX=4 make gemm-comparison-p35-smoke
+```
+
+The fresh preflight reported `OVERALL=PASS`. The smoke ran the clean corrected
+commit, revalidated both sources, compiled the bridge in private `/tmp`, and
+executed all five shapes × four candidates with two warm-ups and ten measured
+launches each. All 20 complete-result checks passed with
+`max_abs_error=0.0` and `max_rel_error=0.0`. Stdout contained exactly one
+100-field header and 20 rows in frozen shape-major order, with
+`git_dirty=false`, `correctness=PASS`, and `publishable=false` throughout. The
+comparison fields are arithmetic, non-publishable functional diagnostics; no
+final campaign, pilot, statistical treatment, significance claim, Nsight
+Compute analysis, or Phase 4 interpretation was performed. The
+`NamedBarrier ID 0 is used by sync_threads` warning was non-fatal and did not
+affect execution or correctness. P3.5 was verified on GB300. P3.5 is closed.
+Phase 3 is closed.
+
+### 12.3 Three stale frontier guards this unit necessarily corrected
 
 At the P3.5 baseline commit `b50dca3`, three closed-unit guards still described
 a repository state that the P3.4 closure had already superseded, so
@@ -544,12 +579,14 @@ failed **before** any P3.5 file existed:
    `P3.5 | Five shapes and comparison | NO | NO | NO`, which structurally
    forbade P3.5 from ever being implemented.
 
-All three were advanced to the truthful state — P3.4 closed, P3.5 implemented
-but neither audited nor GB300-verified — and nothing was weakened: each guard
-still rejects an overstated status, and the closed units' CLIs, schemas, field
-orders, Make targets, one-shape restrictions, output behaviour, correctness and
-provenance checks, and smoke semantics are byte-for-byte unchanged. P3.4 had to
-make the same kind of correction to P3.3's checker when it landed.
+At implementation time all three were advanced to the then-truthful state —
+P3.4 closed, P3.5 implemented but not yet audited or GB300-verified. This
+closure advances only the P3.5-owned frontier assertion to
+`YES / YES / YES`. Nothing is weakened: impossible partial states are still
+rejected, Phase 4 must remain unimplemented, and the closed units' CLIs,
+schemas, field orders, Make targets, one-shape restrictions, output behaviour,
+correctness and provenance checks, and smoke semantics remain unchanged. P3.4
+had to make the same kind of correction to P3.3's checker when it landed.
 
 ## 13. Security model
 
@@ -581,5 +618,5 @@ persistent campaign directory; final or publishable results; Phase 4
 orchestration; automatic GPU selection; multi-GPU execution; or any commit,
 push, merge, or pull request.
 
-Phase 3 remains **open** until P3.5 is independently audited and verified on
-GB300.
+P3.5 and Phase 3 are closed as `YES / YES / YES`. Phase 4 remains
+unimplemented.
