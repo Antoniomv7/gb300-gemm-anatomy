@@ -273,7 +273,9 @@ close P2.4 and Phase 2.
 ## Phase 3 — CuTe DSL GEMM versus cuBLASLt (3–9 August 2026)
 
 Gate: Phase 2 gate passed. P2.1, P2.2, P2.3, and P2.4 are implemented,
-independently audited, and verified on GB300. Phase 3 is in progress.
+independently audited, and verified on GB300. Phase 3 is in progress: P3.1–P3.4
+are closed, and P3.5 is implemented but neither independently audited nor
+verified on GB300.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
@@ -281,7 +283,7 @@ independently audited, and verified on GB300. Phase 3 is in progress.
 | P3.2 | One-shape wrapper | YES | YES | YES |
 | P3.3 | cuBLASLt baseline | YES | YES | YES |
 | P3.4 | Three execution variants | YES | YES | YES |
-| P3.5 | Five shapes and comparison | NO | NO | NO |
+| P3.5 | Five shapes and comparison | YES | NO | NO |
 
 P3.1 (`src/gemm/P3_1_PROTOCOL.md`) is implemented: it executes one pinned,
 unmodified, official NVIDIA CuTe DSL example — `NVIDIA/cutlass` v4.6.1,
@@ -582,11 +584,97 @@ clusters for `persistent_1cta` and 74 for `persistent_2cta`. The smoke emitted
 exactly the required four CSV lines in frozen order, with every row marked
 `correctness=PASS` and `publishable=false`; its timings remain functional,
 non-publishable diagnostics. P3.4 is therefore closed as `YES / YES / YES`.
-P3.5 remains unimplemented, so Phase 3 remains in progress.
+
+P3.5 (`src/gemm/gemm_comparison.py`, `src/gemm/cublaslt_bridge_p35.cu`,
+`scripts/check_gemm_comparison_p35.py`, `src/gemm/P3_5_PROTOCOL.md`) is
+**implemented; an independent audit is PENDING and GB300 verification is
+PENDING**. It extends the already verified P3.3/P3.4 infrastructure to all five
+final Experiment 3 shapes — `(4096,4096,4096,1)`, `(8192,8192,8192,1)`,
+`(16384,512,4096,1)`, `(32768,512,4096,1)`, `(512,16384,4096,1)`, in that frozen
+order — and performs the first explicit, purely descriptive comparison among
+four candidates per shape, always in the frozen order `nonpersistent_1cta`,
+`persistent_1cta`, `persistent_2cta`, and cuBLASLt `heuristic_first_supported`.
+Output is shape-major: exactly 5 × 4 = 20 rows and 21 lines. No arbitrary shape
+is reachable from the command line, the environment, a configuration file, or an
+input CSV: the Python wrapper and the C bridge freeze the same five geometries
+independently, the bridge exposes its own allowlist through `p35_shape_count()` /
+`p35_shape_at()`, and the wrapper reads it back and requires the two to be
+identical before any measurement runs; a geometry outside the allowlist never
+reaches a descriptor, a heuristic query, or a launch. The three CuTe DSL rows are
+byte-for-byte the closed P3.4 table (including the `(256,128)` tiler over a
+`(2,1)` cluster that keeps the per-CTA M extent at 128), and the cuBLASLt policy
+is exactly the closed P3.3 policy — 64 MiB workspace limit, 32 requested
+heuristic results, `CUBLASLT_SEARCH_BEST_FIT`, the first supported entry,
+re-validated with `cublasLtMatmulAlgoCheck()`, no fallback GEMM API, and no
+autotuning by execution — so a different supported algorithm may naturally win
+per shape while the *selection policy* never changes. This repository still owns
+no GEMM kernel and P3.5 adds **no pin**: it reuses the same two already pinned
+official NVIDIA examples P3.4 uses and the cuBLASLt library that already ships in
+the pinned CUDA 13.1 image, so `VERSIONS.env`, `PHASE3_VERSIONS.env`, the
+`Dockerfile`, and `scripts/run_container.sh` are untouched. Per shape the
+operands are built once by the pinned non-persistent example's own
+`create_tensors()` (same factory, seed `1111`, A/B/C order, dtypes and strides as
+P3.2–P3.4), never mutated, and the untimed IEEE-FP32 CUDA oracle is computed once
+and reused by all four candidates; the cuBLASLt candidate receives its own device
+copies of A and B made from those same immutable host tensors, each proved
+byte-identical before anything runs and each layout-checked against the frozen
+descriptor contract. The output buffer is reset to NaN outside every timer before
+every candidate, and every candidate's complete result is validated before any
+warm-up or steady-state timing runs for it. Per candidate the wrapper separates
+`compile_time_ms` (CuTe DSL JIT only) *or* `setup_time_ms` (cuBLASLt plan
+creation only) — never both, each carrying the canonical `not_applicable` on the
+other method's rows, and never compared against each other — plus
+`first_launch_ms` and, from CUDA events on that candidate's own stream,
+`kernel_time_ms`. Only `kernel_time_ms` participates in the comparison:
+`flop_count = 2·M·N·K` exactly, `tflops = flop_count / (kernel_time_ms × 1e9)`,
+`throughput_ratio_vs_cublaslt = candidate_tflops / cublaslt_tflops`, and
+`gap_to_cublaslt_pct = 100 × (1 − ratio)` — positive means slower, zero equal,
+and **negative means faster and is never clamped**. Candidates are ranked by
+full-precision `kernel_time_ms` with an exact tie broken by the frozen candidate
+order, `best_cutedsl_variant` is chosen among the three CuTe DSL candidates only
+and repeated on all four rows of the shape, and exactly one CuTe DSL row carries
+`is_best_cutedsl=true`. No confidence interval, p-value, outlier removal,
+roofline efficiency, empirical-ceiling utilization, bandwidth,
+arithmetic-intensity classification, or causal interpretation is computed
+anywhere. The whole output is buffered under a new frozen 100-field
+`schema_version=p35.v1` contract — the closed `p32.v1`, `p33.v1`, and `p34.v1`
+schemas are neither modified nor reinterpreted — and a failure at **any** shape
+or candidate emits no CSV at all, including rows already completed. Two Make
+targets were added: GPU-free, network-free `gemm-comparison-p35-check` (which
+runs the existing, unmodified P3.4 gate first, then revalidates the checkout and
+both official sources, checks the pinned versions and `pip check`, compiles the
+P3.5 bridge into container-private `/tmp` and inspects its ELF symbols and
+dynamic dependencies to prove it references `cublasLtMatmul` and no fallback GEMM
+API, and runs both GPU-free self-tests plus the full contract check) and
+`gemm-comparison-p35-smoke`, which rejects a missing or non-numeric
+`BLACKWELL_GPU_INDEX` in its first recipe action before any Docker work and then
+runs exclusively through `scripts/run_container.sh`. **P3.5 produces no
+publishable performance result**: every row carries `publishable=false`, the
+comparison fields are arithmetic rather than a conclusion, no result file or
+campaign directory is written, and beating cuBLASLt is not a success criterion.
+Implementing P3.5 also required correcting three stale frontier guards that the
+P3.4 closure had already superseded — the `Makefile` and
+`scripts/check_cublaslt_gemm_p33.py` still demanded that P3.4 be unclosed, and
+the `Makefile`, `scripts/check_cublaslt_gemm_p33.py`, and
+`scripts/check_cutedsl_variants_p34.py` all required the literal row
+`P3.5 | Five shapes and comparison | NO | NO | NO`, which structurally forbade
+P3.5 from existing; at the P3.5 baseline commit `b50dca3` both `make
+check-static` and `python3 scripts/check_cublaslt_gemm_p33.py .` therefore
+already failed. All three guards were advanced to the truthful state and none was
+weakened; every closed unit's CLI, schema, field order, Make targets, one-shape
+restriction, output behaviour, correctness and provenance checks, and smoke
+semantics are unchanged. See `src/gemm/P3_5_PROTOCOL.md` for the full frozen
+contract. The GPU-free checks listed in that protocol's section 12 were run by
+the author and passed; **those are the author's own self-checks, not an
+independent audit, and GPU-free checks are not GB300 verification**. No P3.5
+measurement of any kind exists in this repository, and Phase 3 therefore remains
+in progress until P3.5 is independently audited and verified on GB300.
 
 ## Phase 4 — Campaigns and integration (10–15 August 2026)
 
-Gate: Phase 3 gate remains pending until P3.4 and P3.5 close.
+Gate: Phase 3 gate remains pending until P3.5 closes. P3.4 has closed; P3.5 is
+implemented but still needs an independent audit and GB300 verification. No
+Phase 4 work has begun.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|

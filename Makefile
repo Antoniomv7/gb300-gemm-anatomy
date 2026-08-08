@@ -149,6 +149,35 @@ GEMM_P34_CHECKER := scripts/check_cutedsl_variants_p34.py
 GEMM_P34_PROTOCOL := src/gemm/P3_4_PROTOCOL.md
 GEMM_P34_PERSISTENT_EXAMPLE := /opt/cutlass/$(CUTEDSL_P34_PERSISTENT_EXAMPLE_PATH)
 
+# P3.5: the five frozen final shapes and the first explicit, descriptive
+# comparison among the four candidates (the three P3.4 CuTe DSL execution
+# variants plus the P3.3 cuBLASLt baseline). It reuses the SAME two already
+# pinned official CUTLASS sources and the same cuBLASLt library that already
+# ships in the pinned CUDA 13.1 image, so it adds no package, no image change,
+# and NO key to either version contract. Its own C-ABI bridge is a separate
+# translation unit from the closed P3.3 one, because P3.3 froze a single shape
+# as compile-time constants while P3.5 must serve five - and it therefore
+# refuses every geometry outside its own five-entry allowlist. No NVIDIA GEMM
+# source is copied, vendored, forked, or patched. Every emitted row is
+# publishable=false: the comparison fields are arithmetic, not a conclusion, and
+# the pilot, the final campaigns, the statistics, and every interpretation are
+# Phase 4 work. See src/gemm/P3_5_PROTOCOL.md.
+GEMM_P35_WRAPPER := src/gemm/gemm_comparison.py
+GEMM_P35_BRIDGE := src/gemm/cublaslt_bridge_p35.cu
+GEMM_P35_CHECKER := scripts/check_gemm_comparison_p35.py
+GEMM_P35_PROTOCOL := src/gemm/P3_5_PROTOCOL.md
+# Container-private build output only: the repository is mounted read-only in
+# the gate, and the wrapper looks the library up at exactly this fixed path
+# (BRIDGE_LIBRARY_PATH), which is a constant and not a runtime control.
+GEMM_P35_BRIDGE_DIR := /tmp/p35-bridge
+GEMM_P35_BRIDGE_LIB := $(GEMM_P35_BRIDGE_DIR)/libp35_cublaslt_bridge.so
+# Same pinned-toolchain requirement as P2.1/P2.2/P3.3: nvcc's single-flag
+# "-arch=sm_103a" shorthand does not propagate the "a" suffix to ptxas on this
+# pinned CUDA 13.1.80 toolchain, so the explicit virtual/real split derived from
+# the same pinned CUDA_ARCH value is used here too, unchanged and for the same
+# reason.
+GEMM_P35_ARCH_FLAGS := -arch=compute_$(patsubst sm_%,%,$(CUDA_ARCH)) -code=$(CUDA_ARCH)
+
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
 	PHASE3_VERSIONS.env \
@@ -169,7 +198,8 @@ REQUIRED_FILES := \
 	$(GEMM_P31_PROTOCOL) \
 	$(GEMM_P32_WRAPPER) $(GEMM_P32_CHECKER) $(GEMM_P32_PROTOCOL) \
 	$(GEMM_P33_WRAPPER) $(GEMM_P33_BRIDGE) $(GEMM_P33_CHECKER) $(GEMM_P33_PROTOCOL) \
-	$(GEMM_P34_WRAPPER) $(GEMM_P34_CHECKER) $(GEMM_P34_PROTOCOL)
+	$(GEMM_P34_WRAPPER) $(GEMM_P34_CHECKER) $(GEMM_P34_PROTOCOL) \
+	$(GEMM_P35_WRAPPER) $(GEMM_P35_BRIDGE) $(GEMM_P35_CHECKER) $(GEMM_P35_PROTOCOL)
 
 .DEFAULT_GOAL := help
 .PHONY: help check-static build-image check-env preflight \
@@ -188,7 +218,8 @@ REQUIRED_FILES := \
 	gemm-cutedsl-p31-check gemm-cutedsl-p31-smoke \
 	gemm-cutedsl-p32-check gemm-cutedsl-p32-smoke \
 	gemm-cublaslt-p33-check gemm-cublaslt-p33-smoke \
-	gemm-cutedsl-p34-check gemm-cutedsl-p34-smoke
+	gemm-cutedsl-p34-check gemm-cutedsl-p34-smoke \
+	gemm-comparison-p35-check gemm-comparison-p35-smoke
 
 help:
 	@echo "gb300-gemm-anatomy — Phase 0 + P1.1 (LDGSTS) + P1.2 (TMA) + P1.3 (sweep) targets"
@@ -423,7 +454,7 @@ help:
 	@echo "                                 and NOT a performance comparison."
 	@echo ""
 	@echo "  -- P3.4 three execution variants (see src/gemm/P3_4_PROTOCOL.md; implemented,"
-	@echo "     independent audit PENDING, GB300 verification PENDING. Runs exactly three"
+	@echo "     independently audited, and verified on GB300. Runs exactly three"
 	@echo "     frozen candidates at the SAME single shape (M,N,K,L)=(4096,4096,4096,1) on"
 	@echo "     ONE shared, immutable operand set and one shared untimed FP32 oracle:"
 	@echo "       nonpersistent_1cta  DenseGemmKernel            tiler (128,128) cluster (1,1)"
@@ -450,6 +481,47 @@ help:
 	@echo "                                 with 2 warm-ups and 10 measured launches each."
 	@echo "                                 Emits four CSV lines of functional evidence, NOT"
 	@echo "                                 an experimental result and NOT a comparison."
+	@echo ""
+	@echo "  -- P3.5 five shapes and comparison (see src/gemm/P3_5_PROTOCOL.md; implemented,"
+	@echo "     independent audit PENDING, GB300 verification PENDING. Runs the SAME four"
+	@echo "     frozen candidates on EACH of the five frozen final shapes, always in"
+	@echo "     shape-major order, on one shared immutable operand set and one untimed FP32"
+	@echo "     oracle per shape:"
+	@echo "       shapes      (4096,4096,4096,1) (8192,8192,8192,1) (16384,512,4096,1)"
+	@echo "                   (32768,512,4096,1) (512,16384,4096,1)"
+	@echo "       candidates  nonpersistent_1cta  persistent_1cta  persistent_2cta"
+	@echo "                   cublaslt/heuristic_first_supported (the comparison baseline)"
+	@echo "     No arbitrary shape is reachable from the CLI, the environment, a config"
+	@echo "     file, or an input CSV: the wrapper and the C bridge freeze the same five"
+	@echo "     independently and must agree. The cuBLASLt policy is exactly P3.3's and"
+	@echo "     never changes; only which supported algorithm the vendor heuristic returns"
+	@echo "     may differ per shape. Correctness is mandatory and precedes every timing,"
+	@echo "     per candidate, and the 21 output lines appear only if ALL 20 measurements"
+	@echo "     pass. The comparison is descriptive only: exact 2*M*N*K FLOP counts,"
+	@echo "     TFLOP/s, a ratio and a signed gap against the cuBLASLt baseline (a negative"
+	@echo "     gap means faster and is NEVER clamped), a rank, and the best CuTe DSL"
+	@echo "     variant. NO confidence interval, p-value, outlier removal, roofline,"
+	@echo "     bandwidth, or causal interpretation is computed. Every row is"
+	@echo "     publishable=false: P3.5 is NOT a campaign and NOT a final result, and"
+	@echo "     beating cuBLASLt is NOT a success criterion.) --"
+	@echo "  GPU-free P3.5 contract gate (no GPU, no network; runs the P3.4 gate first):"
+	@echo "  make gemm-comparison-p35-check Revalidate the CUTLASS checkout and BOTH pinned"
+	@echo "                                 official sources, verify the pinned package"
+	@echo "                                 versions and dependency graph, compile the P3.5"
+	@echo "                                 cuBLASLt bridge into container-private /tmp and"
+	@echo "                                 inspect its ELF symbols and dynamic"
+	@echo "                                 dependencies (cublasLtMatmul present, no"
+	@echo "                                 fallback GEMM API present), then run the"
+	@echo "                                 wrapper's GPU-free --help and --self-test plus"
+	@echo "                                 the checker and its own self-test."
+	@echo "  GPU-executing (requires BLACKWELL_GPU_INDEX; never selects a GPU automatically):"
+	@echo "  make gemm-comparison-p35-smoke Re-check both upstream sources inside the GPU"
+	@echo "                                 container, compile the bridge into private /tmp,"
+	@echo "                                 then run all five shapes x four candidates with"
+	@echo "                                 2 warm-ups and 10 measured launches each. Emits"
+	@echo "                                 21 CSV lines of functional comparison evidence,"
+	@echo "                                 NOT an experimental result, NOT a statistical"
+	@echo "                                 conclusion, and NOT a Phase 4 interpretation."
 	@echo ""
 	@echo "Pinned global contract (VERSIONS.env, unchanged since Phase 0 and consumed"
 	@echo "unmodified by the closed P1/P2 aggregators): CUDA $(CUDA_VERSION), CUTLASS"
@@ -857,13 +929,13 @@ check-static:
 	@grep -Fq 'scripts/run_container.sh' Makefile
 	@echo "== truthful P3.1 status assertions =="
 	@grep -Fq 'P3.1 | Pinned official CuTe DSL example | YES | YES | YES |' PLAN.md
-	@# P3.5 genuinely does not exist yet, so its row must stay untouched. P3.4 is
-	@# a later unit that may progress on its own, so it is checked for existence
-	@# and for not being overstated rather than pinned to NO | NO | NO, which
-	@# would fail the moment P3.4 is truthfully implemented.
-	@grep -Fq 'P3.5 | Five shapes and comparison | NO | NO | NO |' PLAN.md
+	@# P3.4 and P3.5 are later units that progress on their own, so P3.1's own
+	@# gate only requires that each still has a status row - never that it is
+	@# pinned to a particular value, which would fail the moment that unit is
+	@# truthfully implemented, audited, or verified. Each unit's own section
+	@# below asserts its own truthful status.
 	@grep -Fq 'P3.4 | Three execution variants |' PLAN.md
-	@! grep -nF 'P3.4 | Three execution variants | YES | YES | YES |' PLAN.md
+	@grep -Fq 'P3.5 | Five shapes and comparison |' PLAN.md
 	@grep -Fq 'P3.1 = YES / YES / YES' $(GEMM_P31_PROTOCOL)
 	@grep -Fq 'P3.1 produces no experimental result' $(GEMM_P31_PROTOCOL)
 	@grep -Fq 'non-persistent' $(GEMM_P31_PROTOCOL)
@@ -1116,17 +1188,142 @@ check-static:
 	@grep -Fq -- '--warmup-iterations 2 \' Makefile
 	@grep -Fq -- '--iterations 10' Makefile
 	@echo "== truthful P3.4 status assertions =="
-	@grep -Fq 'P3.4 | Three execution variants | YES | NO | NO |' PLAN.md
-	@grep -Fq 'P3.4 = YES / NO / NO' $(GEMM_P34_PROTOCOL)
+	@grep -Fq 'P3.4 | Three execution variants | YES | YES | YES |' PLAN.md
+	@grep -Fq 'P3.4 = YES / YES / YES' $(GEMM_P34_PROTOCOL)
 	@grep -Fq 'P3.4 creates no publishable performance result' $(GEMM_P34_PROTOCOL)
 	@grep -Fq 'P3.4 (three execution variants)' README.md
 	@! grep -nF 'P3.4 | Three execution variants | NO | NO | NO |' PLAN.md
+	@! grep -nF 'P3.4 | Three execution variants | YES | NO | NO |' PLAN.md
 	@! grep -nF 'P3.4 | Three execution variants | YES | YES | NO |' PLAN.md
 	@! grep -nF 'P3.4 | Three execution variants | YES | NO | YES |' PLAN.md
-	@! grep -nF 'P3.4 | Three execution variants | YES | YES | YES |' PLAN.md
-	@echo "== P3.4 introduces no P3.5 functionality, no comparison, and no extra shape =="
-	@grep -Fq 'P3.5 | Five shapes and comparison | NO | NO | NO |' PLAN.md
+	@echo "== P3.4 itself still implements no P3.5 functionality and no comparison =="
 	@! grep -nE '^(P35)_' $(GEMM_P34_WRAPPER)
+	@echo "== P3.5 files present, executable, and still vendoring no NVIDIA GEMM source =="
+	@test -f $(GEMM_P35_WRAPPER)
+	@test -f $(GEMM_P35_BRIDGE)
+	@test -f $(GEMM_P35_CHECKER)
+	@test -f $(GEMM_P35_PROTOCOL)
+	@test -x $(GEMM_P35_WRAPPER)
+	@test -x $(GEMM_P35_CHECKER)
+	@! grep -nE '^(import|from|def|class) ' $(GEMM_P35_PROTOCOL)
+	@! test -e src/gemm/dense_gemm.py
+	@! test -e src/gemm/dense_gemm_persistent.py
+	@echo "== P3.5 python syntax, GPU-free self-tests, and the full contract check =="
+	python3 -m py_compile $(GEMM_P35_WRAPPER) $(GEMM_P35_CHECKER)
+	python3 $(GEMM_P35_WRAPPER) --self-test
+	python3 $(GEMM_P35_CHECKER) --self-test
+	python3 $(GEMM_P35_CHECKER) .
+	@rm -rf src/gemm/__pycache__ scripts/__pycache__
+	@echo "== P3.5 declares exactly the five frozen shapes, in the frozen order =="
+	@grep -Fq '    (4096, 4096, 4096, 1),' $(GEMM_P35_WRAPPER)
+	@grep -Fq '    (8192, 8192, 8192, 1),' $(GEMM_P35_WRAPPER)
+	@grep -Fq '    (16384, 512, 4096, 1),' $(GEMM_P35_WRAPPER)
+	@grep -Fq '    (32768, 512, 4096, 1),' $(GEMM_P35_WRAPPER)
+	@grep -Fq '    (512, 16384, 4096, 1),' $(GEMM_P35_WRAPPER)
+	@grep -Fq '    {4096, 4096, 4096},' $(GEMM_P35_BRIDGE)
+	@grep -Fq '    {8192, 8192, 8192},' $(GEMM_P35_BRIDGE)
+	@grep -Fq '    {16384, 512, 4096},' $(GEMM_P35_BRIDGE)
+	@grep -Fq '    {32768, 512, 4096},' $(GEMM_P35_BRIDGE)
+	@grep -Fq '    {512, 16384, 4096},' $(GEMM_P35_BRIDGE)
+	@echo "   (the exact five-shape order, the four-candidate order, and the fact that the"
+	@echo "    wrapper and the C bridge must agree are enforced structurally by"
+	@echo "    $(GEMM_P35_CHECKER))"
+	@echo "== P3.5 frozen scientific contract cannot silently change =="
+	@grep -Eq '^FROZEN_L = 1$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^FROZEN_AB_DTYPE = "BFloat16"$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^FROZEN_ACC_DTYPE = "Float32"$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^FROZEN_C_DTYPE = "Float32"$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^FROZEN_A_MAJOR = "k"$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^FROZEN_B_MAJOR = "k"$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^FROZEN_C_MAJOR = "n"$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^FROZEN_USE_TMA_STORE = True$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^FROZEN_SEED = 1111$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^SCHEMA_VERSION = "p35.v1"$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^RUN_KIND = "smoke"$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^REFERENCE = "torch_cuda_fp32_ieee"$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^CACHE_MODE = "hot"$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^PUBLISHABLE = "false"$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^NOT_APPLICABLE = "not_applicable"$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^FLOPS_PER_MAC = 2$$' $(GEMM_P35_WRAPPER)
+	@echo "== P3.5 keeps the closed P3.3 cuBLASLt policy, unchanged =="
+	@grep -Eq '^FROZEN_WORKSPACE_LIMIT_BYTES = 67108864$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^FROZEN_HEURISTIC_REQUESTED = 32$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^FROZEN_SEARCH_MODE = "CUBLASLT_SEARCH_BEST_FIT"$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^FROZEN_TRANSA = "CUBLAS_OP_N"$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^FROZEN_TRANSB = "CUBLAS_OP_T"$$' $(GEMM_P35_WRAPPER)
+	@grep -Eq '^FROZEN_ORDER = "CUBLASLT_ORDER_ROW"$$' $(GEMM_P35_WRAPPER)
+	@grep -Fq 'static const uint64_t P35_WORKSPACE_LIMIT_BYTES = 67108864ULL;' $(GEMM_P35_BRIDGE)
+	@grep -Fq 'static const int P35_HEURISTIC_REQUESTED = 32;' $(GEMM_P35_BRIDGE)
+	@echo "== the P3.5 measured path is cublasLtMatmul, with no fallback GEMM API =="
+	@grep -Eq 'cublasLtMatmul[[:space:]]*\(' $(GEMM_P35_BRIDGE)
+	@grep -Eq 'cublasLtMatmulAlgoCheck[[:space:]]*\(' $(GEMM_P35_BRIDGE)
+	@grep -Eq 'cublasLtMatmulAlgoGetHeuristic[[:space:]]*\(' $(GEMM_P35_BRIDGE)
+	@# Call sites, not bare names: both files deliberately NAME the forbidden
+	@# entry points in prose that explains they are never used. The rigorous
+	@# comment-stripped scan, and the exactly-one-cublasLtMatmul-call-site rule,
+	@# live in $(GEMM_P35_CHECKER).
+	@pat='cublasGemmEx|cublasGemmStridedBatchedEx|cublasGemmBatchedEx'; \
+	pat="$$pat|cublasSgemm|cublasHgemm|cublasLtMatmulAlgoGetIds|cublasLtMatmulAlgoInit"; \
+	! grep -nE -- "($$pat)[[:space:]]*\(" $(GEMM_P35_WRAPPER) $(GEMM_P35_BRIDGE)
+	@echo "   (the checker names those spellings on purpose, in order to ban them)"
+	@echo "== the P3.5 bridge owns no GEMM kernel, prints nothing, and times nothing =="
+	@! grep -nE '__global__|__device__' $(GEMM_P35_BRIDGE)
+	@! grep -nE '(^|[^a-zA-Z0-9_])(printf|puts|fputs)[[:space:]]*\(' $(GEMM_P35_BRIDGE)
+	@! grep -nE 'std::(cout|cerr|clog)' $(GEMM_P35_BRIDGE)
+	@! grep -nE 'cudaEventRecord|cudaEventElapsedTime|std::chrono|clock_gettime|gettimeofday' $(GEMM_P35_BRIDGE)
+	@grep -Fq 'extern "C"' $(GEMM_P35_BRIDGE)
+	@grep -Fq 'catch (...)' $(GEMM_P35_BRIDGE)
+	@echo "== the P3.5 bridge validates every derived size against overflow =="
+	@grep -Fq 'INT64_MAX' $(GEMM_P35_BRIDGE)
+	@grep -Fq 'SIZE_MAX' $(GEMM_P35_BRIDGE)
+	@grep -Eq 'p35_shape_index_of[[:space:]]*\(' $(GEMM_P35_BRIDGE)
+	@echo "== P3.5 leaves the closed P3.3 bridge and its ABI untouched =="
+	@! grep -nE 'p35_' $(GEMM_P33_BRIDGE)
+	@grep -Fq 'p33_plan_create' $(GEMM_P33_BRIDGE)
+	@echo "== P3.5 exposes no frozen scientific parameter and can never skip correctness =="
+	@pat='--mnkl|--shape|--shapes|--variant|--candidate|--method|--scheduler'; \
+	pat="$$pat|--persistent|--nonpersistent|--mma_tiler|--mma-tiler|--cluster_shape"; \
+	pat="$$pat|--cluster-shape|--use_2cta|--use-2cta|--ab_dtype|--c_dtype|--acc_dtype"; \
+	pat="$$pat|--a_major|--b_major|--c_major|--use_tma_store|--use-tma-store|--seed"; \
+	pat="$$pat|--tolerance|--atol|--rtol|--workspace|--algo|--heuristic|--search"; \
+	pat="$$pat|--skip-ref""-check|--skip_ref""_check|--use_cold""_l2|--example|--source-path"; \
+	pat="$$pat|--output|--out-file|--csv|--publish|--partial|--only|--input|--config"; \
+	! grep -nE -- "$$pat" $(GEMM_P35_WRAPPER)
+	@echo "   (the checker names those spellings on purpose, in order to ban them)"
+	@echo "== P3.5 writes no result file and creates no campaign directory =="
+	@! grep -nE 'results/raw|results/preflight' $(GEMM_P35_WRAPPER)
+	@echo "== P3.5 adds no key to either version contract =="
+	@! grep -nE '^(CUTEDSL_)?P35_' PHASE3_VERSIONS.env VERSIONS.env
+	@! grep -nE '^CUTEDSL_P35' PHASE3_VERSIONS.env VERSIONS.env
+	@echo "== P3.5 reuses the audited launcher and never invokes Docker for GPU work =="
+	@grep -Eq '^gemm-comparison-p35-smoke:$$' Makefile
+	@grep -Fq 'scripts/run_container.sh' Makefile
+	@echo "== P3.5 GPU-free gate actually executes the existing P3.4 gate =="
+	@grep -Eq '^gemm-comparison-p35-check: gemm-cutedsl-p34-check$$' Makefile
+	@echo "== P3.5 smoke runs exactly the frozen non-publishable iteration counts =="
+	@grep -Fq -- '--warmup-iterations 2 \' Makefile
+	@grep -Fq -- '--iterations 10' Makefile
+	@echo "== truthful P3.5 status assertions =="
+	@grep -Fq 'P3.5 | Five shapes and comparison | YES | NO | NO |' PLAN.md
+	@grep -Fq 'P3.5 = YES / NO / NO' $(GEMM_P35_PROTOCOL)
+	@grep -Fq 'P3.5 creates no publishable performance result' $(GEMM_P35_PROTOCOL)
+	@grep -Fq 'P3.5 (five shapes and comparison)' README.md
+	@! grep -nF 'P3.5 | Five shapes and comparison | NO | NO | NO |' PLAN.md
+	@! grep -nF 'P3.5 | Five shapes and comparison | YES | YES | NO |' PLAN.md
+	@! grep -nF 'P3.5 | Five shapes and comparison | YES | NO | YES |' PLAN.md
+	@! grep -nF 'P3.5 | Five shapes and comparison | YES | YES | YES |' PLAN.md
+	@! grep -nF 'P3.5: CLOSED' README.md
+	@! grep -nF 'Phase 3: CLOSED' README.md
+	@echo "== P3.5 introduces no Phase 4 functionality and no statistical treatment =="
+	@grep -Fq 'P4.1 | Orchestrator | NO | NO | NO |' PLAN.md
+	@grep -Fq 'P4.2 | Pilot plus three final campaigns | NO | NO | NO |' PLAN.md
+	@grep -Fq 'P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |' PLAN.md
+	@! grep -nE '^(P4|P41|P42|P43)_' $(GEMM_P35_WRAPPER)
+	@echo "   (the tokenized identifier ban for confidence intervals, bootstraps, outlier"
+	@echo "    removal, rooflines, bandwidth, utilization, Nsight Compute, autotuning,"
+	@echo "    plots, and campaign trees lives in $(GEMM_P35_CHECKER), which scans Python"
+	@echo "    NAME tokens so that prose explaining what P3.5 does NOT compute stays legal"
+	@echo "    while code does not)"
 	@echo "check-static: OK"
 
 build-image:
@@ -2456,6 +2653,255 @@ gemm-cutedsl-p34-smoke:
 	else \
 		echo "P3.4 smoke FAILED with exit status $$status: no CSV header and no CSV row" >&2; \
 		echo "were emitted for ANY variant, and no result may be read from this run." >&2; \
+	fi; \
+	echo "==============================================================================" >&2; \
+	exit $$status
+
+# --- P3.5: five shapes and comparison ----------------------------------------
+# P3.2 established one CuTe DSL execution variant at the first final shape, P3.3
+# established the cuBLASLt baseline for the same geometry, and P3.4 added the two
+# remaining execution variants -- all still at that single shape. P3.5 extends
+# the same already verified infrastructure to ALL FIVE final Experiment 3 shapes
+# and performs the first explicit, purely descriptive comparison among the four
+# candidates:
+#
+#   shapes      (4096,4096,4096,1) (8192,8192,8192,1) (16384,512,4096,1)
+#               (32768,512,4096,1) (512,16384,4096,1)
+#   candidates  nonpersistent_1cta  persistent_1cta  persistent_2cta
+#               cublaslt/heuristic_first_supported   (the comparison baseline)
+#
+# Output is shape-major: five shapes in the frozen order, four candidates in the
+# frozen order inside each, for exactly 20 rows and 21 lines. No arbitrary shape
+# is reachable from the CLI, the environment, a configuration file, or an input
+# CSV: the Python wrapper and the C bridge freeze the same five independently,
+# and the wrapper reads the bridge's own allowlist back and requires the two to
+# be identical before any measurement runs.
+#
+# This repository still owns no GEMM kernel and adds no pin: the three CuTe DSL
+# candidates use the SAME two pinned official NVIDIA examples P3.4 uses, and the
+# cuBLASLt candidate uses the library that already ships in the pinned CUDA 13.1
+# image. VERSIONS.env, PHASE3_VERSIONS.env, the Dockerfile, scripts/
+# run_container.sh, and every closed P3.1/P3.2/P3.3/P3.4 interface are untouched.
+#
+# The comparison is arithmetic, not a conclusion: exact 2*M*N*K FLOP counts,
+# TFLOP/s from kernel_time_ms alone, a ratio and a SIGNED gap against the
+# cuBLASLt baseline (negative means faster, and it is never clamped), a rank with
+# a frozen-order tie break, and the best CuTe DSL variant per shape. No
+# confidence interval, p-value, outlier removal, roofline, empirical-ceiling
+# utilization, bandwidth, arithmetic intensity, or causal interpretation is
+# computed anywhere. Every row is publishable=false. The pilot, the final
+# campaigns, the statistics, the experiment integration, and every
+# interpretation are Phase 4 work. See src/gemm/P3_5_PROTOCOL.md.
+#
+# gemm-comparison-p35-check never touches a GPU, the network, or elevated
+# privileges. It runs the existing P3.4 gate first (which itself runs the P3.3,
+# P3.2, and P3.1 gates, all GPU-free and network-free, and all left completely
+# intact), then runs inside the pinned image with --network none, --cap-drop
+# ALL, no-new-privileges, the invoking UID/GID, no --gpus, and the repository
+# mounted READ-ONLY, with PYTHONPYCACHEPREFIX and every build artifact under the
+# container's own /tmp.
+#
+# gemm-comparison-p35-smoke is the only P3.5 target that executes on GPU. Its
+# first recipe action validates BLACKWELL_GPU_INDEX before Docker, any build, or
+# any check can start, which is why it deliberately has no Make prerequisite
+# (same audited reasoning as the P3.1/P3.2/P3.3/P3.4 smoke targets). It then goes
+# exclusively through scripts/run_container.sh, which alone owns GPU selection,
+# UUID resolution, and the idle-device proof.
+
+gemm-comparison-p35-check: gemm-cutedsl-p34-check
+	docker run --rm \
+		--network none \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-e TMPDIR=/tmp \
+		-e PYTHONPYCACHEPREFIX=/tmp/p35-pycache \
+		-e CUTLASS_COMMIT="$(CUTLASS_COMMIT)" \
+		-e CUDA_SHORT_VERSION="$(CUDA_SHORT_VERSION)" \
+		-e CUTEDSL_VERSION="$(CUTEDSL_VERSION)" \
+		-e PYTORCH_VERSION="$(PYTORCH_VERSION)" \
+		-e PYTORCH_CUDA_VERSION="$(PYTORCH_CUDA_VERSION)" \
+		-e CUDA_PYTHON_VERSION="$(CUDA_PYTHON_VERSION)" \
+		-e CUDA_BINDINGS_VERSION="$(CUDA_BINDINGS_VERSION)" \
+		-e P31_EXAMPLE="$(GEMM_P31_EXAMPLE)" \
+		-e P31_EXAMPLE_GIT_BLOB="$(CUTEDSL_P31_EXAMPLE_GIT_BLOB)" \
+		-e P31_EXAMPLE_SHA256="$(CUTEDSL_P31_EXAMPLE_SHA256)" \
+		-e P34_EXAMPLE="$(GEMM_P34_PERSISTENT_EXAMPLE)" \
+		-e P34_EXAMPLE_GIT_BLOB="$(CUTEDSL_P34_PERSISTENT_EXAMPLE_GIT_BLOB)" \
+		-e P34_EXAMPLE_SHA256="$(CUTEDSL_P34_PERSISTENT_EXAMPLE_SHA256)" \
+		-e P35_WRAPPER="$(GEMM_P35_WRAPPER)" \
+		-e P35_BRIDGE="$(GEMM_P35_BRIDGE)" \
+		-e P35_CHECKER="$(GEMM_P35_CHECKER)" \
+		-e P35_BRIDGE_DIR="$(GEMM_P35_BRIDGE_DIR)" \
+		-e P35_BRIDGE_LIB="$(GEMM_P35_BRIDGE_LIB)" \
+		-e P35_ARCH_FLAGS="$(GEMM_P35_ARCH_FLAGS)" \
+		-v "$(CURDIR):/workspace:ro" \
+		-w /workspace \
+		"$(IMAGE_TAG)" \
+		bash -c 'set -euo pipefail; \
+			fail() { echo "gemm-comparison-p35-check: FAIL: $$*" >&2; exit 1; }; \
+			echo "== the pinned CUDA toolkit that must supply cuBLASLt =="; \
+			nvcc_version="$$(nvcc --version | sed -n "s/.*release \([0-9.]*\).*/\1/p")"; \
+			[ "$$nvcc_version" = "$$CUDA_SHORT_VERSION" ] \
+				|| fail "nvcc reports CUDA $$nvcc_version, pinned is $$CUDA_SHORT_VERSION"; \
+			echo "nvcc CUDA $$nvcc_version (cuBLASLt ships with it; no package is added)"; \
+			echo "== the pinned CUTLASS checkout =="; \
+			[ -d /opt/cutlass ] || fail "/opt/cutlass is missing"; \
+			head_commit="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass rev-parse HEAD)" \
+				|| fail "cannot read the /opt/cutlass HEAD commit"; \
+			[ "$$head_commit" = "$$CUTLASS_COMMIT" ] \
+				|| fail "/opt/cutlass HEAD $$head_commit != pinned $$CUTLASS_COMMIT"; \
+			dirty="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass status --porcelain --untracked-files=all)" \
+				|| fail "cannot read the /opt/cutlass working tree status"; \
+			[ -z "$$dirty" ] || fail "/opt/cutlass has tracked or untracked modifications"; \
+			echo "checkout OK: commit $$head_commit"; \
+			echo "== BOTH pinned official sources, verified independently =="; \
+			for pair in "$$P31_EXAMPLE|$$P31_EXAMPLE_GIT_BLOB|$$P31_EXAMPLE_SHA256" \
+					"$$P34_EXAMPLE|$$P34_EXAMPLE_GIT_BLOB|$$P34_EXAMPLE_SHA256"; do \
+				file="$${pair%%|*}"; rest="$${pair#*|}"; \
+				want_blob="$${rest%%|*}"; want_sha="$${rest#*|}"; \
+				[ ! -L "$$file" ] || fail "$$file is a symlink"; \
+				[ -f "$$file" ] || fail "$$file is not a regular file"; \
+				blob="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass hash-object -- "$$file")" \
+					|| fail "cannot compute the Git blob SHA of $$file"; \
+				[ "$$blob" = "$$want_blob" ] \
+					|| fail "$$file Git blob $$blob != pinned $$want_blob"; \
+				sha="$$(sha256sum "$$file" | cut -d" " -f1)" \
+					|| fail "cannot compute the SHA-256 of $$file"; \
+				[ "$$sha" = "$$want_sha" ] \
+					|| fail "$$file SHA-256 $$sha != pinned $$want_sha"; \
+				echo "source OK: $$file"; \
+				echo "           blob   $$blob"; \
+				echo "           sha256 $$sha"; \
+			done; \
+			[ "$$P31_EXAMPLE" != "$$P34_EXAMPLE" ] \
+				|| fail "the two pinned sources are the same file"; \
+			python3 -c "import os, cutlass, torch; \
+				ce = os.environ[\"CUTEDSL_VERSION\"]; \
+				assert cutlass.__version__ == ce, f\"CuTeDSL {cutlass.__version__} != pinned {ce}\"; \
+				pe = os.environ[\"PYTORCH_VERSION\"]; \
+				assert torch.__version__ == pe, f\"torch {torch.__version__} != pinned {pe}\"; \
+				pc = os.environ[\"PYTORCH_CUDA_VERSION\"]; \
+				assert torch.version.cuda == pc, f\"torch CUDA {torch.version.cuda} != pinned {pc}\"; \
+				print(\"versions OK: cutedsl\", ce, \"torch\", pe, \"torch-cuda\", pc)"; \
+			python3 -c "import os; from importlib.metadata import version; \
+				expected = {\"cuda-python\": os.environ[\"CUDA_PYTHON_VERSION\"], \
+					\"cuda-bindings\": os.environ[\"CUDA_BINDINGS_VERSION\"]}; \
+				installed = {name: version(name) for name in expected}; \
+				assert installed == expected, f\"installed distributions {installed} != pinned {expected}\"; \
+				print(\"cuda distributions OK:\", installed)"; \
+			echo "== pip check: the dependency graph must be consistent =="; \
+			python3 -m pip check; \
+			echo "== compile the P3.5 C-ABI cuBLASLt bridge into container-private /tmp =="; \
+			mkdir -p "$$P35_BRIDGE_DIR"; \
+			nvcc -std=c++17 -O3 -lineinfo \
+				-Xcompiler -fPIC -shared \
+				$$P35_ARCH_FLAGS \
+				-o "$$P35_BRIDGE_LIB" "$$P35_BRIDGE" \
+				-lcublasLt -lcudart \
+				|| fail "the P3.5 cuBLASLt bridge did not compile"; \
+			echo "bridge compiled: $$P35_BRIDGE_LIB"; \
+			echo "== the shared object must call cublasLtMatmul and no fallback GEMM API =="; \
+			nm -D --defined-only "$$P35_BRIDGE_LIB" > /tmp/p35-defined.txt \
+				|| fail "cannot read the defined symbols of the bridge"; \
+			nm -D -u "$$P35_BRIDGE_LIB" > /tmp/p35-undefined.txt \
+				|| fail "cannot read the undefined symbols of the bridge"; \
+			readelf -d "$$P35_BRIDGE_LIB" > /tmp/p35-dynamic.txt \
+				|| fail "cannot read the dynamic section of the bridge"; \
+			grep -qw "cublasLtMatmul" /tmp/p35-undefined.txt \
+				|| fail "the measured path does not reference cublasLtMatmul"; \
+			grep -qw "cublasLtMatmulAlgoCheck" /tmp/p35-undefined.txt \
+				|| fail "the bridge never validates the selected algorithm"; \
+			grep -qw "cublasLtMatmulAlgoGetHeuristic" /tmp/p35-undefined.txt \
+				|| fail "the bridge never queries the vendor heuristic"; \
+			for symbol in p35_bridge_abi_version p35_plan_info_size p35_last_error \
+					p35_cublaslt_version p35_shape_count p35_shape_at \
+					p35_plan_create p35_plan_execute p35_stream_synchronize \
+					p35_plan_destroy; do \
+				grep -qw "$$symbol" /tmp/p35-defined.txt \
+					|| fail "the bridge does not export $$symbol"; \
+			done; \
+			for forbidden in cublasGemmEx cublasGemmStridedBatchedEx cublasGemmBatchedEx \
+					cublasSgemm cublasHgemm cublasLtMatmulAlgoGetIds cublasLtMatmulAlgoInit; do \
+				if grep -qw "$$forbidden" /tmp/p35-defined.txt /tmp/p35-undefined.txt; then \
+					fail "the bridge references the forbidden fallback API $$forbidden"; \
+				fi; \
+			done; \
+			grep -q "libcublasLt.so" /tmp/p35-dynamic.txt \
+				|| fail "the bridge is not linked against libcublasLt"; \
+			grep -q "libcudart.so" /tmp/p35-dynamic.txt \
+				|| fail "the bridge is not linked against libcudart"; \
+			echo "ELF inspection OK: cublasLtMatmul present, no fallback GEMM API present"; \
+			echo "== P3.5 python syntax =="; \
+			python3 -m py_compile "$$P35_WRAPPER" "$$P35_CHECKER"; \
+			echo "== P3.5 wrapper --help and --self-test are GPU-free =="; \
+			python3 "$$P35_WRAPPER" --help > /dev/null \
+				|| fail "the wrapper --help did not exit successfully"; \
+			python3 "$$P35_WRAPPER" --self-test \
+				|| fail "the wrapper GPU-free self-test failed"; \
+			echo "== P3.5 checker self-test and full frozen-contract check =="; \
+			python3 "$$P35_CHECKER" --self-test \
+				|| fail "the checker self-test failed"; \
+			python3 "$$P35_CHECKER" /workspace \
+				|| fail "the P3.5 frozen-contract check failed"; \
+			echo "P3.5 GPU-free contract OK (no GPU was used or required)"'
+	@echo "gemm-comparison-p35-check: OK"
+
+gemm-comparison-p35-smoke:
+	@if [ -z "$${BLACKWELL_GPU_INDEX:-}" ]; then \
+		echo "ERROR: BLACKWELL_GPU_INDEX must be set explicitly to a physical GPU index." >&2; \
+		echo "       Example: BLACKWELL_GPU_INDEX=3 make gemm-comparison-p35-smoke" >&2; \
+		echo "       This project never selects a GPU automatically." >&2; \
+		exit 2; \
+	fi
+	@case "$${BLACKWELL_GPU_INDEX}" in \
+		'' | *[!0-9]*) \
+			echo "ERROR: BLACKWELL_GPU_INDEX must be a non-negative integer, got '$${BLACKWELL_GPU_INDEX}'." >&2; \
+			exit 2; ;; \
+	esac
+	@status=0; \
+	RUN_CONTAINER_STDOUT_IS_DATA=1 scripts/run_container.sh bash -c 'set -euo pipefail; \
+		head_commit="$$(git -c safe.directory=/opt/cutlass -C /opt/cutlass rev-parse HEAD)"; \
+		[ "$$head_commit" = "$(CUTLASS_COMMIT)" ] \
+			|| { echo "gemm-comparison-p35-smoke: FAIL: /opt/cutlass HEAD $$head_commit != pinned $(CUTLASS_COMMIT)" >&2; exit 1; }; \
+		sha_nonpersistent="$$(sha256sum "$(GEMM_P31_EXAMPLE)" | cut -d" " -f1)"; \
+		[ "$$sha_nonpersistent" = "$(CUTEDSL_P31_EXAMPLE_SHA256)" ] \
+			|| { echo "gemm-comparison-p35-smoke: FAIL: non-persistent SHA-256 $$sha_nonpersistent != pinned $(CUTEDSL_P31_EXAMPLE_SHA256)" >&2; exit 1; }; \
+		sha_persistent="$$(sha256sum "$(GEMM_P34_PERSISTENT_EXAMPLE)" | cut -d" " -f1)"; \
+		[ "$$sha_persistent" = "$(CUTEDSL_P34_PERSISTENT_EXAMPLE_SHA256)" ] \
+			|| { echo "gemm-comparison-p35-smoke: FAIL: persistent SHA-256 $$sha_persistent != pinned $(CUTEDSL_P34_PERSISTENT_EXAMPLE_SHA256)" >&2; exit 1; }; \
+		echo "gemm-comparison-p35-smoke: both upstream sources re-checked in this GPU container:" >&2; \
+		echo "gemm-comparison-p35-smoke:   commit          $$head_commit" >&2; \
+		echo "gemm-comparison-p35-smoke:   non-persistent  $$sha_nonpersistent" >&2; \
+		echo "gemm-comparison-p35-smoke:   persistent      $$sha_persistent" >&2; \
+		mkdir -p $(GEMM_P35_BRIDGE_DIR); \
+		nvcc -std=c++17 -O3 -lineinfo -Xcompiler -fPIC -shared \
+			$(GEMM_P35_ARCH_FLAGS) \
+			-o $(GEMM_P35_BRIDGE_LIB) $(GEMM_P35_BRIDGE) \
+			-lcublasLt -lcudart >&2; \
+		echo "gemm-comparison-p35-smoke: bridge compiled into container-private $(GEMM_P35_BRIDGE_LIB)" >&2; \
+		exec python3 $(GEMM_P35_WRAPPER) \
+			--warmup-iterations 2 \
+			--iterations 10' || status=$$?; \
+	echo "==============================================================================" >&2; \
+	echo "P3.5 FUNCTIONAL COMPARISON EVIDENCE ONLY -- NOT AN EXPERIMENTAL RESULT." >&2; \
+	echo "ALL FIVE SHAPES and ALL FOUR CANDIDATES were required: (4096,4096,4096,1)," >&2; \
+	echo "(8192,8192,8192,1), (16384,512,4096,1), (32768,512,4096,1), (512,16384,4096,1)" >&2; \
+	echo "x nonpersistent_1cta, persistent_1cta, persistent_2cta, and cuBLASLt" >&2; \
+	echo "heuristic_first_supported, with 2 warm-ups and 10 measured launches each and" >&2; \
+	echo "hot reused operands. ALL 20 ROWS ARE NON-PUBLISHABLE: every row carries" >&2; \
+	echo "publishable=false, and the comparison fields (TFLOP/s, the baseline ratio, the" >&2; \
+	echo "signed gap, the rank, and the best CuTe DSL variant) are ARITHMETIC, NOT A" >&2; \
+	echo "CONCLUSION. NO FINAL CAMPAIGN, NO PILOT, NO STATISTICAL treatment or" >&2; \
+	echo "significance claim, NO NSIGHT COMPUTE analysis, and NO PHASE 4 interpretation" >&2; \
+	echo "has been performed. Beating cuBLASLt is not a success criterion." >&2; \
+	if [ "$$status" -eq 0 ]; then \
+		echo "P3.5 smoke completed: every candidate of every shape passed correctness before its warm-up and steady-state timing." >&2; \
+	else \
+		echo "P3.5 smoke FAILED with exit status $$status: no CSV header and no CSV row" >&2; \
+		echo "were emitted for ANY shape or candidate, including rows already completed," >&2; \
+		echo "and no result or comparison may be read from this run." >&2; \
 	fi; \
 	echo "==============================================================================" >&2; \
 	exit $$status

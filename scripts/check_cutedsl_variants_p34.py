@@ -313,7 +313,15 @@ CLOSED_STATUS_LINES = (
     "| P3.1 | Pinned official CuTe DSL example | YES | YES | YES |",
     "| P3.2 | One-shape wrapper | YES | YES | YES |",
     "| P3.3 | cuBLASLt baseline | YES | YES | YES |",
-    "| P3.5 | Five shapes and comparison | NO | NO | NO |",
+)
+# P3.5 is a later unit that progresses on its own, so it is checked for having a
+# status row and for not being recorded as audited or GB300-verified without
+# being implemented - never pinned to one value, which would structurally forbid
+# P3.5 from ever being implemented.
+LATER_STATUS_PREFIXES = ("| P3.5 | Five shapes and comparison |",)
+IMPOSSIBLE_LATER_STATUS_LINES = (
+    "| P3.5 | Five shapes and comparison | NO | YES |",
+    "| P3.5 | Five shapes and comparison | NO | NO | YES |",
 )
 
 _GUARD_PRELUDE = """
@@ -1203,6 +1211,15 @@ def validate_status_documents(plan_text, protocol_text, readme_text) -> list:
     for closed in CLOSED_STATUS_LINES:
         if closed not in plan_text:
             errors.append(f"PLAN.md no longer records {closed!r}")
+    for later in LATER_STATUS_PREFIXES:
+        if later not in plan_text:
+            errors.append(f"PLAN.md no longer records a status row for {later!r}")
+    for impossible in IMPOSSIBLE_LATER_STATUS_LINES:
+        if impossible in plan_text:
+            errors.append(
+                f"PLAN.md records a later unit as audited or verified without being "
+                f"implemented: {impossible!r}"
+            )
 
     if "P3.4 = YES / YES / YES" not in protocol_text:
         errors.append(f"{PROTOCOL_RELATIVE_PATH} does not state P3.4 = YES / YES / YES")
@@ -1973,7 +1990,7 @@ def run_self_test() -> int:
         "| P3.2 | One-shape wrapper | YES | YES | YES |\n"
         "| P3.3 | cuBLASLt baseline | YES | YES | YES |\n"
         "| P3.4 | Three execution variants | YES | YES | YES |\n"
-        "| P3.5 | Five shapes and comparison | NO | NO | NO |\n"
+        "| P3.5 | Five shapes and comparison | YES | NO | NO |\n"
     )
     good_protocol = (
         "Status: `P3.4 = YES / YES / YES`.\n"
@@ -1996,11 +2013,29 @@ def run_self_test() -> int:
                 good_plan.replace("| P3.2 | One-shape wrapper | YES | YES | YES |",
                                   "| P3.2 | One-shape wrapper | YES | NO | NO |"),
                 good_protocol, good_readme), "no longer records")
-    rejects("a PLAN.md that implements P3.5 is rejected",
+    # P3.5 may progress on its own: unimplemented, implemented-but-unclosed, and
+    # closed are all truthful states this closed P3.4 gate must accept.
+    for later_status in (
+        "| P3.5 | Five shapes and comparison | NO | NO | NO |",
+        "| P3.5 | Five shapes and comparison | YES | NO | NO |",
+        "| P3.5 | Five shapes and comparison | YES | YES | YES |",
+    ):
+        check("a later P3.5 status is accepted",
+              validate_status_documents(
+                  good_plan.replace("| P3.5 | Five shapes and comparison | YES | NO | NO |",
+                                    later_status),
+                  good_protocol, good_readme) == [],
+              later_status)
+    rejects("a PLAN.md that drops the P3.5 row is rejected",
             validate_status_documents(
-                good_plan.replace("| P3.5 | Five shapes and comparison | NO | NO | NO |",
-                                  "| P3.5 | Five shapes and comparison | YES | NO | NO |"),
-                good_protocol, good_readme), "no longer records")
+                good_plan.replace(
+                    "| P3.5 | Five shapes and comparison | YES | NO | NO |\n", ""),
+                good_protocol, good_readme), "status row")
+    rejects("a P3.5 audited without being implemented is rejected",
+            validate_status_documents(
+                good_plan.replace("| P3.5 | Five shapes and comparison | YES | NO | NO |",
+                                  "| P3.5 | Five shapes and comparison | NO | YES | NO |"),
+                good_protocol, good_readme), "without being")
 
     # Make variable expansion and recipe extraction.
     variables = parse_make_variables("A := src/gemm\nB := $(A)/cutedsl_variants.py\n")
