@@ -37,7 +37,9 @@ NONE; P3.4: CLOSED; P3.4 itself produces no variant or cuBLASLt comparison.
 P3.5 (five shapes and comparison) — implemented; independently audited: YES;
 verified on GB300: YES; complete-result correctness: PASS for all 20
 shape/candidate rows; publishable results: NONE; P3.5: CLOSED; Phase 3:
-CLOSED.`**
+CLOSED. P4.1 (Phase 4 campaign orchestrator) — P4.1: implemented; independent
+audit: PENDING; GB300 verification: PENDING; Phase 4 campaigns executed: NONE;
+publishable results: NONE; P4.2 and P4.3: not implemented.`**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -894,6 +896,129 @@ guards were advanced to the then-truthful state — P3.4 closed and P3.5
 implemented but not yet audited or verified. This closure advances the
 P3.5-owned status guard to `YES / YES / YES`; none is weakened, and all still
 reject impossible partial states. See `src/gemm/P3_5_PROTOCOL.md` section 12.3.
+
+## Phase 4 status: P4.1 implemented; audit and GB300 verification PENDING
+
+### P4.1 (Phase 4 campaign orchestrator) — implemented only
+
+**P4.1: implemented; independent audit: PENDING; GB300 verification: PENDING.**
+**No Phase 4 campaign has been executed** — no pilot, no final campaign, no GPU
+command, not one orchestration stage — and **no publishable result exists**.
+P4.2 (one pilot plus three independent final campaigns) and P4.3 (integrated
+analysis, documentation, and the final audit) are **not implemented**.
+
+`scripts/run_all.sh` is the **only** public Phase 4 orchestration entry point.
+It coordinates one reproducible top-level campaign across the three closed
+experiments by *composing* their already audited entry points — it reimplements
+no kernel, scientific matrix, statistic, profiler plan, correctness rule,
+schema, or execution parameter, adds no external dependency, no version pin,
+and no Nsight Compute case:
+
+| Experiment | Composed unit | Driven through |
+|------------|---------------|----------------|
+| 1. LDGSTS versus TMA | P1.4 | `make memory-paths-p14-pilot` / `-profile` / `-analyze` |
+| 2. BF16 UMMA throughput | P2.4 | `make compute-umma-p24-pilot` / `-profile` / `-analyze` |
+| 3. CuTe DSL GEMM versus cuBLASLt | P3.5 | `make gemm-comparison-p35-smoke` |
+
+Experiment 3 stays **one atomic `gemm` stage**: P3.5 is a single comparison of
+five frozen shapes × four candidates (exactly 20 rows) over shared, immutable
+operands with shape-major ordering and all-or-nothing output, so a separate
+`--only cublaslt` or `--only cutedsl` mode is **forbidden** and rejected by
+name. The supported selector is `--only gemm`.
+
+```text
+scripts/run_all.sh --help
+scripts/run_all.sh --self-test
+
+scripts/run_all.sh --dry-run \
+    --campaign-id <YYYYMMDDTHHMMSSZ> --campaign-kind <pilot|final> \
+    [--only <memory|umma|gemm>]
+
+BLACKWELL_GPU_INDEX=<physical-index> scripts/run_all.sh \
+    --campaign-id <YYYYMMDDTHHMMSSZ> --campaign-kind <pilot|final> \
+    [--only <memory|umma|gemm>] [--resume]
+```
+
+The deterministic full plan is `preflight`, `memory.pilot`, `memory.profile`,
+`umma.pilot`, `umma.profile`, `gemm.capture`, `memory.analyze`, `umma.analyze`,
+`campaign.validate`; `--dry-run` prints it byte-identically and executes
+nothing. `--campaign-id` is a required, explicit canonical UTC timestamp — a
+campaign ID is never generated implicitly — and `--campaign-kind`
+(`pilot`/`final`) is required and immutable. **`campaign-kind=final` does not
+make any raw evidence publishable**: it is a label for P4.2's bookkeeping.
+Duplicate options, missing values, unexpected positional arguments, and unknown
+options exit 2. `--help`, `--self-test`, and a new-campaign `--dry-run` are
+genuinely GPU-free: no Docker, no `nvidia-smi`, no CUDA/PyTorch/CuTe DSL
+import, no network, no results directory, no manifest or log write, and no Git
+mutation.
+
+Every real invocation with pending GPU work requires an explicit numeric
+`BLACKWELL_GPU_INDEX`, rejected before Docker, `nvidia-smi`, result creation, or
+any GPU-related subprocess. The preflight runs only through
+`BLACKWELL_GPU_INDEX=<i> make preflight`, and the exact
+`results/preflight/<TS>/summary.json` **that invocation** produced is identified
+from its own stdout markers — never `ls -t`, a "latest" symlink, glob ordering,
+or a modification time — then validated as a non-symlink, non-empty regular
+JSON file with `overall_status=PASS`, `git_dirty=false`, the current clean
+commit, the explicitly selected GPU's UUID, compute capability `10.3`, logical
+index `0`, and all six required checks at `PASS`. That exact summary path is
+then passed to every remaining P1.4/P2.4 stage. This unit never calls Docker or
+`nvidia-smi` itself, never selects a GPU automatically, and adds no profiler
+route.
+
+The top-level campaign tree lives at `results/raw/phase4/<campaign_id>/`
+(`manifest/`, `plan.json`, `logs/`, `exp03/gemm_comparison.csv`) under the
+existing blanket `results/raw/` Git-ignore rule. The manifest is an
+**append-only, hash-chained revision history**, never one mutable
+`manifest.json`, and records only allowlisted information — schema version,
+campaign ID and immutable kind, immutable scope, the clean Git commit, stage
+order and per-stage status, repository-relative evidence paths, SHA-256 hashes,
+allowlisted GPU identity, the validated preflight reference, timestamps, any
+failure or interruption stage, and `publishable=false`. It never stores
+usernames, home paths, host names, environment dumps, credentials, SSH
+material, process information, host command lines, or dynamic power, clock,
+temperature, or utilization telemetry. The experiment-owned raw trees are
+referenced by validated repository-relative path and hash rather than copied,
+and all five trees share one campaign ID. Symlinks and unexpected file types are
+rejected everywhere; evidence is never overwritten; publication is no-clobber;
+valid partial evidence survives an interruption or a child failure; and
+everything is re-hashed and revalidated immediately before a stage or campaign
+is declared complete.
+
+`--resume` is evidence-driven, not existence-driven: each apparently complete
+stage is re-loaded through the underlying unit's **own** semantic loader
+(`load_p14_manifest_chain` / `load_p24_manifest_chain`) or P3.5's own
+`validate_serialized_output`, re-hashed, and rechecked against the immutable
+campaign identity before it is skipped, and a fresh preflight is created and
+validated whenever GPU work is still pending. An existing campaign without
+`--resume` is rejected, `--resume` for a missing campaign is rejected, a
+tampered artifact aborts rather than being regenerated, and a resume of an
+already complete campaign is a pure read-only revalidation. A P2.4
+`INCONCLUSIVE` analysis propagates to a non-complete top-level outcome and is
+never accepted as a complete final campaign. **P4.1 creates no Phase 4
+variability threshold, publication threshold, or scientific acceptance rule**;
+integrated tables, interpretation, publication decisions, and final figures
+belong exclusively to P4.3.
+
+```bash
+make phase4-p41-plan    # GPU-free. Prints the deterministic full-campaign plan
+                        # through the real --dry-run path; creates nothing.
+make phase4-p41-check   # GPU-free, network-free. Runs the existing
+                        # memory-paths-p14-check and compute-umma-p24-check
+                        # gates first, then the shell/Python syntax checks, the
+                        # public CLI surface, the synthetic acceptance suite,
+                        # and the full repository contract check.
+```
+
+Implementing P4.1 required advancing one stale frontier assertion that the P4.1
+row itself owned: the `Makefile` and `scripts/check_gemm_comparison_p35.py`
+both required the literal `PLAN.md` row `P4.1 | Orchestrator | NO | NO | NO`,
+which structurally forbade P4.1 from ever being implemented. Both were advanced
+to the truthful `YES | NO | NO`; neither was weakened, a new regression rejects
+a prematurely closed P4.1, and P4.2 and P4.3 are still required to remain
+unimplemented. See `src/phase4/P4_1_PROTOCOL.md` for the complete frozen
+contract, including the author's own GPU-free checks — **which are not an
+independent audit, and which are not GB300 verification**.
 
 ## Research question
 

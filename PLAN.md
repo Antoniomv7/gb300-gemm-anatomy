@@ -695,11 +695,85 @@ therefore closed as `YES / YES / YES`.
 
 ## Phase 4 — Campaigns and integration (10–15 August 2026)
 
-Gate: Phase 3 gate passed. P3.1–P3.5 are closed as `YES / YES / YES`. No Phase
-4 work has begun.
+Gate: Phase 3 gate passed. P3.1–P3.5 are closed as `YES / YES / YES`. P4.1 is
+implemented; its independent audit and GB300 verification are both pending. No
+Phase 4 campaign has been executed and no publishable result exists.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
-| P4.1 | Orchestrator | NO | NO | NO |
+| P4.1 | Orchestrator | YES | NO | NO |
 | P4.2 | Pilot plus three final campaigns | NO | NO | NO |
 | P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |
+
+P4.1 (`scripts/run_all.sh`, `scripts/phase4_orchestrator.py`,
+`scripts/check_phase4_orchestrator_p41.py`, `src/phase4/P4_1_PROTOCOL.md`) is
+**implemented infrastructure only**. `scripts/run_all.sh` is the single public
+Phase 4 orchestration entry point; it coordinates one reproducible top-level
+campaign across the three closed experiments by **composing** their existing
+audited entry points — `make memory-paths-p14-pilot` / `-profile` / `-analyze`
+for experiment 1, `make compute-umma-p24-pilot` / `-profile` / `-analyze` for
+experiment 2, and `make gemm-comparison-p35-smoke` for experiment 3 — passing
+the same top-level campaign ID through `P1_4_CAMPAIGN_ID`/`P2_4_CAMPAIGN_ID`
+and the exact preflight summary that invocation created and validated through
+`P1_4_PREFLIGHT_SUMMARY`/`P2_4_PREFLIGHT_SUMMARY`. It reimplements no kernel,
+scientific matrix, statistic, profiler plan, correctness rule, schema, or
+execution parameter, adds no external dependency and no version pin, and adds
+no Nsight Compute case or profiler route. Experiment 3 remains **one atomic
+`gemm` stage** — five frozen shapes × four candidates, exactly 20 rows — because
+P3.5 enforces shared operands, shape-major ordering, all-or-nothing output, and
+one common comparison contract; a separate `--only cublaslt` or `--only
+cutedsl` mode is forbidden and rejected by name, and the supported selector is
+`--only gemm`. The deterministic full plan is `preflight`, `memory.pilot`,
+`memory.profile`, `umma.pilot`, `umma.profile`, `gemm.capture`,
+`memory.analyze`, `umma.analyze`, `campaign.validate`, with the three `--only`
+plans given in `src/phase4/P4_1_PROTOCOL.md` section 3. Every real invocation
+with pending GPU work requires an explicit numeric `BLACKWELL_GPU_INDEX`,
+rejected before Docker, `nvidia-smi`, result creation, or any GPU-related
+subprocess; the preflight runs only through `BLACKWELL_GPU_INDEX=<i> make
+preflight`, and the exact `results/preflight/<TS>/summary.json` it produced is
+identified from that invocation's own stdout markers — never `ls -t`, a
+"latest" symlink, glob ordering, or a modification time — then validated as a
+non-symlink, non-empty regular JSON file with `overall_status=PASS`, the
+current clean commit, the explicitly selected GPU, and all six required checks
+at `PASS`. The top-level campaign tree
+(`results/raw/phase4/<campaign_id>/manifest/`, `plan.json`, `logs/`,
+`exp03/gemm_comparison.csv`) carries an append-only, hash-chained manifest
+history rather than one mutable `manifest.json`; it records only allowlisted
+information (schema version, campaign ID and immutable kind, immutable scope,
+the clean Git commit, stage order and per-stage status, repository-relative
+evidence paths, SHA-256 hashes, allowlisted GPU identity, the validated
+preflight reference, timestamps, any failure or interruption stage, and
+`publishable=false`), never usernames, home paths, host names, environment
+dumps, credentials, SSH material, process information, host command lines, or
+dynamic power/clock/temperature/utilization telemetry. The experiment-owned raw
+trees are referenced by validated repository-relative path and hash rather than
+copied. Symlinks and unexpected file types are rejected everywhere, evidence is
+never overwritten, publication is no-clobber, valid partial evidence survives an
+interruption or a child failure, and everything is re-hashed and revalidated
+immediately before a stage or campaign is declared complete. `--resume` is
+evidence-driven rather than existence-driven: each apparently complete stage is
+re-loaded through the underlying unit's **own** semantic loader
+(`load_p14_manifest_chain` / `load_p24_manifest_chain`) or P3.5's own
+`validate_serialized_output`, re-hashed, and rechecked against the immutable
+campaign identity before it is skipped, and a fresh preflight is created and
+validated whenever GPU work is still pending. A P2.4 `INCONCLUSIVE` analysis
+propagates to a non-complete top-level outcome and is never accepted as a
+complete campaign. P4.1 creates no Phase 4 variability threshold, publication
+threshold, or scientific acceptance rule; those belong to P4.2/P4.3. Two
+GPU-free Make targets were added, `phase4-p41-plan` and `phase4-p41-check`, the
+latter depending on the existing `memory-paths-p14-check` and
+`compute-umma-p24-check` gates. Implementing P4.1 also required advancing one
+stale frontier assertion that the P4.1 row itself owned — the `Makefile` and
+`scripts/check_gemm_comparison_p35.py` both demanded the literal row
+`P4.1 | Orchestrator | NO | NO | NO`, which structurally forbade P4.1 from
+being implemented at all; both were advanced to the truthful
+`YES | NO | NO`, neither was weakened, a new regression rejects a prematurely
+closed P4.1, and P4.2/P4.3 are still required to remain unimplemented. The
+GPU-free checks in `src/phase4/P4_1_PROTOCOL.md` section 12 were run by the
+author and passed; **those are the author's own self-checks, not an independent
+audit, and GPU-free checks are not GB300 verification.** **No Phase 4 campaign
+was executed** — no pilot, no final campaign, no GPU command, not one stage —
+and **no publishable result exists**: every artifact P4.1 can write records
+`publishable=false`. P4.2 will execute one pilot and three independent final
+campaigns; P4.3 will perform the integrated analysis, documentation, and final
+audit. P4.1 is therefore recorded as `YES / NO / NO`.

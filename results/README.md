@@ -17,6 +17,14 @@ This closes P2.4 and Phase 2, but the campaign remains reviewed pilot
 evidence with `publishable: false`, not a final campaign. See
 `src/compute/P2_4_PROTOCOL.md` for the frozen contract and limitations.
 
+**No Phase 4 campaign has been executed.** P4.1 (the campaign orchestrator,
+`scripts/run_all.sh`) is implemented infrastructure only: its independent
+audit and GB300 verification are both pending, no pilot or final campaign has
+been run through it, no `results/raw/phase4/` tree exists in this repository,
+and no publishable result exists anywhere. P4.2 will execute one pilot and
+three independent final campaigns; P4.3 will perform the integrated analysis,
+documentation, and final audit.
+
 ## Trust model
 
 The campaign filesystem under `results/raw/` is trusted and single-writer.
@@ -338,6 +346,62 @@ Git-ignore rule as every other campaign tree in this repository. Campaign
 `20260805T102759Z` executed this complete path on GB300 and reached
 `ANALYZED`; its closure record appears above. See
 `src/compute/P2_4_PROTOCOL.md` for the complete frozen contract.
+
+### `results/raw/phase4/<campaign_id>/` (raw, not committed)
+
+**This tree does not exist yet: no Phase 4 campaign has been executed.** The
+layout below is what P4.1 (`scripts/run_all.sh`, see
+`src/phase4/P4_1_PROTOCOL.md`) will create for one real top-level campaign,
+under the same blanket `results/raw/` Git-ignore rule as every other raw
+campaign tree in this repository:
+
+```text
+results/raw/phase4/<campaign_id>/
+├── manifest/            # append-only, hash-chained revisions: 000000.json, ...
+├── plan.json            # the immutable deterministic stage plan, written once
+├── logs/                # one no-clobber log set per stage/attempt
+└── exp03/
+    └── gemm_comparison.csv   # the accepted P3.5 capture (21 lines, 20 rows)
+```
+
+The three experiments keep their own raw trees; P4.1 does **not** copy them,
+and instead records validated repository-relative references plus SHA-256
+hashes. All five trees share one explicit campaign ID:
+
+```text
+results/raw/phase4/<id>/
+results/raw/exp01_memory_paths/<id>/
+results/raw/exp01_memory_paths_p14/<id>/
+results/raw/exp02_umma_throughput/<id>/
+results/raw/exp02_umma_throughput_p24/<id>/
+```
+
+The top-level manifest is never a single mutable file: each transition appends
+one complete, immutable snapshot whose `previous_manifest_sha256` is the
+freshly recomputed hash of the preceding revision, and loading re-opens,
+re-hashes, and revalidates every revision from `000000.json` forward on every
+call. `os.replace()` is never used. Its `state` field follows
+`IN_PROGRESS` → `COMPLETE` / `INCONCLUSIVE` / `FAILED` / `INTERRUPTED`, with
+`FAILED` and `INTERRUPTED` reopenable only by an explicit `--resume` and only
+for the two stages that own no persistent per-experiment state
+(`preflight`, `gemm.capture`). `COMPLETE` means every selected component
+independently passed its own existing validator **and** the final top-level
+integrity gate; it never means the result is publishable — `publishable` is
+always `false`. A P2.4 `INCONCLUSIVE` analysis propagates to a non-complete
+top-level outcome and is never accepted as a complete campaign.
+
+The manifest records only allowlisted information: schema version, the
+campaign ID and its immutable kind (`pilot`/`final`), the immutable selected
+scope (`full`/`memory`/`umma`/`gemm`), the current clean Git commit, the stage
+order and per-stage status, repository-relative evidence paths, SHA-256
+hashes, allowlisted GPU identity (UUID, name, compute capability, driver
+version) taken from validated evidence, the validated preflight reference,
+timestamps, any failure or interruption stage, and `publishable=false`. It
+never stores usernames, home paths, host names, full environment dumps,
+credentials or tokens, SSH material, unrelated process information, complete
+host command lines, or dynamic power, clock, temperature, or utilization
+telemetry; a structural privacy gate rejects any offending field name at any
+nesting depth and any absolute path value.
 
 ## Safe public metadata
 

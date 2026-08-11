@@ -13,7 +13,9 @@
 # compute-umma-p24-check, compute-umma-p24-pilot, compute-umma-p24-profile,
 # compute-umma-p24-analyze, gemm-cutedsl-p31-check, gemm-cutedsl-p31-smoke,
 # gemm-cutedsl-p32-check, gemm-cutedsl-p32-smoke, gemm-cublaslt-p33-check,
-# gemm-cublaslt-p33-smoke, gemm-cutedsl-p34-check, gemm-cutedsl-p34-smoke.
+# gemm-cublaslt-p33-smoke, gemm-cutedsl-p34-check, gemm-cutedsl-p34-smoke,
+# gemm-comparison-p35-check, gemm-comparison-p35-smoke, phase4-p41-plan,
+# phase4-p41-check.
 # No target selects a GPU automatically, elevates privileges, or exceeds two
 # build jobs.
 
@@ -178,6 +180,29 @@ GEMM_P35_BRIDGE_LIB := $(GEMM_P35_BRIDGE_DIR)/libp35_cublaslt_bridge.so
 # reason.
 GEMM_P35_ARCH_FLAGS := -arch=compute_$(patsubst sm_%,%,$(CUDA_ARCH)) -code=$(CUDA_ARCH)
 
+# P4.1: the single public Phase 4 campaign orchestration entry point. It
+# COMPOSES the already closed and audited P1.4, P2.4, and P3.5 units through
+# their existing Make targets and reimplements none of them: no kernel, no
+# scientific matrix, no statistic, no profiler plan, no correctness rule, no
+# schema, and no execution parameter changes. Experiment 3 stays ONE atomic
+# gemm stage because P3.5 enforces shared operands, shape-major ordering,
+# all-or-nothing output, and one common comparison contract, so there is
+# deliberately no --only cublaslt and no --only cutedsl. P4.1 adds no external
+# dependency and no version pin, runs no pilot and no final campaign, and marks
+# nothing publishable: every artifact it can write records publishable=false.
+# P4.2 will execute one pilot plus three independent final campaigns; P4.3 will
+# perform the integrated analysis, documentation, and audit. See
+# src/phase4/P4_1_PROTOCOL.md.
+PHASE4_P41_ENTRYPOINT := scripts/run_all.sh
+PHASE4_P41_ORCHESTRATOR := scripts/phase4_orchestrator.py
+PHASE4_P41_CHECKER := scripts/check_phase4_orchestrator_p41.py
+PHASE4_P41_PROTOCOL := src/phase4/P4_1_PROTOCOL.md
+PHASE4_P41_RAW_ROOT := results/raw/phase4
+# A fixed, obviously synthetic placeholder: phase4-p41-plan prints a plan and
+# never creates anything, and this project never generates a campaign ID
+# implicitly.
+PHASE4_P41_PLAN_CAMPAIGN_ID := 20990101T000000Z
+
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
 	PHASE3_VERSIONS.env \
@@ -199,7 +224,9 @@ REQUIRED_FILES := \
 	$(GEMM_P32_WRAPPER) $(GEMM_P32_CHECKER) $(GEMM_P32_PROTOCOL) \
 	$(GEMM_P33_WRAPPER) $(GEMM_P33_BRIDGE) $(GEMM_P33_CHECKER) $(GEMM_P33_PROTOCOL) \
 	$(GEMM_P34_WRAPPER) $(GEMM_P34_CHECKER) $(GEMM_P34_PROTOCOL) \
-	$(GEMM_P35_WRAPPER) $(GEMM_P35_BRIDGE) $(GEMM_P35_CHECKER) $(GEMM_P35_PROTOCOL)
+	$(GEMM_P35_WRAPPER) $(GEMM_P35_BRIDGE) $(GEMM_P35_CHECKER) $(GEMM_P35_PROTOCOL) \
+	$(PHASE4_P41_ENTRYPOINT) $(PHASE4_P41_ORCHESTRATOR) $(PHASE4_P41_CHECKER) \
+	$(PHASE4_P41_PROTOCOL)
 
 .DEFAULT_GOAL := help
 .PHONY: help check-static build-image check-env preflight \
@@ -219,7 +246,8 @@ REQUIRED_FILES := \
 	gemm-cutedsl-p32-check gemm-cutedsl-p32-smoke \
 	gemm-cublaslt-p33-check gemm-cublaslt-p33-smoke \
 	gemm-cutedsl-p34-check gemm-cutedsl-p34-smoke \
-	gemm-comparison-p35-check gemm-comparison-p35-smoke
+	gemm-comparison-p35-check gemm-comparison-p35-smoke \
+	phase4-p41-plan phase4-p41-check
 
 help:
 	@echo "gb300-gemm-anatomy — Phase 0 + P1.1 (LDGSTS) + P1.2 (TMA) + P1.3 (sweep) targets"
@@ -523,6 +551,29 @@ help:
 	@echo "                                 21 CSV lines of functional comparison evidence,"
 	@echo "                                 NOT an experimental result, NOT a statistical"
 	@echo "                                 conclusion, and NOT a Phase 4 interpretation."
+	@echo ""
+	@echo "  -- P4.1 Phase 4 campaign orchestrator (see src/phase4/P4_1_PROTOCOL.md;"
+	@echo "     IMPLEMENTED ONLY: independent audit PENDING, GB300 verification PENDING."
+	@echo "     No Phase 4 campaign has been executed and no publishable result exists."
+	@echo "     scripts/run_all.sh is the ONLY public Phase 4 entry point. It COMPOSES"
+	@echo "     the closed P1.4, P2.4, and P3.5 units through their existing Make"
+	@echo "     targets and reimplements no kernel, matrix, statistic, profiler plan,"
+	@echo "     correctness rule, schema, or execution parameter. Experiment 3 is ONE"
+	@echo "     atomic 'gemm' stage: there is no --only cublaslt and no --only cutedsl."
+	@echo "     P4.2 will run one pilot plus three final campaigns; P4.3 will do the"
+	@echo "     integrated analysis, documentation, and audit.) --"
+	@echo "  GPU-free P4.1 planning/checking (no GPU, no Docker, no network):"
+	@echo "  make phase4-p41-plan          Print the deterministic full-campaign stage"
+	@echo "                                plan through the real --dry-run path. Creates"
+	@echo "                                nothing and executes nothing."
+	@echo "  make phase4-p41-check         Shell/Python syntax, executable bits, the"
+	@echo "                                public CLI surface, the synthetic acceptance"
+	@echo "                                suite, and the full repository contract check,"
+	@echo "                                after re-running the existing GPU-free P1.4"
+	@echo "                                and P2.4 gates."
+	@echo "  GPU-executing Phase 4 campaigns are P4.2 work and have NOT been run:"
+	@echo "  BLACKWELL_GPU_INDEX=<i> scripts/run_all.sh --campaign-id <YYYYMMDDTHHMMSSZ> \\"
+	@echo "      --campaign-kind <pilot|final> [--only <memory|umma|gemm>] [--resume]"
 	@echo ""
 	@echo "Pinned global contract (VERSIONS.env, unchanged since Phase 0 and consumed"
 	@echo "unmodified by the closed P1/P2 aggregators): CUDA $(CUDA_VERSION), CUTLASS"
@@ -1316,7 +1367,10 @@ check-static:
 	@grep -Fq 'P3.5: CLOSED' README.md
 	@grep -Fq 'Phase 3: CLOSED' README.md
 	@echo "== P3.5 introduces no Phase 4 functionality and no statistical treatment =="
-	@grep -Fq 'P4.1 | Orchestrator | NO | NO | NO |' PLAN.md
+	@# The P4.1-owned row advanced when P4.1 landed (P4.1 is implemented but
+	@# neither audited nor GB300-verified). P4.2 and P4.3 must still be
+	@# recorded unimplemented; that requirement is NOT weakened.
+	@grep -Fq 'P4.1 | Orchestrator | YES | NO | NO |' PLAN.md
 	@grep -Fq 'P4.2 | Pilot plus three final campaigns | NO | NO | NO |' PLAN.md
 	@grep -Fq 'P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |' PLAN.md
 	@! grep -nE '^(P4|P41|P42|P43)_' $(GEMM_P35_WRAPPER)
@@ -1325,6 +1379,68 @@ check-static:
 	@echo "    plots, and campaign trees lives in $(GEMM_P35_CHECKER), which scans Python"
 	@echo "    NAME tokens so that prose explaining what P3.5 does NOT compute stays legal"
 	@echo "    while code does not)"
+	@echo "== P4.1 files present, executable, and syntactically valid =="
+	@test -f $(PHASE4_P41_ENTRYPOINT)
+	@test -f $(PHASE4_P41_ORCHESTRATOR)
+	@test -f $(PHASE4_P41_CHECKER)
+	@test -f $(PHASE4_P41_PROTOCOL)
+	@test -x $(PHASE4_P41_ENTRYPOINT)
+	@test -x $(PHASE4_P41_ORCHESTRATOR)
+	@test -x $(PHASE4_P41_CHECKER)
+	@! grep -nE '^(import|from|def|class) ' $(PHASE4_P41_PROTOCOL)
+	bash -n $(PHASE4_P41_ENTRYPOINT)
+	python3 -m py_compile $(PHASE4_P41_ORCHESTRATOR) $(PHASE4_P41_CHECKER)
+	@rm -rf scripts/__pycache__
+	@echo "== P4.1 GPU-free self-tests and the full frozen-contract check =="
+	python3 $(PHASE4_P41_ORCHESTRATOR) --self-test
+	$(PHASE4_P41_ENTRYPOINT) --self-test
+	python3 $(PHASE4_P41_CHECKER) --self-test
+	python3 $(PHASE4_P41_CHECKER) .
+	@rm -rf scripts/__pycache__
+	@echo "== P4.1 orchestrates ONLY the existing closed entry points =="
+	@grep -Fq '"memory-paths-p14-pilot"' $(PHASE4_P41_ORCHESTRATOR)
+	@grep -Fq '"memory-paths-p14-profile"' $(PHASE4_P41_ORCHESTRATOR)
+	@grep -Fq '"memory-paths-p14-analyze"' $(PHASE4_P41_ORCHESTRATOR)
+	@grep -Fq '"compute-umma-p24-pilot"' $(PHASE4_P41_ORCHESTRATOR)
+	@grep -Fq '"compute-umma-p24-profile"' $(PHASE4_P41_ORCHESTRATOR)
+	@grep -Fq '"compute-umma-p24-analyze"' $(PHASE4_P41_ORCHESTRATOR)
+	@grep -Fq '"gemm-comparison-p35-smoke"' $(PHASE4_P41_ORCHESTRATOR)
+	@echo "== P4.1 never calls Docker, nvidia-smi, or NCU itself (command position only, so"
+	@echo "   honest help text naming a tool in order to say it is never used stays legal) =="
+	@! grep -nE '(^|[;|&(]|\$$\(|`)[[:space:]]*(docker|nvidia-smi|ncu)\b' $(PHASE4_P41_ENTRYPOINT)
+	@echo "== P4.1 forbidden patterns absent from the new files =="
+	@echo "   (checked against code with '#' comment lines stripped, so a header comment"
+	@echo "    explaining why e.g. '--gpus all' is never used cannot itself trip these"
+	@echo "    checks; $(PHASE4_P41_CHECKER) is deliberately excluded here because it"
+	@echo "    NAMES those spellings on purpose, in order to ban them, and it runs the"
+	@echo "    rigorous comment-stripped scan over all three files itself)"
+	@pat='--gpus[ =]+all|NVIDIA_VISIBLE_DEVICES=all|--privileged|--pid[ =]+host|docker\.sock|--cap-add|SYS_ADMIN|set -x'; \
+	pat="$$pat|\bs""udo\b|\$$\(np""roc\)|--force-overwrite|--set[ =]+full"; \
+	pat="$$pat|clock-control[ =]+base|clock-control[ =]+boost|clock-control[ =]+force-boost"; \
+	pat="$$pat|nvidia-smi[^|]*(-pm|--persistence-mode|-lgc|--lock-gpu-clocks|-pl|--power-limit)"; \
+	! sed 's/^[[:space:]]*#.*//' $(PHASE4_P41_ENTRYPOINT) | grep -nE -- "$$pat" && \
+	! sed 's/^[[:space:]]*#.*//' $(PHASE4_P41_ORCHESTRATOR) | grep -nE -- "$$pat"
+	@echo "== P4.1 exposes exactly one atomic gemm selector, never a per-library one =="
+	@grep -Fq -- '--only gemm' $(PHASE4_P41_ENTRYPOINT)
+	@! grep -nE -- '--only[ =]+(cublaslt|cutedsl)[^)|]*\)[[:space:]]*;;' $(PHASE4_P41_ENTRYPOINT)
+	@echo "== P4.1 adds no key to either version contract and no new dependency =="
+	@! grep -nE '^(PHASE4_|P41_)' PHASE3_VERSIONS.env VERSIONS.env
+	@echo "== P4.1 raw campaign output is git-ignored (shared results/raw/ rule) =="
+	@grep -Fq 'results/raw/' .gitignore
+	@echo "== P4.1 executed no Phase 4 campaign in this repository =="
+	@! test -e $(PHASE4_P41_RAW_ROOT)
+	@echo "== truthful P4.1 status assertions =="
+	@grep -Fq 'P4.1 = YES / NO / NO' $(PHASE4_P41_PROTOCOL)
+	@grep -Fq 'Independent audit: PENDING' $(PHASE4_P41_PROTOCOL)
+	@grep -Fq 'GB300 verification: PENDING' $(PHASE4_P41_PROTOCOL)
+	@grep -Fq 'No Phase 4 campaign was executed' $(PHASE4_P41_PROTOCOL)
+	@grep -Fq 'No publishable result exists' $(PHASE4_P41_PROTOCOL)
+	@grep -Fq 'P4.1 (Phase 4 campaign orchestrator)' README.md
+	@! grep -nF 'P4.1 | Orchestrator | NO | NO | NO |' PLAN.md
+	@! grep -nF 'P4.1 | Orchestrator | YES | YES | NO |' PLAN.md
+	@! grep -nF 'P4.1 | Orchestrator | YES | NO | YES |' PLAN.md
+	@! grep -nF 'P4.1 | Orchestrator | YES | YES | YES |' PLAN.md
+	@! grep -rnF 'Phase 4: CLOSED' README.md PLAN.md $(PHASE4_P41_PROTOCOL)
 	@echo "check-static: OK"
 
 build-image:
@@ -2906,3 +3022,51 @@ gemm-comparison-p35-smoke:
 	fi; \
 	echo "==============================================================================" >&2; \
 	exit $$status
+
+# --- P4.1: the Phase 4 campaign orchestrator --------------------------------
+# scripts/run_all.sh is the ONLY public Phase 4 orchestration entry point. Both
+# targets below are GPU-free and neither executes a campaign: P4.1 is
+# orchestration infrastructure whose independent audit and GB300 verification
+# are both PENDING, no Phase 4 campaign has been run, and no publishable result
+# exists. Real campaigns (one pilot plus three final replicates) are P4.2 work
+# and are invoked directly through scripts/run_all.sh with an explicit
+# BLACKWELL_GPU_INDEX; there is deliberately no Make target that could start
+# one. See src/phase4/P4_1_PROTOCOL.md.
+
+phase4-p41-plan:
+	$(PHASE4_P41_ENTRYPOINT) --dry-run \
+		--campaign-id $(PHASE4_P41_PLAN_CAMPAIGN_ID) \
+		--campaign-kind pilot
+
+# Depends on the existing GPU-free P1.4 and P2.4 gates so the components being
+# orchestrated are revalidated before any P4.1-specific check runs. The
+# Docker-backed P3.5 gate (gemm-comparison-p35-check) is deliberately NOT a
+# prerequisite, so this target stays runnable with no container runtime at all;
+# the P4.1 checker instead revalidates P3.5's frozen row count, candidate
+# order, and shape count directly from scripts/check_gemm_comparison_p35.py,
+# and uses P3.5's own validator for every synthetic capture.
+phase4-p41-check: memory-paths-p14-check compute-umma-p24-check
+	@echo "== P4.1 gate: the P1.4 and P2.4 GPU-free gates passed (memory-paths-p14-check, compute-umma-p24-check) =="
+	bash -n $(PHASE4_P41_ENTRYPOINT)
+	@test -x $(PHASE4_P41_ENTRYPOINT)
+	@test -x $(PHASE4_P41_ORCHESTRATOR)
+	@test -x $(PHASE4_P41_CHECKER)
+	python3 -m py_compile $(PHASE4_P41_ORCHESTRATOR) $(PHASE4_P41_CHECKER)
+	@rm -rf scripts/__pycache__
+	@echo "== P4.1 public CLI surface (GPU-free, side-effect free) =="
+	$(PHASE4_P41_ENTRYPOINT) --help > /dev/null
+	$(PHASE4_P41_ENTRYPOINT) --self-test
+	$(PHASE4_P41_ENTRYPOINT) --dry-run \
+		--campaign-id $(PHASE4_P41_PLAN_CAMPAIGN_ID) --campaign-kind pilot > /dev/null
+	$(PHASE4_P41_ENTRYPOINT) --dry-run \
+		--campaign-id $(PHASE4_P41_PLAN_CAMPAIGN_ID) --campaign-kind final \
+		--only gemm > /dev/null
+	@echo "== P4.1 private helper and checker self-tests =="
+	python3 $(PHASE4_P41_ORCHESTRATOR) --self-test
+	python3 $(PHASE4_P41_CHECKER) --self-test
+	@echo "== P4.1 full frozen-contract check against this repository =="
+	python3 $(PHASE4_P41_CHECKER) .
+	@rm -rf scripts/__pycache__
+	@echo "== P4.1 executed no Phase 4 campaign =="
+	@! test -e $(PHASE4_P41_RAW_ROOT)
+	@echo "phase4-p41-check: OK (P4.1 implemented; audit PENDING; GB300 verification PENDING; no publishable result)"

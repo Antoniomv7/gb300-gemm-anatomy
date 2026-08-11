@@ -520,11 +520,24 @@ FORBIDDEN_P35_STATUS_LINES = (
     "| P3.5 | Five shapes and comparison | YES | NO | YES |",
     "| P3.5 | Five shapes and comparison | YES | NO | NO |",
 )
-# Phase 4 must stay unimplemented.
+# The Phase 4 frontier. P4.1 (the campaign orchestrator) is implemented but
+# neither independently audited nor GB300-verified; P4.2 and P4.3 must stay
+# entirely unimplemented. This guard is not weakened by P4.1's arrival: it
+# still rejects a premature closure of P4.1 and any implementation of P4.2 or
+# P4.3. (Before P4.1 landed, this tuple demanded the literal
+# "| P4.1 | Orchestrator | NO | NO | NO |", which structurally forbade P4.1
+# from ever being implemented -- exactly the stale-frontier situation P3.5
+# itself had to correct for P3.4. See src/phase4/P4_1_PROTOCOL.md section 9.1.)
 PHASE4_STATUS_LINES = (
-    "| P4.1 | Orchestrator | NO | NO | NO |",
+    "| P4.1 | Orchestrator | YES | NO | NO |",
     "| P4.2 | Pilot plus three final campaigns | NO | NO | NO |",
     "| P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |",
+)
+FORBIDDEN_PHASE4_STATUS_LINES = (
+    "| P4.1 | Orchestrator | NO | NO | NO |",
+    "| P4.1 | Orchestrator | YES | YES | NO |",
+    "| P4.1 | Orchestrator | YES | NO | YES |",
+    "| P4.1 | Orchestrator | YES | YES | YES |",
 )
 
 _GUARD_PRELUDE = """
@@ -2148,7 +2161,10 @@ def validate_status_documents(plan_text, protocol_text, readme_text) -> list:
             errors.append(f"PLAN.md no longer records {closed!r}")
     for phase4 in PHASE4_STATUS_LINES:
         if phase4 not in plan_text:
-            errors.append(f"PLAN.md no longer records the unimplemented {phase4!r}")
+            errors.append(f"PLAN.md no longer records the Phase 4 frontier row {phase4!r}")
+    for wrong in FORBIDDEN_PHASE4_STATUS_LINES:
+        if wrong in plan_text:
+            errors.append(f"PLAN.md records a stale or premature P4.1 status: {wrong!r}")
 
     if "P3.5 = YES / YES / YES" not in protocol_text:
         errors.append(f"{PROTOCOL_RELATIVE_PATH} does not state P3.5 = YES / YES / YES")
@@ -3616,7 +3632,7 @@ def run_self_test() -> int:
         "| P3.3 | cuBLASLt baseline | YES | YES | YES |\n"
         "| P3.4 | Three execution variants | YES | YES | YES |\n"
         "| P3.5 | Five shapes and comparison | YES | YES | YES |\n"
-        "| P4.1 | Orchestrator | NO | NO | NO |\n"
+        "| P4.1 | Orchestrator | YES | NO | NO |\n"
         "| P4.2 | Pilot plus three final campaigns | NO | NO | NO |\n"
         "| P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |\n"
     )
@@ -3644,11 +3660,22 @@ def run_self_test() -> int:
                 good_plan.replace("| P3.2 | One-shape wrapper | YES | YES | YES |",
                                   "| P3.2 | One-shape wrapper | YES | NO | NO |"),
                 good_protocol, good_readme), "no longer records")
-    rejects("a PLAN.md that implements Phase 4 is rejected",
+    rejects("a PLAN.md that implements P4.2 is rejected",
             validate_status_documents(
-                good_plan.replace("| P4.1 | Orchestrator | NO | NO | NO |",
-                                  "| P4.1 | Orchestrator | YES | NO | NO |"),
-                good_protocol, good_readme), "unimplemented")
+                good_plan.replace("| P4.2 | Pilot plus three final campaigns | NO | NO | NO |",
+                                  "| P4.2 | Pilot plus three final campaigns | YES | NO | NO |"),
+                good_protocol, good_readme), "Phase 4 frontier row")
+    rejects("a PLAN.md that implements P4.3 is rejected",
+            validate_status_documents(
+                good_plan.replace(
+                    "| P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |",
+                    "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |"),
+                good_protocol, good_readme), "Phase 4 frontier row")
+    for premature in FORBIDDEN_PHASE4_STATUS_LINES:
+        rejects(f"a PLAN.md recording the untrue P4.1 status {premature!r} is rejected",
+                validate_status_documents(
+                    good_plan.replace("| P4.1 | Orchestrator | YES | NO | NO |", premature),
+                    good_protocol, good_readme))
     rejects("a stale pre-closure protocol status is rejected",
             validate_status_documents(
                 good_plan,
