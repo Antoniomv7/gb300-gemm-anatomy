@@ -759,8 +759,9 @@ re-loaded through the underlying unit's **own** semantic loader
 campaign identity before it is skipped, and a fresh preflight is created and
 validated whenever GPU work is still pending. A unit accepted in a terminal
 state stays pinned to the exact manifest revision it was accepted at (path,
-revision, SHA-256, and the digest of its own evidence-integrity snapshot), so a
-later terminal revision, a changed revision, or changed referenced evidence is
+revision, SHA-256, and a digest covering its own evidence-integrity snapshot and
+fresh hashes of every canonical terminal `analysis/` artifact), so a later
+terminal revision, a changed revision, or changed raw or derived evidence is
 rejected rather than adopted silently; every component must also agree with the
 current preflight and with each other on Git commit, clean-tree status, GPU UUID
 and name, compute capability, and — where the closed schemas expose them — the
@@ -768,9 +769,12 @@ CUDA driver and runtime API versions, compared after normalizing the two textual
 formats those schemas use. An interruption, including one inside
 `campaign.validate`, preserves every artifact and log already created, exits
 130, and leaves that stage eligible for a new attempt under the next free
-attempt number. Every experimental Make target is invoked with
+attempt number; an attempt is recorded only once both named logs exist. Every
+experimental Make target is invoked with
 `--silent --no-print-directory` so no echoed recipe line can put an absolute
-bind-mount source into a durable log. A P2.4 `INCONCLUSIVE` analysis
+bind-mount source into a durable log, and the exact checkout root emitted by a
+child is replaced with `<repo-root>` only at the textual-log boundary. A P2.4
+`INCONCLUSIVE` analysis
 propagates to a non-complete top-level outcome and is never accepted as a
 complete campaign. P4.1 creates no Phase 4 variability threshold, publication
 threshold, or scientific acceptance rule; those belong to P4.2/P4.3. Two

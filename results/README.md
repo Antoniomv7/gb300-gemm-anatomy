@@ -370,8 +370,10 @@ hashes. For a P1.4 or P2.4 stage that reference **pins** the exact manifest
 revision the campaign accepted — its repository-relative path, its revision
 number, and its SHA-256 — and, once that unit is terminal, a digest over the
 snapshot the unit's own `verify_campaign_evidence_integrity()` recomputed fresh
-from disk. A later terminal revision, a changed revision, or changed referenced
-evidence is therefore rejected on revalidation rather than adopted silently.
+from disk together with fresh hashes of every canonical terminal `analysis/`
+artifact. A later terminal revision, a changed revision, or changed raw or
+derived evidence is therefore rejected on revalidation rather than adopted
+silently.
 All five trees share one explicit campaign ID:
 
 ```text
@@ -410,10 +412,10 @@ telemetry; a structural privacy gate rejects any offending field name at any
 nesting depth and any absolute path value. The campaign logs are held to the
 same standard: every experimental Make target is invoked with
 `--silent --no-print-directory` so no echoed recipe line can carry the absolute
-bind-mount source of the checkout, and the durable text P4.1 writes itself
-replaces this checkout's own root with the stable token `<repo-root>`. The
-invoked scripts' and experiments' own output is captured verbatim and no
-scientific content is ever rewritten.
+bind-mount source of the checkout, and durable textual logs and failure details
+replace this checkout's exact root with the stable token `<repo-root>`. Ordinary
+child diagnostics remain unchanged; P3.5's scientific CSV stdout is copied byte
+for byte and no scientific content is rewritten.
 
 ## Safe public metadata
 

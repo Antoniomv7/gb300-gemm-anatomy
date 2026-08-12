@@ -199,8 +199,11 @@ Every one of those Make invocations is made **silently and without directory
 diagnostics** (`make --silent --no-print-directory <target>`), so Make never
 echoes a recipe line. A recipe line can carry the absolute bind-mount source of
 this checkout, and a private host path must never reach a durable Phase 4 log.
-The targets themselves, and the output of the scripts and experiments they run,
-are unchanged and are captured verbatim.
+The targets themselves are unchanged. Before child output becomes a durable
+text log, only this checkout's exact absolute root is replaced with
+`<repo-root>`; ordinary diagnostics remain unchanged. P3.5 stdout is scientific
+CSV data and is copied byte for byte, while its textual stderr uses the same
+narrow replacement.
 
 Every P1.4 stage receives `P1_4_CAMPAIGN_ID` = the top-level campaign ID and
 `P1_4_PREFLIGHT_SUMMARY` = the exact preflight summary this invocation created
@@ -318,8 +321,10 @@ exact manifest revision this campaign accepted — `unit_manifest_path` (a
 repository-relative path), `unit_manifest_revision`, `unit_manifest_sha256`, and
 `unit_state` — plus, once that state is terminal, `unit_evidence_sha256`: a
 digest over the snapshot the unit's **own** `verify_campaign_evidence_integrity()`
-just recomputed fresh from disk for every artifact it references. `gpu` carries
-exactly `uuid`, `name`, `compute_capability`, `driver_version`.
+just recomputed fresh from disk, combined with fresh SHA-256 hashes of every
+canonical terminal `analysis/` artifact checked against that unit manifest's
+`artifact_sha256`. `gpu` carries exactly `uuid`, `name`, `compute_capability`,
+`driver_version`.
 `stage_attempts` records every attempt explicitly: stage, attempt number, start
 and finish timestamps, outcome (`COMPLETE`/`FAILED`/`INTERRUPTED`), the child's
 exact exit status, and both log paths.
@@ -329,13 +334,13 @@ credentials or tokens, SSH material, unrelated process information, complete
 host command lines, or dynamic power, clock, temperature, or utilization
 telemetry. A structural privacy gate rejects any manifest key whose name
 matches a forbidden token at any nesting depth, and any string value that is an
-absolute path. The durable text P4.1 writes itself — its `campaign.validate`
-logs and the manifest's `failure_detail` — passes through one narrow redaction
-at the write boundary that replaces this checkout's own absolute root with the
-stable token `<repo-root>`, because a diagnostic may legitimately quote an
-absolute evidence path. Nothing else is rewritten: no general sanitization, no
-scientific content, no experiment-owned evidence, and no GPU identity, failure
-diagnostic, or reproducibility detail is removed.
+absolute path. Durable textual child logs, P4.1's `campaign.validate` logs, and
+the manifest's `failure_detail` pass through one narrow redaction at their write
+boundary that replaces this checkout's own absolute root with the stable token
+`<repo-root>`, because a diagnostic may legitimately quote an absolute evidence
+path. Nothing else is rewritten: no general sanitization, no scientific CSV,
+no experiment-owned evidence, and no GPU identity, failure diagnostic, or
+reproducibility detail is removed.
 
 ### 6.1.1 Comparable provenance
 
@@ -379,7 +384,10 @@ gate, and on every `--resume` revalidation.
   before the child runs, so a hard interruption can leave a log set whose
   attempt record was never published; the next attempt skips that number
   instead of colliding with it forever. Attempt numbers are therefore strictly
-  increasing per stage, and a gap is legal evidence of exactly that.
+  increasing per stage, and a gap is legal evidence of exactly that. An attempt
+  is recorded only after both named logs exist; if interruption lands between
+  their exclusive writes, the lone log remains unmodified but is not referenced
+  as a complete pair.
 * Durable metadata always uses repository-relative paths.
 * Evidence is re-hashed and revalidated immediately before a stage or a
   campaign is declared complete.

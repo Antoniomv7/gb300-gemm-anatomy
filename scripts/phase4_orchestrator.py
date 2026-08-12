@@ -53,6 +53,7 @@ import re
 import stat
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -723,6 +724,55 @@ def redact_repo_root(text: str, repo_root: Path) -> str:
     if not root or root == os.sep:
         return text
     return text.replace(root, REPO_ROOT_TOKEN)
+
+
+def write_all(fd: int, payload: bytes) -> None:
+    """Write every byte to an already-open descriptor."""
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:  # pragma: no cover - os.write either progresses or raises
+            raise OSError("short write while publishing a stage log")
+        view = view[written:]
+
+
+def copy_log_stream(read_fd: int, write_fd: int, *, repo_root: Path, redact: bool) -> None:
+    """Copy one child stream, replacing only the exact checkout-root bytes.
+
+    A small suffix is retained between reads so a path split across pipe chunks
+    is still recognized. Streaming keeps partial, already-sanitized diagnostics
+    in the no-clobber attempt log if the child is interrupted.
+    """
+    needle = str(Path(repo_root).resolve()).encode("utf-8")
+    replacement = REPO_ROOT_TOKEN.encode("utf-8")
+    if not needle or needle == os.sep.encode("utf-8"):
+        redact = False
+    pending = b""
+    try:
+        while True:
+            chunk = os.read(read_fd, 1 << 16)
+            if not chunk:
+                break
+            if not redact:
+                write_all(write_fd, chunk)
+                continue
+            pending += chunk
+            while True:
+                index = pending.find(needle)
+                if index >= 0:
+                    write_all(write_fd, pending[:index])
+                    write_all(write_fd, replacement)
+                    pending = pending[index + len(needle):]
+                    continue
+                safe = len(pending) - len(needle) + 1
+                if safe > 0:
+                    write_all(write_fd, pending[:safe])
+                    pending = pending[safe:]
+                break
+        if pending:
+            write_all(write_fd, pending)
+    finally:
+        os.close(read_fd)
 
 
 # --------------------------------------------------------------------------
@@ -1403,6 +1453,69 @@ def _import_sibling(module_name: str):
     return importlib.import_module(module_name)
 
 
+def _sha256_relative_regular_file(root: Path, relative_path: str) -> str:
+    """Hash one validated relative file without following directory symlinks."""
+    if (not isinstance(relative_path, str) or relative_path.startswith("/")
+            or any(part in ("", ".", "..") for part in relative_path.split("/"))):
+        raise RunFailure(f"invalid relative analysis artifact path {relative_path!r}")
+    parts = relative_path.split("/")
+    current_fd = open_dir_nofollow(str(root))
+    try:
+        for part in parts[:-1]:
+            next_fd = open_dir_nofollow(part, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        payload = read_file_nofollow(parts[-1], dir_fd=current_fd)
+    finally:
+        os.close(current_fd)
+    return sha256_bytes(payload)
+
+
+def verify_terminal_analysis_artifacts(analyzer, campaign_dir: Path, manifest: dict) -> dict:
+    """Re-hash the closed unit's canonical terminal ``analysis/`` outputs.
+
+    The P1.4/P2.4 evidence-integrity functions reconstruct the raw pilot and
+    profile evidence. Their terminal manifests additionally pin the derived
+    analysis files. P4.1 verifies that small, explicit second set here using
+    the canonical inventory exported by the owning analyzer; it does not
+    reinterpret or recompute any scientific result.
+    """
+    state = manifest.get("state")
+    if state not in UNIT_TERMINAL_STATES:
+        return {}
+    canonical = getattr(analyzer, "ANALYSIS_ARTIFACT_RELATIVE_PATHS", None)
+    if (not isinstance(canonical, (tuple, list)) or not canonical
+            or any(not isinstance(path, str) for path in canonical)):
+        raise RunFailure("the unit analyzer exposes no usable canonical analysis inventory")
+    expected = set(canonical)
+    recorded = manifest.get("artifact_sha256")
+    if not isinstance(recorded, dict):
+        raise RunFailure("the terminal unit manifest has no artifact_sha256 object")
+    observed = {
+        path for path in recorded
+        if isinstance(path, str) and path.startswith("analysis/")
+    }
+    if observed != expected:
+        raise RunFailure(
+            "the terminal unit manifest's analysis artifact inventory differs from its "
+            f"canonical contract: missing={sorted(expected - observed)!r}, "
+            f"unexpected={sorted(observed - expected)!r}")
+
+    verified: dict[str, str] = {}
+    for relative_path in sorted(expected):
+        expected_hash = recorded.get(relative_path)
+        if not isinstance(expected_hash, str) or not SHA256_RE.fullmatch(expected_hash):
+            raise RunFailure(
+                f"artifact_sha256[{relative_path!r}] is not a canonical SHA-256")
+        actual_hash = _sha256_relative_regular_file(campaign_dir, relative_path)
+        if actual_hash != expected_hash:
+            raise RunFailure(
+                f"{relative_path}: content changed after terminal analysis "
+                f"(manifest records {expected_hash}, now {actual_hash})")
+        verified[relative_path] = actual_hash
+    return verified
+
+
 def _load_unit_campaign(analyzer, campaign_rel: str, *, resolve, load) -> dict:
     """One composed unit's campaign, loaded through its own semantic loader and
     pinned cryptographically.
@@ -1435,7 +1548,11 @@ def _load_unit_campaign(analyzer, campaign_rel: str, *, resolve, load) -> dict:
         if errors or snapshot is None:
             raise RunFailure(
                 f"{campaign_rel}: the unit's own evidence-integrity gate failed: {errors}")
-        payload["evidence_sha256"] = stable_digest(snapshot)
+        evidence = {"unit_evidence": snapshot}
+        if manifest.get("state") in UNIT_TERMINAL_STATES:
+            evidence["terminal_analysis_sha256"] = verify_terminal_analysis_artifacts(
+                analyzer, campaign_dir, manifest)
+        payload["evidence_sha256"] = stable_digest(evidence)
     return payload
 
 
@@ -1937,9 +2054,14 @@ class Campaign:
 
     def _run_stage_command(self, argv: list[str], env: dict[str, str], *, stdout_name: str,
                            stderr_name: str, created: list[str]) -> tuple[int, bytes]:
-        """Execute one child with descriptor-anchored, no-clobber capture. Both
-        logs are created before the child starts, so an interruption still
-        leaves a real, per-attempt log set on disk."""
+        """Execute one child with descriptor-anchored, no-clobber capture.
+
+        The child writes through two streaming filters. Before those bytes cross
+        the durable log boundary, only this checkout's exact absolute root is
+        replaced. P3.5's stdout is scientific CSV data and is copied byte for
+        byte; its textual stderr still receives the narrow replacement. Already
+        copied diagnostics remain available if the child is interrupted.
+        """
         campaign_fd = self._campaign_fd()
         try:
             logs_fd = open_dir_nofollow(LOGS_DIR_NAME, dir_fd=campaign_fd)
@@ -1953,8 +2075,43 @@ class Campaign:
                 stderr_fd = create_file_exclusive(stderr_name, dir_fd=logs_fd)
                 created.append(stderr_name)
                 try:
-                    status = self.context.run_command(
-                        argv, env=env, stdout_fd=stdout_fd, stderr_fd=stderr_fd)
+                    stdout_read, stdout_write = os.pipe()
+                    stderr_read, stderr_write = os.pipe()
+                    stream_errors: list[BaseException] = []
+
+                    def pump(read_fd: int, write_fd: int, *, redact: bool) -> None:
+                        try:
+                            copy_log_stream(
+                                read_fd, write_fd, repo_root=self.context.repo_root,
+                                redact=redact)
+                        except BaseException as exc:  # noqa: BLE001 - reported after both joins
+                            stream_errors.append(exc)
+
+                    threads = (
+                        threading.Thread(
+                            target=pump, args=(stdout_read, stdout_fd),
+                            kwargs={"redact": env.get("RUN_CONTAINER_STDOUT_IS_DATA") != "1"}),
+                        threading.Thread(
+                            target=pump, args=(stderr_read, stderr_fd),
+                            kwargs={"redact": True}),
+                    )
+                    for thread in threads:
+                        thread.start()
+                    try:
+                        status = self.context.run_command(
+                            argv, env=env, stdout_fd=stdout_write, stderr_fd=stderr_write)
+                    finally:
+                        os.close(stdout_write)
+                        os.close(stderr_write)
+                        for thread in threads:
+                            thread.join()
+                        os.fsync(stdout_fd)
+                        os.fsync(stderr_fd)
+                    if stream_errors:
+                        raise RunFailure(
+                            "failed while publishing a redacted child log: "
+                            + "; ".join(
+                                f"{type(exc).__name__}: {exc}" for exc in stream_errors))
                 finally:
                     os.close(stderr_fd)
             finally:
@@ -2024,7 +2181,9 @@ class Campaign:
             status, captured = self._run_stage_command(
                 argv, env, stdout_name=stdout_name, stderr_name=stderr_name, created=created)
         except KeyboardInterrupt:
-            self._interrupt(stage, attempt, started, stdout_name, stderr_name, bool(created))
+            self._interrupt(
+                stage, attempt, started, stdout_name, stderr_name,
+                stdout_name in created and stderr_name in created)
             raise
         finished = self.context.now_utc()
 
@@ -2071,14 +2230,14 @@ class Campaign:
                             for item in detail]))
 
     def _interrupt(self, stage: str, attempt: int, started: str, stdout_name: str,
-                   stderr_name: str, logs_created: bool) -> None:
+                   stderr_name: str, complete_log_pair: bool) -> None:
         """Preserve every completed stage's evidence and record exactly where
         the campaign stopped. Nothing an earlier attempt produced is deleted."""
         if self.manifest.get("state") in TERMINAL_STATES:
             return
         updates: dict = {"state": STATE_INTERRUPTED, "failure_stage": stage,
                          "failure_detail": ["interrupted before the stage finished"]}
-        if logs_created:
+        if complete_log_pair:
             attempts = list(self.manifest["stage_attempts"])
             finished = self.context.now_utc()
             attempts.append(self._attempt_record(
@@ -2257,7 +2416,7 @@ class Campaign:
             return self._campaign_validate(attempt, started, stdout_name, stderr_name, created)
         except KeyboardInterrupt:
             self._interrupt(STAGE_CAMPAIGN_VALIDATE, attempt, started, stdout_name, stderr_name,
-                            bool(created))
+                            stdout_name in created and stderr_name in created)
             raise
 
     def _campaign_validate(self, attempt: int, started: str, stdout_name: str, stderr_name: str,

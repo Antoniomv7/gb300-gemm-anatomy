@@ -522,6 +522,7 @@ def run_self_test(orchestrator, p35) -> int:
     _test_inconclusive_propagation(reporter, o, p35)
     _test_bad_gemm_captures(reporter, o, p35)
     _test_unit_evidence_pinning(reporter, o, p35)
+    _test_terminal_analysis_hashing(reporter, o)
     _test_provenance_agreement(reporter, o, p35)
     _test_validate_interruption(reporter, o, p35)
     _test_durable_log_privacy(reporter, o, p35)
@@ -1299,6 +1300,55 @@ def _test_unit_evidence_pinning(reporter: Reporter, o, p35) -> None:
                      "evidence-integrity gate failed")
 
 
+def _test_terminal_analysis_hashing(reporter: Reporter, o) -> None:
+    """The terminal pin also covers the derived analysis files that the two
+    unit evidence-integrity snapshots do not include."""
+    root = Path(tempfile.mkdtemp(prefix="p41-analysis-"))
+    _STACK.append(root)
+    campaign_dir = root / "unit"
+    (campaign_dir / "manifest").mkdir(parents=True)
+    (campaign_dir / "analysis" / "figures").mkdir(parents=True)
+    report_path = campaign_dir / "analysis" / "report.md"
+    figure_path = campaign_dir / "analysis" / "figures" / "result.svg"
+    report_path.write_text("terminal report\n", encoding="utf-8")
+    figure_path.write_text("<svg/>\n", encoding="utf-8")
+    inventory = ("analysis/report.md", "analysis/figures/result.svg")
+    hashes = {
+        relative: hashlib.sha256((campaign_dir / relative).read_bytes()).hexdigest()
+        for relative in inventory
+    }
+    manifest = {"state": "ANALYZED", "artifact_sha256": hashes}
+    (campaign_dir / "manifest" / "000000.json").write_text(
+        json.dumps(manifest) + "\n", encoding="utf-8")
+
+    class Analyzer:
+        ANALYSIS_ARTIFACT_RELATIVE_PATHS = inventory
+
+        @staticmethod
+        def verify_campaign_evidence_integrity(_campaign_dir, _manifest):
+            return [], {"raw_evidence": "verified"}
+
+    previous_root = o.REPO_ROOT
+    o.REPO_ROOT = root
+    try:
+        def load(_campaign_dir):
+            return manifest, 0
+
+        def accepted():
+            return o._load_unit_campaign(
+                Analyzer, "unit", resolve=lambda _relative: campaign_dir, load=load)
+
+        payload = accepted()
+        reporter.check("terminal P1.4/P2.4 analysis artifacts contribute to the evidence pin",
+                       bool(o.SHA256_RE.fullmatch(payload.get("evidence_sha256", ""))),
+                       str(payload))
+        report_path.write_text("tampered terminal report\n", encoding="utf-8")
+        reporter.rejects("a changed terminal analysis artifact is rejected on revalidation",
+                         accepted, o.RunFailure, "content changed after terminal analysis")
+    finally:
+        o.REPO_ROOT = previous_root
+
+
 def _test_provenance_agreement(reporter: Reporter, o, p35) -> None:
     """Commit, GPU identity, compute capability, and both CUDA API versions must
     agree across every selected component and the current preflight."""
@@ -1421,6 +1471,52 @@ def _test_validate_interruption(reporter: Reporter, o, p35) -> None:
                    and len(fixture.calls) == calls_before
                    and len(fixture.validate_logs()) == 4, str(status))
 
+    # If interruption lands between the two exclusive log writes, the lone
+    # file is preserved but no attempt may claim a stderr log that never
+    # existed. The disk-derived attempt counter then skips the partial number.
+    fixture = _fixture(o, p35, _STACK)
+    campaign_id = "20991231T000000Z"
+    original_write = o.write_file_exclusive
+    interrupted_once = False
+
+    def interrupt_between_logs(name, payload, *, dir_fd):
+        nonlocal interrupted_once
+        if not interrupted_once and name == "campaign_validate.001.stderr.log":
+            interrupted_once = True
+            raise KeyboardInterrupt
+        return original_write(name, payload, dir_fd=dir_fd)
+
+    o.write_file_exclusive = interrupt_between_logs
+    try:
+        try:
+            fixture.run(campaign_id=campaign_id)
+            reporter.check("an interruption between validation logs propagates", False,
+                           "no raise")
+        except KeyboardInterrupt:
+            reporter.check("an interruption between validation logs propagates", True)
+    finally:
+        o.write_file_exclusive = original_write
+
+    manifest = fixture.load_manifest(campaign_id)
+    partial_attempts = [entry for entry in manifest["stage_attempts"]
+                        if entry["stage"] == "campaign.validate"]
+    reporter.check("a partial validation log pair is not recorded as an attempt",
+                   partial_attempts == [], str(partial_attempts))
+    reporter.check("the unpaired validation log is preserved without a false reference",
+                   fixture.validate_logs() == ["campaign_validate.001.stdout.log"],
+                   str(fixture.validate_logs()))
+    status = fixture.run(campaign_id=campaign_id, resume=True)
+    manifest = fixture.load_manifest(campaign_id)
+    resumed_attempts = [entry["attempt"] for entry in manifest["stage_attempts"]
+                        if entry["stage"] == "campaign.validate"]
+    reporter.check("resume skips the partial log number and completes validation",
+                   status == o.EXIT_OK and resumed_attempts == [2]
+                   and fixture.validate_logs() == [
+                       "campaign_validate.001.stdout.log",
+                       "campaign_validate.002.stderr.log",
+                       "campaign_validate.002.stdout.log",
+                   ], f"status={status} attempts={resumed_attempts} logs={fixture.validate_logs()}")
+
 
 def _check_exit_code_contract(reporter: Reporter, o) -> None:
     """The real process-level mapping, exercised directly: an interruption exits
@@ -1456,7 +1552,10 @@ def _test_durable_log_privacy(reporter: Reporter, o, p35) -> None:
     root = parent / "work" / "gb300-gemm-anatomy"
     root.mkdir(parents=True)
     fixture = Fixture(o, p35, root)
-    fixture.child_noise = "stub: ordinary child diagnostic line\n"
+    fixture.child_noise = (
+        "stub: ordinary child diagnostic line\n"
+        f"child error at {root}/results/bad.csv\n"
+    )
     fixture.destroy_preflight_at = "compute-umma-p24-analyze"
     campaign_id = "20991229T000000Z"
     reporter.rejects("evidence that disappeared mid-campaign fails the final gate",
@@ -1479,6 +1578,9 @@ def _test_durable_log_privacy(reporter: Reporter, o, p35) -> None:
     child_log = (logs_dir / "umma_analyze.001.stderr.log").read_text(encoding="utf-8")
     reporter.check("ordinary child output is preserved verbatim",
                    "ordinary child diagnostic line" in child_log, child_log[:200])
+    reporter.check("a child-emitted checkout path is narrowly redacted before log publication",
+                   f"{o.REPO_ROOT_TOKEN}/results/bad.csv" in child_log
+                   and absolute not in child_log, child_log[:200])
 
     document = json.dumps(fixture.load_manifest(campaign_id))
     reporter.check("no manifest field carries the absolute checkout path",
@@ -1669,6 +1771,9 @@ def _check_composition(reporter: Reporter, repo_root: Path, orchestrator: str) -
     reporter.check("the orchestrator pins the accepted unit manifest revision by hash",
                    all(field in orchestrator for field in
                        ("unit_manifest_path", "unit_manifest_sha256", "unit_evidence_sha256")), "")
+    reporter.check("the terminal unit pin re-hashes the canonical analysis artifacts",
+                   "verify_terminal_analysis_artifacts" in orchestrator
+                   and "ANALYSIS_ARTIFACT_RELATIVE_PATHS" in orchestrator, "")
     reporter.check("the orchestrator exits 130 when it is interrupted",
                    "return EXIT_INTERRUPTED" in orchestrator
                    and "raise SystemExit(cli_main())" in orchestrator
@@ -1676,6 +1781,9 @@ def _check_composition(reporter: Reporter, repo_root: Path, orchestrator: str) -
     reporter.check("the orchestrator invokes every Make target silently",
                    module.MAKE_QUIET_FLAGS == ("--silent", "--no-print-directory"),
                    str(module.MAKE_QUIET_FLAGS))
+    reporter.check("child text crosses a narrow checkout-root redaction boundary",
+                   "copy_log_stream" in orchestrator
+                   and "RUN_CONTAINER_STDOUT_IS_DATA" in orchestrator, "")
     reporter.check("the orchestrator compares both CUDA API versions between components",
                    {"cuda_driver_version", "cuda_runtime_version"}
                    <= set(module.COMPARABLE_EVIDENCE_FIELDS)
