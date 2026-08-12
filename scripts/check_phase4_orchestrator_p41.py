@@ -124,14 +124,13 @@ FORBIDDEN_P41_TOKENS = (
     r"cp\.async",
 )
 
-# The Phase 4 status frontier this unit is allowed to advance, and the two
-# rows that must stay unimplemented.
-EXPECTED_P41_STATUS_LINE = "| P4.1 | Orchestrator | YES | NO | NO |"
+# P4.1 is closed; the two later rows must stay unimplemented.
+EXPECTED_P41_STATUS_LINE = "| P4.1 | Orchestrator | YES | YES | YES |"
 FORBIDDEN_P41_STATUS_LINES = (
     "| P4.1 | Orchestrator | NO | NO | NO |",
     "| P4.1 | Orchestrator | YES | YES | NO |",
     "| P4.1 | Orchestrator | YES | NO | YES |",
-    "| P4.1 | Orchestrator | YES | YES | YES |",
+    "| P4.1 | Orchestrator | YES | NO | NO |",
 )
 UNIMPLEMENTED_PHASE4_STATUS_LINES = (
     "| P4.2 | Pilot plus three final campaigns | NO | NO | NO |",
@@ -144,19 +143,20 @@ CLOSED_STATUS_LINES = (
 )
 
 REQUIRED_PROTOCOL_STATEMENTS = (
-    "P4.1 = YES / NO / NO",
+    "P4.1 = YES / YES / YES",
     "P4.1 is implemented infrastructure",
-    "Independent audit: PENDING",
-    "GB300 verification: PENDING",
-    "No Phase 4 campaign was executed",
+    "Independent audit: PASSED",
+    "GB300 verification: PASSED",
+    "Pilot campaign `20260812T013848Z`: COMPLETE",
     "No publishable result exists",
-    "P4.2 will execute one pilot and three independent final campaigns",
+    "P4.2 has completed its pilot and still requires three independent final",
     "P4.3 will perform integrated analysis and publication review",
 )
 FORBIDDEN_PROTOCOL_STATEMENTS = (
-    "P4.1 = YES / YES / YES",
-    "P4.1 has been independently audited",
-    "P4.1 was verified on GB300",
+    "P4.1 = YES / NO / NO",
+    "Independent audit: PENDING",
+    "GB300 verification: PENDING",
+    "No Phase 4 campaign was executed",
     "publishable=true",
     "publishable: true",
 )
@@ -1931,7 +1931,7 @@ def _check_makefile(reporter: Reporter, makefile: str) -> None:
 
 def _check_status_documents(reporter: Reporter, plan_text: str, protocol: str, readme: str,
                             results_readme: str, makefile: str) -> None:
-    reporter.check("PLAN.md records P4.1 as implemented only",
+    reporter.check("PLAN.md records P4.1 as closed",
                    EXPECTED_P41_STATUS_LINE in plan_text, "")
     for wrong in FORBIDDEN_P41_STATUS_LINES:
         reporter.check(f"PLAN.md does not record the untrue P4.1 status {wrong!r}",
@@ -1941,8 +1941,8 @@ def _check_status_documents(reporter: Reporter, plan_text: str, protocol: str, r
                        line in plan_text, "")
     for line in CLOSED_STATUS_LINES:
         reporter.check(f"PLAN.md still records the closed {line!r}", line in plan_text, "")
-    reporter.check("the Makefile's frontier assertion advanced to the truthful P4.1 row",
-                   "P4.1 | Orchestrator | YES | NO | NO |" in makefile, "")
+    reporter.check("the Makefile's frontier assertion records the closed P4.1 row",
+                   "P4.1 | Orchestrator | YES | YES | YES |" in makefile, "")
     reporter.check("the Makefile still requires P4.2 to be unimplemented",
                    "P4.2 | Pilot plus three final campaigns | NO | NO | NO |" in makefile, "")
     reporter.check("the Makefile still requires P4.3 to be unimplemented",
@@ -1960,15 +1960,17 @@ def _check_status_documents(reporter: Reporter, plan_text: str, protocol: str, r
 
     reporter.check("README.md describes P4.1",
                    "P4.1 (Phase 4 campaign orchestrator)" in readme, "")
-    reporter.check("README.md records P4.1 as pending audit and GB300 verification",
-                   "P4.1: implemented; independent audit: PENDING; GB300 verification: PENDING"
+    reporter.check("README.md records P4.1 as audited and GB300-verified",
+                   "P4.1: CLOSED; independent audit: YES; GB300 verification: YES"
                    in readme, "")
     reporter.check("README.md does not claim a Phase 4 result",
                    "Phase 4: CLOSED" not in readme, "")
     reporter.check("results/README.md documents the Phase 4 orchestration tree",
                    "results/raw/phase4/" in results_readme, "")
-    reporter.check("results/README.md states no Phase 4 campaign has been executed",
-                   "No Phase 4 campaign has been executed" in results_readme, "")
+    reporter.check("results/README.md records the completed Phase 4 pilot",
+                   "20260812T013848Z" in results_readme
+                   and re.search(r"No publishable\s+Phase 4 result exists",
+                                 results_readme) is not None, "")
 
 
 # ---------------------------------------------------------------------------

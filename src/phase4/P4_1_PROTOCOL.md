@@ -1,15 +1,16 @@
 # P4.1 — Phase 4 campaign orchestrator (frozen protocol)
 
-Status: `P4.1 = YES / NO / NO` (Implemented / Audited / Verified on GB300).
+Status: `P4.1 = YES / YES / YES` (Implemented / Audited / Verified on GB300).
 
 * **P4.1 is implemented infrastructure.**
-* **Independent audit: PENDING.**
-* **GB300 verification: PENDING.**
-* **No Phase 4 campaign was executed** — no pilot, no final campaign, no GPU
-  command, not one stage.
+* **Independent audit: PASSED.**
+* **GB300 verification: PASSED.**
+* **Pilot campaign `20260812T013848Z`: COMPLETE.** No final campaign has been
+  executed.
 * **No publishable result exists**, and none is claimed. Every artifact this
   unit can ever write records `publishable=false`.
-* **P4.2 will execute one pilot and three independent final campaigns.**
+* **P4.2 has completed its pilot and still requires three independent final
+  campaigns.**
 * **P4.3 will perform integrated analysis and publication review**, the final
   tables and figures, and the closing audit.
 
@@ -543,13 +544,12 @@ being implemented:
    with the self-test case that used the P4.1 row to prove "a PLAN.md that
    implements Phase 4 is rejected".
 
-Only that exact assertion was advanced to the new truthful frontier —
-`P4.1 | Orchestrator | YES | NO | NO` — and the P3.5 self-test now demonstrates
-the same rejection with the P4.2 row, plus a new regression proving that a
-prematurely closed `P4.1 | Orchestrator | YES | YES | YES` is rejected. Nothing
-was weakened: every closed-unit regression is preserved, impossible partial
-states are still rejected, and **P4.2 and P4.3 must still be recorded
-unimplemented**.
+At implementation time only that exact assertion was advanced to the
+then-truthful frontier `P4.1 | Orchestrator | YES | NO | NO`. This documentary
+closure advances the P4.1-owned assertions in the `Makefile`, the P3.5 checker,
+and the P4.1 checker to `YES | YES | YES`. Nothing is weakened: every
+closed-unit regression is preserved, stale and impossible partial states are
+rejected, and **P4.2 and P4.3 must still be recorded unimplemented**.
 
 ## 10. Make targets
 
@@ -641,13 +641,44 @@ make check-static
 **These are the author's own self-checks. They are not an independent audit,
 and GPU-free checks are not GB300 verification.**
 
-### 12.2 What was deliberately not run
+### 12.2 Independent audit and remediation
 
-No pilot, no final campaign, no GPU command, no Docker invocation, no
-`nvidia-smi` query, no network access, and not one orchestration stage. No
-`results/raw/phase4/` tree exists in this repository. No cross-experiment
-interpretation, integrated table, or figure was produced, and no existing
-result row was ever promoted out of its recorded `publishable=false` status.
+The independent review covered implementation commit
+`129c20c1eeb11b11076e765fa1e59a73831d6f2d` and two focused remediation
+rounds. The first correction was published as
+`0605b48d03361763cbea92c269c1a79775401d84`; the final correction was published
+as `77908dae377fb131ff90baef455c79d6d2c28b0b`. The final independent re-audit
+accepted `77908dae377fb131ff90baef455c79d6d2c28b0b` with no remaining blocker.
+P4.1 was independently audited.
+
+### 12.3 GB300 verification and P4.2 pilot
+
+On 12 August 2026 the operator ran `make phase4-p41-check` and
+`make check-static`; both completed successfully. The operator then selected
+idle physical GPU index 7 (NVIDIA B300 SXM6 AC, driver `610.43.02`) and ran the
+full deterministic nine-stage plan from clean commit
+`77908dae377fb131ff90baef455c79d6d2c28b0b`:
+
+```bash
+BLACKWELL_GPU_INDEX=7 scripts/run_all.sh \
+  --campaign-id 20260812T013848Z \
+  --campaign-kind pilot
+```
+
+The process exited 0 and the campaign reached terminal state `COMPLETE`. A
+subsequent invocation with `--resume`, after unsetting `BLACKWELL_GPU_INDEX`,
+revalidated and skipped all nine stages, exited 0, and reported that no artifact
+was rewritten and no manifest revision was appended. P4.1 was verified on
+GB300. The same campaign satisfies P4.2's single pilot requirement. Every
+artifact remains `publishable=false`.
+
+### 12.4 What has not been run
+
+No final campaign has been executed. No cross-campaign statistical treatment,
+cross-experiment interpretation, integrated table, final figure, or publication
+review has been produced, and no existing result row has been promoted out of
+its recorded `publishable=false` status. The pilot raw tree remains ignored and
+uncommitted under `results/raw/`.
 
 ## 13. Non-goals
 
@@ -657,18 +688,20 @@ algorithm benchmarking; a new Nsight Compute case; a separate cuBLASLt or
 CuTe DSL execution path; multi-GPU execution; clock or power control; automatic
 GPU selection; raw-result publication; final statistical aggregation; a
 high-variability rejection threshold; integrated roofline analysis; a final
-conclusion, table, or figure; P4.2 campaign execution; P4.3 documentation or
-audit closure; a new external dependency; a version-pin change; or any commit,
-push, merge, or pull request.
+conclusion, table, or figure; P4.2 final-campaign policy or completion; P4.3
+documentation or audit closure; a new external dependency; a version-pin
+change; or any commit, push, merge, or pull request.
 
 ## 14. Status
 
 ```text
-P4.1 | Orchestrator                                | YES | NO | NO
+P4.1 | Orchestrator                                | YES | YES | YES
 P4.2 | Pilot plus three final campaigns            | NO  | NO | NO
 P4.3 | Integrated analysis, documentation, audit   | NO  | NO | NO
 ```
 
-`P4.1 = YES / NO / NO`. The independent audit is pending, GB300 verification is
-pending, no Phase 4 campaign has been executed, and no publishable result
-exists anywhere in this repository.
+`P4.1 = YES / YES / YES`. The independent audit and GB300 verification passed.
+Pilot campaign `20260812T013848Z` is terminally `COMPLETE` and remains
+non-publishable. P4.2 still requires three independent final campaigns, P4.3
+remains unimplemented, and no publishable result exists anywhere in this
+repository.

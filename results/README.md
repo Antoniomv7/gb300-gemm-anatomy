@@ -17,13 +17,15 @@ This closes P2.4 and Phase 2, but the campaign remains reviewed pilot
 evidence with `publishable: false`, not a final campaign. See
 `src/compute/P2_4_PROTOCOL.md` for the frozen contract and limitations.
 
-**No Phase 4 campaign has been executed.** P4.1 (the campaign orchestrator,
-`scripts/run_all.sh`) is implemented infrastructure only: its independent
-audit and GB300 verification are both pending, no pilot or final campaign has
-been run through it, no `results/raw/phase4/` tree exists in this repository,
-and no publishable result exists anywhere. P4.2 will execute one pilot and
-three independent final campaigns; P4.3 will perform the integrated analysis,
-documentation, and final audit.
+P4.1 (the campaign orchestrator, `scripts/run_all.sh`) is implemented,
+independently audited, and verified on GB300. Pilot campaign
+`20260812T013848Z` completed all nine stages on 12 August 2026 and a subsequent
+read-only `--resume` revalidated every stage without rewriting an artifact or
+appending a manifest revision. The raw tree remains deliberately ignored and
+uncommitted, and every artifact records `publishable=false`. P4.2 has completed
+its one pilot but still requires three independent final campaigns; P4.3 will
+perform the integrated analysis, documentation, and final audit. No publishable
+Phase 4 result exists.
 
 ## Trust model
 
@@ -349,11 +351,12 @@ Git-ignore rule as every other campaign tree in this repository. Campaign
 
 ### `results/raw/phase4/<campaign_id>/` (raw, not committed)
 
-**This tree does not exist yet: no Phase 4 campaign has been executed.** The
-layout below is what P4.1 (`scripts/run_all.sh`, see
-`src/phase4/P4_1_PROTOCOL.md`) will create for one real top-level campaign,
-under the same blanket `results/raw/` Git-ignore rule as every other raw
-campaign tree in this repository:
+Pilot campaign `20260812T013848Z` created this tree in the operator's cluster
+checkout and reached terminal state `COMPLETE`; it is intentionally absent from
+Git under the same blanket `results/raw/` ignore rule as every other raw
+campaign tree. P4.1 (`scripts/run_all.sh`, see
+`src/phase4/P4_1_PROTOCOL.md`) uses the following layout for each top-level
+campaign:
 
 ```text
 results/raw/phase4/<campaign_id>/

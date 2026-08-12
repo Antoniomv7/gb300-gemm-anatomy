@@ -38,8 +38,9 @@ P3.5 (five shapes and comparison) — implemented; independently audited: YES;
 verified on GB300: YES; complete-result correctness: PASS for all 20
 shape/candidate rows; publishable results: NONE; P3.5: CLOSED; Phase 3:
 CLOSED. P4.1 (Phase 4 campaign orchestrator) — P4.1: implemented; independent
-audit: PENDING; GB300 verification: PENDING; Phase 4 campaigns executed: NONE;
-publishable results: NONE; P4.2 and P4.3: not implemented.`**
+audit: YES; GB300 verification: YES; pilot campaign `20260812T013848Z`:
+COMPLETE; publishable results: NONE; P4.1: CLOSED; P4.2: one pilot complete,
+three final campaigns pending; P4.3: not implemented.`**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -897,15 +898,16 @@ implemented but not yet audited or verified. This closure advances the
 P3.5-owned status guard to `YES / YES / YES`; none is weakened, and all still
 reject impossible partial states. See `src/gemm/P3_5_PROTOCOL.md` section 12.3.
 
-## Phase 4 status: P4.1 implemented; audit and GB300 verification PENDING
+## Phase 4 status: P4.1 closed as YES / YES / YES
 
-### P4.1 (Phase 4 campaign orchestrator) — implemented only
+### P4.1 (Phase 4 campaign orchestrator) — closed
 
-**P4.1: implemented; independent audit: PENDING; GB300 verification: PENDING.**
-**No Phase 4 campaign has been executed** — no pilot, no final campaign, no GPU
-command, not one orchestration stage — and **no publishable result exists**.
-P4.2 (one pilot plus three independent final campaigns) and P4.3 (integrated
-analysis, documentation, and the final audit) are **not implemented**.
+**P4.1: CLOSED; independent audit: YES; GB300 verification: YES.** Pilot
+campaign `20260812T013848Z` completed all nine stages on GB300 and remains
+`publishable=false`. No final campaign has been executed and **no publishable
+result exists**. P4.2 has completed its one pilot but remains open pending three
+independent final campaigns; P4.3 (integrated analysis, documentation, and the
+final audit) remains unimplemented.
 
 `scripts/run_all.sh` is the **only** public Phase 4 orchestration entry point.
 It coordinates one reproducible top-level campaign across the three closed
@@ -1041,11 +1043,26 @@ Implementing P4.1 required advancing one stale frontier assertion that the P4.1
 row itself owned: the `Makefile` and `scripts/check_gemm_comparison_p35.py`
 both required the literal `PLAN.md` row `P4.1 | Orchestrator | NO | NO | NO`,
 which structurally forbade P4.1 from ever being implemented. Both were advanced
-to the truthful `YES | NO | NO`; neither was weakened, a new regression rejects
-a prematurely closed P4.1, and P4.2 and P4.3 are still required to remain
-unimplemented. See `src/phase4/P4_1_PROTOCOL.md` for the complete frozen
-contract, including the author's own GPU-free checks — **which are not an
-independent audit, and which are not GB300 verification**.
+to the then-truthful `YES | NO | NO`. This closure advances the P4.1-owned
+status assertions in the `Makefile`, the P3.5 checker, and the P4.1 checker to
+`YES | YES | YES`; none is weakened, stale and impossible partial states remain
+rejected, and P4.2/P4.3 are still required to remain unimplemented. The
+author's GPU-free checks in `src/phase4/P4_1_PROTOCOL.md` were not treated as an
+independent audit or as GB300 verification.
+
+The independent review covered implementation commit
+`129c20c1eeb11b11076e765fa1e59a73831d6f2d` and its two remediation rounds. The
+final re-audit accepted corrected commit
+`77908dae377fb131ff90baef455c79d6d2c28b0b` with no remaining blocker. On 12
+August 2026, after both `make phase4-p41-check` and `make check-static` passed,
+the operator selected idle physical GPU index 7 (NVIDIA B300 SXM6 AC, driver
+`610.43.02`) and ran the full nine-stage pilot `20260812T013848Z` from that
+same clean commit. The process exited 0. A subsequent `--resume` revalidated
+and skipped every stage, reported terminal state `COMPLETE`, exited 0, and
+confirmed that no artifact was rewritten and no manifest revision was
+appended. This closes P4.1 as `YES / YES / YES` and supplies P4.2's required
+pilot. All evidence remains `publishable=false`; P4.2 still requires three
+independent final campaigns, and P4.3 remains unimplemented.
 
 ## Research question
 

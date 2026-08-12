@@ -520,16 +520,16 @@ FORBIDDEN_P35_STATUS_LINES = (
     "| P3.5 | Five shapes and comparison | YES | NO | YES |",
     "| P3.5 | Five shapes and comparison | YES | NO | NO |",
 )
-# The Phase 4 frontier. P4.1 (the campaign orchestrator) is implemented but
-# neither independently audited nor GB300-verified; P4.2 and P4.3 must stay
-# entirely unimplemented. This guard is not weakened by P4.1's arrival: it
-# still rejects a premature closure of P4.1 and any implementation of P4.2 or
-# P4.3. (Before P4.1 landed, this tuple demanded the literal
+# The Phase 4 frontier. P4.1 (the campaign orchestrator) is closed after
+# independent audit and GB300 verification; P4.2 and P4.3 must stay entirely
+# unimplemented. This guard still rejects every stale or impossible P4.1 state
+# and any implementation of P4.2 or P4.3. (Before P4.1 landed, this tuple
+# demanded the literal
 # "| P4.1 | Orchestrator | NO | NO | NO |", which structurally forbade P4.1
 # from ever being implemented -- exactly the stale-frontier situation P3.5
 # itself had to correct for P3.4. See src/phase4/P4_1_PROTOCOL.md section 9.1.)
 PHASE4_STATUS_LINES = (
-    "| P4.1 | Orchestrator | YES | NO | NO |",
+    "| P4.1 | Orchestrator | YES | YES | YES |",
     "| P4.2 | Pilot plus three final campaigns | NO | NO | NO |",
     "| P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |",
 )
@@ -537,7 +537,7 @@ FORBIDDEN_PHASE4_STATUS_LINES = (
     "| P4.1 | Orchestrator | NO | NO | NO |",
     "| P4.1 | Orchestrator | YES | YES | NO |",
     "| P4.1 | Orchestrator | YES | NO | YES |",
-    "| P4.1 | Orchestrator | YES | YES | YES |",
+    "| P4.1 | Orchestrator | YES | NO | NO |",
 )
 
 _GUARD_PRELUDE = """
@@ -3632,7 +3632,7 @@ def run_self_test() -> int:
         "| P3.3 | cuBLASLt baseline | YES | YES | YES |\n"
         "| P3.4 | Three execution variants | YES | YES | YES |\n"
         "| P3.5 | Five shapes and comparison | YES | YES | YES |\n"
-        "| P4.1 | Orchestrator | YES | NO | NO |\n"
+        "| P4.1 | Orchestrator | YES | YES | YES |\n"
         "| P4.2 | Pilot plus three final campaigns | NO | NO | NO |\n"
         "| P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |\n"
     )
@@ -3672,9 +3672,9 @@ def run_self_test() -> int:
                     "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |"),
                 good_protocol, good_readme), "Phase 4 frontier row")
     for premature in FORBIDDEN_PHASE4_STATUS_LINES:
-        rejects(f"a PLAN.md recording the untrue P4.1 status {premature!r} is rejected",
+        rejects(f"a PLAN.md recording the stale or invalid P4.1 status {premature!r} is rejected",
                 validate_status_documents(
-                    good_plan.replace("| P4.1 | Orchestrator | YES | NO | NO |", premature),
+                    good_plan.replace("| P4.1 | Orchestrator | YES | YES | YES |", premature),
                     good_protocol, good_readme))
     rejects("a stale pre-closure protocol status is rejected",
             validate_status_documents(

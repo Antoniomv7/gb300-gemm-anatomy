@@ -189,10 +189,11 @@ GEMM_P35_ARCH_FLAGS := -arch=compute_$(patsubst sm_%,%,$(CUDA_ARCH)) -code=$(CUD
 # gemm stage because P3.5 enforces shared operands, shape-major ordering,
 # all-or-nothing output, and one common comparison contract, so there is
 # deliberately no --only cublaslt and no --only cutedsl. P4.1 adds no external
-# dependency and no version pin, runs no pilot and no final campaign, and marks
-# nothing publishable: every artifact it can write records publishable=false.
-# P4.2 will execute one pilot plus three independent final campaigns; P4.3 will
-# perform the integrated analysis, documentation, and audit. See
+# dependency or version pin and marks nothing publishable: every artifact it
+# can write records publishable=false. P4.1 closed as YES / YES / YES after
+# independent audit and GB300 verification through P4.2 pilot
+# 20260812T013848Z. P4.2 still requires three independent final campaigns;
+# P4.3 will perform the integrated analysis, documentation, and audit. See
 # src/phase4/P4_1_PROTOCOL.md.
 PHASE4_P41_ENTRYPOINT := scripts/run_all.sh
 PHASE4_P41_ORCHESTRATOR := scripts/phase4_orchestrator.py
@@ -559,15 +560,15 @@ help:
 	@echo "                                 conclusion, and NOT a Phase 4 interpretation."
 	@echo ""
 	@echo "  -- P4.1 Phase 4 campaign orchestrator (see src/phase4/P4_1_PROTOCOL.md;"
-	@echo "     IMPLEMENTED ONLY: independent audit PENDING, GB300 verification PENDING."
-	@echo "     No Phase 4 campaign has been executed and no publishable result exists."
+	@echo "     CLOSED as YES / YES / YES after independent audit and GB300 verification."
+	@echo "     Pilot 20260812T013848Z is COMPLETE; no final or publishable result exists."
 	@echo "     scripts/run_all.sh is the ONLY public Phase 4 entry point. It COMPOSES"
 	@echo "     the closed P1.4, P2.4, and P3.5 units through their existing Make"
 	@echo "     targets and reimplements no kernel, matrix, statistic, profiler plan,"
 	@echo "     correctness rule, schema, or execution parameter. Experiment 3 is ONE"
 	@echo "     atomic 'gemm' stage: there is no --only cublaslt and no --only cutedsl."
-	@echo "     P4.2 will run one pilot plus three final campaigns; P4.3 will do the"
-	@echo "     integrated analysis, documentation, and audit.) --"
+	@echo "     P4.2 has completed its pilot and still requires three final campaigns;"
+	@echo "     P4.3 will do the integrated analysis, documentation, and audit.) --"
 	@echo "  GPU-free P4.1 planning/checking (no GPU, no Docker, no network):"
 	@echo "  make phase4-p41-plan          Print the deterministic full-campaign stage"
 	@echo "                                plan through the real --dry-run path. Creates"
@@ -579,7 +580,8 @@ help:
 	@echo "                                P2.4 gates (memory-paths-p14-check,"
 	@echo "                                compute-umma-p24-check-gpu-free). Needs no"
 	@echo "                                container runtime at all."
-	@echo "  GPU-executing Phase 4 campaigns are P4.2 work and have NOT been run:"
+	@echo "  GPU-executing Phase 4 campaigns are P4.2 work; the pilot is complete and"
+	@echo "  the three independent final campaigns remain pending:"
 	@echo "  BLACKWELL_GPU_INDEX=<i> scripts/run_all.sh --campaign-id <YYYYMMDDTHHMMSSZ> \\"
 	@echo "      --campaign-kind <pilot|final> [--only <memory|umma|gemm>] [--resume]"
 	@echo ""
@@ -1381,10 +1383,10 @@ check-static:
 	@grep -Fq 'P3.5: CLOSED' README.md
 	@grep -Fq 'Phase 3: CLOSED' README.md
 	@echo "== P3.5 introduces no Phase 4 functionality and no statistical treatment =="
-	@# The P4.1-owned row advanced when P4.1 landed (P4.1 is implemented but
-	@# neither audited nor GB300-verified). P4.2 and P4.3 must still be
-	@# recorded unimplemented; that requirement is NOT weakened.
-	@grep -Fq 'P4.1 | Orchestrator | YES | NO | NO |' PLAN.md
+	@# P4.1 is now closed after independent audit and GB300 verification. P4.2
+	@# and P4.3 must still be recorded unimplemented; that requirement is NOT
+	@# weakened by advancing the P4.1-owned row.
+	@grep -Fq 'P4.1 | Orchestrator | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P4.2 | Pilot plus three final campaigns | NO | NO | NO |' PLAN.md
 	@grep -Fq 'P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |' PLAN.md
 	@! grep -nE '^(P4|P41|P42|P43)_' $(GEMM_P35_WRAPPER)
@@ -1441,19 +1443,19 @@ check-static:
 	@! grep -nE '^(PHASE4_|P41_)' PHASE3_VERSIONS.env VERSIONS.env
 	@echo "== P4.1 raw campaign output is git-ignored (shared results/raw/ rule) =="
 	@grep -Fq 'results/raw/' .gitignore
-	@echo "== P4.1 executed no Phase 4 campaign in this repository =="
-	@! test -e $(PHASE4_P41_RAW_ROOT)
+	@echo "== P4.1 GPU-free checks created no synthetic placeholder campaign =="
+	@! test -e $(PHASE4_P41_RAW_ROOT)/$(PHASE4_P41_PLAN_CAMPAIGN_ID)
 	@echo "== truthful P4.1 status assertions =="
-	@grep -Fq 'P4.1 = YES / NO / NO' $(PHASE4_P41_PROTOCOL)
-	@grep -Fq 'Independent audit: PENDING' $(PHASE4_P41_PROTOCOL)
-	@grep -Fq 'GB300 verification: PENDING' $(PHASE4_P41_PROTOCOL)
-	@grep -Fq 'No Phase 4 campaign was executed' $(PHASE4_P41_PROTOCOL)
+	@grep -Fq 'P4.1 = YES / YES / YES' $(PHASE4_P41_PROTOCOL)
+	@grep -Fq 'Independent audit: PASSED' $(PHASE4_P41_PROTOCOL)
+	@grep -Fq 'GB300 verification: PASSED' $(PHASE4_P41_PROTOCOL)
+	@grep -Fq 'Pilot campaign `20260812T013848Z`: COMPLETE' $(PHASE4_P41_PROTOCOL)
 	@grep -Fq 'No publishable result exists' $(PHASE4_P41_PROTOCOL)
 	@grep -Fq 'P4.1 (Phase 4 campaign orchestrator)' README.md
 	@! grep -nF 'P4.1 | Orchestrator | NO | NO | NO |' PLAN.md
 	@! grep -nF 'P4.1 | Orchestrator | YES | YES | NO |' PLAN.md
 	@! grep -nF 'P4.1 | Orchestrator | YES | NO | YES |' PLAN.md
-	@! grep -nF 'P4.1 | Orchestrator | YES | YES | YES |' PLAN.md
+	@! grep -nF 'P4.1 | Orchestrator | YES | NO | NO |' PLAN.md
 	@! grep -rnF 'Phase 4: CLOSED' README.md PLAN.md $(PHASE4_P41_PROTOCOL)
 	@echo "check-static: OK"
 
@@ -3053,13 +3055,12 @@ gemm-comparison-p35-smoke:
 
 # --- P4.1: the Phase 4 campaign orchestrator --------------------------------
 # scripts/run_all.sh is the ONLY public Phase 4 orchestration entry point. Both
-# targets below are GPU-free and neither executes a campaign: P4.1 is
-# orchestration infrastructure whose independent audit and GB300 verification
-# are both PENDING, no Phase 4 campaign has been run, and no publishable result
-# exists. Real campaigns (one pilot plus three final replicates) are P4.2 work
-# and are invoked directly through scripts/run_all.sh with an explicit
-# BLACKWELL_GPU_INDEX; there is deliberately no Make target that could start
-# one. See src/phase4/P4_1_PROTOCOL.md.
+# targets below are GPU-free and neither executes a campaign. P4.1 closed as
+# YES / YES / YES after independent audit and GB300 verification through pilot
+# 20260812T013848Z; no publishable result exists. The three remaining final
+# campaigns are P4.2 work and are invoked directly through scripts/run_all.sh
+# with an explicit BLACKWELL_GPU_INDEX; there is deliberately no Make target
+# that could start one. See src/phase4/P4_1_PROTOCOL.md.
 
 phase4-p41-plan:
 	$(PHASE4_P41_ENTRYPOINT) --dry-run \
@@ -3104,6 +3105,6 @@ phase4-p41-check: memory-paths-p14-check compute-umma-p24-check-gpu-free
 	@echo "== P4.1 full frozen-contract check against this repository =="
 	python3 $(PHASE4_P41_CHECKER) .
 	@rm -rf scripts/__pycache__
-	@echo "== P4.1 executed no Phase 4 campaign =="
-	@! test -e $(PHASE4_P41_RAW_ROOT)
-	@echo "phase4-p41-check: OK (P4.1 implemented; audit PENDING; GB300 verification PENDING; no publishable result)"
+	@echo "== P4.1 check created no synthetic placeholder campaign =="
+	@! test -e $(PHASE4_P41_RAW_ROOT)/$(PHASE4_P41_PLAN_CAMPAIGN_ID)
+	@echo "phase4-p41-check: OK (P4.1 closed YES / YES / YES; no publishable result)"

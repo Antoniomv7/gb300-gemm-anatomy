@@ -696,19 +696,21 @@ therefore closed as `YES / YES / YES`.
 ## Phase 4 — Campaigns and integration (10–15 August 2026)
 
 Gate: Phase 3 gate passed. P3.1–P3.5 are closed as `YES / YES / YES`. P4.1 is
-implemented; its independent audit and GB300 verification are both pending. No
-Phase 4 campaign has been executed and no publishable result exists.
+implemented, independently audited, and verified on GB300. One non-publishable
+pilot campaign, `20260812T013848Z`, has completed; no final campaign has been
+executed and no publishable result exists.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
-| P4.1 | Orchestrator | YES | NO | NO |
+| P4.1 | Orchestrator | YES | YES | YES |
 | P4.2 | Pilot plus three final campaigns | NO | NO | NO |
 | P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |
 
 P4.1 (`scripts/run_all.sh`, `scripts/phase4_orchestrator.py`,
 `scripts/check_phase4_orchestrator_p41.py`, `src/phase4/P4_1_PROTOCOL.md`) is
-**implemented infrastructure only**. `scripts/run_all.sh` is the single public
-Phase 4 orchestration entry point; it coordinates one reproducible top-level
+**implemented, independently audited, and verified on GB300**.
+`scripts/run_all.sh` is the single public Phase 4 orchestration entry point; it
+coordinates one reproducible top-level
 campaign across the three closed experiments by **composing** their existing
 audited entry points — `make memory-paths-p14-pilot` / `-profile` / `-analyze`
 for experiment 1, `make compute-umma-p24-pilot` / `-profile` / `-analyze` for
@@ -786,14 +788,28 @@ so the P4.1 gate runs with no container runtime at all. Implementing P4.1 also r
 stale frontier assertion that the P4.1 row itself owned — the `Makefile` and
 `scripts/check_gemm_comparison_p35.py` both demanded the literal row
 `P4.1 | Orchestrator | NO | NO | NO`, which structurally forbade P4.1 from
-being implemented at all; both were advanced to the truthful
-`YES | NO | NO`, neither was weakened, a new regression rejects a prematurely
-closed P4.1, and P4.2/P4.3 are still required to remain unimplemented. The
-GPU-free checks in `src/phase4/P4_1_PROTOCOL.md` section 12 were run by the
-author and passed; **those are the author's own self-checks, not an independent
-audit, and GPU-free checks are not GB300 verification.** **No Phase 4 campaign
-was executed** — no pilot, no final campaign, no GPU command, not one stage —
-and **no publishable result exists**: every artifact P4.1 can write records
-`publishable=false`. P4.2 will execute one pilot and three independent final
-campaigns; P4.3 will perform the integrated analysis, documentation, and final
-audit. P4.1 is therefore recorded as `YES / NO / NO`.
+being implemented at all; both were advanced to the then-truthful
+`YES | NO | NO`. This closure advances the P4.1-owned assertions in the
+`Makefile`, the P3.5 checker, and the P4.1 checker to `YES | YES | YES` while
+continuing to reject every stale or impossible partial state. P4.2/P4.3 are
+still required to remain unimplemented. The GPU-free checks in
+`src/phase4/P4_1_PROTOCOL.md` section 12 were run by the author and passed;
+**those checks were not treated as an independent audit or as GB300
+verification.**
+
+The independent review covered implementation commit
+`129c20c1eeb11b11076e765fa1e59a73831d6f2d` and its two remediation rounds,
+ending at commit `77908dae377fb131ff90baef455c79d6d2c28b0b`. The final re-audit
+accepted that corrected commit with no remaining blocker. On 12 August 2026,
+the operator then ran the full nine-stage pilot campaign `20260812T013848Z` on
+an explicitly selected idle physical NVIDIA B300 at index 7, with driver
+`610.43.02`, from that same clean commit. All stages reached `COMPLETE`; the
+process exited 0. A subsequent `--resume` revalidated and skipped all nine
+stages, reported the campaign terminally `COMPLETE`, exited 0, and confirmed
+that no artifact was rewritten and no manifest revision was appended. This is
+the P4.1 GB300 verification and also satisfies the single P4.2 pilot. Every
+artifact remains `publishable=false`; no final campaign, cross-campaign
+statistics, integrated interpretation, final table, or figure has been
+produced. P4.1 is therefore closed as `YES / YES / YES`. P4.2 remains open at
+one completed pilot and zero of three required final campaigns, and P4.3
+remains unimplemented.
