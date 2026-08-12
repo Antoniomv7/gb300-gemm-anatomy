@@ -137,11 +137,12 @@ not a measurement. It:
 * contributes nothing to P4.3's numerical aggregation, variability estimates,
   rankings, tables, or figures.
 
-The pilot ran from commit `77908dae377fb131ff90baef455c79d6d2c28b0b`. The
-three final campaigns may run from a later P4.2 commit precisely because the
-pilot is not part of the final statistical population. The checker therefore
-excludes `git_commit` from the four-campaign agreement set and requires it to
-be identical only across the three finals.
+The pilot ran from commit `77908dae377fb131ff90baef455c79d6d2c28b0b`, and
+the checker requires that exact historical provenance pin for the accepted
+pilot ID. The three final campaigns may run from a later P4.2 commit precisely
+because the pilot is not part of the final statistical population. The checker
+therefore excludes `git_commit` from the four-campaign agreement set while
+requiring it to be identical across the three finals.
 
 That freedom is bounded. The independent audit must confirm that **no
 experimental runner, kernel, matrix, parameter, version pin, schema, or
@@ -257,18 +258,20 @@ Each final campaign is accepted only if **all** of the following hold:
 * no manifest revision is appended.
 
 The last four are properties of an *invocation* the operator performs and
-records; the checker verifies the durable evidence those invocations leave
-behind — a terminal `COMPLETE` state, a nine-stage `stage_results`, an intact
-hash-chained manifest, and a `plan.json` that still hashes to its pinned
-`plan_sha256`.
+records. In addition to loading the intact hash-chained manifest and pinned
+`plan.json`, evidence mode constructs P4.1's own `Campaign` in read-only form,
+calls `load()` and `revalidate_completed()`, and therefore re-hashes and
+re-derives every recorded stage exactly as terminal `--resume` does. It never
+calls `run()` and never appends, repairs, or regenerates evidence.
 
 ## 8. Cross-campaign validation
 
 `scripts/check_phase4_campaigns_p42.py` reuses P4.1's audited manifest-chain
-loader and filesystem primitives and re-implements none of them. Every
-per-campaign semantic decision — the hash chain, the append-only revision
-rules, the allowlisted schema, the privacy gate, the symlink and file-type
-rejection, the descriptor-anchored opens — is delegated to
+loader, filesystem primitives, and complete terminal-stage revalidation and
+re-implements none of them. Every per-campaign semantic decision — the hash
+chain, the append-only revision rules, the allowlisted schema, the privacy
+gate, the symlink and file-type rejection, the descriptor-anchored opens, and
+the fresh revalidation of every accepted stage artifact — is delegated to
 `scripts/phase4_orchestrator.py`. What P4.2 adds is only what needs more than
 one campaign to see:
 

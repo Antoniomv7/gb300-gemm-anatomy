@@ -31,8 +31,8 @@ Three modes:
         deletes, or regenerates anything, and it never invokes --resume.
 
 Every per-campaign semantic decision is delegated to P4.1's own audited
-manifest-chain loader and filesystem primitives; this unit re-implements none
-of them.
+manifest-chain loader, filesystem primitives, and read-only terminal stage
+revalidation; this unit re-implements none of them.
 
 Exit codes: 0 OK; 1 at least one check failed; 2 usage error.
 """
@@ -79,8 +79,9 @@ REQUIRED_P42_FILES = (
 # The single accepted pilot. It is fixed, non-publishable, and is never one of
 # the three final replicates. See src/phase4/P4_2_PROTOCOL.md section 5.1.
 PILOT_CAMPAIGN_ID = "20260812T013848Z"
-# The commit the accepted pilot ran from. Recorded for provenance only: the
-# pilot is deliberately excluded from the three-final commit-equality set.
+# The exact commit the accepted pilot ran from. It is a historical provenance
+# pin: the pilot is excluded from the three-final commit-equality set, but a
+# different campaign on the right ID is never accepted as that pilot.
 PILOT_GIT_COMMIT = "77908dae377fb131ff90baef455c79d6d2c28b0b"
 
 REQUIRED_FINAL_CAMPAIGN_COUNT = 3
@@ -230,7 +231,7 @@ FORBIDDEN_EVIDENCE_MODE_CALLS = (
     r"\bcreate_file_exclusive\b", r"\bwrite_file_exclusive\b",
     r"\blink_no_clobber\b", r"\bwrite_next_manifest_revision\b",
     r"\bcreate_campaign_tree\b", r"\bmkdir_component\b",
-    r"\brun_campaign\b", r"\bsubprocess\b", r"--resume",
+    r"\brun_campaign\b", r"\.run\s*\(", r"\bsubprocess\b", r"--resume",
     r"\bopen\s*\([^)]*[\"']w",
 )
 
@@ -308,9 +309,9 @@ def read_campaign_file(orchestrator, repo_root: Path, campaign_dir: Path, name: 
 
 
 def summarize_campaign(orchestrator, repo_root: Path, campaign_id: str) -> dict:
-    """Load one campaign through P4.1's audited loader and reduce it to the
-    few cross-campaign facts P4.2 compares. Raises EvidenceError for anything
-    malformed, partial, missing, symlinked, unexpected, or inconsistent."""
+    """Load one top-level campaign through P4.1's audited manifest loader and
+    reduce it to the few cross-campaign facts P4.2 compares. Deep stage-owned
+    evidence is checked separately by revalidate_campaign_evidence()."""
     try:
         orchestrator.validate_campaign_id(campaign_id)
     except orchestrator.OrchestratorError as exc:
@@ -398,10 +399,51 @@ def summarize_campaign(orchestrator, repo_root: Path, campaign_id: str) -> dict:
     }
 
 
+def revalidate_campaign_evidence(orchestrator, repo_root: Path, summary: dict, *,
+                                 context=None) -> None:
+    """Run P4.1's complete terminal revalidation over one loaded campaign.
+
+    The production path uses P4.1's real semantic P1.4/P2.4 loaders and P3.5
+    validator. A context may be injected only by the synthetic self-test so its
+    GPU-free fixtures are revalidated through the same Campaign methods.
+    """
+    if context is None:
+        orchestrator_root = Path(os.path.abspath(str(orchestrator.REPO_ROOT)))
+        if repo_root != orchestrator_root:
+            raise EvidenceError(
+                f"{summary['campaign_id']}: the campaign evidence belongs to {repo_root}, "
+                f"but the audited P4.1 module belongs to {orchestrator_root}")
+        context = orchestrator.Context(repo_root=repo_root)
+    elif Path(os.path.abspath(str(context.repo_root))) != repo_root:
+        raise EvidenceError(
+            f"{summary['campaign_id']}: the injected P4.1 context is anchored on "
+            f"{context.repo_root}, not {repo_root}")
+
+    campaign = orchestrator.Campaign(
+        context,
+        campaign_id=summary["campaign_id"],
+        campaign_kind=summary["campaign_kind"],
+        scope=summary["scope"],
+    )
+    campaign.git_commit = summary["git_commit"]
+    try:
+        campaign.load()
+        campaign.revalidate_completed()
+    except (orchestrator.OrchestratorError, orchestrator.ManifestError,
+            orchestrator.RunFailure) as exc:
+        raise EvidenceError(
+            f"{summary['campaign_id']}: P4.1 terminal revalidation rejected the "
+            f"campaign: {exc}") from exc
+
+
 def validate_campaign_acceptance(summary: dict, *, expected_kind: str,
-                                 orchestrator) -> list[str]:
-    """The per-campaign half of P4.2 acceptance (protocol section 5.5). Every
-    deeper integrity and provenance gate already ran inside P4.1's loader."""
+                                 orchestrator,
+                                 expected_git_commit: str | None = None) -> list[str]:
+    """Check P4.2's top-level per-campaign acceptance facts.
+
+    The caller follows this with P4.1's complete terminal-stage revalidation;
+    neither layer substitutes for the other.
+    """
     errors: list[str] = []
     label = f"{summary['campaign_id']} ({expected_kind})"
     if summary["campaign_kind"] != expected_kind:
@@ -424,6 +466,11 @@ def validate_campaign_acceptance(summary: dict, *, expected_kind: str,
         errors.append(f"{label}: publishable is not false")
     if summary["git_dirty"] is not False:
         errors.append(f"{label}: git_dirty is not false")
+    if (expected_git_commit is not None
+            and summary["git_commit"] != expected_git_commit):
+        errors.append(
+            f"{label}: git_commit={summary['git_commit']!r}, not the frozen "
+            f"historical commit {expected_git_commit!r}")
     return errors
 
 
@@ -520,7 +567,9 @@ def scan_for_undeclared_finals(orchestrator, repo_root: Path,
 
 def check_campaign_evidence(orchestrator, campaign_root: Path, pilot_ids: list[str],
                             final_ids: list[str], *,
-                            expected_pilot_id: str = PILOT_CAMPAIGN_ID) -> int:
+                            expected_pilot_id: str = PILOT_CAMPAIGN_ID,
+                            expected_pilot_commit: str = PILOT_GIT_COMMIT,
+                            revalidation_contexts: dict[str, object] | None = None) -> int:
     """Evidence mode. Read-only from the first call to the last."""
     reporter = Reporter("check_phase4_campaigns_p42: evidence")
 
@@ -576,9 +625,34 @@ def check_campaign_evidence(orchestrator, campaign_root: Path, pilot_ids: list[s
 
     for campaign_id, kind in [(pilot_id, PILOT_KIND)] + [(f, FINAL_KIND) for f in final_ids]:
         errors = validate_campaign_acceptance(
-            summaries[campaign_id], expected_kind=kind, orchestrator=orchestrator)
+            summaries[campaign_id], expected_kind=kind, orchestrator=orchestrator,
+            expected_git_commit=(expected_pilot_commit if campaign_id == pilot_id else None))
         reporter.check(f"{campaign_id}: accepted as a complete full-scope {kind} campaign",
                        not errors, "; ".join(errors))
+
+    if reporter.failures:
+        print(f"check_phase4_campaigns_p42: evidence: FAILED "
+              f"({len(reporter.failures)} check(s))", file=sys.stderr)
+        return 1
+
+    for campaign_id, kind in [(pilot_id, PILOT_KIND)] + [(f, FINAL_KIND) for f in final_ids]:
+        try:
+            revalidate_campaign_evidence(
+                orchestrator, repo_root, summaries[campaign_id],
+                context=(revalidation_contexts or {}).get(campaign_id))
+        except EvidenceError as exc:
+            reporter.check(
+                f"{campaign_id}: P4.1 deeply revalidates every completed {kind} stage",
+                False, str(exc))
+        else:
+            reporter.check(
+                f"{campaign_id}: P4.1 deeply revalidates every completed {kind} stage",
+                True)
+
+    if reporter.failures:
+        print(f"check_phase4_campaigns_p42: evidence: FAILED "
+              f"({len(reporter.failures)} check(s))", file=sys.stderr)
+        return 1
 
     errors = compare_final_set(finals)
     reporter.check("the three final campaigns share one frozen execution commit, plan, and "
@@ -622,6 +696,7 @@ EVIDENCE_MODE_FUNCTIONS = (
     campaign_root_to_repo_root,
     read_campaign_file,
     summarize_campaign,
+    revalidate_campaign_evidence,
     validate_campaign_acceptance,
     compare_final_set,
     compare_campaign_population,
@@ -733,8 +808,9 @@ def _check_single_public_runner(reporter: Reporter, repo_root: Path,
     # own text would be self-defeating; stripping comments and string literals
     # leaves exactly the code that would actually invoke something.
     code = _strip_python_comments(p42_source)
-    reporter.check("the P4.2 checker never executes a campaign",
-                   not re.search(r"\brun_campaign\b|\bCampaign\s*\(", code), "")
+    reporter.check("the P4.2 checker never executes a real campaign",
+                   not re.search(r"\brun_campaign\b|\bcampaign\s*\.\s*run\s*\(",
+                                 code), "")
     reporter.check("the P4.2 checker never invokes a container runtime, nvidia-smi, NCU, "
                    "a CUDA compiler, or any child process",
                    not re.search(r"\b(docker|podman|nvidia|ncu|nvcc|subprocess|popen|"
@@ -775,7 +851,8 @@ def _check_reuses_p41(reporter: Reporter, p42_source: str) -> None:
     for name in ("load_manifest_chain", "resolve_campaign_tree", "read_file_nofollow",
                  "open_dir_chain", "reject_unsafe_path", "validate_campaign_id",
                  "sha256_bytes", "stable_digest", "COMPARABLE_EVIDENCE_FIELDS",
-                 "GPU_IDENTITY_FIELDS", "PHASE4_RAW_PARTS"):
+                 "GPU_IDENTITY_FIELDS", "PHASE4_RAW_PARTS", "Context", "Campaign",
+                 "revalidate_completed"):
         # The stripped stream is one token per line, so an attribute access is
         # matched by its own name; a mention inside prose or a string literal is
         # already gone and cannot satisfy this.
@@ -901,6 +978,9 @@ def check_repository(repo_root: Path) -> int:
                    str(orchestrator.STAGE_PLANS["full"]))
     reporter.check("the accepted pilot ID is unchanged",
                    PILOT_CAMPAIGN_ID == "20260812T013848Z", PILOT_CAMPAIGN_ID)
+    reporter.check("the accepted pilot commit is unchanged",
+                   PILOT_GIT_COMMIT == "77908dae377fb131ff90baef455c79d6d2c28b0b",
+                   PILOT_GIT_COMMIT)
     reporter.check("P4.2 requires exactly three final campaigns",
                    REQUIRED_FINAL_CAMPAIGN_COUNT == 3, "")
 
@@ -941,6 +1021,7 @@ FIXTURE_OTHER_COMMIT = "3333333333333333333333333333333333333333"
 class _TempStack:
     def __init__(self):
         self.paths: list[Path] = []
+        self.revalidation_contexts: dict[Path, dict[str, object]] = {}
 
     def new_root(self) -> Path:
         root = Path(tempfile.mkdtemp(prefix="p42-"))
@@ -950,6 +1031,11 @@ class _TempStack:
     def cleanup(self) -> None:
         for path in self.paths:
             shutil.rmtree(path, ignore_errors=True)
+        self.revalidation_contexts.clear()
+
+    def remember_context(self, root: Path, campaign_id: str, context) -> None:
+        key = Path(os.path.abspath(str(root)))
+        self.revalidation_contexts.setdefault(key, {})[campaign_id] = context
 
 
 _STACK = _TempStack()
@@ -969,20 +1055,54 @@ def _set_commit(fixture, commit: str) -> None:
     fixture.unit_commit = commit
 
 
+def _fixture_revalidation_context(fixture, campaign_id: str):
+    """Freeze the two semantic loader payloads belonging to one fixture run.
+
+    A Fixture instance is reused sequentially, while each real campaign keeps
+    its own P1.4/P2.4 state. Capturing those payloads lets the later evidence
+    check re-open every campaign with the exact state its completed run left.
+    """
+    p14_payload = (fixture.p14_loader(campaign_id)
+                   if fixture.p14_state is not None else None)
+    p24_payload = (fixture.p24_loader(campaign_id)
+                   if fixture.p24_state is not None else None)
+
+    def loader(expected_id: str, payload: dict | None):
+        def load(requested_id: str) -> dict:
+            if requested_id != expected_id:
+                raise RuntimeError(
+                    f"fixture loader for {expected_id} cannot load {requested_id}")
+            if payload is None:
+                raise RuntimeError(f"no fixture unit campaign exists for {expected_id}")
+            return json.loads(json.dumps(payload))
+        return load
+
+    return fixture.context(
+        p14_loader=loader(campaign_id, p14_payload),
+        p24_loader=loader(campaign_id, p24_payload),
+    )
+
+
 def _drive(fixture, campaign_id: str, *, kind: str, selector=None) -> int:
     _reset_units(fixture)
-    return fixture.run(campaign_id=campaign_id, kind=kind, selector=selector)
+    status = fixture.run(campaign_id=campaign_id, kind=kind, selector=selector)
+    _STACK.remember_context(
+        fixture.root, campaign_id,
+        _fixture_revalidation_context(fixture, campaign_id),
+    )
+    return status
 
 
 def _build_population(o, p35, p41, reporter: Reporter, label: str, *,
                       root: Path | None = None,
+                      pilot_commit=FIXTURE_PILOT_COMMIT,
                       final_commits=None, gpu_overrides=None, runtime_overrides=None,
                       final_kinds=None, final_selectors=None):
     """One temporary repository holding a real pilot plus three real final
     campaigns, all produced by P4.1's own orchestration path."""
     root = root if root is not None else _STACK.new_root()
     fixture = p41.Fixture(o, p35, root)
-    _set_commit(fixture, FIXTURE_PILOT_COMMIT)
+    _set_commit(fixture, pilot_commit)
     statuses = {PILOT_FIXTURE_ID: _drive(fixture, PILOT_FIXTURE_ID, kind=PILOT_KIND)}
     commits = final_commits or [FIXTURE_FINAL_COMMIT] * REQUIRED_FINAL_CAMPAIGN_COUNT
     kinds = final_kinds or [FINAL_KIND] * REQUIRED_FINAL_CAMPAIGN_COUNT
@@ -1003,11 +1123,14 @@ def _build_population(o, p35, p41, reporter: Reporter, label: str, *,
 
 
 def _evidence(o, root: Path, *, pilot_ids=None, final_ids=None) -> int:
+    root_key = Path(os.path.abspath(str(root)))
     return check_campaign_evidence(
         o, root / "results" / "raw" / "phase4",
         list(pilot_ids if pilot_ids is not None else [PILOT_FIXTURE_ID]),
         list(final_ids if final_ids is not None else FINAL_FIXTURE_IDS),
-        expected_pilot_id=PILOT_FIXTURE_ID)
+        expected_pilot_id=PILOT_FIXTURE_ID,
+        expected_pilot_commit=FIXTURE_PILOT_COMMIT,
+        revalidation_contexts=_STACK.revalidation_contexts.get(root_key, {}))
 
 
 def _rejects(reporter: Reporter, label: str, call) -> bool:
@@ -1062,6 +1185,26 @@ def run_self_test(o, p35, p41) -> int:
                    _evidence(o, root) == 0, "")
     reporter.check("evidence mode wrote, repaired, deleted, or regenerated nothing",
                    _tree_snapshot(o, root) == before, "")
+
+    # Focused audit regression 1: the top-level manifest chain and plan remain
+    # intact, but P4.1's terminal stage revalidation must notice that the
+    # completed P3.5 capture changed on disk.
+    csv_root, _ = _build_population(
+        o, p35, p41, reporter, "tampered-P3.5 set")
+    csv_path = (csv_root / "results" / "raw" / "phase4" / FINAL_FIXTURE_IDS[1]
+                / o.GEMM_ARTIFACT_REL)
+    csv_path.write_text(csv_path.read_text(encoding="utf-8") + "tampered\n",
+                        encoding="utf-8")
+    _rejects(reporter, "a changed completed P3.5 CSV is rejected by P4.1 revalidation",
+             lambda: _evidence(o, csv_root))
+
+    # Focused audit regression 2: the canonical pilot ID is insufficient by
+    # itself; its recorded commit must be the exact accepted historical SHA.
+    pilot_commit_root, _ = _build_population(
+        o, p35, p41, reporter, "wrong-pilot-commit set",
+        pilot_commit=FIXTURE_OTHER_COMMIT)
+    _rejects(reporter, "the accepted pilot ID on the wrong Git commit is rejected",
+             lambda: _evidence(o, pilot_commit_root))
 
     # 7. The pilot keeps its own historical commit and is excluded from the
     #    three-final commit-equality set.
