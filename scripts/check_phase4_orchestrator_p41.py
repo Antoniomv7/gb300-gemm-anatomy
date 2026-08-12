@@ -124,7 +124,12 @@ FORBIDDEN_P41_TOKENS = (
     r"cp\.async",
 )
 
-# P4.1 is closed; the two later rows must stay unimplemented.
+# P4.1 is closed. P4.2 is now implemented (its frozen protocol plus the
+# GPU-free cross-campaign checker) but is neither independently audited nor
+# GB300-verified, because no final campaign has been executed; only that
+# P4.2-owned row advanced, and every impossible or premature P4.2 state stays
+# rejected. P4.3 must still be recorded unimplemented. See
+# src/phase4/P4_2_PROTOCOL.md section 9.1.
 EXPECTED_P41_STATUS_LINE = "| P4.1 | Orchestrator | YES | YES | YES |"
 FORBIDDEN_P41_STATUS_LINES = (
     "| P4.1 | Orchestrator | NO | NO | NO |",
@@ -132,8 +137,17 @@ FORBIDDEN_P41_STATUS_LINES = (
     "| P4.1 | Orchestrator | YES | NO | YES |",
     "| P4.1 | Orchestrator | YES | NO | NO |",
 )
-UNIMPLEMENTED_PHASE4_STATUS_LINES = (
+EXPECTED_P42_STATUS_LINE = "| P4.2 | Pilot plus three final campaigns | YES | NO | NO |"
+FORBIDDEN_P42_STATUS_LINES = (
     "| P4.2 | Pilot plus three final campaigns | NO | NO | NO |",
+    "| P4.2 | Pilot plus three final campaigns | NO | YES | NO |",
+    "| P4.2 | Pilot plus three final campaigns | NO | NO | YES |",
+    "| P4.2 | Pilot plus three final campaigns | NO | YES | YES |",
+    "| P4.2 | Pilot plus three final campaigns | YES | YES | NO |",
+    "| P4.2 | Pilot plus three final campaigns | YES | NO | YES |",
+    "| P4.2 | Pilot plus three final campaigns | YES | YES | YES |",
+)
+UNIMPLEMENTED_PHASE4_STATUS_LINES = (
     "| P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |",
 )
 CLOSED_STATUS_LINES = (
@@ -1936,6 +1950,11 @@ def _check_status_documents(reporter: Reporter, plan_text: str, protocol: str, r
     for wrong in FORBIDDEN_P41_STATUS_LINES:
         reporter.check(f"PLAN.md does not record the untrue P4.1 status {wrong!r}",
                        wrong not in plan_text, "")
+    reporter.check("PLAN.md records P4.2 as implemented but neither audited nor verified",
+                   EXPECTED_P42_STATUS_LINE in plan_text, "")
+    for wrong in FORBIDDEN_P42_STATUS_LINES:
+        reporter.check(f"PLAN.md does not record the untrue P4.2 status {wrong!r}",
+                       wrong not in plan_text, "")
     for line in UNIMPLEMENTED_PHASE4_STATUS_LINES:
         reporter.check(f"PLAN.md still records the unimplemented {line!r}",
                        line in plan_text, "")
@@ -1943,11 +1962,14 @@ def _check_status_documents(reporter: Reporter, plan_text: str, protocol: str, r
         reporter.check(f"PLAN.md still records the closed {line!r}", line in plan_text, "")
     reporter.check("the Makefile's frontier assertion records the closed P4.1 row",
                    "P4.1 | Orchestrator | YES | YES | YES |" in makefile, "")
-    reporter.check("the Makefile still requires P4.2 to be unimplemented",
-                   "P4.2 | Pilot plus three final campaigns | NO | NO | NO |" in makefile, "")
+    reporter.check("the Makefile records P4.2 as implemented, unaudited, and unverified",
+                   "P4.2 | Pilot plus three final campaigns | YES | NO | NO |" in makefile, "")
     reporter.check("the Makefile still requires P4.3 to be unimplemented",
                    "P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |" in makefile,
                    "")
+    reporter.check("P4.2 did not change the audited P4.1 runner or orchestrator",
+                   "P4.1 is implemented infrastructure" in protocol
+                   and "GB300 verification: PASSED" in protocol, "")
 
     for statement in REQUIRED_PROTOCOL_STATEMENTS:
         reporter.check(f"{PROTOCOL_RELATIVE_PATH} states {statement!r}",

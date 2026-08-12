@@ -696,8 +696,8 @@ change; or any commit, push, merge, or pull request.
 
 ```text
 P4.1 | Orchestrator                                | YES | YES | YES
-P4.2 | Pilot plus three final campaigns            | NO  | NO | NO
-P4.3 | Integrated analysis, documentation, audit   | NO  | NO | NO
+P4.2 | Pilot plus three final campaigns            | YES | NO  | NO
+P4.3 | Integrated analysis, documentation, audit   | NO  | NO  | NO
 ```
 
 `P4.1 = YES / YES / YES`. The independent audit and GB300 verification passed.
@@ -705,3 +705,12 @@ Pilot campaign `20260812T013848Z` is terminally `COMPLETE` and remains
 non-publishable. P4.2 still requires three independent final campaigns, P4.3
 remains unimplemented, and no publishable result exists anywhere in this
 repository.
+
+P4.2 has since landed its frozen protocol and its GPU-free cross-campaign
+checker (`src/phase4/P4_2_PROTOCOL.md`,
+`scripts/check_phase4_campaigns_p42.py`), which is why the P4.2 row above now
+reads `YES | NO | NO`. That unit is implemented only: the independent P4.2
+audit remains pending, GB300 verification of P4.2 remains pending, and no final
+campaign has been executed. **Nothing in this document's P4.1 implementation,
+audit, remediation, or GB300 record changed**, and P4.2 changed neither
+`scripts/run_all.sh` nor `scripts/phase4_orchestrator.py`.

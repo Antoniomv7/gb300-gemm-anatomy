@@ -39,8 +39,11 @@ verified on GB300: YES; complete-result correctness: PASS for all 20
 shape/candidate rows; publishable results: NONE; P3.5: CLOSED; Phase 3:
 CLOSED. P4.1 (Phase 4 campaign orchestrator) — P4.1: implemented; independent
 audit: YES; GB300 verification: YES; pilot campaign `20260812T013848Z`:
-COMPLETE; publishable results: NONE; P4.1: CLOSED; P4.2: one pilot complete,
-three final campaigns pending; P4.3: not implemented.`**
+COMPLETE; publishable results: NONE; P4.1: CLOSED. P4.2 (one accepted pilot
+plus three final campaigns) — implemented; the
+independent P4.2 audit remains pending, and
+GB300 verification of P4.2 remains pending; zero of three final campaigns
+executed; publishable results: NONE; P4.3: not implemented.`**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -898,16 +901,19 @@ implemented but not yet audited or verified. This closure advances the
 P3.5-owned status guard to `YES / YES / YES`; none is weakened, and all still
 reject impossible partial states. See `src/gemm/P3_5_PROTOCOL.md` section 12.3.
 
-## Phase 4 status: P4.1 closed as YES / YES / YES
+## Phase 4 status: P4.1 closed as YES / YES / YES; P4.2 = YES / NO / NO
 
 ### P4.1 (Phase 4 campaign orchestrator) — closed
 
 **P4.1: CLOSED; independent audit: YES; GB300 verification: YES.** Pilot
 campaign `20260812T013848Z` completed all nine stages on GB300 and remains
 `publishable=false`. No final campaign has been executed and **no publishable
-result exists**. P4.2 has completed its one pilot but remains open pending three
-independent final campaigns; P4.3 (integrated analysis, documentation, and the
-final audit) remains unimplemented.
+result exists**. P4.2's frozen protocol and its cross-campaign validator are
+implemented, but the
+independent P4.2 audit remains pending, and
+GB300 verification of P4.2 remains pending; zero of three required final
+campaigns have run. P4.3 (integrated analysis, documentation, and the final
+audit) remains unimplemented.
 
 `scripts/run_all.sh` is the **only** public Phase 4 orchestration entry point.
 It coordinates one reproducible top-level campaign across the three closed
@@ -1063,6 +1069,83 @@ confirmed that no artifact was rewritten and no manifest revision was
 appended. This closes P4.1 as `YES / YES / YES` and supplies P4.2's required
 pilot. All evidence remains `publishable=false`; P4.2 still requires three
 independent final campaigns, and P4.3 remains unimplemented.
+
+### P4.2 (one accepted pilot plus three final campaigns) — implemented, audit pending
+
+**P4.2: IMPLEMENTED; independent audit: PENDING; GB300 verification:
+PENDING.** P4.2 freezes the final-campaign policy *before* any result is
+collected and adds one small GPU-free checker for the invariants P4.1
+structurally cannot see, because P4.1 validates exactly one campaign at a time.
+It is not a runner: `scripts/run_all.sh` remains the **only** public Phase 4
+execution entry point, and no Make target can start a campaign. See
+`src/phase4/P4_2_PROTOCOL.md` for the complete frozen contract.
+
+The frozen population is one accepted pilot plus three final campaigns. Pilot
+`20260812T013848Z` remains accepted and `publishable=false`; it is a functional
+qualification of the orchestration path, not a measurement, and it is never one
+of the three replicates and contributes nothing to P4.3's aggregation. Each
+final campaign uses `--campaign-kind final` with `scope=full` — the `--only`
+selectors are forbidden for P4.2 finals — and runs all nine stages. All three
+must share one clean Git commit, one immutable plan and stage order, one
+physical GPU UUID, name, compute capability and driver version, one campaign
+scope, one audited execution path, and the provenance fields the accepted P4.1
+schema already exposes. P4.2 invents no provenance field and changes no part of
+the P4.1 schema. The three run sequentially, never concurrently, and nothing
+tracked may change between the start of final campaign 1 and the terminal
+revalidation of final campaign 3.
+
+The failure policy is deliberately unforgiving: an interrupted campaign keeps
+its own ID and uses the existing `--resume` path, and a terminally
+`INCONCLUSIVE`, integrity-violating, provenance-incompatible, or unresumable
+campaign stops the sequence and produces **no** fourth or replacement final
+campaign. It leaves P4.2 incomplete and requires a documented protocol
+amendment plus a new audit before further GPU work. No failed, interrupted,
+inconclusive, or inconvenient campaign may be silently omitted.
+
+```text
+python3 scripts/check_phase4_campaigns_p42.py --self-test
+python3 scripts/check_phase4_campaigns_p42.py .
+
+# Later cluster use only, once the three audited final campaigns exist.
+# Strictly read-only: it never writes, repairs, resumes, deletes, or
+# regenerates evidence, and it never invokes --resume.
+python3 scripts/check_phase4_campaigns_p42.py \
+    --campaign-root results/raw/phase4 \
+    --pilot-campaign-id 20260812T013848Z \
+    --final-campaign-id <FINAL_1> \
+    --final-campaign-id <FINAL_2> \
+    --final-campaign-id <FINAL_3>
+
+make phase4-p42-check        # fast, GPU-free, no prerequisites, no Docker,
+                             # no nvidia-smi, no CUDA, no preflight, no
+                             # network, and no raw campaign evidence needed.
+```
+
+The checker reuses P4.1's audited manifest-chain loader, descriptor-anchored
+opens, and hashing primitives instead of reimplementing them, and it adds no
+dependency and no version pin. Because the pilot sits outside the final
+statistical population, the three finals may run from a later P4.2 commit; to
+bound that freedom the checker pins the SHA-256 of `scripts/run_all.sh` and
+`scripts/phase4_orchestrator.py` to their content at the accepted P4.1 closure
+commit, so any change to the execution path fails closed and must be
+re-audited.
+
+Implementing P4.2 required advancing one stale frontier assertion that the P4.2
+row itself owned: the `Makefile`, `scripts/check_gemm_comparison_p35.py`, and
+`scripts/check_phase4_orchestrator_p41.py` all required the literal `PLAN.md`
+row `P4.2 | Pilot plus three final campaigns | NO | NO | NO`, which
+structurally forbade P4.2 from ever being implemented. Only that row advanced,
+to the now-truthful `YES | NO | NO`; nothing is weakened, every closed P1–P4.1
+assertion is preserved, P4.3 must still be recorded unimplemented, and every
+impossible or premature P4.2 state remains rejected. The author's GPU-free
+checks in `src/phase4/P4_2_PROTOCOL.md` were not treated as an independent
+audit or as GB300 verification.
+
+**No final campaign has been executed**, no cross-campaign statistic,
+threshold, ranking, table, figure, or conclusion has been produced, and no
+publishable Phase 4 result exists. The next GPU work will be the three final
+campaigns, but only after the independent P4.2 audit passes and the execution
+commit is frozen.
 
 ## Research question
 

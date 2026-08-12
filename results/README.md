@@ -27,6 +27,22 @@ its one pilot but still requires three independent final campaigns; P4.3 will
 perform the integrated analysis, documentation, and final audit. No publishable
 Phase 4 result exists.
 
+P4.2's frozen protocol (`src/phase4/P4_2_PROTOCOL.md`) and its GPU-free
+cross-campaign validator (`scripts/check_phase4_campaigns_p42.py`) are
+implemented, but the
+independent P4.2 audit remains pending, and
+GB300 verification of P4.2 remains pending. **No final campaign has been
+executed**: zero of the three required final campaigns exist, and nothing under
+`results/` was created, modified, or promoted by that work. Pilot
+`20260812T013848Z` remains accepted, untouched, and `publishable=false`, and it
+is never one of the three final replicates. The validator's evidence mode is
+strictly read-only — it never writes, repairs, resumes, deletes, or regenerates
+evidence, and it never invokes `--resume` — and it has not been run, because
+there is no final campaign for it to validate. No publishable Phase 4 result
+exists. The next GPU work will be the three final campaigns, which will write
+three new `results/raw/phase4/<campaign_id>/` trees, but only after the
+independent P4.2 audit passes and the execution commit is frozen.
+
 ## Trust model
 
 The campaign filesystem under `results/raw/` is trusted and single-writer.
