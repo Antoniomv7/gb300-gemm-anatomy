@@ -119,11 +119,14 @@ name with an explicit diagnostic.
 ### 2.2 Exit codes
 
 ```text
-0  success, --help, --self-test, --dry-run, or a pure revalidation of an
-   already COMPLETE campaign
-1  a stage or validation failure
-2  a CLI, repository-state, or safety-precondition failure
-4  a terminal but non-complete INCONCLUSIVE campaign outcome
+0    success, --help, --self-test, --dry-run, or a pure revalidation of an
+     already COMPLETE campaign
+1    a stage or validation failure
+2    a CLI, repository-state, or safety-precondition failure
+4    a terminal but non-complete INCONCLUSIVE campaign outcome
+130  interrupted (the conventional SIGINT status); every completed stage's
+     evidence is preserved and the interrupted stage stays eligible for a new
+     attempt on --resume
 ```
 
 A failing child command's **exact** exit status is preserved as evidence: it is
@@ -191,6 +194,13 @@ invocation for the same arguments — and exits 0 without executing it.
 | `memory.analyze` | gpu-free | `make memory-paths-p14-analyze` |
 | `umma.analyze` | gpu-free | `make compute-umma-p24-analyze` |
 | `campaign.validate` | gpu-free | this unit's own final integrity gate |
+
+Every one of those Make invocations is made **silently and without directory
+diagnostics** (`make --silent --no-print-directory <target>`), so Make never
+echoes a recipe line. A recipe line can carry the absolute bind-mount source of
+this checkout, and a private host path must never reach a durable Phase 4 log.
+The targets themselves, and the output of the scripts and experiments they run,
+are unchanged and are captured verbatim.
 
 Every P1.4 stage receives `P1_4_CAMPAIGN_ID` = the top-level campaign ID and
 `P1_4_PREFLIGHT_SUMMARY` = the exact preflight summary this invocation created
@@ -302,9 +312,14 @@ A revision may carry only these fields, each typed and classified:
 | `outcome`, `failure_stage`, `failure_detail` | terminal-only |
 
 `stage_results` records per-stage evidence: repository-relative paths, SHA-256
-hashes, the underlying unit's own campaign directory, manifest revision, and
-terminal state, and the allowlisted GPU identity taken from validated evidence.
-`gpu` carries exactly `uuid`, `name`, `compute_capability`, `driver_version`.
+hashes, and the normalized comparable provenance of that component. For a P1.4
+or P2.4 stage that is the unit's own campaign directory plus the **pin** of the
+exact manifest revision this campaign accepted — `unit_manifest_path` (a
+repository-relative path), `unit_manifest_revision`, `unit_manifest_sha256`, and
+`unit_state` — plus, once that state is terminal, `unit_evidence_sha256`: a
+digest over the snapshot the unit's **own** `verify_campaign_evidence_integrity()`
+just recomputed fresh from disk for every artifact it references. `gpu` carries
+exactly `uuid`, `name`, `compute_capability`, `driver_version`.
 `stage_attempts` records every attempt explicitly: stage, attempt number, start
 and finish timestamps, outcome (`COMPLETE`/`FAILED`/`INTERRUPTED`), the child's
 exact exit status, and both log paths.
@@ -314,7 +329,38 @@ credentials or tokens, SSH material, unrelated process information, complete
 host command lines, or dynamic power, clock, temperature, or utilization
 telemetry. A structural privacy gate rejects any manifest key whose name
 matches a forbidden token at any nesting depth, and any string value that is an
-absolute path.
+absolute path. The durable text P4.1 writes itself — its `campaign.validate`
+logs and the manifest's `failure_detail` — passes through one narrow redaction
+at the write boundary that replaces this checkout's own absolute root with the
+stable token `<repo-root>`, because a diagnostic may legitimately quote an
+absolute evidence path. Nothing else is rewritten: no general sanitization, no
+scientific content, no experiment-owned evidence, and no GPU identity, failure
+diagnostic, or reproducibility detail is removed.
+
+### 6.1.1 Comparable provenance
+
+Every selected component must agree with this invocation's own validated
+preflight, and with every component already accepted, on all directly
+comparable fields: Git commit, clean-tree status, GPU UUID, GPU name, compute
+capability, and — between the closed unit schemas that expose them — the CUDA
+driver and CUDA runtime API versions. Those two are recorded as an integer by
+one schema and as a string by the other, so they are normalized to their decimal
+text exactly the way P2.4's own `compare_application_provenance()` does: a
+difference in textual formatting of the same version is never a mismatch, and a
+difference in the version itself always is. A field an applicable closed schema
+requires but that is absent or malformed fails closed.
+
+The preflight's `gpu.driver_version` is the NVIDIA display-driver package string
+reported by the launcher, a different measurement of a different thing from the
+integer-encoded CUDA API versions; P1.4 documents that boundary explicitly and
+P4.1 never crosses it either. Clean-tree status is enforced where each schema
+exposes it: the campaign refuses to start on a dirty tree, every accepted
+preflight summary must record `git_dirty=false`, every P3.5 row must record
+`git_dirty=false`, and a composed unit that ever reported a dirty tree in its
+own provenance is rejected.
+
+The same comparison runs at initial acceptance, in the final `campaign.validate`
+gate, and on every `--resume` revalidation.
 
 ### 6.2 Fail-closed filesystem handling
 
@@ -326,8 +372,14 @@ absolute path.
   directory descriptor, and the accepted GEMM artifact is published with an
   in-place hard link whose own `EEXIST` is the no-clobber guarantee.
 * Valid partial evidence survives an interruption or a child failure; nothing
-  an earlier attempt created is ever deleted. A retry uses the next attempt
-  number, so an earlier stage log can never be overwritten.
+  an earlier attempt created is ever deleted. A retry uses the next free
+  attempt number — derived from the validated campaign state **and** from the
+  no-clobber logs already on disk — so an earlier stage log can never be
+  overwritten or reused. An attempt claims its number by creating its two logs
+  before the child runs, so a hard interruption can leave a log set whose
+  attempt record was never published; the next attempt skips that number
+  instead of colliding with it forever. Attempt numbers are therefore strictly
+  increasing per stage, and a gap is legal evidence of exactly that.
 * Durable metadata always uses repository-relative paths.
 * Evidence is re-hashed and revalidated immediately before a stage or a
   campaign is declared complete.
@@ -347,9 +399,9 @@ A top-level campaign may reach `COMPLETE` only when every selected component
 has independently passed its existing validator **and** the final top-level
 integrity gate. For a full campaign that means P1.4 with valid terminal
 `ANALYZED` evidence, P2.4 with valid terminal `ANALYZED` evidence, a P3.5
-capture passing the checks in section 7, and agreement across all three on
-campaign ID, Git commit, GPU UUID and name, driver provenance where comparable,
-and clean-tree status.
+capture passing the checks in section 7, every accepted unit still pinned to the
+exact terminal manifest revision it was accepted at, and agreement across all
+three on campaign ID and on every comparable provenance field of section 6.1.1.
 
 A P2.4 `INCONCLUSIVE` analysis propagates: the top-level outcome becomes
 `INCONCLUSIVE`, never `COMPLETE`, and the process exits 4. It is never silently
@@ -401,12 +453,24 @@ appears complete the orchestrator:
 
 1. loads the top-level manifest chain (re-hashing every revision);
 2. loads the underlying P1.4/P2.4 campaign through **its own** semantic loader
-   (`load_p14_manifest_chain` / `load_p24_manifest_chain`), or re-parses the
-   P3.5 CSV through P3.5's own validator;
-3. re-hashes all referenced evidence;
-4. rechecks the immutable campaign ID, kind, scope, Git commit, and GPU
-   provenance;
+   (`load_p14_manifest_chain` / `load_p24_manifest_chain`) and, at the states
+   that unit's own protocol re-verifies, its own
+   `verify_campaign_evidence_integrity()`; or re-parses the P3.5 CSV through
+   P3.5's own validator;
+3. re-hashes all referenced evidence, including the exact unit manifest
+   revision file this campaign pinned;
+4. rechecks the immutable campaign ID, kind, scope, and the full comparable
+   provenance of section 6.1.1;
 5. skips the stage **only** if all of those still pass.
+
+A unit accepted in a terminal state stays pinned to exactly the revision that
+was accepted: its recorded path, revision number, SHA-256, and evidence-integrity
+digest must all still match. A **later** terminal revision, however internally
+valid, is never silently adopted; the same revision with changed content is
+rejected by its hash; and changed referenced evidence is rejected by the unit's
+own integrity gate. A unit still legitimately advancing (`PILOT_COMPLETE` →
+`COMPLETE` → `ANALYZED`) may move forward, but the earlier revision file it was
+accepted at must still exist unchanged, byte for byte.
 
 A stage is never skipped merely because a directory or a filename exists. The
 underlying unit's state is revalidated as "at or after" what was accepted while
@@ -417,8 +481,12 @@ label is always rejected.
 
 Additional rules:
 
-* an earlier stage log is never overwritten; each retry uses the next attempt
-  number and every attempt is recorded explicitly;
+* an earlier stage log is never overwritten; each retry uses the next free
+  attempt number and every attempt is recorded explicitly. An interruption is
+  handled at exactly the same orchestration boundary for every stage, including
+  `campaign.validate`: the campaign is recorded `INTERRUPTED` where that is
+  safe, the process exits 130, every artifact and log already created is
+  preserved, and that stage stays eligible for a new attempt on `--resume`;
 * execution stops immediately when a child command fails, preserving its exit
   status and all evidence, and no downstream stage runs;
 * a resume of an already `COMPLETE` (or `INCONCLUSIVE`) campaign performs pure
@@ -445,7 +513,10 @@ scripts/check_phase4_orchestrator_p41.py    the fail-closed checker
 src/phase4/P4_1_PROTOCOL.md                 this document
 ```
 
-Updated minimally: `Makefile`, `PLAN.md`, `README.md`, `results/README.md`.
+Updated minimally: `Makefile`, `PLAN.md`, `README.md`, `results/README.md`. The
+only P2.4-owned change is the split of `compute-umma-p24-check`'s GPU-free half
+into `compute-umma-p24-check-gpu-free`, which that gate still depends on, so its
+meaning is unchanged (see section 10).
 
 Unchanged: every CUDA and CuTe DSL kernel, `VERSIONS.env`,
 `PHASE3_VERSIONS.env`, the `Dockerfile`, `scripts/run_container.sh`,
@@ -483,20 +554,38 @@ point's `--dry-run`, using a fixed placeholder campaign ID. No mutation.
 
 ### `phase4-p41-check`
 
-Exercises the real P4.1 checker and the synthetic self-tests, and depends on
-the existing GPU-free P1.4 and P2.4 gates (`memory-paths-p14-check`,
-`compute-umma-p24-check`) so the components being orchestrated are revalidated
-first. It then runs `bash -n`, `python3 -m py_compile`,
+Runs with **no container runtime, no `nvidia-smi`, no CUDA compilation, no GPU,
+and no network**, and creates no campaign. Its complete prerequisite closure is:
+
+```text
+phase4-p41-check
+├── memory-paths-p14-check            (already container-free in full)
+└── compute-umma-p24-check-gpu-free   (the GPU-free semantic/schema half of
+                                       compute-umma-p24-check)
+```
+
+`compute-umma-p24-check` itself is **not** a prerequisite: its own P2.1/P2.2/P2.3
+prerequisites compile and disassemble inside the pinned image and therefore need
+Docker. Its GPU-free half was split out verbatim into
+`compute-umma-p24-check-gpu-free`, and `compute-umma-p24-check` now depends on
+that half plus the same three gates as before, so P2.4's own gate keeps exactly
+its previous meaning. The Docker-backed P3.5 gate (`gemm-comparison-p35-check`)
+is likewise not a prerequisite.
+
+That dependency graph is enforced mechanically rather than by comment: the
+checker parses the Makefile, walks the real transitive prerequisites of
+`phase4-p41-check`, and fails if any recipe in that closure invokes a container
+runtime, `nvidia-smi`, or a CUDA compiler, or if a Docker-backed gate becomes
+reachable again through a new dependency edge.
+
+On top of its prerequisites the target runs `bash -n`, `python3 -m py_compile`,
 `scripts/run_all.sh --help`, `scripts/run_all.sh --self-test`, the two
 representative `--dry-run` plans,
 `python3 scripts/check_phase4_orchestrator_p41.py --self-test`, and
-`python3 scripts/check_phase4_orchestrator_p41.py .`.
-
-The P3.5 GPU-free gate (`gemm-comparison-p35-check`) is deliberately **not** a
-prerequisite: it is Docker-backed, and `phase4-p41-check` must stay runnable
-with no container runtime at all. `make check-static` runs the same P4.1
-checker, and the checker itself revalidates P3.5's frozen row count, candidate
-order, and shape count directly from `scripts/check_gemm_comparison_p35.py`.
+`python3 scripts/check_phase4_orchestrator_p41.py .`. `make check-static` runs
+the same P4.1 checker, and the checker itself revalidates P3.5's frozen row
+count, candidate order, and shape count directly from
+`scripts/check_gemm_comparison_p35.py`.
 
 ## 11. Security model
 
@@ -515,6 +604,12 @@ order, and shape count directly from `scripts/check_gemm_comparison_p35.py`.
   and driver version, all taken from already-validated evidence.
 * Child processes write into already-open, no-clobber descriptors and never
   perform their own path lookup for an output name.
+* No durable Phase 4 log carries a private host path. Every experimental Make
+  target is invoked with `--silent --no-print-directory`, so no recipe line —
+  and therefore no absolute bind-mount source — is ever echoed into a captured
+  stream, and the narrow redaction of section 6.1 replaces this checkout's own
+  root in the durable text P4.1 writes itself. The children's own output is
+  preserved verbatim and no scientific content is ever rewritten.
 
 ## 12. What was and was not run
 
@@ -530,6 +625,7 @@ scripts/run_all.sh --dry-run --campaign-id 20990101T000000Z --campaign-kind pilo
 scripts/run_all.sh --dry-run --campaign-id 20990101T000000Z --campaign-kind pilot --only memory
 python3 scripts/check_phase4_orchestrator_p41.py --self-test
 python3 scripts/check_phase4_orchestrator_p41.py .
+make -n phase4-p41-check    # the dependency graph itself, before running it
 make phase4-p41-check
 make check-static
 ```

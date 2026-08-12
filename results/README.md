@@ -366,7 +366,13 @@ results/raw/phase4/<campaign_id>/
 
 The three experiments keep their own raw trees; P4.1 does **not** copy them,
 and instead records validated repository-relative references plus SHA-256
-hashes. All five trees share one explicit campaign ID:
+hashes. For a P1.4 or P2.4 stage that reference **pins** the exact manifest
+revision the campaign accepted — its repository-relative path, its revision
+number, and its SHA-256 — and, once that unit is terminal, a digest over the
+snapshot the unit's own `verify_campaign_evidence_integrity()` recomputed fresh
+from disk. A later terminal revision, a changed revision, or changed referenced
+evidence is therefore rejected on revalidation rather than adopted silently.
+All five trees share one explicit campaign ID:
 
 ```text
 results/raw/phase4/<id>/
@@ -401,7 +407,13 @@ never stores usernames, home paths, host names, full environment dumps,
 credentials or tokens, SSH material, unrelated process information, complete
 host command lines, or dynamic power, clock, temperature, or utilization
 telemetry; a structural privacy gate rejects any offending field name at any
-nesting depth and any absolute path value.
+nesting depth and any absolute path value. The campaign logs are held to the
+same standard: every experimental Make target is invoked with
+`--silent --no-print-directory` so no echoed recipe line can carry the absolute
+bind-mount source of the checkout, and the durable text P4.1 writes itself
+replaces this checkout's own root with the stable token `<repo-root>`. The
+invoked scripts' and experiments' own output is captured verbatim and no
+scientific content is ever rewritten.
 
 ## Safe public metadata
 

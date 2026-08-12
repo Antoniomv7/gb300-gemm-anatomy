@@ -977,7 +977,12 @@ allowlisted GPU identity, the validated preflight reference, timestamps, any
 failure or interruption stage, and `publishable=false`. It never stores
 usernames, home paths, host names, environment dumps, credentials, SSH
 material, process information, host command lines, or dynamic power, clock,
-temperature, or utilization telemetry. The experiment-owned raw trees are
+temperature, or utilization telemetry. Every experimental Make target is invoked
+with `--silent --no-print-directory` so no recipe line — and therefore no
+absolute bind-mount source — is ever echoed into a captured log, and the durable
+text P4.1 writes itself replaces this checkout's own root with the stable token
+`<repo-root>`; the invoked scripts' and experiments' own output is captured
+verbatim. The experiment-owned raw trees are
 referenced by validated repository-relative path and hash rather than copied,
 and all five trees share one campaign ID. Symlinks and unexpected file types are
 rejected everywhere; evidence is never overwritten; publication is no-clobber;
@@ -987,13 +992,26 @@ is declared complete.
 
 `--resume` is evidence-driven, not existence-driven: each apparently complete
 stage is re-loaded through the underlying unit's **own** semantic loader
-(`load_p14_manifest_chain` / `load_p24_manifest_chain`) or P3.5's own
+(`load_p14_manifest_chain` / `load_p24_manifest_chain`) and its own
+`verify_campaign_evidence_integrity()`, or P3.5's own
 `validate_serialized_output`, re-hashed, and rechecked against the immutable
 campaign identity before it is skipped, and a fresh preflight is created and
-validated whenever GPU work is still pending. An existing campaign without
-`--resume` is rejected, `--resume` for a missing campaign is rejected, a
-tampered artifact aborts rather than being regenerated, and a resume of an
-already complete campaign is a pure read-only revalidation. A P2.4
+validated whenever GPU work is still pending. A unit accepted in a terminal
+state stays **pinned** to the exact manifest revision it was accepted at — its
+repository-relative path, revision number, SHA-256, and the digest of its own
+evidence-integrity snapshot — so a later terminal revision, a changed revision,
+or changed referenced evidence is rejected instead of being adopted silently.
+Every component must also agree with the current preflight and with each other
+on Git commit, clean-tree status, GPU UUID and name, compute capability, and —
+where the closed schemas expose them — the CUDA driver and runtime API
+versions, compared after normalizing the two textual formats those schemas use.
+An existing campaign without `--resume` is rejected, `--resume` for a missing
+campaign is rejected, a tampered artifact aborts rather than being regenerated,
+and a resume of an already complete campaign is a pure read-only revalidation.
+An interruption — including one inside `campaign.validate` — preserves every
+artifact and log already created, exits 130, and leaves that stage eligible for
+a new attempt, which always claims the next free attempt number rather than
+reusing an existing log. A P2.4
 `INCONCLUSIVE` analysis propagates to a non-complete top-level outcome and is
 never accepted as a complete final campaign. **P4.1 creates no Phase 4
 variability threshold, publication threshold, or scientific acceptance rule**;
@@ -1003,11 +1021,16 @@ belong exclusively to P4.3.
 ```bash
 make phase4-p41-plan    # GPU-free. Prints the deterministic full-campaign plan
                         # through the real --dry-run path; creates nothing.
-make phase4-p41-check   # GPU-free, network-free. Runs the existing
-                        # memory-paths-p14-check and compute-umma-p24-check
-                        # gates first, then the shell/Python syntax checks, the
-                        # public CLI surface, the synthetic acceptance suite,
-                        # and the full repository contract check.
+make phase4-p41-check   # GPU-free, container-free, network-free: no Docker, no
+                        # nvidia-smi, no CUDA compilation, no GPU. Runs the
+                        # container-free memory-paths-p14-check and
+                        # compute-umma-p24-check-gpu-free gates first, then the
+                        # shell/Python syntax checks, the public CLI surface,
+                        # the synthetic acceptance suite, and the full
+                        # repository contract check. The checker walks this
+                        # target's real transitive Make prerequisites and fails
+                        # if any recipe in that closure would invoke a container
+                        # runtime, nvidia-smi, or a CUDA compiler.
 ```
 
 Implementing P4.1 required advancing one stale frontier assertion that the P4.1

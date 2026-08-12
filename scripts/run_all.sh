@@ -31,11 +31,13 @@
 # See src/phase4/P4_1_PROTOCOL.md for the complete frozen contract.
 #
 # Exit codes:
-#   0  success, --help, --self-test, --dry-run, or a pure revalidation of an
-#      already COMPLETE campaign
-#   1  a stage or validation failure
-#   2  a CLI, repository-state, or safety-precondition failure
-#   4  a terminal but non-complete INCONCLUSIVE campaign outcome
+#   0    success, --help, --self-test, --dry-run, or a pure revalidation of an
+#        already COMPLETE campaign
+#   1    a stage or validation failure
+#   2    a CLI, repository-state, or safety-precondition failure
+#   4    a terminal but non-complete INCONCLUSIVE campaign outcome
+#   130  interrupted (the conventional SIGINT status); completed evidence is
+#        preserved and the interrupted stage stays eligible for --resume
 
 set -Eeuo pipefail
 set -o noclobber
@@ -86,8 +88,12 @@ Options:
                       atomic comparison.
   --resume            Continue an existing matching top-level campaign. Every
                       apparently complete stage is re-validated from its own
-                      evidence before it is skipped; a fresh preflight is
-                      created and validated whenever GPU work is still pending.
+                      evidence before it is skipped, and every accepted unit
+                      stays pinned to the exact manifest revision it was
+                      accepted at; a fresh preflight is created and validated
+                      whenever GPU work is still pending. An interrupted stage
+                      is retried under a new attempt number; no existing log is
+                      ever reused or overwritten.
 
 An existing campaign without --resume is rejected; --resume for a missing
 campaign is rejected. Duplicate options, missing values, unexpected positional

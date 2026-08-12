@@ -10,7 +10,8 @@
 # compute-umma-2sm-build, compute-umma-2sm-sass, compute-umma-2sm-check,
 # compute-umma-2sm-self-test, compute-umma-2sm-smoke, compute-umma-sweep-plan,
 # compute-umma-sweep-check, compute-umma-sweep-smoke, compute-umma-p24-plan,
-# compute-umma-p24-check, compute-umma-p24-pilot, compute-umma-p24-profile,
+# compute-umma-p24-check, compute-umma-p24-check-gpu-free,
+# compute-umma-p24-pilot, compute-umma-p24-profile,
 # compute-umma-p24-analyze, gemm-cutedsl-p31-check, gemm-cutedsl-p31-smoke,
 # gemm-cutedsl-p32-check, gemm-cutedsl-p32-smoke, gemm-cublaslt-p33-check,
 # gemm-cublaslt-p33-smoke, gemm-cutedsl-p34-check, gemm-cutedsl-p34-smoke,
@@ -239,7 +240,8 @@ REQUIRED_FILES := \
 	compute-umma-1sm-self-test compute-umma-1sm-smoke \
 	compute-umma-2sm-build compute-umma-2sm-sass compute-umma-2sm-check \
 	compute-umma-2sm-self-test compute-umma-2sm-smoke \
-	compute-umma-p24-plan compute-umma-p24-check compute-umma-p24-pilot \
+	compute-umma-p24-plan compute-umma-p24-check compute-umma-p24-check-gpu-free \
+	compute-umma-p24-pilot \
 	compute-umma-p24-profile compute-umma-p24-analyze \
 	compute-umma-sweep-plan compute-umma-sweep-check compute-umma-sweep-smoke \
 	gemm-cutedsl-p31-check gemm-cutedsl-p31-smoke \
@@ -391,6 +393,10 @@ help:
 	@echo "  GPU-free P2.4 planning/checking (no GPU, no Docker, no network):"
 	@echo "  make compute-umma-p24-plan     Print the frozen 24-case profile plan (the"
 	@echo "                                 same P2.3 configurations, plus kernel_symbol)."
+	@echo "  make compute-umma-p24-check-gpu-free"
+	@echo "                                The container-free half of the gate below:"
+	@echo "                                shell/Python syntax, executable bits, the P2.4"
+	@echo "                                self-tests, and the frozen 24-case plan counts."
 	@echo "  make compute-umma-p24-check    Shell/Python syntax, executable bits, GPU-free"
 	@echo "                                 synthetic/adversarial tests, exact 24-way plan"
 	@echo "                                 validation, plus the existing P2.1/P2.2/P2.3 gates."
@@ -569,8 +575,10 @@ help:
 	@echo "  make phase4-p41-check         Shell/Python syntax, executable bits, the"
 	@echo "                                public CLI surface, the synthetic acceptance"
 	@echo "                                suite, and the full repository contract check,"
-	@echo "                                after re-running the existing GPU-free P1.4"
-	@echo "                                and P2.4 gates."
+	@echo "                                after re-running the container-free P1.4 and"
+	@echo "                                P2.4 gates (memory-paths-p14-check,"
+	@echo "                                compute-umma-p24-check-gpu-free). Needs no"
+	@echo "                                container runtime at all."
 	@echo "  GPU-executing Phase 4 campaigns are P4.2 work and have NOT been run:"
 	@echo "  BLACKWELL_GPU_INDEX=<i> scripts/run_all.sh --campaign-id <YYYYMMDDTHHMMSSZ> \\"
 	@echo "      --campaign-kind <pilot|final> [--only <memory|umma|gemm>] [--resume]"
@@ -932,7 +940,13 @@ check-static:
 	@grep -Fq -- '--launch-skip' $(EXP02_P24_NCU_BRIDGE)
 	@grep -Fq -- '--kernel-name-base' $(EXP02_P24_NCU_BRIDGE)
 	@echo "== P2.4 repair: the P2.4 Make gate actually executes the P2.1/P2.2/P2.3 GPU-free gates =="
-	@grep -Eq '^compute-umma-p24-check: compute-umma-1sm-check compute-umma-2sm-check compute-umma-sweep-check$$' Makefile
+	@# P4.1 split the P2.4 gate's own GPU-free half into
+	@# compute-umma-p24-check-gpu-free so a Docker-free gate can depend on
+	@# exactly that half. compute-umma-p24-check keeps all three earlier gates
+	@# as REAL Make prerequisites and now also depends on that half, so its
+	@# meaning is unchanged and this repair is not weakened.
+	@grep -Eq '^compute-umma-p24-check: compute-umma-1sm-check compute-umma-2sm-check compute-umma-sweep-check compute-umma-p24-check-gpu-free$$' Makefile
+	@grep -Eq '^compute-umma-p24-check-gpu-free:$$' Makefile
 	@echo "== P2.4 raw campaign output is git-ignored (shared results/raw/ rule) =="
 	@grep -Fq 'results/raw/' .gitignore
 	@echo "== truthful P2.4 status assertions =="
@@ -2013,11 +2027,16 @@ compute-umma-sweep-smoke:
 	@echo "=============================================================================="
 
 # --- P2.4: profiling and empirical BF16 UMMA per-SM ceiling candidate (exp02_umma_throughput_p24) -
-# compute-umma-p24-plan and compute-umma-p24-check never touch a GPU, Docker,
-# or the network: they only exercise scripts/run_exp02_umma_throughput_p24.sh's
-# and scripts/analyze_exp02_umma_throughput_p24.py's own GPU-free CLI paths
-# and synthetic/adversarial self-tests, plus the existing P2.1/P2.2/P2.3
-# gates. compute-umma-p24-check (audit repair) has a REAL Make prerequisite
+# compute-umma-p24-plan, compute-umma-p24-check, and
+# compute-umma-p24-check-gpu-free never touch a GPU or the network: they only
+# exercise scripts/run_exp02_umma_throughput_p24.sh's and
+# scripts/analyze_exp02_umma_throughput_p24.py's own GPU-free CLI paths and
+# synthetic/adversarial self-tests. compute-umma-p24-check additionally runs the
+# existing P2.1/P2.2/P2.3 gates, which are GPU-free but NOT container-free: they
+# compile and disassemble inside the pinned, network-less, unprivileged image.
+# compute-umma-p24-check-gpu-free is the half that needs no container runtime at
+# all, and is what the P4.1 gate depends on.
+# compute-umma-p24-check (audit repair) has a REAL Make prerequisite
 # on all three earlier GPU-free validation gates -- compute-umma-1sm-check,
 # compute-umma-2sm-check, and compute-umma-sweep-check -- so a P2.1, P2.2, or
 # P2.3 regression fails compute-umma-p24-check before any P2.4-specific check
@@ -2044,8 +2063,13 @@ compute-umma-sweep-smoke:
 compute-umma-p24-plan:
 	$(EXP02_P24_RUNNER) --print-plan
 
-compute-umma-p24-check: compute-umma-1sm-check compute-umma-2sm-check compute-umma-sweep-check
-	@echo "== P2.4 gate: P2.1/P2.2/P2.3 GPU-free gates passed (compute-umma-1sm-check, compute-umma-2sm-check, compute-umma-sweep-check) =="
+# The GPU-free semantic/schema half of compute-umma-p24-check, split out
+# verbatim so another GPU-free gate can depend on exactly this much. It runs no
+# container and compiles no CUDA: shell/Python syntax, executable bits, the P2.4
+# analyzer/safe-capture/NCU-bridge self-tests, the frozen 24-configuration plan
+# counts, and the runner's own self-test. compute-umma-p24-check keeps its full
+# meaning by depending on it, so P2.4's own gate is unchanged.
+compute-umma-p24-check-gpu-free:
 	bash -n $(EXP02_P24_RUNNER)
 	@test -x $(EXP02_P24_RUNNER)
 	@test -x $(EXP02_P24_ANALYZER)
@@ -2059,6 +2083,10 @@ compute-umma-p24-check: compute-umma-1sm-check compute-umma-2sm-check compute-um
 	@test "$$(python3 $(EXP02_AGGREGATOR) plan --format lines | wc -l | tr -d ' ')" -eq 24
 	@test "$$(python3 $(EXP02_P24_ANALYZER) plan --format lines | wc -l | tr -d ' ')" -eq 24
 	$(EXP02_P24_RUNNER) --self-test
+	@echo "compute-umma-p24-check-gpu-free: OK"
+
+compute-umma-p24-check: compute-umma-1sm-check compute-umma-2sm-check compute-umma-sweep-check compute-umma-p24-check-gpu-free
+	@echo "== P2.4 gate: P2.1/P2.2/P2.3 GPU-free gates passed (compute-umma-1sm-check, compute-umma-2sm-check, compute-umma-sweep-check) =="
 	@echo "compute-umma-p24-check: OK"
 
 compute-umma-p24-pilot:
@@ -3038,15 +3066,24 @@ phase4-p41-plan:
 		--campaign-id $(PHASE4_P41_PLAN_CAMPAIGN_ID) \
 		--campaign-kind pilot
 
-# Depends on the existing GPU-free P1.4 and P2.4 gates so the components being
-# orchestrated are revalidated before any P4.1-specific check runs. The
-# Docker-backed P3.5 gate (gemm-comparison-p35-check) is deliberately NOT a
-# prerequisite, so this target stays runnable with no container runtime at all;
-# the P4.1 checker instead revalidates P3.5's frozen row count, candidate
-# order, and shape count directly from scripts/check_gemm_comparison_p35.py,
-# and uses P3.5's own validator for every synthetic capture.
-phase4-p41-check: memory-paths-p14-check compute-umma-p24-check
-	@echo "== P4.1 gate: the P1.4 and P2.4 GPU-free gates passed (memory-paths-p14-check, compute-umma-p24-check) =="
+# Depends only on GPU-free prerequisites, so the whole target runs with no
+# container runtime, no nvidia-smi, no CUDA compilation, no GPU, and no network:
+#
+#   memory-paths-p14-check          already GPU-free and Docker-free in full
+#   compute-umma-p24-check-gpu-free the GPU-free semantic/schema half of
+#                                   compute-umma-p24-check (whose own P2.1/P2.2/
+#                                   P2.3 prerequisites are Docker-backed and are
+#                                   therefore deliberately NOT reached from here)
+#
+# The Docker-backed P3.5 gate (gemm-comparison-p35-check) is likewise not a
+# prerequisite; the P4.1 checker instead revalidates P3.5's frozen row count,
+# candidate order, and shape count directly from
+# scripts/check_gemm_comparison_p35.py, and uses P3.5's own validator for every
+# synthetic capture. The checker enforces this dependency graph mechanically:
+# it walks the transitive prerequisites of this target and fails if any recipe
+# in that closure invokes a container runtime, nvidia-smi, or a CUDA compiler.
+phase4-p41-check: memory-paths-p14-check compute-umma-p24-check-gpu-free
+	@echo "== P4.1 gate: the GPU-free P1.4 and P2.4 gates passed (memory-paths-p14-check, compute-umma-p24-check-gpu-free) =="
 	bash -n $(PHASE4_P41_ENTRYPOINT)
 	@test -x $(PHASE4_P41_ENTRYPOINT)
 	@test -x $(PHASE4_P41_ORCHESTRATOR)

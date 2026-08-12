@@ -753,16 +753,32 @@ interruption or a child failure, and everything is re-hashed and revalidated
 immediately before a stage or campaign is declared complete. `--resume` is
 evidence-driven rather than existence-driven: each apparently complete stage is
 re-loaded through the underlying unit's **own** semantic loader
-(`load_p14_manifest_chain` / `load_p24_manifest_chain`) or P3.5's own
+(`load_p14_manifest_chain` / `load_p24_manifest_chain`) and its own
+`verify_campaign_evidence_integrity()`, or P3.5's own
 `validate_serialized_output`, re-hashed, and rechecked against the immutable
 campaign identity before it is skipped, and a fresh preflight is created and
-validated whenever GPU work is still pending. A P2.4 `INCONCLUSIVE` analysis
+validated whenever GPU work is still pending. A unit accepted in a terminal
+state stays pinned to the exact manifest revision it was accepted at (path,
+revision, SHA-256, and the digest of its own evidence-integrity snapshot), so a
+later terminal revision, a changed revision, or changed referenced evidence is
+rejected rather than adopted silently; every component must also agree with the
+current preflight and with each other on Git commit, clean-tree status, GPU UUID
+and name, compute capability, and — where the closed schemas expose them — the
+CUDA driver and runtime API versions, compared after normalizing the two textual
+formats those schemas use. An interruption, including one inside
+`campaign.validate`, preserves every artifact and log already created, exits
+130, and leaves that stage eligible for a new attempt under the next free
+attempt number. Every experimental Make target is invoked with
+`--silent --no-print-directory` so no echoed recipe line can put an absolute
+bind-mount source into a durable log. A P2.4 `INCONCLUSIVE` analysis
 propagates to a non-complete top-level outcome and is never accepted as a
 complete campaign. P4.1 creates no Phase 4 variability threshold, publication
 threshold, or scientific acceptance rule; those belong to P4.2/P4.3. Two
 GPU-free Make targets were added, `phase4-p41-plan` and `phase4-p41-check`, the
-latter depending on the existing `memory-paths-p14-check` and
-`compute-umma-p24-check` gates. Implementing P4.1 also required advancing one
+latter depending only on container-free gates (`memory-paths-p14-check` and
+`compute-umma-p24-check-gpu-free`, the GPU-free half split out of
+`compute-umma-p24-check`, which still depends on it and is otherwise unchanged),
+so the P4.1 gate runs with no container runtime at all. Implementing P4.1 also required advancing one
 stale frontier assertion that the P4.1 row itself owned — the `Makefile` and
 `scripts/check_gemm_comparison_p35.py` both demanded the literal row
 `P4.1 | Orchestrator | NO | NO | NO`, which structurally forbade P4.1 from

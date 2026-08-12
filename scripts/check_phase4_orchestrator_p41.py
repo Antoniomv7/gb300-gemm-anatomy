@@ -24,6 +24,7 @@ Exit codes: 0 OK; 1 at least one check failed; 2 usage error.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import io
 import json
@@ -107,6 +108,14 @@ FORBIDDEN_CLUSTER_PATTERNS = (
 FORBIDDEN_P41_COMMANDS = ("ncu", "nvidia-smi", "docker")
 _COMMAND_POSITION = r"(?:^|[;|&(]|\$\(|`)\s*{name}\b"
 
+# `make phase4-p41-check` is documented as runnable with no container runtime,
+# no nvidia-smi, no CUDA compilation, no GPU, and no network. These are the
+# commands that would break that promise; the check walks the target's real
+# transitive Make prerequisites, so a Docker-backed gate cannot be reintroduced
+# into the P4.1 check path by a dependency edge either.
+FORBIDDEN_CHECK_PATH_COMMANDS = ("docker", "podman", "nvidia-smi", "ncu", "nvcc", "cuobjdump",
+                                 "nsys")
+
 # Tokens that must not appear at all: P4.1 owns no kernel and no library call.
 FORBIDDEN_P41_TOKENS = (
     r"__global__",
@@ -160,6 +169,11 @@ FIXTURE_OTHER_GPU_UUID = "GPU-99999999-8888-7777-6666-555555555555"
 FIXTURE_GPU_NAME = "SYNTHETIC TEST DEVICE"
 FIXTURE_GPU_CC = "10.3"
 FIXTURE_GPU_DRIVER = "610.43.02"
+# The integer-encoded CUDA API versions the closed unit schemas record. One
+# component records them as an integer and another as a string; both must
+# normalize to the same value.
+FIXTURE_CUDA_DRIVER = 13010
+FIXTURE_CUDA_RUNTIME = "13010"
 
 
 def load_module(path: Path, name: str):
@@ -198,8 +212,13 @@ class Fixture:
         self.clock = 0
         self.preflight_seq = 0
         self.calls: list[tuple[str, dict]] = []
+        self.argvs: list[list[str]] = []
         self.fail_targets: dict[str, int] = {}
         self.interrupt_targets: set[str] = set()
+        self.interrupt_validate = False
+        self.watch_campaign_id: str | None = None
+        self.child_noise = ""
+        self.destroy_preflight_at: str | None = None
         self.gemm_text_override: str | None = None
         self.gpu = {
             "uuid": FIXTURE_GPU_UUID,
@@ -215,14 +234,41 @@ class Fixture:
         self.unit_commit = commit
         self.unit_gpu_uuid = FIXTURE_GPU_UUID
         self.unit_gpu_name = FIXTURE_GPU_NAME
+        self.unit_compute_capability = FIXTURE_GPU_CC
+        self.unit_cuda_driver_version: object = FIXTURE_CUDA_DRIVER
+        self.unit_cuda_runtime_version: object = FIXTURE_CUDA_RUNTIME
+        self.unit_provenance_drop: str | None = None
+        # Applied to the P2.4 payload only, so one component can be given
+        # provenance that disagrees with the component already accepted.
+        self.p24_provenance_overrides: dict = {}
+        # The synthetic stand-ins for the two pins a real loader derives from
+        # the unit's own terminal manifest revision and its own
+        # verify_campaign_evidence_integrity() snapshot.
+        self.unit_manifest_body = "synthetic-unit-manifest"
+        self.unit_evidence_body = "synthetic-unit-evidence"
 
     # -- seams ----------------------------------------------------------
 
     def now_utc(self) -> str:
+        # The clock is also the interruption seam: campaign.validate reads it
+        # immediately after writing its two no-clobber logs, which is exactly
+        # the window that used to leave a log with no attempt record.
+        if self.interrupt_validate and self.validate_logs():
+            self.interrupt_validate = False
+            raise KeyboardInterrupt
         self.clock += 1
         minute, second = divmod(self.clock, 60)
         hour, minute = divmod(minute, 60)
         return f"20990101T{hour:02d}{minute:02d}{second:02d}Z"
+
+    def validate_logs(self) -> list[str]:
+        if self.watch_campaign_id is None:
+            return []
+        logs = self.campaign_dir(self.watch_campaign_id) / "logs"
+        if not logs.is_dir():
+            return []
+        return sorted(p.name for p in logs.iterdir()
+                      if p.name.startswith("campaign_validate."))
 
     def git_state(self) -> tuple[str, bool]:
         return self.commit, self.dirty
@@ -245,10 +291,21 @@ class Fixture:
 
     def run_command(self, argv, *, env, stdout_fd, stderr_fd) -> int:
         assert argv[0] == "make", argv
-        target = argv[1]
+        # Recorded so the suite can prove every orchestrated invocation is
+        # silent and prints no directory diagnostics.
+        self.argvs.append(list(argv))
+        target = argv[-1]
         self.calls.append((target, dict(env)))
+        if self.child_noise:
+            os.write(stderr_fd, self.child_noise.encode("utf-8"))
         if target in self.interrupt_targets:
             raise KeyboardInterrupt
+        if target == self.destroy_preflight_at:
+            # A validated preflight summary that disappears mid-campaign: the
+            # final gate then reports it by its absolute path, which is exactly
+            # the durable text that must be redacted before it is written.
+            for directory in sorted((self.root / "results" / "preflight").iterdir()):
+                (directory / "summary.json").unlink()
         os.write(stderr_fd, f"stub: {target}\n".encode())
         status = self.fail_targets.get(target, 0)
         if status == 0:
@@ -321,22 +378,45 @@ class Fixture:
 
     # -- stubbed semantic loaders ---------------------------------------
 
-    def _unit_payload(self, state, revision, rel):
+    def _unit_payload(self, state, revision, rel, overrides=None):
+        """The payload a real semantic loader returns: the unit's manifest and
+        revision, the exact revision file that carried this state (a real file
+        under the temporary root, so the SHA-256 pin is a real hash of real
+        bytes), and -- at the states the unit's own protocol re-verifies -- a
+        digest standing in for its verify_campaign_evidence_integrity()
+        snapshot."""
         if state is None:
             raise RuntimeError("no such campaign")
-        return {
-            "manifest": {
-                "state": state,
-                "provenance": {
-                    "git_commit": self.unit_commit,
-                    "gpu_uuid": self.unit_gpu_uuid,
-                    "gpu_name": self.unit_gpu_name,
-                    "compute_capability": FIXTURE_GPU_CC,
-                },
-            },
+        manifest_rel = f"{rel}/manifest/{revision:06d}.json"
+        path = self.root / manifest_rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(
+                json.dumps({"state": state, "manifest_revision": revision,
+                            "body": self.unit_manifest_body}, indent=2) + "\n",
+                encoding="utf-8")
+        provenance = {
+            "git_commit": self.unit_commit,
+            "gpu_uuid": self.unit_gpu_uuid,
+            "gpu_name": self.unit_gpu_name,
+            "compute_capability": self.unit_compute_capability,
+            "cuda_driver_version": self.unit_cuda_driver_version,
+            "cuda_runtime_version": self.unit_cuda_runtime_version,
+        }
+        provenance.update(overrides or {})
+        if self.unit_provenance_drop is not None:
+            provenance.pop(self.unit_provenance_drop, None)
+        payload = {
+            "manifest": {"state": state, "provenance": provenance},
             "revision": revision,
             "campaign_dir": rel,
+            "manifest_path": manifest_rel,
+            "manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
+        if state in ("COMPLETE", "ANALYZED", "INCONCLUSIVE"):
+            payload["evidence_sha256"] = hashlib.sha256(
+                f"{rel}|{state}|{self.unit_evidence_body}".encode("utf-8")).hexdigest()
+        return payload
 
     def p14_loader(self, campaign_id: str) -> dict:
         return self._unit_payload(self.p14_state, self.p14_revision,
@@ -344,7 +424,8 @@ class Fixture:
 
     def p24_loader(self, campaign_id: str) -> dict:
         return self._unit_payload(self.p24_state, self.p24_revision,
-                                  f"{self.o.P24_RAW_REL}/{campaign_id}")
+                                  f"{self.o.P24_RAW_REL}/{campaign_id}",
+                                  self.p24_provenance_overrides)
 
     # -- P3.5 fixtures --------------------------------------------------
 
@@ -383,6 +464,7 @@ class Fixture:
 
     def run(self, *, campaign_id: str, kind: str = "pilot", selector=None,
             gpu_index: str | None = "3", resume: bool = False, context=None) -> int:
+        self.watch_campaign_id = campaign_id
         ctx = context if context is not None else self.context()
         return self.o.run_campaign(
             ctx, campaign_id=campaign_id, campaign_kind=kind, selector=selector,
@@ -439,6 +521,10 @@ def run_self_test(orchestrator, p35) -> int:
     _test_mismatch_rejection(reporter, o, p35)
     _test_inconclusive_propagation(reporter, o, p35)
     _test_bad_gemm_captures(reporter, o, p35)
+    _test_unit_evidence_pinning(reporter, o, p35)
+    _test_provenance_agreement(reporter, o, p35)
+    _test_validate_interruption(reporter, o, p35)
+    _test_durable_log_privacy(reporter, o, p35)
     _test_privacy(reporter, o, p35)
 
     if reporter.failures:
@@ -969,7 +1055,10 @@ def _test_no_clobber(reporter: Reporter, o, p35) -> None:
     finally:
         os.close(fd)
 
-    # An occupied next-attempt log name fails the whole stage closed.
+    # An already occupied attempt-log name is never reused or overwritten: the
+    # next attempt number is derived from the logs actually on disk as well as
+    # from the validated campaign state, so a log an interrupted attempt left
+    # behind cannot block the stage forever either.
     fixture = _fixture(o, p35, _STACK)
     campaign_id = "20991001T000000Z"
     fixture.fail_targets["gemm-comparison-p35-smoke"] = 4
@@ -980,11 +1069,14 @@ def _test_no_clobber(reporter: Reporter, o, p35) -> None:
     fixture.fail_targets.pop("gemm-comparison-p35-smoke")
     squatter = fixture.campaign_dir(campaign_id) / "logs" / "preflight.002.stdout.log"
     squatter.write_text("pre-existing evidence", encoding="utf-8")
-    reporter.rejects("an occupied next-attempt log name fails the stage closed",
-                     lambda: fixture.run(campaign_id=campaign_id, resume=True),
-                     o.OrchestratorError, "already exists")
-    reporter.check("the squatting log file was never overwritten",
+    status = fixture.run(campaign_id=campaign_id, resume=True)
+    reporter.check("an occupied attempt-log name is skipped, not reused", status == o.EXIT_OK,
+                   str(status))
+    reporter.check("the pre-existing log file was never overwritten",
                    squatter.read_text(encoding="utf-8") == "pre-existing evidence", "")
+    logs = sorted(p.name for p in (fixture.campaign_dir(campaign_id) / "logs").iterdir())
+    reporter.check("the retried stage claimed the next free attempt number",
+                   "preflight.003.stdout.log" in logs, str(logs))
 
 
 def _test_symlink_rejection(reporter: Reporter, o, p35) -> None:
@@ -1131,6 +1223,277 @@ def _test_bad_gemm_captures(reporter: Reporter, o, p35) -> None:
                        str(manifest.get("failure_stage")))
         reporter.check(f"{label} prevents any downstream stage from completing",
                        "memory.analyze" not in manifest["stage_results"], "")
+
+
+def _test_unit_evidence_pinning(reporter: Reporter, o, p35) -> None:
+    """A completed unit is pinned by the exact terminal manifest revision it was
+    accepted at -- path, revision, and SHA-256 -- plus the digest of its own
+    evidence-integrity snapshot. None of them may drift afterwards."""
+    campaign_id = "20991221T000000Z"
+
+    def completed():
+        fixture = _fixture(o, p35, _STACK)
+        status = fixture.run(campaign_id=campaign_id)
+        reporter.check("a campaign that pins its units still completes", status == o.EXIT_OK,
+                       str(status))
+        return fixture
+
+    fixture = completed()
+    manifest = fixture.load_manifest(campaign_id)
+    evidence = manifest["stage_results"]["memory.analyze"]["evidence"]
+    reporter.check("an accepted terminal unit records its exact manifest revision path and hash",
+                   evidence.get("unit_manifest_path", "").endswith(
+                       f"manifest/{evidence.get('unit_manifest_revision'):06d}.json")
+                   and bool(o.SHA256_RE.fullmatch(evidence.get("unit_manifest_sha256", ""))),
+                   str(evidence))
+    reporter.check("an accepted terminal unit records its own evidence-integrity pin",
+                   bool(o.SHA256_RE.fullmatch(evidence.get("unit_evidence_sha256", ""))),
+                   str(evidence))
+    reporter.check("no pinned unit reference is an absolute path",
+                   not str(evidence["unit_manifest_path"]).startswith("/"), "")
+
+    # 1. A valid but LATER terminal revision must not replace the accepted one.
+    fixture = completed()
+    fixture.p14_revision += 1
+    reporter.rejects("a later P1.4 terminal manifest revision is rejected",
+                     lambda: fixture.run(campaign_id=campaign_id, resume=True), o.RunFailure,
+                     "later terminal revision is never adopted silently")
+
+    fixture = completed()
+    fixture.p24_revision += 1
+    reporter.rejects("a later P2.4 terminal manifest revision is rejected",
+                     lambda: fixture.run(campaign_id=campaign_id, resume=True), o.RunFailure,
+                     "later terminal revision is never adopted silently")
+
+    # 2. The accepted revision file's own content may not change either.
+    fixture = completed()
+    pinned = fixture.root / fixture.load_manifest(campaign_id)[
+        "stage_results"]["memory.analyze"]["evidence"]["unit_manifest_path"]
+    pinned.write_text(pinned.read_text(encoding="utf-8") + " ", encoding="utf-8")
+    reporter.rejects("a changed accepted unit manifest is rejected",
+                     lambda: fixture.run(campaign_id=campaign_id, resume=True), o.RunFailure,
+                     "changed since it was accepted")
+    reporter.check("the changed unit manifest was not regenerated",
+                   pinned.read_text(encoding="utf-8").endswith(" "), "")
+
+    # 3. Changed referenced evidence: the unit's own integrity snapshot moves.
+    fixture = completed()
+    fixture.unit_evidence_body = "tampered"
+    reporter.rejects("changed referenced unit evidence is rejected",
+                     lambda: fixture.run(campaign_id=campaign_id, resume=True), o.RunFailure,
+                     "evidence-integrity snapshot no longer matches")
+
+    # 4. A unit whose own integrity gate fails is never accepted at all.
+    fixture = _fixture(o, p35, _STACK)
+    original = fixture.p14_loader
+
+    def failing_gate(cid):
+        payload = original(cid)
+        if payload["manifest"]["state"] == "ANALYZED":
+            raise RuntimeError("the unit's own evidence-integrity gate failed: ['synthetic']")
+        return payload
+
+    fixture.p14_loader = failing_gate
+    reporter.rejects("a unit whose own evidence-integrity gate fails is never accepted",
+                     lambda: fixture.run(campaign_id="20991222T000000Z"), o.RunFailure,
+                     "evidence-integrity gate failed")
+
+
+def _test_provenance_agreement(reporter: Reporter, o, p35) -> None:
+    """Commit, GPU identity, compute capability, and both CUDA API versions must
+    agree across every selected component and the current preflight."""
+    for field, value in (("cuda_driver_version", 13020), ("cuda_runtime_version", 13020),
+                         ("compute_capability", "9.9")):
+        fixture = _fixture(o, p35, _STACK)
+        fixture.p24_provenance_overrides = {field: value}
+        reporter.rejects(f"a component disagreeing on {field} is rejected",
+                         lambda f=fixture: f.run(campaign_id="20991223T000000Z"), o.RunFailure,
+                         field)
+
+    for field in o.UNIT_PROVENANCE_FIELDS:
+        fixture = _fixture(o, p35, _STACK)
+        fixture.unit_provenance_drop = field
+        reporter.rejects(f"a unit whose provenance is missing {field} is rejected",
+                         lambda f=fixture: f.run(campaign_id="20991224T000000Z"), o.RunFailure,
+                         "unusable campaign provenance")
+
+    for label, value in (("an empty", ""), ("a non-scalar", [13010]), ("a boolean", True)):
+        fixture = _fixture(o, p35, _STACK)
+        fixture.unit_cuda_driver_version = value
+        reporter.rejects(f"{label} CUDA driver version is rejected",
+                         lambda f=fixture: f.run(campaign_id="20991225T000000Z"), o.RunFailure,
+                         "cuda_driver_version")
+
+    # The same version in the two textual formats the closed schemas use is one
+    # value, not a mismatch.
+    fixture = _fixture(o, p35, _STACK)
+    campaign_id = "20991226T000000Z"
+    fixture.unit_cuda_driver_version = 13010
+    fixture.p24_provenance_overrides = {"cuda_driver_version": "13010"}
+    status = fixture.run(campaign_id=campaign_id)
+    reporter.check("an int and a string spelling of the same CUDA version agree",
+                   status == o.EXIT_OK, str(status))
+    manifest = fixture.load_manifest(campaign_id)
+    recorded = {record["evidence"].get("cuda_driver_version")
+                for record in manifest["stage_results"].values()
+                if record["evidence"].get("cuda_driver_version") is not None}
+    reporter.check("the normalized CUDA driver version is recorded once, not twice",
+                   recorded == {"13010"}, str(recorded))
+
+    # Provenance is re-compared on resume, not only at acceptance.
+    fixture = _fixture(o, p35, _STACK)
+    campaign_id = "20991227T000000Z"
+    fixture.run(campaign_id=campaign_id)
+    fixture.unit_cuda_runtime_version = 13020
+    reporter.rejects("changed unit provenance aborts a completed-campaign revalidation",
+                     lambda: fixture.run(campaign_id=campaign_id, resume=True), o.RunFailure,
+                     "cuda_runtime_version")
+
+
+def _test_validate_interruption(reporter: Reporter, o, p35) -> None:
+    """An interruption inside campaign.validate is handled at the same
+    orchestration boundary as every other stage, and leaves the stage eligible
+    for a new attempt."""
+    fixture = _fixture(o, p35, _STACK)
+    campaign_id = "20991228T000000Z"
+    fixture.interrupt_validate = True
+    try:
+        fixture.run(campaign_id=campaign_id)
+        reporter.check("an interrupted campaign.validate propagates KeyboardInterrupt", False,
+                       "no raise")
+    except KeyboardInterrupt:
+        reporter.check("an interrupted campaign.validate propagates KeyboardInterrupt", True)
+
+    manifest = fixture.load_manifest(campaign_id)
+    reporter.check("an interrupted campaign.validate is recorded INTERRUPTED",
+                   manifest["state"] == o.STATE_INTERRUPTED
+                   and manifest.get("failure_stage") == "campaign.validate",
+                   f"{manifest['state']} {manifest.get('failure_stage')}")
+    interrupted = [e for e in manifest["stage_attempts"]
+                   if e["stage"] == "campaign.validate" and e["outcome"] == "INTERRUPTED"]
+    reporter.check("the interrupted attempt records the conventional interrupted status",
+                   len(interrupted) == 1 and interrupted[0]["exit_status"] == o.EXIT_INTERRUPTED
+                   and o.EXIT_INTERRUPTED == 130, str(interrupted))
+    reporter.check("every stage completed before the interruption is preserved",
+                   list(manifest["stage_results"]) == list(EXPECTED_FULL_PLAN[:-1]),
+                   str(list(manifest["stage_results"])))
+    first_logs = fixture.validate_logs()
+    reporter.check("the interrupted attempt's own logs are preserved",
+                   first_logs == ["campaign_validate.001.stderr.log",
+                                  "campaign_validate.001.stdout.log"], str(first_logs))
+    kept = (fixture.campaign_dir(campaign_id) / "logs"
+            / "campaign_validate.001.stdout.log").read_text(encoding="utf-8")
+
+    status = fixture.run(campaign_id=campaign_id, resume=True)
+    reporter.check("resuming after an interrupted campaign.validate completes it",
+                   status == o.EXIT_OK, str(status))
+    reporter.check("the resumed validation used a new attempt log",
+                   fixture.validate_logs() == ["campaign_validate.001.stderr.log",
+                                               "campaign_validate.001.stdout.log",
+                                               "campaign_validate.002.stderr.log",
+                                               "campaign_validate.002.stdout.log"],
+                   str(fixture.validate_logs()))
+    reporter.check("the interrupted attempt's log was never overwritten",
+                   (fixture.campaign_dir(campaign_id) / "logs"
+                    / "campaign_validate.001.stdout.log").read_text(encoding="utf-8") == kept, "")
+    _check_exit_code_contract(reporter, o)
+
+    manifest = fixture.load_manifest(campaign_id)
+    reporter.check("the resumed campaign reaches COMPLETE",
+                   manifest["state"] == o.STATE_COMPLETE, manifest["state"])
+    attempts = [e["attempt"] for e in manifest["stage_attempts"]
+                if e["stage"] == "campaign.validate"]
+    reporter.check("both validation attempts are recorded explicitly, in order",
+                   attempts == [1, 2], str(attempts))
+    reporter.check("no completed stage was re-executed by the resume",
+                   [target for target, _env in fixture.calls].count(
+                       "gemm-comparison-p35-smoke") == 1,
+                   str([target for target, _env in fixture.calls]))
+
+    # An attempt log left behind with no attempt record (a hard interruption)
+    # is skipped rather than reused, so the stage stays resumable.
+    revisions_before = fixture.manifest_revisions(campaign_id)
+    calls_before = len(fixture.calls)
+    status = fixture.run(campaign_id=campaign_id, resume=True)
+    reporter.check("resuming the now COMPLETE campaign stays read-only",
+                   status == o.EXIT_OK
+                   and fixture.manifest_revisions(campaign_id) == revisions_before
+                   and len(fixture.calls) == calls_before
+                   and len(fixture.validate_logs()) == 4, str(status))
+
+
+def _check_exit_code_contract(reporter: Reporter, o) -> None:
+    """The real process-level mapping, exercised directly: an interruption exits
+    130, and every other escaping error keeps its own documented status."""
+    original = o.main
+    cases = (
+        ("an interruption", KeyboardInterrupt(), o.EXIT_INTERRUPTED),
+        ("a stage failure", o.RunFailure("synthetic"), o.EXIT_RUN_FAILURE),
+        ("a manifest defect", o.ManifestError("synthetic"), o.EXIT_RUN_FAILURE),
+        ("a precondition failure", o.OrchestratorError("synthetic"), o.EXIT_PRECONDITION),
+    )
+    try:
+        for label, error, expected in cases:
+            def raiser(argv=None, _error=error):
+                raise _error
+
+            o.main = raiser
+            with redirect_stderr(io.StringIO()):
+                status = o.cli_main([])
+            reporter.check(f"{label} exits {expected}", status == expected, str(status))
+        o.main = lambda argv=None: o.EXIT_OK
+        with redirect_stderr(io.StringIO()):
+            reporter.check("a successful run still exits 0", o.cli_main([]) == o.EXIT_OK, "")
+    finally:
+        o.main = original
+
+
+def _test_durable_log_privacy(reporter: Reporter, o, p35) -> None:
+    """No durable Phase 4 log or manifest field carries this checkout's absolute
+    path, and the invoked children's own output is preserved untouched."""
+    parent = Path(tempfile.mkdtemp(prefix="p41-"))
+    _STACK.append(parent)
+    root = parent / "work" / "gb300-gemm-anatomy"
+    root.mkdir(parents=True)
+    fixture = Fixture(o, p35, root)
+    fixture.child_noise = "stub: ordinary child diagnostic line\n"
+    fixture.destroy_preflight_at = "compute-umma-p24-analyze"
+    campaign_id = "20991229T000000Z"
+    reporter.rejects("evidence that disappeared mid-campaign fails the final gate",
+                     lambda: fixture.run(campaign_id=campaign_id), o.RunFailure,
+                     "integrity gate failed")
+
+    absolute = str(root)
+    logs_dir = fixture.campaign_dir(campaign_id) / "logs"
+    durable = sorted(p.name for p in logs_dir.iterdir())
+    for name in durable:
+        text = (logs_dir / name).read_text(encoding="utf-8", errors="replace")
+        reporter.check(f"the durable log {name} carries no absolute checkout path",
+                       absolute not in text, text[:200])
+    validate_stderr = (logs_dir / "campaign_validate.001.stderr.log").read_text(encoding="utf-8")
+    reporter.check("the redacted diagnostic keeps its stable token",
+                   o.REPO_ROOT_TOKEN in validate_stderr, validate_stderr[:200])
+    reporter.check("the redacted diagnostic keeps the failure information itself",
+                   "preflight" in validate_stderr and "does not exist" in validate_stderr,
+                   validate_stderr[:200])
+    child_log = (logs_dir / "umma_analyze.001.stderr.log").read_text(encoding="utf-8")
+    reporter.check("ordinary child output is preserved verbatim",
+                   "ordinary child diagnostic line" in child_log, child_log[:200])
+
+    document = json.dumps(fixture.load_manifest(campaign_id))
+    reporter.check("no manifest field carries the absolute checkout path",
+                   absolute not in document, "")
+    reporter.check("the manifest failure detail is redacted, not discarded",
+                   o.REPO_ROOT_TOKEN in document, "")
+
+    reporter.check("every orchestrated Make invocation is silent",
+                   all(argv[:3] == ["make", "--silent", "--no-print-directory"]
+                       for argv in fixture.argvs) and bool(fixture.argvs),
+                   str(fixture.argvs[:1]))
+    reporter.check("the invoked target itself is unchanged",
+                   [argv[-1] for argv in fixture.argvs]
+                   == [EXPECTED_MAKE_TARGETS[stage] for stage in EXPECTED_FULL_PLAN[:-1]],
+                   str([argv[-1] for argv in fixture.argvs]))
 
 
 def _test_privacy(reporter: Reporter, o, p35) -> None:
@@ -1301,6 +1664,24 @@ def _check_composition(reporter: Reporter, repo_root: Path, orchestrator: str) -
                    "load_p24_manifest_chain" in orchestrator, "")
     reporter.check("the orchestrator reuses P3.5's own serialized-output validator",
                    "validate_serialized_output" in orchestrator, "")
+    reporter.check("the orchestrator reuses each unit's own evidence-integrity gate",
+                   orchestrator.count("verify_campaign_evidence_integrity") >= 1, "")
+    reporter.check("the orchestrator pins the accepted unit manifest revision by hash",
+                   all(field in orchestrator for field in
+                       ("unit_manifest_path", "unit_manifest_sha256", "unit_evidence_sha256")), "")
+    reporter.check("the orchestrator exits 130 when it is interrupted",
+                   "return EXIT_INTERRUPTED" in orchestrator
+                   and "raise SystemExit(cli_main())" in orchestrator
+                   and module.EXIT_INTERRUPTED == 130, str(module.EXIT_INTERRUPTED))
+    reporter.check("the orchestrator invokes every Make target silently",
+                   module.MAKE_QUIET_FLAGS == ("--silent", "--no-print-directory"),
+                   str(module.MAKE_QUIET_FLAGS))
+    reporter.check("the orchestrator compares both CUDA API versions between components",
+                   {"cuda_driver_version", "cuda_runtime_version"}
+                   <= set(module.COMPARABLE_EVIDENCE_FIELDS)
+                   and {"cuda_driver_version", "cuda_runtime_version"}
+                   <= set(module.UNIT_PROVENANCE_FIELDS),
+                   str(module.COMPARABLE_EVIDENCE_FIELDS))
     reporter.check("the orchestrator adds no P3.5 schema of its own",
                    "p35.v1" not in orchestrator and "EXPECTED_CSV_FIELDS" not in orchestrator, "")
     reporter.check("the orchestrator adds no scientific threshold",
@@ -1320,13 +1701,105 @@ def _check_composition(reporter: Reporter, repo_root: Path, orchestrator: str) -
                    len(p35.EXPECTED_SHAPES) == 5, str(p35.EXPECTED_SHAPES))
 
 
+def _parse_makefile_rules(makefile: str) -> dict[str, tuple[list[str], list[str]]]:
+    """target -> (prerequisites, recipe lines). Simple `NAME := value` variables
+    are expanded so a prerequisite written through one is still resolved."""
+    variables = dict(re.findall(r"^([A-Za-z0-9_]+)\s*:=\s*(.*)$", makefile, re.MULTILINE))
+
+    def expand(text: str) -> str:
+        for _ in range(4):
+            replaced = re.sub(r"\$\(([A-Za-z0-9_]+)\)",
+                              lambda m: variables.get(m.group(1), m.group(0)), text)
+            if replaced == text:
+                break
+            text = replaced
+        return text
+
+    rules: dict[str, tuple[list[str], list[str]]] = {}
+    current: list[str] = []
+    for line in makefile.splitlines():
+        if line.startswith("\t"):
+            for target in current:
+                rules[target][1].append(line[1:])
+            continue
+        match = re.match(r"^([A-Za-z0-9._/$()-][^:=]*):(?!=)(.*)$", line)
+        if match is None:
+            # A comment or a blank line does not end a recipe; anything else at
+            # column 0 does. Attributing too many lines to a target only makes
+            # the scan below stricter, which is the fail-closed direction.
+            if line.strip() and not line.startswith(("#", " ")):
+                current = []
+            continue
+        targets = expand(match.group(1)).split()
+        prerequisites = expand(match.group(2)).split()
+        current = []
+        for target in targets:
+            rules.setdefault(target, ([], []))
+            rules[target][0].extend(prerequisites)
+            current.append(target)
+    return rules
+
+
+def _target_closure(rules: dict[str, tuple[list[str], list[str]]], root: str) -> list[str]:
+    seen: list[str] = []
+    pending = [root]
+    while pending:
+        target = pending.pop()
+        if target in seen:
+            continue
+        seen.append(target)
+        pending.extend(rules.get(target, ([], []))[0])
+    return seen
+
+
+def _check_p41_check_is_container_free(reporter: Reporter, makefile: str) -> None:
+    """The documented P4.1 contract is that `make phase4-p41-check` runs with no
+    container runtime, no nvidia-smi, no CUDA compilation, no GPU, and no
+    network. This walks the target's real transitive prerequisites and fails if
+    any recipe in that closure would invoke one of them."""
+    rules = _parse_makefile_rules(makefile)
+    reporter.check("the Makefile rule graph is parseable and declares phase4-p41-check",
+                   "phase4-p41-check" in rules, str(sorted(rules)[:5]))
+    if "phase4-p41-check" not in rules:
+        return
+    closure = _target_closure(rules, "phase4-p41-check")
+    unknown = [target for target in closure if target not in rules]
+    reporter.check("every prerequisite of phase4-p41-check resolves to a real rule",
+                   not unknown, str(unknown))
+    offenders: list[str] = []
+    for target in closure:
+        for line in rules.get(target, ([], []))[1]:
+            command = line.lstrip().lstrip("@-+").lstrip()
+            for name in FORBIDDEN_CHECK_PATH_COMMANDS:
+                if re.search(_COMMAND_POSITION.format(name=re.escape(name)), command):
+                    offenders.append(f"{target}: {line.strip()[:80]}")
+    reporter.check("no recipe reachable from phase4-p41-check invokes a container runtime, "
+                   "nvidia-smi, or a CUDA compiler", not offenders, str(offenders[:3]))
+    reporter.check("the Docker-backed P2.4 and P3.5 gates are not reachable from "
+                   "phase4-p41-check",
+                   "compute-umma-p24-check" not in closure
+                   and "gemm-comparison-p35-check" not in closure, str(sorted(closure)))
+    reporter.check("phase4-p41-check still revalidates the GPU-free P1.4 and P2.4 gates",
+                   "memory-paths-p14-check" in closure
+                   and "compute-umma-p24-check-gpu-free" in closure, str(sorted(closure)))
+    # The split is only legitimate while the full P2.4 gate still runs that same
+    # GPU-free half plus its own three Docker-backed prerequisites.
+    reporter.check("the full P2.4 gate still contains its GPU-free half and its own gates",
+                   set(rules.get("compute-umma-p24-check", ([], []))[0])
+                   == {"compute-umma-1sm-check", "compute-umma-2sm-check",
+                       "compute-umma-sweep-check", "compute-umma-p24-check-gpu-free"},
+                   str(rules.get("compute-umma-p24-check", ([], []))[0]))
+
+
 def _check_makefile(reporter: Reporter, makefile: str) -> None:
     reporter.check("the Makefile declares phase4-p41-plan",
                    re.search(r"^phase4-p41-plan:", makefile, re.MULTILINE) is not None, "")
-    reporter.check("the Makefile declares phase4-p41-check with the closed GPU-free gates",
+    reporter.check("the Makefile declares phase4-p41-check with the GPU-free gates only",
                    re.search(
-                       r"^phase4-p41-check: memory-paths-p14-check compute-umma-p24-check$",
+                       r"^phase4-p41-check: memory-paths-p14-check "
+                       r"compute-umma-p24-check-gpu-free$",
                        makefile, re.MULTILINE) is not None, "")
+    _check_p41_check_is_container_free(reporter, makefile)
     reporter.check("both P4.1 targets are declared .PHONY",
                    "phase4-p41-plan phase4-p41-check" in makefile, "")
     reporter.check("phase4-p41-check runs the real P4.1 checker",

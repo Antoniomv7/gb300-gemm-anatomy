@@ -36,7 +36,8 @@ Subcommands:
 
 Exit codes: 0 success (including a pure revalidation of a COMPLETE campaign);
 1 execution/validation failure; 2 CLI, repository-state, or safety
-precondition failure; 4 a terminal but non-complete INCONCLUSIVE outcome.
+precondition failure; 4 a terminal but non-complete INCONCLUSIVE outcome;
+130 interrupted (the conventional SIGINT status).
 """
 
 from __future__ import annotations
@@ -66,6 +67,10 @@ EXIT_OK = 0
 EXIT_RUN_FAILURE = 1
 EXIT_PRECONDITION = 2
 EXIT_INCONCLUSIVE = 4
+# The conventional status for "terminated by SIGINT". It is both this process's
+# own exit code on an interruption and the status recorded in the interrupted
+# attempt, so an interruption is never confused with an ordinary stage failure.
+EXIT_INTERRUPTED = 130
 
 # --------------------------------------------------------------------------
 # Frozen identifiers and the deterministic stage plans.
@@ -209,6 +214,35 @@ P24_STATE_ORDER = ("PILOT_IN_PROGRESS", "PILOT_COMPLETE", "PROFILE_IN_PROGRESS",
 P24_TERMINAL_INCONCLUSIVE = "INCONCLUSIVE"
 UNIT_TERMINAL_STATES = frozenset({"ANALYZED", P24_TERMINAL_INCONCLUSIVE})
 
+# The unit states at which that unit's own verify_campaign_evidence_integrity()
+# applies: exactly the states its own frozen protocol re-verifies before
+# publishing (before COMPLETE, and before ANALYZED/INCONCLUSIVE). P4.1 calls
+# that function; it never reimplements any of the semantics behind it.
+UNIT_INTEGRITY_STATES = frozenset({"COMPLETE", "ANALYZED", P24_TERMINAL_INCONCLUSIVE})
+
+# The campaign-provenance fields both closed unit schemas expose (P1.4 records
+# them in `provenance` when it records its pilot; P2.4 additionally requires
+# them by name in MANDATORY_PROVENANCE_FIELDS). They are the only unit
+# provenance P4.1 compares, and a missing or malformed one fails closed.
+#
+# `cuda_driver_version` and `cuda_runtime_version` are the integer-encoded CUDA
+# API versions the profiled binary itself reports. The preflight's
+# `gpu.driver_version` is the NVIDIA display-driver package string reported by
+# the launcher: a different measurement of a different thing. P1.4 documents
+# that boundary explicitly, and P4.1 never crosses it either -- the CUDA
+# versions are compared between components, never against the driver string.
+UNIT_PROVENANCE_FIELDS = ("git_commit", "gpu_uuid", "gpu_name", "compute_capability",
+                          "cuda_driver_version", "cuda_runtime_version")
+# unit provenance field -> the field of the campaign's validated preflight GPU
+# identity that reports the same measurement.
+UNIT_TO_PREFLIGHT_GPU_FIELDS = (("gpu_uuid", "uuid"), ("gpu_name", "name"),
+                                ("compute_capability", "compute_capability"))
+# The comparable fields every component of one campaign must agree on. They are
+# collected from each stage's recorded evidence and compared as a set in the
+# final integrity gate.
+COMPARABLE_EVIDENCE_FIELDS = ("git_commit", "gpu_uuid", "gpu_name", "compute_capability",
+                              "cuda_driver_version", "cuda_runtime_version")
+
 STAGE_REQUIRED_UNIT_STATE = {
     STAGE_MEMORY_PILOT: "PILOT_COMPLETE",
     STAGE_MEMORY_PROFILE: "COMPLETE",
@@ -334,7 +368,22 @@ ALLOWED_TRANSITIONS: dict[str | None, frozenset[str]] = {
 ATTEMPT_OUTCOMES = ("COMPLETE", "FAILED", "INTERRUPTED")
 ATTEMPT_KEYS = ("stage", "attempt", "started_at_utc", "finished_at_utc",
                 "outcome", "exit_status", "stdout_log", "stderr_log")
-INTERRUPTED_EXIT_STATUS = 130
+INTERRUPTED_EXIT_STATUS = EXIT_INTERRUPTED
+
+# One attempt's two no-clobber log names, which are also how the next free
+# attempt number is derived from disk (see Campaign._attempt_number).
+LOG_NAME_RE = re.compile(r"^(?P<stage>[A-Za-z0-9_]+)\.(?P<attempt>\d{3})\.(stdout|stderr)\.log$")
+
+# Every experimental Make target is invoked silently and without directory
+# diagnostics: an echoed recipe line can carry the absolute bind-mount source of
+# this checkout, which must never reach a durable Phase 4 log. The invoked
+# scripts' and experiments' own output is passed through untouched.
+MAKE_QUIET_FLAGS = ("--silent", "--no-print-directory")
+
+# The stable replacement for this checkout's own absolute root in the durable
+# text P4.1 writes itself (its campaign.validate logs and the manifest's
+# failure detail). Nothing else about any message is rewritten.
+REPO_ROOT_TOKEN = "<repo-root>"
 
 # Allowlisted GPU identity. Nothing else about the device, the host, the
 # operator, the environment, or dynamic telemetry is ever recorded.
@@ -639,6 +688,18 @@ def sha256_of_path(path: Path) -> str:
     return digest.hexdigest()
 
 
+def stable_digest(document: object) -> str:
+    """A reproducible SHA-256 over an already validated evidence snapshot.
+
+    Keys are sorted here (unlike canonical_json_bytes, which preserves a
+    manifest's own construction order) because this digest is only ever a pin
+    over another unit's returned snapshot, whose key order P4.1 does not own.
+    """
+    payload = json.dumps(document, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=True, default=str)
+    return sha256_bytes(payload.encode("utf-8"))
+
+
 def repo_relative(path: Path, repo_root: Path) -> str:
     """Durable metadata always records repository-relative paths, never an
     absolute path that would leak a home directory or an operator name."""
@@ -646,6 +707,22 @@ def repo_relative(path: Path, repo_root: Path) -> str:
         return str(Path(path).resolve().relative_to(Path(repo_root).resolve()))
     except ValueError as exc:
         raise OrchestratorError(f"{path}: is outside the repository root {repo_root}") from exc
+
+
+def redact_repo_root(text: str, repo_root: Path) -> str:
+    """Replace this checkout's own absolute root with a stable token.
+
+    Applied only where P4.1 itself writes durable text: its campaign.validate
+    logs and the manifest's failure detail. A diagnostic can legitimately quote
+    an absolute path (a preflight summary, an evidence file), and that absolute
+    prefix is a private host path. Nothing else in the message is rewritten: no
+    general sanitization, no scientific content, no child-owned evidence, and
+    no GPU identity, failure diagnostic, or reproducibility detail is removed.
+    """
+    root = str(Path(repo_root).resolve())
+    if not root or root == os.sep:
+        return text
+    return text.replace(root, REPO_ROOT_TOKEN)
 
 
 # --------------------------------------------------------------------------
@@ -767,12 +844,20 @@ def _validate_stage_attempts(document: dict) -> list[str]:
         if stage not in order:
             errors.append(f"{label}: stage {stage!r} is not in this campaign's plan")
             continue
-        expected_attempt = seen.get(stage, 0) + 1
-        if entry["attempt"] != expected_attempt:
+        # Strictly increasing, not necessarily contiguous: an attempt number is
+        # claimed by creating its two no-clobber logs *before* the child runs,
+        # and a hard interruption can leave those logs on disk with no attempt
+        # record. The next attempt then skips that number rather than reusing
+        # it, so a gap is legal but a repeat or a regression never is.
+        attempt = entry["attempt"]
+        if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+            errors.append(f"{label}: attempt={attempt!r} is not a positive integer")
+            continue
+        if attempt <= seen.get(stage, 0):
             errors.append(
-                f"{label}: attempt={entry['attempt']!r} != the next attempt number "
-                f"{expected_attempt} for stage {stage!r}")
-        seen[stage] = expected_attempt
+                f"{label}: attempt={attempt} does not follow the previous attempt "
+                f"{seen[stage]} for stage {stage!r}")
+        seen[stage] = attempt
         if entry["outcome"] not in ATTEMPT_OUTCOMES:
             errors.append(f"{label}: outcome={entry['outcome']!r} is not one of {list(ATTEMPT_OUTCOMES)}")
         if not isinstance(entry["exit_status"], int) or isinstance(entry["exit_status"], bool):
@@ -1318,23 +1403,94 @@ def _import_sibling(module_name: str):
     return importlib.import_module(module_name)
 
 
+def _load_unit_campaign(analyzer, campaign_rel: str, *, resolve, load) -> dict:
+    """One composed unit's campaign, loaded through its own semantic loader and
+    pinned cryptographically.
+
+    Beyond the unit's own (manifest, revision) the payload carries the exact
+    revision file that carried this state -- its repository-relative path and
+    its SHA-256 -- plus, whenever the unit's own frozen protocol re-verifies its
+    evidence at that state, a digest over the snapshot its own
+    verify_campaign_evidence_integrity() just recomputed fresh from disk. Those
+    three values are what a later revalidation re-derives and compares, so a
+    synthetically valid *later* terminal revision can never quietly replace the
+    revision this campaign originally accepted.
+
+    P4.1 reimplements none of the semantics behind either function.
+    """
+    campaign_dir = resolve(campaign_rel)
+    manifest, revision = load(campaign_dir)
+    if revision < 0 or not manifest:
+        raise RunFailure(f"{campaign_rel}: carries no manifest revision")
+    manifest_rel = f"{campaign_rel}/{MANIFEST_DIR_NAME}/{revision:06d}.json"
+    payload = {
+        "manifest": manifest,
+        "revision": revision,
+        "campaign_dir": campaign_rel,
+        "manifest_path": manifest_rel,
+        "manifest_sha256": sha256_of_path(REPO_ROOT / manifest_rel),
+    }
+    if manifest.get("state") in UNIT_INTEGRITY_STATES:
+        errors, snapshot = analyzer.verify_campaign_evidence_integrity(campaign_dir, manifest)
+        if errors or snapshot is None:
+            raise RunFailure(
+                f"{campaign_rel}: the unit's own evidence-integrity gate failed: {errors}")
+        payload["evidence_sha256"] = stable_digest(snapshot)
+    return payload
+
+
 def default_p14_loader(campaign_id: str) -> dict:
     """Load the underlying P1.4 campaign through P1.4's own semantic loader,
     which re-opens, re-hashes, and revalidates its entire manifest chain."""
     analyzer = _import_sibling("analyze_exp01_memory_paths_p14")
-    campaign_dir = analyzer.resolve_p14_campaign_dir(f"{P14_RAW_REL}/{campaign_id}")
-    manifest, revision = analyzer.load_p14_manifest_chain(campaign_dir)
-    return {"manifest": manifest, "revision": revision,
-            "campaign_dir": f"{P14_RAW_REL}/{campaign_id}"}
+    return _load_unit_campaign(
+        analyzer, f"{P14_RAW_REL}/{campaign_id}",
+        resolve=analyzer.resolve_p14_campaign_dir, load=analyzer.load_p14_manifest_chain)
 
 
 def default_p24_loader(campaign_id: str) -> dict:
     """Load the underlying P2.4 campaign through P2.4's own semantic loader."""
     analyzer = _import_sibling("analyze_exp02_umma_throughput_p24")
-    campaign_dir = analyzer.resolve_p24_campaign_dir(f"{P24_RAW_REL}/{campaign_id}")
-    manifest, revision = analyzer.load_p24_manifest_chain(campaign_dir)
-    return {"manifest": manifest, "revision": revision,
-            "campaign_dir": f"{P24_RAW_REL}/{campaign_id}"}
+    return _load_unit_campaign(
+        analyzer, f"{P24_RAW_REL}/{campaign_id}",
+        resolve=analyzer.resolve_p24_campaign_dir, load=analyzer.load_p24_manifest_chain)
+
+
+def normalize_unit_provenance(provenance: object, *, label: str) -> dict:
+    """The comparable provenance tuple of one composed unit, normalized.
+
+    Every field both closed schemas expose is required by key and must be a
+    non-empty scalar; a missing or malformed one fails closed. The two CUDA API
+    versions are recorded as an int by one schema and as a string by the other,
+    so they are normalized to their decimal text exactly the way P2.4's own
+    compare_application_provenance() does -- a difference in textual formatting
+    of the same version is never a mismatch, and a difference in the version
+    itself always is.
+    """
+    if not isinstance(provenance, dict):
+        raise RunFailure(f"{label}: the campaign provenance tuple is absent or not an object")
+    snapshot: dict[str, str] = {}
+    errors: list[str] = []
+    for field in UNIT_PROVENANCE_FIELDS:
+        if field not in provenance:
+            errors.append(f"{field}: absent (mandatory campaign provenance field)")
+            continue
+        value = provenance[field]
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            errors.append(f"{field}={value!r}: must be a string or an integer")
+            continue
+        text = str(value).strip()
+        if not text:
+            errors.append(f"{field}: is empty")
+            continue
+        snapshot[field] = text
+    if not errors and provenance.get("git_dirty") not in (None, False):
+        # Only P4.1's own preflight and P3.5's rows expose a clean-tree flag
+        # today; if a composed unit ever records one it must agree too.
+        errors.append("git_dirty is not false; a campaign only ever runs on a clean tree")
+    if errors:
+        raise RunFailure(f"{label}: unusable campaign provenance: {errors}")
+    return snapshot
 
 
 def default_p35_validator(text: str) -> list[str]:
@@ -1646,16 +1802,70 @@ class Campaign:
             raise RunFailure(
                 f"{stage}: the {unit} campaign is now in state {state!r}, but this campaign "
                 f"accepted {recorded_state!r}")
-        self._check_unit_provenance(evidence, loaded["manifest"].get("provenance", {}), stage)
+        self._check_unit_pin(stage, evidence, loaded, unit=unit,
+                             terminal=recorded_state in UNIT_TERMINAL_STATES)
+        label = f"{stage}: the {unit} campaign"
+        observed = normalize_unit_provenance(loaded["manifest"].get("provenance"), label=label)
+        self._check_campaign_agreement(observed, label)
+        changed = [f"{field}: accepted {evidence.get(field)!r}, now {value!r}"
+                   for field, value in observed.items() if evidence.get(field) != value]
+        if changed:
+            raise RunFailure(f"{label} no longer reports the provenance accepted here: {changed}")
 
-    def _check_unit_provenance(self, evidence: dict, provenance: dict, stage: str) -> None:
-        for key in ("git_commit", "gpu_uuid", "gpu_name"):
-            recorded = evidence.get(key)
-            observed = provenance.get(key)
-            if recorded is not None and observed is not None and recorded != observed:
+    def _check_unit_pin(self, stage: str, evidence: dict, loaded: dict, *, unit: str,
+                        terminal: bool) -> None:
+        """The exact manifest revision this campaign accepted must still be that
+        exact file, byte for byte, and a unit accepted in a terminal state must
+        still be at exactly that revision. A later terminal revision, however
+        internally valid, is never silently adopted, and a changed accepted
+        artifact is never regenerated."""
+        recorded_path = evidence.get("unit_manifest_path")
+        recorded_sha256 = evidence.get("unit_manifest_sha256")
+        recorded_revision = evidence.get("unit_manifest_revision")
+        if (not isinstance(recorded_path, str) or not recorded_path
+                or not isinstance(recorded_sha256, str)
+                or not SHA256_RE.fullmatch(recorded_sha256)
+                or not isinstance(recorded_revision, int)
+                or isinstance(recorded_revision, bool)):
+            raise RunFailure(
+                f"{stage}: the accepted unit evidence carries no usable manifest pin; refusing "
+                f"to trust it")
+        # The pin must name exactly this unit's own campaign manifest revision
+        # for this campaign ID, so a recorded reference can never point at
+        # another tree or outside the repository.
+        unit_root = P14_RAW_REL if unit == "P1.4" else P24_RAW_REL
+        expected_dir = f"{unit_root}/{self.campaign_id}"
+        expected_path = f"{expected_dir}/{MANIFEST_DIR_NAME}/{recorded_revision:06d}.json"
+        if evidence.get("unit_campaign_dir") != expected_dir or recorded_path != expected_path:
+            raise RunFailure(
+                f"{stage}: the accepted unit reference {recorded_path!r} is not this campaign's "
+                f"own {unit} manifest revision {expected_path!r}")
+        digest = sha256_of_path(self.context.repo_root / recorded_path)
+        if digest != recorded_sha256:
+            raise RunFailure(
+                f"{recorded_path}: content changed since it was accepted "
+                f"(recorded {recorded_sha256}, now {digest})")
+        observed_revision = loaded.get("revision")
+        if terminal:
+            if observed_revision != recorded_revision or loaded.get("manifest_path") != recorded_path:
                 raise RunFailure(
-                    f"{stage}: the underlying campaign now reports {key}={observed!r}, but this "
-                    f"campaign accepted {recorded!r}")
+                    f"{stage}: the underlying campaign's terminal manifest is now revision "
+                    f"{observed_revision!r} ({loaded.get('manifest_path')!r}), but this campaign "
+                    f"accepted revision {recorded_revision} ({recorded_path}); a later terminal "
+                    f"revision is never adopted silently")
+            recorded_evidence = evidence.get("unit_evidence_sha256")
+            if not isinstance(recorded_evidence, str) or not SHA256_RE.fullmatch(recorded_evidence):
+                raise RunFailure(
+                    f"{stage}: a terminal unit was accepted without an evidence-integrity pin")
+            if loaded.get("evidence_sha256") != recorded_evidence:
+                raise RunFailure(
+                    f"{stage}: the underlying campaign's own evidence-integrity snapshot no "
+                    f"longer matches the one accepted here; refusing to regenerate it")
+        elif (not isinstance(observed_revision, int) or isinstance(observed_revision, bool)
+                or observed_revision < recorded_revision):
+            raise RunFailure(
+                f"{stage}: the underlying campaign is now at manifest revision "
+                f"{observed_revision!r}, before the revision {recorded_revision} accepted here")
 
     def _revalidate_gemm(self, evidence: dict) -> None:
         path = self.context.repo_root / evidence["csv_path"]
@@ -1686,7 +1896,37 @@ class Campaign:
     # -- stage execution ------------------------------------------------
 
     def _attempt_number(self, stage: str) -> int:
-        return 1 + sum(1 for entry in self.manifest["stage_attempts"] if entry["stage"] == stage)
+        """The next free attempt number for one stage, derived from both the
+        validated campaign state and the no-clobber log files already on disk.
+
+        An attempt claims its number by creating its two logs *before* the child
+        runs, so a hard interruption can leave a log set whose attempt record was
+        never published. Taking the maximum of both sources means an earlier
+        log is never reused or overwritten, and an interrupted stage stays
+        eligible for a new attempt on --resume instead of colliding forever.
+        """
+        recorded = max((entry["attempt"] for entry in self.manifest["stage_attempts"]
+                        if entry["stage"] == stage), default=0)
+        return max(recorded, self._highest_log_attempt(stage)) + 1
+
+    def _highest_log_attempt(self, stage: str) -> int:
+        """The highest attempt number this stage already has a log for."""
+        safe = stage.replace(".", "_")
+        campaign_fd = self._campaign_fd()
+        try:
+            logs_fd = open_dir_nofollow(LOGS_DIR_NAME, dir_fd=campaign_fd)
+            try:
+                names = os.listdir(logs_fd)
+            finally:
+                os.close(logs_fd)
+        finally:
+            os.close(campaign_fd)
+        highest = 0
+        for name in names:
+            match = LOG_NAME_RE.fullmatch(name)
+            if match is not None and match.group("stage") == safe:
+                highest = max(highest, int(match.group("attempt")))
+        return highest
 
     def _log_names(self, stage: str, attempt: int) -> tuple[str, str]:
         safe = stage.replace(".", "_")
@@ -1771,7 +2011,11 @@ class Campaign:
     def execute_stage(self, stage: str) -> None:
         attempt = self._attempt_number(stage)
         stdout_name, stderr_name = self._log_names(stage, attempt)
-        argv = ["make", STAGE_MAKE_TARGET[stage]]
+        # Silent and without directory diagnostics: Make never echoes a recipe
+        # line, so an absolute bind-mount source can never reach a durable log.
+        # The target's own behaviour and the invoked scripts' output are
+        # unchanged.
+        argv = ["make", *MAKE_QUIET_FLAGS, STAGE_MAKE_TARGET[stage]]
         env = self._stage_env(stage)
         started = self.context.now_utc()
         created: list[str] = []
@@ -1823,7 +2067,8 @@ class Campaign:
             stdout_name, stderr_name))
         self._publish(self._next(
             stage_attempts=attempts, state=STATE_FAILED, failure_stage=stage,
-            failure_detail=[str(item)[:400] for item in detail]))
+            failure_detail=[redact_repo_root(str(item), self.context.repo_root)[:400]
+                            for item in detail]))
 
     def _interrupt(self, stage: str, attempt: int, started: str, stdout_name: str,
                    stderr_name: str, logs_created: bool) -> None:
@@ -1896,36 +2141,53 @@ class Campaign:
         elif state != required:
             raise RunFailure(
                 f"the {unit} campaign reached state {state!r}, not the required {required!r}")
-        provenance = manifest.get("provenance", {})
-        if not isinstance(provenance, dict):
-            provenance = {}
-        self._check_campaign_agreement(provenance, unit)
-        return {"stage_evidence": {
+        label = f"{stage}: the {unit} campaign"
+        provenance = normalize_unit_provenance(manifest.get("provenance"), label=label)
+        self._check_campaign_agreement(provenance, label)
+        evidence = {
             "unit": unit,
             "unit_campaign_dir": loaded["campaign_dir"],
+            "unit_manifest_path": loaded["manifest_path"],
             "unit_manifest_revision": loaded["revision"],
+            "unit_manifest_sha256": loaded["manifest_sha256"],
             "unit_state": state,
-            "git_commit": provenance.get("git_commit"),
-            "gpu_uuid": provenance.get("gpu_uuid"),
-            "gpu_name": provenance.get("gpu_name"),
-        }}
+        }
+        if state in UNIT_TERMINAL_STATES:
+            pin = loaded.get("evidence_sha256")
+            if not isinstance(pin, str) or not SHA256_RE.fullmatch(pin):
+                raise RunFailure(
+                    f"{label} reached the terminal state {state!r} without its own "
+                    f"evidence-integrity snapshot; refusing to accept it")
+            evidence["unit_evidence_sha256"] = pin
+        evidence.update(provenance)
+        return {"stage_evidence": evidence}
 
     def _check_campaign_agreement(self, provenance: dict, label: str) -> None:
-        """All experiments of one campaign must agree on commit and device."""
-        commit = provenance.get("git_commit")
-        if commit is not None and commit != self.git_commit:
+        """Every component of one campaign must agree with this invocation's own
+        validated preflight, and with every component already accepted, on all
+        directly comparable fields."""
+        commit = provenance["git_commit"]
+        if commit != self.git_commit:
             raise RunFailure(
                 f"{label}: git_commit={commit!r} != the campaign commit {self.git_commit!r}")
         gpu = self.manifest.get("gpu")
         if not isinstance(gpu, dict):
-            return
-        for evidence_key, gpu_key in (("gpu_uuid", "uuid"), ("gpu_name", "name"),
-                                      ("compute_capability", "compute_capability")):
-            observed = provenance.get(evidence_key)
-            if observed is not None and observed != gpu[gpu_key]:
+            raise RunFailure(
+                f"{label}: the campaign carries no validated preflight GPU identity to compare "
+                f"against")
+        for field, gpu_key in UNIT_TO_PREFLIGHT_GPU_FIELDS:
+            if provenance[field] != gpu[gpu_key]:
                 raise RunFailure(
-                    f"{label}: {evidence_key}={observed!r} != the campaign's validated preflight "
+                    f"{label}: {field}={provenance[field]!r} != the campaign's validated preflight "
                     f"{gpu_key}={gpu[gpu_key]!r}")
+        for stage, record in self.manifest["stage_results"].items():
+            accepted = record["evidence"]
+            for field in COMPARABLE_EVIDENCE_FIELDS:
+                other = accepted.get(field)
+                if field in provenance and other is not None and other != provenance[field]:
+                    raise RunFailure(
+                        f"{label}: {field}={provenance[field]!r} != {other!r}, already accepted "
+                        f"from stage {stage!r}")
 
     def _accept_gemm(self, captured: bytes, stdout_name: str) -> dict:
         gpu = self.manifest.get("gpu")
@@ -1971,6 +2233,7 @@ class Campaign:
             "git_commit": self.git_commit,
             "gpu_uuid": gpu["uuid"],
             "gpu_name": gpu["name"],
+            "compute_capability": gpu["compute_capability"],
         }}
 
     # -- the final top-level integrity gate ------------------------------
@@ -1978,12 +2241,27 @@ class Campaign:
     def run_campaign_validate(self) -> str:
         """Re-hash and revalidate every selected component immediately before
         the campaign is declared complete, and require all of them to agree on
-        campaign ID, Git commit, GPU identity, and clean-tree status."""
+        campaign ID, Git commit, GPU identity, and clean-tree status.
+
+        An interruption is handled at exactly the same orchestration boundary as
+        every other stage: the campaign is recorded INTERRUPTED, every artifact
+        and log already created is preserved, and the next --resume claims a
+        fresh attempt number rather than reusing this one.
+        """
         attempt = self._attempt_number(STAGE_CAMPAIGN_VALIDATE)
         stdout_name, stderr_name = self._log_names(STAGE_CAMPAIGN_VALIDATE, attempt)
         started = self.context.now_utc()
         self.context.log(f"stage {STAGE_CAMPAIGN_VALIDATE}: attempt {attempt}: integrity gate")
+        created: list[str] = []
+        try:
+            return self._campaign_validate(attempt, started, stdout_name, stderr_name, created)
+        except KeyboardInterrupt:
+            self._interrupt(STAGE_CAMPAIGN_VALIDATE, attempt, started, stdout_name, stderr_name,
+                            bool(created))
+            raise
 
+    def _campaign_validate(self, attempt: int, started: str, stdout_name: str, stderr_name: str,
+                           created: list[str]) -> str:
         errors: list[str] = []
         report: list[str] = [
             f"campaign_id: {self.campaign_id}",
@@ -2008,21 +2286,24 @@ class Campaign:
         if not isinstance(gpu, dict):
             errors.append("the campaign carries no validated preflight GPU identity")
 
-        commits = {self.git_commit}
-        uuids = {gpu["uuid"]} if isinstance(gpu, dict) else set()
-        names = {gpu["name"]} if isinstance(gpu, dict) else set()
+        # Every directly comparable provenance field, collected from this
+        # invocation's own validated preflight and from every component's
+        # recorded evidence, must resolve to exactly one value.
+        observed: dict[str, set] = {field: set() for field in COMPARABLE_EVIDENCE_FIELDS}
+        observed["git_commit"].add(self.git_commit)
+        if isinstance(gpu, dict):
+            for field, gpu_key in UNIT_TO_PREFLIGHT_GPU_FIELDS:
+                observed[field].add(gpu[gpu_key])
         for record in self.manifest["stage_results"].values():
             evidence = record["evidence"]
-            for key, sink in (("git_commit", commits), ("gpu_uuid", uuids), ("gpu_name", names)):
-                value = evidence.get(key)
+            for field in COMPARABLE_EVIDENCE_FIELDS:
+                value = evidence.get(field)
                 if value is not None:
-                    sink.add(value)
-        if len(commits) != 1:
-            errors.append(f"the composed experiments disagree on git_commit: {sorted(commits)}")
-        if len(uuids) > 1:
-            errors.append(f"the composed experiments disagree on gpu_uuid: {sorted(uuids)}")
-        if len(names) > 1:
-            errors.append(f"the composed experiments disagree on gpu_name: {sorted(names)}")
+                    observed[field].add(value)
+        for field in COMPARABLE_EVIDENCE_FIELDS:
+            if len(observed[field]) > 1:
+                errors.append(
+                    f"the composed experiments disagree on {field}: {sorted(observed[field])}")
 
         outcome = STATE_COMPLETE
         umma = self.manifest["stage_results"].get(STAGE_UMMA_ANALYZE)
@@ -2034,16 +2315,22 @@ class Campaign:
                 "never a complete campaign")
         report.append(f"outcome: {outcome}")
 
+        # The durable log-write boundary of this unit's own output: a diagnostic
+        # may legitimately quote an absolute evidence path, and only this
+        # checkout's own root is replaced by a stable token on the way out.
+        report_bytes = redact_repo_root("\n".join(report) + "\n",
+                                        self.context.repo_root).encode("utf-8")
+        errors_bytes = (redact_repo_root("\n".join(errors) + "\n",
+                                         self.context.repo_root).encode("utf-8")
+                        if errors else b"")
         campaign_fd = self._campaign_fd()
         try:
             logs_fd = open_dir_nofollow(LOGS_DIR_NAME, dir_fd=campaign_fd)
             try:
-                write_file_exclusive(stdout_name, ("\n".join(report) + "\n").encode("utf-8"),
-                                     dir_fd=logs_fd)
-                write_file_exclusive(
-                    stderr_name,
-                    ("\n".join(errors) + "\n").encode("utf-8") if errors else b"",
-                    dir_fd=logs_fd)
+                write_file_exclusive(stdout_name, report_bytes, dir_fd=logs_fd)
+                created.append(stdout_name)
+                write_file_exclusive(stderr_name, errors_bytes, dir_fd=logs_fd)
+                created.append(stderr_name)
             finally:
                 os.close(logs_fd)
         finally:
@@ -2320,6 +2607,32 @@ def _self_test() -> int:
           rendered == render_plan(build_plan_document("20990101T000000Z", "pilot", "full")), "")
     check("the rendered plan states publishable: false", "publishable: false" in rendered, rendered)
 
+    good = {"git_commit": "a" * 40, "gpu_uuid": "GPU-1", "gpu_name": "D",
+            "compute_capability": "10.3", "cuda_driver_version": 13010,
+            "cuda_runtime_version": "13010"}
+    normalized = normalize_unit_provenance(good, label="self-test")
+    check("an integer and a string CUDA version normalize to the same text",
+          normalized["cuda_driver_version"] == normalized["cuda_runtime_version"] == "13010",
+          str(normalized))
+    for field in UNIT_PROVENANCE_FIELDS:
+        try:
+            normalize_unit_provenance({k: v for k, v in good.items() if k != field},
+                                      label="self-test")
+            check(f"unit provenance without {field} is rejected", False, "accepted")
+        except RunFailure:
+            check(f"unit provenance without {field} is rejected", True)
+    try:
+        normalize_unit_provenance(dict(good, git_dirty=True), label="self-test")
+        check("unit provenance reporting a dirty tree is rejected", False, "accepted")
+    except RunFailure:
+        check("unit provenance reporting a dirty tree is rejected", True)
+
+    redacted = redact_repo_root("read /checkout/results/x.json failed", Path("/checkout"))
+    check("the durable log-write boundary redacts only the checkout root",
+          redacted == f"read {REPO_ROOT_TOKEN}/results/x.json failed", redacted)
+    check("the orchestrated Make invocation is silent and prints no directory",
+          MAKE_QUIET_FLAGS == ("--silent", "--no-print-directory"), str(MAKE_QUIET_FLAGS))
+
     check("a manifest field named username is rejected",
           bool(validate_manifest_privacy({"username": "x"})), "")
     check("an absolute path in durable metadata is rejected",
@@ -2334,15 +2647,23 @@ def _self_test() -> int:
     return EXIT_OK
 
 
-if __name__ == "__main__":
+def cli_main(argv: list[str] | None = None) -> int:
+    """The process-level exit-code contract: every exception that can escape
+    maps to exactly one documented status, and an interruption is never
+    reported as an ordinary stage failure."""
     try:
-        raise SystemExit(main())
+        return main(argv)
     except OrchestratorError as error:
         print(f"run_all: ERROR: {error}", file=sys.stderr)
-        raise SystemExit(EXIT_PRECONDITION) from error
+        return EXIT_PRECONDITION
     except (RunFailure, ManifestError) as error:
         print(f"run_all: ERROR: {error}", file=sys.stderr)
-        raise SystemExit(EXIT_RUN_FAILURE) from error
+        return EXIT_RUN_FAILURE
     except KeyboardInterrupt:
-        print("run_all: ERROR: interrupted; completed evidence is preserved", file=sys.stderr)
-        raise SystemExit(EXIT_RUN_FAILURE) from None
+        print("run_all: ERROR: interrupted; completed evidence is preserved and the interrupted "
+              "stage stays eligible for a new attempt on --resume", file=sys.stderr)
+        return EXIT_INTERRUPTED
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli_main())
