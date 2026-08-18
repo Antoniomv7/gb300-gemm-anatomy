@@ -146,8 +146,23 @@ FORBIDDEN_P42_STATUS_LINES = (
     "| P4.2 | Pilot plus three final campaigns | YES | YES | NO |",
     "| P4.2 | Pilot plus three final campaigns | YES | NO | YES |",
 )
-UNIMPLEMENTED_PHASE4_STATUS_LINES = (
+# P4.3 (the offline integrated analysis) is now implemented, and is neither
+# independently audited nor run against the real evidence. The row it owns
+# advanced by exactly one step; every other P4.3 state stays rejected, including
+# the stale "NO | NO | NO" this tuple used to require, which would have
+# structurally forbidden P4.3 from existing at all.
+# See src/phase4/P4_3_PROTOCOL.md section 6.1.
+EXPECTED_P43_STATUS_LINE = (
+    "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |"
+)
+FORBIDDEN_P43_STATUS_LINES = (
     "| P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |",
+    "| P4.3 | Integrated analysis, documentation, audit | NO | YES | NO |",
+    "| P4.3 | Integrated analysis, documentation, audit | NO | NO | YES |",
+    "| P4.3 | Integrated analysis, documentation, audit | NO | YES | YES |",
+    "| P4.3 | Integrated analysis, documentation, audit | YES | YES | NO |",
+    "| P4.3 | Integrated analysis, documentation, audit | YES | NO | YES |",
+    "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |",
 )
 CLOSED_STATUS_LINES = (
     "| P1.4 | Profiling, validation, analysis, pilot | YES | YES | YES |",
@@ -1954,18 +1969,23 @@ def _check_status_documents(reporter: Reporter, plan_text: str, protocol: str, r
     for wrong in FORBIDDEN_P42_STATUS_LINES:
         reporter.check(f"PLAN.md does not record the untrue P4.2 status {wrong!r}",
                        wrong not in plan_text, "")
-    for line in UNIMPLEMENTED_PHASE4_STATUS_LINES:
-        reporter.check(f"PLAN.md still records the unimplemented {line!r}",
-                       line in plan_text, "")
+    reporter.check("PLAN.md records the truthful implemented-only P4.3 status",
+                   EXPECTED_P43_STATUS_LINE in plan_text, "")
+    for wrong in FORBIDDEN_P43_STATUS_LINES:
+        reporter.check(f"PLAN.md does not record the stale or untrue P4.3 status {wrong!r}",
+                       wrong not in plan_text, "")
     for line in CLOSED_STATUS_LINES:
         reporter.check(f"PLAN.md still records the closed {line!r}", line in plan_text, "")
     reporter.check("the Makefile's frontier assertion records the closed P4.1 row",
                    "P4.1 | Orchestrator | YES | YES | YES |" in makefile, "")
     reporter.check("the Makefile records P4.2 as closed",
                    "P4.2 | Pilot plus three final campaigns | YES | YES | YES |" in makefile, "")
-    reporter.check("the Makefile still requires P4.3 to be unimplemented",
-                   "P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |" in makefile,
-                   "")
+    # Presence only: the Makefile necessarily also NAMES the stale and
+    # impossible rows in order to reject them with `! grep`, so a
+    # "must not appear anywhere" scan of its text would be self-defeating.
+    reporter.check("the Makefile asserts the truthful implemented-only P4.3 row",
+                   "P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |"
+                   in makefile, "")
     reporter.check("P4.2 did not change the audited P4.1 runner or orchestrator",
                    "P4.1 is implemented infrastructure" in protocol
                    and "GB300 verification: PASSED" in protocol, "")

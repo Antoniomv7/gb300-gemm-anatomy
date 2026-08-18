@@ -16,7 +16,8 @@
 # gemm-cutedsl-p32-check, gemm-cutedsl-p32-smoke, gemm-cublaslt-p33-check,
 # gemm-cublaslt-p33-smoke, gemm-cutedsl-p34-check, gemm-cutedsl-p34-smoke,
 # gemm-comparison-p35-check, gemm-comparison-p35-smoke, phase4-p41-plan,
-# phase4-p41-check.
+# phase4-p41-check, phase4-p42-check, phase4-p43-check, phase4-p43-analyze,
+# phase4-p43-verify.
 # No target selects a GPU automatically, elevates privileges, or exceeds two
 # build jobs.
 
@@ -220,6 +221,35 @@ PHASE4_P41_PLAN_CAMPAIGN_ID := 20990101T000000Z
 PHASE4_P42_CHECKER := scripts/check_phase4_campaigns_p42.py
 PHASE4_P42_PROTOCOL := src/phase4/P4_2_PROTOCOL.md
 
+# P4.3 -- the offline, read-only integrated analysis over the frozen Phase 4
+# population, plus its own GPU-free repository-contract checker. P4.3 adds NO
+# CUDA, CuTe DSL, or cuBLASLt code, NO shape, candidate, matrix, layout, dtype,
+# tile, cluster, or algorithm, NO campaign runner or resume path, NO measurement
+# parameter, NO Nsight Compute case, NO raw or existing analysis schema change,
+# NO external dependency, and NO version pin; it changes neither
+# scripts/run_all.sh nor scripts/phase4_orchestrator.py, whose content P4.2
+# pinned by SHA-256. It executes no GPU command and starts no container,
+# nvidia-smi, CUDA, NCU, preflight, or campaign: the statistical unit is one
+# complete final campaign, the accepted pilot 20260812T013848Z is excluded from
+# every statistic, and nothing is ever written under results/raw/. P4.3 is
+# implemented only: its independent audit has NOT been performed and the
+# production analysis of the three final campaigns has NOT been run, so no
+# curated P4.3 result is accepted for publication. See
+# src/phase4/P4_3_PROTOCOL.md.
+PHASE4_P43_ANALYZER := scripts/analyze_phase4_p43.py
+PHASE4_P43_CHECKER := scripts/check_phase4_integration_p43.py
+PHASE4_P43_PROTOCOL := src/phase4/P4_3_PROTOCOL.md
+# The frozen population, restated here so the production target can never
+# analyse a campaign outside it. These are literals, never a discovered
+# "latest" campaign, a glob, or a modification-time ranking.
+PHASE4_P43_PILOT_CAMPAIGN_ID := 20260812T013848Z
+PHASE4_P43_FINAL_CAMPAIGN_1 := 20260817T110330Z
+PHASE4_P43_FINAL_CAMPAIGN_2 := 20260817T111310Z
+PHASE4_P43_FINAL_CAMPAIGN_3 := 20260817T112011Z
+# The curated output tree. Small, reviewed, and deliberately NOT under
+# results/raw/, which stays immutable and Git-ignored.
+PHASE4_P43_OUTPUT_ROOT := results/phase4
+
 REQUIRED_FILES := \
 	AGENTS.md README.md PLAN.md LICENSE .gitignore VERSIONS.env \
 	PHASE3_VERSIONS.env \
@@ -244,7 +274,8 @@ REQUIRED_FILES := \
 	$(GEMM_P35_WRAPPER) $(GEMM_P35_BRIDGE) $(GEMM_P35_CHECKER) $(GEMM_P35_PROTOCOL) \
 	$(PHASE4_P41_ENTRYPOINT) $(PHASE4_P41_ORCHESTRATOR) $(PHASE4_P41_CHECKER) \
 	$(PHASE4_P41_PROTOCOL) \
-	$(PHASE4_P42_CHECKER) $(PHASE4_P42_PROTOCOL)
+	$(PHASE4_P42_CHECKER) $(PHASE4_P42_PROTOCOL) \
+	$(PHASE4_P43_ANALYZER) $(PHASE4_P43_CHECKER) $(PHASE4_P43_PROTOCOL)
 
 .DEFAULT_GOAL := help
 .PHONY: help check-static build-image check-env preflight \
@@ -266,7 +297,8 @@ REQUIRED_FILES := \
 	gemm-cublaslt-p33-check gemm-cublaslt-p33-smoke \
 	gemm-cutedsl-p34-check gemm-cutedsl-p34-smoke \
 	gemm-comparison-p35-check gemm-comparison-p35-smoke \
-	phase4-p41-plan phase4-p41-check phase4-p42-check
+	phase4-p41-plan phase4-p41-check phase4-p42-check \
+	phase4-p43-check phase4-p43-analyze phase4-p43-verify
 
 help:
 	@echo "gb300-gemm-anatomy — Phase 0 + P1.1 (LDGSTS) + P1.2 (TMA) + P1.3 (sweep) targets"
@@ -605,14 +637,49 @@ help:
 	@echo "     frozen policy plus one GPU-free cross-campaign checker; it adds no"
 	@echo "     runner and no target that could start a campaign, and it computes no"
 	@echo "     statistic, threshold, ranking, table, or figure -- those belong"
-	@echo "     exclusively to P4.3, which remains unimplemented.) --"
+	@echo "     exclusively to P4.3, whose offline analysis layer is now implemented"
+	@echo "     but neither audited nor run against the real evidence.) --"
 	@echo "  make phase4-p42-check         Fast and GPU-free: syntax checks for the P4.2"
 	@echo "                                files, the focused P4.2 self-test, and the"
 	@echo "                                P4.2 repository-contract check. No Docker, no"
 	@echo "                                nvidia-smi, no CUDA, no preflight, no network,"
 	@echo "                                and no raw campaign evidence required."
 	@echo "  P4.2 execution is closed. Do not create a fourth or replacement final"
-	@echo "  campaign; the next work is P4.3 integrated analysis and documentation."
+	@echo "  campaign."
+	@echo ""
+	@echo "  -- P4.3 integrated analysis, documentation, and closing audit preparation"
+	@echo "     (see src/phase4/P4_3_PROTOCOL.md; P4.3 = YES / NO / NO. The"
+	@echo "     implementation exists; the independent audit has NOT been performed and"
+	@echo "     the production analysis of the three final campaigns has NOT been run,"
+	@echo "     so no curated P4.3 result is accepted for publication and neither"
+	@echo "     Phase 4 nor the TFM is closed. P4.3 is an offline, read-only analysis"
+	@echo "     layer over already accepted GB300 evidence: it runs no GPU command and"
+	@echo "     starts no Docker, nvidia-smi, CUDA, NCU, preflight, or campaign, adds no"
+	@echo "     kernel, shape, candidate, measurement parameter, profiler case, schema,"
+	@echo "     dependency, or version pin, and never writes under results/raw/. The"
+	@echo "     independent replicate is ONE COMPLETE FINAL CAMPAIGN: the three finals"
+	@echo "     $(PHASE4_P43_FINAL_CAMPAIGN_1), $(PHASE4_P43_FINAL_CAMPAIGN_2), and"
+	@echo "     $(PHASE4_P43_FINAL_CAMPAIGN_3). The accepted pilot"
+	@echo "     $(PHASE4_P43_PILOT_CAMPAIGN_ID) is recorded only as excluded"
+	@echo "     qualification provenance and never enters a statistic, ranking,"
+	@echo "     variability estimate, table, figure, or conclusion.) --"
+	@echo "  make phase4-p43-check         Fast and GPU-free: syntax checks for the P4.3"
+	@echo "                                files, the analyzer's temporary-fixture"
+	@echo "                                self-test, the checker's own self-test, and"
+	@echo "                                the P4.3 repository-contract check. No Docker,"
+	@echo "                                no nvidia-smi, no CUDA, no NCU, no preflight,"
+	@echo "                                no network, and no results/raw/ required."
+	@echo "  make phase4-p43-analyze       GPU-free production analysis of exactly the"
+	@echo "                                three frozen final campaigns. Requires the real"
+	@echo "                                raw evidence to be present; deeply revalidates"
+	@echo "                                the whole population through the closed P4.2"
+	@echo "                                read-only checker first, then writes the small"
+	@echo "                                curated tree under $(PHASE4_P43_OUTPUT_ROOT)."
+	@echo "                                It never starts, resumes, repairs, or creates a"
+	@echo "                                campaign, and it overwrites nothing."
+	@echo "  make phase4-p43-verify        Recompute the complete analysis from the same"
+	@echo "                                evidence and compare every output byte for"
+	@echo "                                byte. Writes nothing."
 	@echo ""
 	@echo "Pinned global contract (VERSIONS.env, unchanged since Phase 0 and consumed"
 	@echo "unmodified by the closed P1/P2 aggregators): CUDA $(CUDA_VERSION), CUTLASS"
@@ -1412,13 +1479,15 @@ check-static:
 	@grep -Fq 'P3.5: CLOSED' README.md
 	@grep -Fq 'Phase 3: CLOSED' README.md
 	@echo "== P3.5 introduces no Phase 4 functionality and no statistical treatment =="
-	@# P4.1 and P4.2 are closed after independent audit and GB300 verification;
-	@# P4.3 must still be recorded unimplemented. No closed assertion is weakened,
-	@# and every stale or impossible P4.2
-	@# state is still rejected below.
+	@# P4.1 and P4.2 are closed after independent audit and GB300 verification.
+	@# P4.3 now owns its own row: its implementation exists, so the previously
+	@# asserted "NO | NO | NO" became false and was advanced -- by exactly one
+	@# step -- to the truthful "YES | NO | NO". Nothing is weakened: no closed
+	@# assertion changed, and every stale or impossible P4.2 and P4.3 state is
+	@# still rejected below.
 	@grep -Fq 'P4.1 | Orchestrator | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P4.2 | Pilot plus three final campaigns | YES | YES | YES |' PLAN.md
-	@grep -Fq 'P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |' PLAN.md
+	@grep -Fq 'P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |' PLAN.md
 	@! grep -nE '^(P4|P41|P42|P43)_' $(GEMM_P35_WRAPPER)
 	@echo "   (the tokenized identifier ban for confidence intervals, bootstraps, outlier"
 	@echo "    removal, rooflines, bandwidth, utilization, Nsight Compute, autotuning,"
@@ -1518,8 +1587,7 @@ check-static:
 	@grep -Fq '20260817T112011Z' $(PHASE4_P42_PROTOCOL)
 	@grep -Fq 'b08e45c2636a3ac17c94ad8b1368084914196d7a' $(PHASE4_P42_PROTOCOL)
 	@grep -Fq '20260812T013848Z' $(PHASE4_P42_PROTOCOL)
-	@# Every stale or impossible P4.2 state stays rejected. P4.3 must still be
-	@# recorded unimplemented.
+	@# Every stale or impossible P4.2 state stays rejected.
 	@! grep -nF 'P4.2 | Pilot plus three final campaigns | NO | NO | NO |' PLAN.md
 	@! grep -nF 'P4.2 | Pilot plus three final campaigns | NO | YES | NO |' PLAN.md
 	@! grep -nF 'P4.2 | Pilot plus three final campaigns | NO | NO | YES |' PLAN.md
@@ -1527,8 +1595,59 @@ check-static:
 	@! grep -nF 'P4.2 | Pilot plus three final campaigns | YES | NO | NO |' PLAN.md
 	@! grep -nF 'P4.2 | Pilot plus three final campaigns | YES | YES | NO |' PLAN.md
 	@! grep -nF 'P4.2 | Pilot plus three final campaigns | YES | NO | YES |' PLAN.md
-	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |' PLAN.md
 	@grep -Fq 'P4.2: CLOSED' README.md
+	@echo "== P4.3 files present, executable, and syntactically valid =="
+	@test -f $(PHASE4_P43_ANALYZER)
+	@test -f $(PHASE4_P43_CHECKER)
+	@test -f $(PHASE4_P43_PROTOCOL)
+	@test -x $(PHASE4_P43_ANALYZER)
+	@test -x $(PHASE4_P43_CHECKER)
+	@! grep -nE '^(import|from|def|class) ' $(PHASE4_P43_PROTOCOL)
+	python3 -m py_compile $(PHASE4_P43_ANALYZER) $(PHASE4_P43_CHECKER)
+	@rm -rf scripts/__pycache__
+	@echo "== P4.3 GPU-free self-tests and the full frozen-contract check =="
+	python3 $(PHASE4_P43_ANALYZER) --self-test
+	python3 $(PHASE4_P43_CHECKER) --self-test
+	python3 $(PHASE4_P43_CHECKER) .
+	@rm -rf scripts/__pycache__
+	@echo "== P4.3 adds no runner: scripts/run_all.sh stays the only Phase 4 entry point =="
+	@# The rigorous comment- and literal-stripped scan for a child process, a
+	@# container runtime, nvidia-smi, NCU, a CUDA compiler, a campaign runner, a
+	@# bootstrap, a p-value, an outlier filter, or a clamp lives in
+	@# $(PHASE4_P43_CHECKER), which NAMES those spellings on purpose in order to
+	@# ban them, so a raw grep is not usable there.
+	@! grep -nE '^phase4-p43-(pilot|final|campaign|run|smoke):' Makefile
+	@! grep -nF 'phase4_orchestrator.run_campaign' $(PHASE4_P43_ANALYZER)
+	@! grep -nF -- '--resume' $(PHASE4_P43_ANALYZER)
+	@echo "== P4.3 analyses exactly the frozen population and never discovers a campaign =="
+	@grep -Fq '$(PHASE4_P43_PILOT_CAMPAIGN_ID)' $(PHASE4_P43_ANALYZER)
+	@grep -Fq '$(PHASE4_P43_FINAL_CAMPAIGN_1)' $(PHASE4_P43_ANALYZER)
+	@grep -Fq '$(PHASE4_P43_FINAL_CAMPAIGN_2)' $(PHASE4_P43_ANALYZER)
+	@grep -Fq '$(PHASE4_P43_FINAL_CAMPAIGN_3)' $(PHASE4_P43_ANALYZER)
+	@echo "== P4.3 adds no key to either version contract and no new dependency =="
+	@! grep -nE '^(PHASE4_|P43_)' PHASE3_VERSIONS.env VERSIONS.env
+	@echo "== P4.3 leaves the audited P4.1 execution path byte-identical =="
+	@grep -Fq '5a7e9c9ef9f84c0a0b99a50e8c44995e4388183c329ab5b17916e7567a4fd428' $(PHASE4_P42_CHECKER)
+	@grep -Fq '67877fcd74f91d9699290e107b9dc12cf13f0bc28e88ce0137980403cbf25453' $(PHASE4_P42_CHECKER)
+	@echo "== the curated P4.3 output tree is committable and never under results/raw/ =="
+	@! grep -nE '^$(PHASE4_P43_OUTPUT_ROOT)/?$$' .gitignore
+	@case '$(PHASE4_P43_OUTPUT_ROOT)' in results/raw*|results/preflight*) exit 1 ;; esac
+	@echo "== truthful P4.3 status assertions =="
+	@grep -Fq 'P4.3 = YES / NO / NO' $(PHASE4_P43_PROTOCOL)
+	@grep -Fq 'Independent audit: NOT PERFORMED' $(PHASE4_P43_PROTOCOL)
+	@grep -Fq 'Production analysis: NOT RUN' $(PHASE4_P43_PROTOCOL)
+	@grep -Fq 'no publishable result exists' $(PHASE4_P43_PROTOCOL)
+	@grep -Fq 'Phase 4 and the complete TFM are not closed' $(PHASE4_P43_PROTOCOL)
+	@grep -Fq 'P4.3: IMPLEMENTED; independent audit: NO; production analysis: NO' README.md
+	@# Every stale or impossible P4.3 state stays rejected.
+	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |' PLAN.md
+	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | NO | YES | NO |' PLAN.md
+	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | NO | NO | YES |' PLAN.md
+	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | NO | YES | YES |' PLAN.md
+	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | YES | YES | NO |' PLAN.md
+	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | YES | NO | YES |' PLAN.md
+	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |' PLAN.md
+	@! grep -rnF 'P4.3: CLOSED' README.md PLAN.md results/README.md $(PHASE4_P43_PROTOCOL)
 	@echo "check-static: OK"
 
 build-image:
@@ -3213,4 +3332,76 @@ phase4-p42-check:
 	@! test -e $(PHASE4_P41_RAW_ROOT)/$(PHASE4_P41_PLAN_CAMPAIGN_ID)
 	@echo "phase4-p42-check: OK (P4.2 = YES / YES / YES: independently audited and"
 	@echo "                   verified on GB300; three finals accepted; no publishable"
-	@echo "                   result exists; P4.3 remains unimplemented)"
+	@echo "                   result exists; P4.2 itself still computes no statistic)"
+
+# P4.3 -- fast, GPU-free, container-free, network-free, and independent of
+# results/raw/. It has NO prerequisites, and its whole recipe is the syntax
+# checks for the P4.3 files, the analyzer's temporary-fixture self-test, the
+# checker's own self-test, and the P4.3 repository-contract check. It can neither
+# start nor resume a campaign and reads no cluster evidence.
+phase4-p43-check:
+	@echo "== P4.3 files present, executable, and syntactically valid =="
+	@test -f $(PHASE4_P43_ANALYZER)
+	@test -f $(PHASE4_P43_CHECKER)
+	@test -f $(PHASE4_P43_PROTOCOL)
+	@test -x $(PHASE4_P43_ANALYZER)
+	@test -x $(PHASE4_P43_CHECKER)
+	@! grep -nE '^(import|from|def|class) ' $(PHASE4_P43_PROTOCOL)
+	python3 -m py_compile $(PHASE4_P43_ANALYZER) $(PHASE4_P43_CHECKER)
+	@rm -rf scripts/__pycache__
+	@echo "== P4.3 analyzer self-test (temporary fixtures only) =="
+	python3 $(PHASE4_P43_ANALYZER) --self-test
+	@echo "== P4.3 checker self-test (temporary fixtures only) =="
+	python3 $(PHASE4_P43_CHECKER) --self-test
+	@echo "== P4.3 frozen-contract check against this repository (no campaign evidence,"
+	@echo "   no container, no GPU, no network) =="
+	python3 $(PHASE4_P43_CHECKER) .
+	@rm -rf scripts/__pycache__
+	@# This recipe deliberately names no raw campaign path at all: the gate must
+	@# run on a checkout that has never seen a campaign. The checker enforces
+	@# that by scanning this recipe's own text.
+	@echo "phase4-p43-check: OK (P4.3 = YES / NO / NO: implemented; the independent audit"
+	@echo "                   has NOT been performed and the production analysis of the"
+	@echo "                   three final campaigns has NOT been run; no publishable"
+	@echo "                   result exists and neither Phase 4 nor the TFM is closed)"
+
+# P4.3 -- the GPU-free production analysis. It requires the real accepted raw
+# evidence to already exist, names exactly the frozen campaign IDs, and starts
+# nothing: no GPU, no container, no nvidia-smi, no CUDA, no NCU, no preflight,
+# and no campaign. The population is deeply revalidated through the closed,
+# read-only P4.2 evidence mode before a single scientific value is read.
+phase4-p43-analyze:
+	@echo "== P4.3 production analysis of the three frozen final campaigns =="
+	@echo "   pilot $(PHASE4_P43_PILOT_CAMPAIGN_ID) is excluded from every statistic"
+	@test -d $(PHASE4_P41_RAW_ROOT) || { \
+		echo "phase4-p43-analyze: $(PHASE4_P41_RAW_ROOT) does not exist; the real accepted" >&2; \
+		echo "                    Phase 4 evidence must be present. Nothing is created." >&2; \
+		exit 2; }
+	python3 $(PHASE4_P43_ANALYZER) --analyze \
+		--campaign-root $(PHASE4_P41_RAW_ROOT) \
+		--pilot-campaign-id $(PHASE4_P43_PILOT_CAMPAIGN_ID) \
+		--final-campaign-id $(PHASE4_P43_FINAL_CAMPAIGN_1) \
+		--final-campaign-id $(PHASE4_P43_FINAL_CAMPAIGN_2) \
+		--final-campaign-id $(PHASE4_P43_FINAL_CAMPAIGN_3) \
+		--output-root $(PHASE4_P43_OUTPUT_ROOT)
+	@echo "phase4-p43-analyze: OK (curated artifacts under $(PHASE4_P43_OUTPUT_ROOT);"
+	@echo "                    publishable=false pending the independent P4.3 audit and"
+	@echo "                    the review of these outputs)"
+
+# P4.3 -- deterministic verification. It recomputes the complete analysis from
+# the same evidence and compares every output byte for byte. It writes nothing.
+phase4-p43-verify:
+	@echo "== P4.3 deterministic verification of the curated artifacts =="
+	@test -d $(PHASE4_P41_RAW_ROOT) || { \
+		echo "phase4-p43-verify: $(PHASE4_P41_RAW_ROOT) does not exist; the real accepted" >&2; \
+		echo "                   Phase 4 evidence must be present." >&2; \
+		exit 2; }
+	python3 $(PHASE4_P43_ANALYZER) --verify \
+		--campaign-root $(PHASE4_P41_RAW_ROOT) \
+		--pilot-campaign-id $(PHASE4_P43_PILOT_CAMPAIGN_ID) \
+		--final-campaign-id $(PHASE4_P43_FINAL_CAMPAIGN_1) \
+		--final-campaign-id $(PHASE4_P43_FINAL_CAMPAIGN_2) \
+		--final-campaign-id $(PHASE4_P43_FINAL_CAMPAIGN_3) \
+		--output-root $(PHASE4_P43_OUTPUT_ROOT)
+	@echo "phase4-p43-verify: OK (every curated artifact byte-identical to a fresh"
+	@echo "                   recomputation; nothing was written)"

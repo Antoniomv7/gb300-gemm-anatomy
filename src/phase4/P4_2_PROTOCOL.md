@@ -464,13 +464,23 @@ push, merge, or pull request.
 ```text
 P4.1 | Orchestrator                                | YES | YES | YES
 P4.2 | Pilot plus three final campaigns            | YES | YES | YES
-P4.3 | Integrated analysis, documentation, audit   | NO  | NO  | NO
+P4.3 | Integrated analysis, documentation, audit   | YES | NO  | NO
 ```
 
 `P4.2 = YES / YES / YES`. The policy and cross-campaign validator are
 implemented, the independent audit passed, and the accepted pilot plus all
 three declared final campaigns passed terminal GB300 revalidation and the
-read-only population check. P4.2 is closed. P4.3 remains unimplemented, every
-campaign remains non-publishable, and no publishable result exists anywhere in
-this repository. The next work is P4.3 integrated analysis, documentation, and
-closing audit.
+read-only population check. P4.2 is closed. Every campaign remains
+non-publishable, and no publishable result exists anywhere in this repository.
+
+P4.3's offline, read-only analysis layer is now implemented
+(`scripts/analyze_phase4_p43.py`,
+`scripts/check_phase4_integration_p43.py`, `src/phase4/P4_3_PROTOCOL.md`); its
+independent audit has not been performed and its production analysis of the
+three final campaigns has not been run. P4.3 consumes this unit rather than
+changing it: it calls `check_campaign_evidence()` in evidence mode before
+reading any value, and `scripts/run_all.sh` and
+`scripts/phase4_orchestrator.py` remain byte-identical to the content pinned in
+section 4. The P4.2 repository-contract check still proves, on this checker's
+own source, that **P4.2 itself computes no statistic, threshold, ranking, table,
+or figure** even though the separate P4.3 analyzer now exists.

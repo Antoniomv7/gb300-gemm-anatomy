@@ -42,7 +42,9 @@ audit: YES; GB300 verification: YES; pilot campaign `20260812T013848Z`:
 COMPLETE; publishable results: NONE; P4.1: CLOSED. P4.2 (one accepted pilot
 plus three final campaigns) — implemented; independently audited: YES;
 verified on GB300: YES; three of three final campaigns terminally revalidated;
-publishable results: NONE; P4.2: CLOSED; P4.3: not implemented.`**
+publishable results: NONE; P4.2: CLOSED. P4.3 (integrated analysis,
+documentation, closing audit preparation) — P4.3: IMPLEMENTED; independent
+audit: NO; production analysis: NO; publishable results: NONE.`**
 
 The Phase 0 environment, single-GPU launcher, CUDA smoke test, CuTe DSL smoke
 test, and Nsight Compute access were successfully verified on the target
@@ -909,7 +911,8 @@ campaign `20260812T013848Z` completed all nine stages on GB300 and remains
 `publishable=false`. P4.2's frozen protocol, three final campaigns, terminal
 revalidations, and cross-campaign validator have since closed independently as
 `YES / YES / YES`. No publishable result exists. P4.3 (integrated analysis,
-documentation, and the final audit) remains unimplemented.
+documentation, and the closing audit preparation) is implemented but neither
+independently audited nor run against the real evidence.
 
 `scripts/run_all.sh` is the **only** public Phase 4 orchestration entry point.
 It coordinates one reproducible top-level campaign across the three closed
@@ -1047,8 +1050,9 @@ both required the literal `PLAN.md` row `P4.1 | Orchestrator | NO | NO | NO`,
 which structurally forbade P4.1 from ever being implemented. Both were advanced
 to the then-truthful `YES | NO | NO`. This closure advances the P4.1-owned
 status assertions in the `Makefile`, the P3.5 checker, and the P4.1 checker to
-`YES | YES | YES`; none is weakened, stale and impossible partial states remain
-rejected, and P4.2/P4.3 are still required to remain unimplemented. The
+`YES | YES | YES`; none is weakened and stale and impossible partial states
+remain rejected. At that P4.1 closure P4.2 and P4.3 were still required to
+remain unimplemented; both rows have since advanced under their own units. The
 author's GPU-free checks in `src/phase4/P4_1_PROTOCOL.md` were not treated as an
 independent audit or as GB300 verification.
 
@@ -1064,8 +1068,8 @@ and skipped every stage, reported terminal state `COMPLETE`, exited 0, and
 confirmed that no artifact was rewritten and no manifest revision was
 appended. This closes P4.1 as `YES / YES / YES` and supplies P4.2's required
 pilot. At that P4.1 closure, all evidence remained `publishable=false` and the
-three P4.2 final campaigns had not yet run. P4.2 has since closed independently;
-P4.3 remains unimplemented.
+three P4.2 final campaigns had not yet run. P4.2 has since closed independently,
+and P4.3's offline analysis layer is now implemented but not yet audited or run.
 
 ### P4.2 (one accepted pilot plus three final campaigns) — closed
 
@@ -1132,11 +1136,81 @@ closure changes neither execution file.
 
 The P4.2-owned status guards in the `Makefile`, the P3.5 checker, the P4.1
 checker, and the P4.2 checker now require `YES / YES / YES` and reject every
-stale or impossible partial state. P4.3 is still required to remain
-unimplemented. Every campaign remains `publishable=false`; P4.2 computed no
-statistic, threshold, ranking, table, figure, or conclusion, and no publishable
-Phase 4 result exists. The next work is P4.3 integrated analysis,
-documentation, and closing audit.
+stale or impossible partial state. Every campaign remains `publishable=false`;
+P4.2 computed no statistic, threshold, ranking, table, figure, or conclusion,
+and no publishable Phase 4 result exists.
+
+### P4.3 (integrated analysis, documentation, closing audit preparation)
+
+**P4.3: IMPLEMENTED; independent audit: NO; production analysis: NO.**
+**The P4.3 independent audit has not been performed**, and no production
+analysis of the three final campaigns has been run in this repository. No
+curated P4.3 artifact exists, no P4.3 result has been accepted for publication,
+and no publishable result exists anywhere here. Phase 4 and the complete TFM
+stay open.
+
+P4.3 (`scripts/analyze_phase4_p43.py`,
+`scripts/check_phase4_integration_p43.py`, `src/phase4/P4_3_PROTOCOL.md`) is an
+offline, **read-only** analysis layer over the already accepted GB300 evidence.
+It executes no GPU command and starts no Docker container, `nvidia-smi`, CUDA
+compilation, Nsight Compute run, preflight, or campaign — it starts no child
+process at all. It adds no CUDA, CuTe DSL, or cuBLASLt code, no shape,
+candidate, matrix, layout, dtype, tile, cluster, or algorithm, no runner or
+resume path, no measurement parameter, no profiler case, no raw or existing
+analysis schema change, no external dependency, and no version pin;
+`scripts/run_all.sh` and `scripts/phase4_orchestrator.py` stay byte-identical to
+the content P4.2 pinned by SHA-256, and nothing under `results/raw/` is ever
+written.
+
+The frozen population is restated as literal constants and never discovered:
+the accepted pilot `20260812T013848Z` is recorded **only** as excluded
+qualification provenance, and the three final campaigns `20260817T110330Z`,
+`20260817T111310Z`, and `20260817T112011Z` are the statistical population.
+Before a single scientific value is read, the whole population is revalidated
+through P4.2's own read-only `check_campaign_evidence()`, which delegates every
+per-campaign decision to P4.1's audited loader, hashing primitives, and terminal
+revalidation; each captured GEMM table is validated by P3.5's own canonical
+validator. The canonical terminal P1.4, P2.4, and P3.5 artifacts each campaign's
+manifest pins are then read and re-verified against that pin.
+
+**The independent replicate is one complete final campaign.** Across the three
+campaign-level values only `campaign_count = 3`, mean, median, sample standard
+deviation (`n - 1`), coefficient of variation where mathematically meaningful,
+minimum, and maximum are computed. Internal timing repetitions are never pooled,
+nothing is ever excluded, no outlier filter runs, no p-value or significance
+claim is produced, and no confidence interval is bootstrapped from three
+campaigns. The strict `CV > 5.0%` threshold is a review diagnostic only; no
+coefficient of variation is computed for a signed or zero-centred quantity such
+as `gap_to_cublaslt_pct`; and every ratio is formed inside a campaign before it
+is summarized, never from two aggregates. Saturation candidates, ceiling
+selections, and best CuTe DSL variants are reported as a consensus only when all
+three campaigns agree, and otherwise as not stable. A device-wide estimate is
+emitted only with validated, agreeing SM-count evidence in all three campaigns;
+otherwise a structured `unavailable` result carries the exact reason and no SM
+count is imported from a specification, hard-coded, or inferred. Negative GEMM
+gaps and scaling values outside `[0, 100]` are never clamped.
+
+The generated report separates directly measured results, deterministic derived
+quantities, modeled estimates, interpretations, and quantities that are
+unavailable from the collected evidence. It states explicitly that the memory
+benchmark is not a direct measurement of GEMM memory traffic, that the UMMA
+ceiling is a one-/two-SM empirical microbenchmark ceiling rather than an
+architectural peak, that the GEMM timing is hot-cache, and that P3.5 contains no
+GEMM Nsight Compute profile — so no bottleneck attribution, roofline placement,
+or arithmetic-intensity classification is made.
+
+Three GPU-free Make targets were added: `phase4-p43-check` (fast,
+container-free, network-free, no prerequisites, and independent of
+`results/raw/`), `phase4-p43-analyze`, and `phase4-p43-verify`. The latter two
+require the real accepted evidence explicitly, name only the frozen campaign
+IDs, and can neither start nor resume a campaign. The curated tree
+(`results/phase4/`) is written no-clobber, never overwrites a differing
+artifact, verifies an existing byte-identical one instead of rewriting it, and
+is checked byte for byte by a full recomputation.
+
+The implementation-time GPU-free checks in `src/phase4/P4_3_PROTOCOL.md`
+section 12 are the author's own self-checks. **They are not an independent
+audit, and a GPU-free check is never GB300 verification.**
 
 ## Research question
 

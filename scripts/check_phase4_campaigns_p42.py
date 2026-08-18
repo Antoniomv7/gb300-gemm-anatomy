@@ -17,8 +17,9 @@ Three modes:
     python3 scripts/check_phase4_campaigns_p42.py <repo-root>
         The frozen P4.2 repository contract: the required files, the truthful
         status frontier, the untouched P4.1 execution path, the GPU-free Make
-        target, the documentary closure, and the absence of any publishable
-        claim or P4.3 implementation.
+        target, the documentary closure, the absence of any publishable claim,
+        and the P4.2/P4.3 boundary -- P4.3's own files exist, and P4.2 itself
+        still computes no statistic, threshold, ranking, or figure.
         Needs no results/raw/ and no cluster evidence.
 
     python3 scripts/check_phase4_campaigns_p42.py \
@@ -120,7 +121,7 @@ FROZEN_EXECUTION_PATH_SHA256 = {
 EXPECTED_STATUS_LINES = (
     "| P4.1 | Orchestrator | YES | YES | YES |",
     "| P4.2 | Pilot plus three final campaigns | YES | YES | YES |",
-    "| P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |",
+    "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |",
 )
 # Every stale or impossible P4.2 state. P4.2 is closed; nothing else is legal.
 FORBIDDEN_P42_STATUS_LINES = (
@@ -132,7 +133,11 @@ FORBIDDEN_P42_STATUS_LINES = (
     "| P4.2 | Pilot plus three final campaigns | YES | YES | NO |",
     "| P4.2 | Pilot plus three final campaigns | YES | NO | YES |",
 )
-# The closed P4.1 row must not regress, and P4.3 must stay unimplemented.
+# The closed P4.1 row must not regress. P4.3 is implemented and is neither
+# independently audited nor run against the real evidence: its row advanced by
+# exactly one step, and every other P4.3 state -- including the stale
+# "NO | NO | NO" this checker used to require, which structurally forbade P4.3
+# from existing -- stays rejected. See src/phase4/P4_3_PROTOCOL.md section 6.1.
 FORBIDDEN_P41_STATUS_LINES = (
     "| P4.1 | Orchestrator | NO | NO | NO |",
     "| P4.1 | Orchestrator | YES | YES | NO |",
@@ -140,9 +145,12 @@ FORBIDDEN_P41_STATUS_LINES = (
     "| P4.1 | Orchestrator | YES | NO | NO |",
 )
 FORBIDDEN_P43_STATUS_LINES = (
-    "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |",
+    "| P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |",
     "| P4.3 | Integrated analysis, documentation, audit | NO | YES | NO |",
     "| P4.3 | Integrated analysis, documentation, audit | NO | NO | YES |",
+    "| P4.3 | Integrated analysis, documentation, audit | NO | YES | YES |",
+    "| P4.3 | Integrated analysis, documentation, audit | YES | YES | NO |",
+    "| P4.3 | Integrated analysis, documentation, audit | YES | NO | YES |",
     "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |",
 )
 
@@ -193,8 +201,13 @@ REQUIRED_P42_PROTOCOL_STATEMENTS = (
     "b08e45c2636a3ac17c94ad8b1368084914196d7a",
 )
 
-# P4.3 belongs to P4.3. Nothing here may implement it.
-FORBIDDEN_P43_ARTEFACTS = (
+# P4.3 belongs to P4.3. These three files are its own; P4.2 does not implement
+# them, does not depend on them, and still computes no statistic of its own.
+# (Until P4.3 landed this tuple required their ABSENCE, which structurally
+# forbade P4.3 from ever being implemented -- exactly the stale-frontier
+# situation P4.2 itself had to correct for its own row. See
+# src/phase4/P4_3_PROTOCOL.md section 6.1.)
+P43_OWNED_ARTEFACTS = (
     "src/phase4/P4_3_PROTOCOL.md",
     "scripts/check_phase4_integration_p43.py",
     "scripts/analyze_phase4_p43.py",
@@ -781,6 +794,16 @@ EXPECTED_CLI_OPTIONS = frozenset({
 
 def _check_single_public_runner(reporter: Reporter, repo_root: Path,
                                 p42_source: str) -> None:
+    # The scripts allowed to reference the orchestrator are the runner itself
+    # and the read-only checkers/analysers that reuse its audited primitives.
+    # Each of the latter is additionally required, below, to contain no route
+    # that could execute a campaign.
+    read_only_consumers = (
+        Path(P41_CHECKER_RELATIVE_PATH).name,
+        Path(P42_CHECKER_RELATIVE_PATH).name,
+        "analyze_phase4_p43.py",
+        "check_phase4_integration_p43.py",
+    )
     drivers = []
     for path in sorted((repo_root / "scripts").iterdir()):
         if not path.is_file() or path.is_symlink() or path.name == Path(
@@ -788,12 +811,20 @@ def _check_single_public_runner(reporter: Reporter, repo_root: Path,
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         if "phase4_orchestrator.py" in text and path.name not in (
-                Path(RUN_ALL_RELATIVE_PATH).name,
-                Path(P41_CHECKER_RELATIVE_PATH).name,
-                Path(P42_CHECKER_RELATIVE_PATH).name):
+                (Path(RUN_ALL_RELATIVE_PATH).name,) + read_only_consumers):
             drivers.append(path.name)
     reporter.check("scripts/run_all.sh remains the only public Phase 4 execution entry point",
                    not drivers, str(drivers))
+    for name in read_only_consumers[2:]:
+        path = repo_root / "scripts" / name
+        if not path.is_file():
+            reporter.check(f"the read-only Phase 4 consumer scripts/{name} exists", False,
+                           str(path))
+            continue
+        consumer = _strip_python_comments(path.read_text(encoding="utf-8"))
+        reporter.check(f"scripts/{name} reuses P4.1 read-only and can never run a campaign",
+                       not re.search(r"\brun_campaign\b|\bcampaign\s*\.\s*run\s*\(|"
+                                     r"\bsubprocess\b|--resume", consumer), "")
     # Scanned over executable code only. This file necessarily *names* the
     # forbidden spellings in order to ban them, so a raw substring scan of its
     # own text would be self-defeating; stripping comments and string literals
@@ -861,11 +892,16 @@ def _check_reuses_p41(reporter: Reporter, p42_source: str) -> None:
                                  p42_source, re.MULTILINE) is None, "")
 
 
-def _check_no_p43_work(reporter: Reporter, repo_root: Path, p42_source: str,
-                       documents: dict[str, str]) -> None:
-    for relative in FORBIDDEN_P43_ARTEFACTS:
-        reporter.check(f"no P4.3 artefact {relative} exists yet",
-                       not (repo_root / relative).exists(), "")
+def _check_p43_boundary(reporter: Reporter, repo_root: Path, p42_source: str,
+                        documents: dict[str, str]) -> None:
+    """P4.3 now exists. This check keeps the boundary rather than the absence:
+    the three P4.3 files are owned by P4.3, P4.2 still defers every statistic
+    and conclusion to it, and P4.2's own source still computes nothing."""
+    for relative in P43_OWNED_ARTEFACTS:
+        path = repo_root / relative
+        reporter.check(f"the P4.3-owned artefact {relative} exists as a regular, "
+                       f"non-symlink file",
+                       path.is_file() and not path.is_symlink(), str(path))
     protocol = documents[P42_PROTOCOL_RELATIVE_PATH]
     reporter.check(f"{P42_PROTOCOL_RELATIVE_PATH} defers every statistic and conclusion "
                    f"to P4.3",
@@ -875,8 +911,13 @@ def _check_no_p43_work(reporter: Reporter, repo_root: Path, p42_source: str,
     body = _strip_python_comments(p42_source)
     hits = [pattern for pattern in FORBIDDEN_ANALYSIS_TOKENS
             if re.search(pattern, body, re.IGNORECASE)]
+    # The whole point of this check: a separate P4.3 analyzer now exists, and
+    # P4.2 itself must still compute no statistic, threshold, ranking, or figure.
     reporter.check("the P4.2 checker computes no statistic, threshold, ranking, or figure",
                    not hits, str(hits))
+    reporter.check("the P4.2 checker imports nothing from P4.3",
+                   re.search(r"analyze_phase4_p43|check_phase4_integration_p43",
+                             body) is None, "")
 
 
 def _strip_python_comments(source: str) -> str:
@@ -982,7 +1023,7 @@ def check_repository(repo_root: Path) -> int:
     _check_no_new_dependency(reporter, repo_root, p42_source)
     _check_read_only_evidence_mode(reporter)
     _check_reuses_p41(reporter, p42_source)
-    _check_no_p43_work(reporter, repo_root, p42_source, documents)
+    _check_p43_boundary(reporter, repo_root, p42_source, documents)
     _check_make_target(reporter, repo_root, makefile)
 
     reporter.check("the repository contract check needed no raw campaign evidence",
@@ -994,7 +1035,7 @@ def check_repository(repo_root: Path) -> int:
         return 1
     print("check_phase4_campaigns_p42: OK "
           "(P4.2 = YES / YES / YES; three finals accepted; no publishable result; "
-          "P4.3 unimplemented)")
+          "P4.2 itself still computes no statistic)")
     return 0
 
 
@@ -1364,7 +1405,8 @@ def run_self_test(o, p35, p41) -> int:
 def _copy_repository_for_contract_check(source: Path, destination: Path) -> None:
     """A minimal copy of exactly what repository-contract mode reads, with no
     results/raw/ tree, to prove the mode needs no raw campaign evidence."""
-    needed = list(REQUIRED_P42_FILES) + list(STATUS_DOCUMENTS) + [
+    needed = list(REQUIRED_P42_FILES) + list(STATUS_DOCUMENTS) + list(
+        P43_OWNED_ARTEFACTS) + [
         "Makefile", "VERSIONS.env", "PHASE3_VERSIONS.env", P35_CHECKER_RELATIVE_PATH]
     destination.mkdir(parents=True)
     for relative in sorted(set(needed)):

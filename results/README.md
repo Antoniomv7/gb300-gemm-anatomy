@@ -23,9 +23,9 @@ independently audited, and verified on GB300. Pilot campaign
 read-only `--resume` revalidated every stage without rewriting an artifact or
 appending a manifest revision. The raw tree remains deliberately ignored and
 uncommitted, and every artifact records `publishable=false`. P4.2 has since
-completed and independently validated its three final campaigns; P4.3 will
-perform the integrated analysis, documentation, and final audit. No publishable
-Phase 4 result exists.
+completed and independently validated its three final campaigns, and P4.3's
+offline integrated-analysis layer is implemented.
+No publishable Phase 4 result exists.
 
 P4.2's frozen protocol (`src/phase4/P4_2_PROTOCOL.md`) and its GPU-free
 cross-campaign validator (`scripts/check_phase4_campaigns_p42.py`) are
@@ -39,8 +39,20 @@ strictly read-only population check accepted one pilot plus exactly those
 three finals, their shared plan, commit, stage order, GPU identity, and
 comparable provenance, and found no undeclared final. All four campaign trees
 remain raw, ignored, and uncommitted; every artifact records
-`publishable=false`. P4.2 is closed, P4.3 remains unimplemented, and no
-publishable Phase 4 result exists.
+`publishable=false`. P4.2 is closed and no publishable Phase 4 result exists.
+
+P4.3 is implemented (`scripts/analyze_phase4_p43.py`,
+`scripts/check_phase4_integration_p43.py`, `src/phase4/P4_3_PROTOCOL.md`): an
+offline, read-only analysis layer that revalidates the frozen four-campaign
+population through P4.2's own checker, reads the canonical terminal P1.4, P2.4,
+and P3.5 artifacts each final campaign's manifest pins, and aggregates across
+the three finals with **one complete final campaign as the independent
+replicate**. The accepted pilot `20260812T013848Z` is recorded only as excluded
+qualification provenance and never enters a statistic. **The P4.3 independent
+audit has not been performed**, no production analysis of the three final
+campaigns has been run, and **no P4.3 curated result has been accepted for
+publication**. The directory `results/phase4/` described below is therefore the
+declared destination of that future analysis, not an existing result.
 
 ## Trust model
 
@@ -435,6 +447,43 @@ bind-mount source of the checkout, and durable textual logs and failure details
 replace this checkout's exact root with the stable token `<repo-root>`. Ordinary
 child diagnostics remain unchanged; P3.5's scientific CSV stdout is copied byte
 for byte and no scientific content is rewritten.
+
+### `results/phase4/` (curated P4.3 output — declared, not yet produced)
+
+This is the only tree P4.3 may write, and it is deliberately **not** under
+`results/raw/`: the analyzer refuses any output root under `results/raw/` or
+`results/preflight/`, so raw evidence stays immutable. The frozen inventory is
+exactly:
+
+```text
+results/phase4/
+├── memory_paths.csv
+├── umma_throughput.csv
+├── gemm_comparison.csv
+├── integrated_summary.json
+├── report.md
+├── analysis_manifest.json
+└── figures/
+    ├── memory_paths.svg
+    ├── umma_throughput.svg
+    └── gemm_comparison.svg
+```
+
+Every file carries schema version `p43.v1`, deterministic row order, key order,
+decimal formatting, and bytes; the three final campaign IDs in the order the
+`campaign_1_value` / `campaign_2_value` / `campaign_3_value` columns follow; the
+pilot ID only as excluded qualification provenance; the final execution commit,
+the common GPU identity, and the comparable provenance; exact
+repository-relative source paths and SHA-256 hashes for everything read; and
+`publishable=false`. `analysis_manifest.json` pins an exact SHA-256 for every
+other artifact — it is the one file it cannot hash from inside itself, and
+`make phase4-p43-verify` recomputes and compares every byte of it too.
+Publication is no-clobber: an existing byte-identical artifact is verified
+rather than rewritten, an existing different artifact is fatal, and a symlink,
+an unexpected file type, or any artifact outside this inventory fails closed.
+
+**This tree does not exist yet.** No production P4.3 analysis has been run, and
+no P4.3 curated result has been accepted for publication.
 
 ## Safe public metadata
 
