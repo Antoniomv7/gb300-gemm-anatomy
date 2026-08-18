@@ -22,26 +22,25 @@ independently audited, and verified on GB300. Pilot campaign
 `20260812T013848Z` completed all nine stages on 12 August 2026 and a subsequent
 read-only `--resume` revalidated every stage without rewriting an artifact or
 appending a manifest revision. The raw tree remains deliberately ignored and
-uncommitted, and every artifact records `publishable=false`. P4.2 has completed
-its one pilot but still requires three independent final campaigns; P4.3 will
+uncommitted, and every artifact records `publishable=false`. P4.2 has since
+completed and independently validated its three final campaigns; P4.3 will
 perform the integrated analysis, documentation, and final audit. No publishable
 Phase 4 result exists.
 
 P4.2's frozen protocol (`src/phase4/P4_2_PROTOCOL.md`) and its GPU-free
 cross-campaign validator (`scripts/check_phase4_campaigns_p42.py`) are
-implemented, but the
-independent P4.2 audit remains pending, and
-GB300 verification of P4.2 remains pending. **No final campaign has been
-executed**: zero of the three required final campaigns exist, and nothing under
-`results/` was created, modified, or promoted by that work. Pilot
-`20260812T013848Z` remains accepted, untouched, and `publishable=false`, and it
-is never one of the three final replicates. The validator's evidence mode is
-strictly read-only — it never writes, repairs, resumes, deletes, or regenerates
-evidence, and it never invokes `--resume` — and it has not been run, because
-there is no final campaign for it to validate. No publishable Phase 4 result
-exists. The next GPU work will be the three final campaigns, which will write
-three new `results/raw/phase4/<campaign_id>/` trees, but only after the
-independent P4.2 audit passes and the execution commit is frozen.
+implemented, independently audited, and verified on GB300. Pilot
+`20260812T013848Z` remains accepted, untouched, and outside the replicate set.
+Final campaigns `20260817T110330Z`, `20260817T111310Z`, and
+`20260817T112011Z` each completed the full nine-stage plan from frozen commit
+`b08e45c2636a3ac17c94ad8b1368084914196d7a` and passed terminal
+revalidation without an artifact rewrite or a new manifest revision. The
+strictly read-only population check accepted one pilot plus exactly those
+three finals, their shared plan, commit, stage order, GPU identity, and
+comparable provenance, and found no undeclared final. All four campaign trees
+remain raw, ignored, and uncommitted; every artifact records
+`publishable=false`. P4.2 is closed, P4.3 remains unimplemented, and no
+publishable Phase 4 result exists.
 
 ## Trust model
 
@@ -367,10 +366,11 @@ Git-ignore rule as every other campaign tree in this repository. Campaign
 
 ### `results/raw/phase4/<campaign_id>/` (raw, not committed)
 
-Pilot campaign `20260812T013848Z` created this tree in the operator's cluster
-checkout and reached terminal state `COMPLETE`; it is intentionally absent from
-Git under the same blanket `results/raw/` ignore rule as every other raw
-campaign tree. P4.1 (`scripts/run_all.sh`, see
+Pilot campaign `20260812T013848Z` and final campaigns `20260817T110330Z`,
+`20260817T111310Z`, and `20260817T112011Z` each created one such tree in the
+operator's cluster checkout and reached terminal state `COMPLETE`. All four are
+intentionally absent from Git under the same blanket `results/raw/` ignore rule
+as every other raw campaign tree. P4.1 (`scripts/run_all.sh`, see
 `src/phase4/P4_1_PROTOCOL.md`) uses the following layout for each top-level
 campaign:
 

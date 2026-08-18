@@ -17,7 +17,8 @@ Three modes:
     python3 scripts/check_phase4_campaigns_p42.py <repo-root>
         The frozen P4.2 repository contract: the required files, the truthful
         status frontier, the untouched P4.1 execution path, the GPU-free Make
-        target, and the absence of any final-campaign or publishable claim.
+        target, the documentary closure, and the absence of any publishable
+        claim or P4.3 implementation.
         Needs no results/raw/ and no cluster evidence.
 
     python3 scripts/check_phase4_campaigns_p42.py \
@@ -26,9 +27,9 @@ Three modes:
         --final-campaign-id <FINAL_1> \
         --final-campaign-id <FINAL_2> \
         --final-campaign-id <FINAL_3>
-        Strictly read-only evidence mode, for later cluster use once the three
-        audited final campaigns exist. It never writes, repairs, resumes,
-        deletes, or regenerates anything, and it never invokes --resume.
+        Strictly read-only evidence mode for an existing campaign population.
+        It never writes, repairs, resumes, deletes, or regenerates anything,
+        and it never invokes --resume.
 
 Every per-campaign semantic decision is delegated to P4.1's own audited
 manifest-chain loader, filesystem primitives, and read-only terminal stage
@@ -118,19 +119,18 @@ FROZEN_EXECUTION_PATH_SHA256 = {
 # ---------------------------------------------------------------------------
 EXPECTED_STATUS_LINES = (
     "| P4.1 | Orchestrator | YES | YES | YES |",
-    "| P4.2 | Pilot plus three final campaigns | YES | NO | NO |",
+    "| P4.2 | Pilot plus three final campaigns | YES | YES | YES |",
     "| P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |",
 )
-# Every impossible or premature P4.2 state, plus the now-stale unimplemented
-# row. P4.2 is implemented, unaudited, and unverified; nothing else is legal.
+# Every stale or impossible P4.2 state. P4.2 is closed; nothing else is legal.
 FORBIDDEN_P42_STATUS_LINES = (
     "| P4.2 | Pilot plus three final campaigns | NO | NO | NO |",
     "| P4.2 | Pilot plus three final campaigns | NO | YES | NO |",
     "| P4.2 | Pilot plus three final campaigns | NO | NO | YES |",
     "| P4.2 | Pilot plus three final campaigns | NO | YES | YES |",
+    "| P4.2 | Pilot plus three final campaigns | YES | NO | NO |",
     "| P4.2 | Pilot plus three final campaigns | YES | YES | NO |",
     "| P4.2 | Pilot plus three final campaigns | YES | NO | YES |",
-    "| P4.2 | Pilot plus three final campaigns | YES | YES | YES |",
 )
 # The closed P4.1 row must not regress, and P4.3 must stay unimplemented.
 FORBIDDEN_P41_STATUS_LINES = (
@@ -149,55 +149,48 @@ FORBIDDEN_P43_STATUS_LINES = (
 STATUS_DOCUMENTS = ("PLAN.md", "README.md", "results/README.md",
                     P41_PROTOCOL_RELATIVE_PATH, P42_PROTOCOL_RELATIVE_PATH)
 
-# No document may claim a completed final campaign, a closed P4.2 or Phase 4,
-# or a publishable Phase 4 result.
+# No document may retain a stale P4.2 frontier, close all of Phase 4, or claim a
+# publishable Phase 4 result.
 FORBIDDEN_DOCUMENT_CLAIMS = (
-    "P4.2 = YES / YES / YES",
+    "P4.2 = YES / NO / NO",
     "P4.2 = YES / YES / NO",
-    "P4.2: CLOSED",
-    "P4.2 is closed",
-    "P4.2 is complete",
+    "P4.2 = YES / NO / YES",
+    "Independent audit: PENDING",
+    "GB300 verification: PENDING",
+    "zero of three final campaigns",
+    "still requires three independent final campaigns",
     "Phase 4: CLOSED",
     "Phase 4 is closed",
     "publishable=true",
     "publishable: true",
     "publishable = true",
-    "final campaign completed",
-    "final campaigns completed",
-    "final campaign has completed",
-    "final campaigns have completed",
-    "final campaign was executed",
-    "final campaigns were executed",
-    "final campaigns have been executed",
 )
-# Every status document must still say, in so many words, that no final
-# campaign has run and that no publishable Phase 4 result exists. The patterns
-# tolerate the line wrapping these documents use.
+# Every project-level narrative must retain the accepted population and the
+# non-publication boundary. The patterns tolerate normal line wrapping.
 REQUIRED_DOCUMENT_STATEMENTS = (
-    (r"no\s+final\s+campaign\s+has\s+been\s+executed",
-     "no final campaign has been executed"),
     (r"no\s+publishable\s+(phase\s+4\s+)?result", "no publishable result exists"),
+    (r"20260817T110330Z", "final campaign 20260817T110330Z is recorded"),
+    (r"20260817T111310Z", "final campaign 20260817T111310Z is recorded"),
+    (r"20260817T112011Z", "final campaign 20260817T112011Z is recorded"),
 )
-# The documents that carry the project-level status narrative must also record
-# that the independent P4.2 audit and its GB300 verification are pending. Both
-# statements must appear on one line, so a match cannot be assembled across
-# unrelated sentences.
-NARRATIVE_DOCUMENTS = ("PLAN.md", "README.md", "results/README.md",
-                       P42_PROTOCOL_RELATIVE_PATH)
-REQUIRED_PENDING_STATEMENTS = (
-    (r"independent P4\.2 audit[^\n]{0,40}?pending", "independent P4.2 audit is pending"),
-    (r"GB300 verification[^\n]{0,60}?pending", "P4.2 GB300 verification is pending"),
-)
+REQUIRED_CLOSURE_STATEMENTS = {
+    "PLAN.md": "| P4.2 | Pilot plus three final campaigns | YES | YES | YES |",
+    "README.md": "P4.2: CLOSED; independent audit: YES; GB300 verification: YES",
+    "results/README.md": "P4.2 is closed",
+    P42_PROTOCOL_RELATIVE_PATH: "P4.2 = YES / YES / YES",
+}
 
 REQUIRED_P42_PROTOCOL_STATEMENTS = (
-    "P4.2 = YES / NO / NO",
+    "P4.2 = YES / YES / YES",
     "P4.2 is implemented",
-    "Independent audit: PENDING",
-    "GB300 verification: PENDING",
-    "No final campaign has been executed",
+    "Independent audit: PASSED",
+    "GB300 verification: PASSED",
     "no publishable result exists",
-    "not an independent audit",
     PILOT_CAMPAIGN_ID,
+    "20260817T110330Z",
+    "20260817T111310Z",
+    "20260817T112011Z",
+    "b08e45c2636a3ac17c94ad8b1368084914196d7a",
 )
 
 # P4.3 belongs to P4.3. Nothing here may implement it.
@@ -749,13 +742,11 @@ def _check_truthful_claims(reporter: Reporter, documents: dict[str, str]) -> Non
                      P42_PROTOCOL_RELATIVE_PATH):
         text = documents[relative]
         for pattern, label in REQUIRED_DOCUMENT_STATEMENTS:
-            reporter.check(f"{relative} still states that {label}",
+            reporter.check(f"{relative} states that {label}",
                            re.search(pattern, text, re.IGNORECASE) is not None, "")
-    for relative in NARRATIVE_DOCUMENTS:
-        text = documents[relative]
-        for pattern, label in REQUIRED_PENDING_STATEMENTS:
-            reporter.check(f"{relative} records that the {label}",
-                           re.search(pattern, text, re.IGNORECASE) is not None, "")
+    for relative, statement in REQUIRED_CLOSURE_STATEMENTS.items():
+        reporter.check(f"{relative} records the P4.2 closure",
+                       statement in documents[relative], statement)
     protocol = documents[P42_PROTOCOL_RELATIVE_PATH]
     for statement in REQUIRED_P42_PROTOCOL_STATEMENTS:
         reporter.check(f"{P42_PROTOCOL_RELATIVE_PATH} states {statement!r}",
@@ -1002,7 +993,8 @@ def check_repository(repo_root: Path) -> int:
               file=sys.stderr)
         return 1
     print("check_phase4_campaigns_p42: OK "
-          "(P4.2 = YES / NO / NO; no final campaign executed; no publishable result)")
+          "(P4.2 = YES / YES / YES; three finals accepted; no publishable result; "
+          "P4.3 unimplemented)")
     return 0
 
 

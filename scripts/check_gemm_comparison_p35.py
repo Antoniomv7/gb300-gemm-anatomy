@@ -523,9 +523,9 @@ FORBIDDEN_P35_STATUS_LINES = (
 # The Phase 4 frontier. P4.1 (the campaign orchestrator) is closed after
 # independent audit and GB300 verification. P4.2 (the frozen protocol for one
 # accepted pilot plus three final campaigns, and its cross-campaign checker) is
-# implemented but neither independently audited nor GB300-verified, because no
-# final campaign has been executed. P4.3 must stay entirely unimplemented.
-# This guard still rejects every stale or impossible P4.1 and P4.2 state and any
+# closed after independent audit and GB300 verification. P4.3 must stay entirely
+# unimplemented. This guard still rejects every stale or impossible P4.1 and
+# P4.2 state and any
 # implementation of P4.3. (Before P4.1 landed, this tuple demanded the literal
 # "| P4.1 | Orchestrator | NO | NO | NO |", which structurally forbade P4.1
 # from ever being implemented -- exactly the stale-frontier situation P3.5
@@ -534,7 +534,7 @@ FORBIDDEN_P35_STATUS_LINES = (
 # src/phase4/P4_2_PROTOCOL.md section 9.1.)
 PHASE4_STATUS_LINES = (
     "| P4.1 | Orchestrator | YES | YES | YES |",
-    "| P4.2 | Pilot plus three final campaigns | YES | NO | NO |",
+    "| P4.2 | Pilot plus three final campaigns | YES | YES | YES |",
     "| P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |",
 )
 FORBIDDEN_PHASE4_STATUS_LINES = (
@@ -546,9 +546,9 @@ FORBIDDEN_PHASE4_STATUS_LINES = (
     "| P4.2 | Pilot plus three final campaigns | NO | YES | NO |",
     "| P4.2 | Pilot plus three final campaigns | NO | NO | YES |",
     "| P4.2 | Pilot plus three final campaigns | NO | YES | YES |",
+    "| P4.2 | Pilot plus three final campaigns | YES | NO | NO |",
     "| P4.2 | Pilot plus three final campaigns | YES | YES | NO |",
     "| P4.2 | Pilot plus three final campaigns | YES | NO | YES |",
-    "| P4.2 | Pilot plus three final campaigns | YES | YES | YES |",
 )
 
 _GUARD_PRELUDE = """
@@ -3644,7 +3644,7 @@ def run_self_test() -> int:
         "| P3.4 | Three execution variants | YES | YES | YES |\n"
         "| P3.5 | Five shapes and comparison | YES | YES | YES |\n"
         "| P4.1 | Orchestrator | YES | YES | YES |\n"
-        "| P4.2 | Pilot plus three final campaigns | YES | NO | NO |\n"
+        "| P4.2 | Pilot plus three final campaigns | YES | YES | YES |\n"
         "| P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |\n"
     )
     good_protocol = (
@@ -3673,13 +3673,13 @@ def run_self_test() -> int:
                 good_protocol, good_readme), "no longer records")
     rejects("a PLAN.md that regresses P4.2 to unimplemented is rejected",
             validate_status_documents(
-                good_plan.replace("| P4.2 | Pilot plus three final campaigns | YES | NO | NO |",
+                good_plan.replace("| P4.2 | Pilot plus three final campaigns | YES | YES | YES |",
                                   "| P4.2 | Pilot plus three final campaigns | NO | NO | NO |"),
                 good_protocol, good_readme), "Phase 4 frontier row")
-    rejects("a PLAN.md that claims P4.2 is audited or GB300-verified is rejected",
+    rejects("a PLAN.md that regresses closed P4.2 to implemented-only is rejected",
             validate_status_documents(
-                good_plan.replace("| P4.2 | Pilot plus three final campaigns | YES | NO | NO |",
-                                  "| P4.2 | Pilot plus three final campaigns | YES | YES | YES |"),
+                good_plan.replace("| P4.2 | Pilot plus three final campaigns | YES | YES | YES |",
+                                  "| P4.2 | Pilot plus three final campaigns | YES | NO | NO |"),
                 good_protocol, good_readme), "Phase 4 frontier row")
     rejects("a PLAN.md that implements P4.3 is rejected",
             validate_status_documents(
@@ -3691,7 +3691,7 @@ def run_self_test() -> int:
     # so the rejection is caused by that row and not by an unrelated absence.
     for premature in FORBIDDEN_PHASE4_STATUS_LINES:
         owned = ("| P4.1 | Orchestrator | YES | YES | YES |" if "| P4.1 |" in premature
-                 else "| P4.2 | Pilot plus three final campaigns | YES | NO | NO |")
+                 else "| P4.2 | Pilot plus three final campaigns | YES | YES | YES |")
         rejects(f"a PLAN.md recording the stale or invalid Phase 4 status {premature!r} "
                 f"is rejected",
                 validate_status_documents(

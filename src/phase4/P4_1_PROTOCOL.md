@@ -5,12 +5,12 @@ Status: `P4.1 = YES / YES / YES` (Implemented / Audited / Verified on GB300).
 * **P4.1 is implemented infrastructure.**
 * **Independent audit: PASSED.**
 * **GB300 verification: PASSED.**
-* **Pilot campaign `20260812T013848Z`: COMPLETE.** No final campaign has been
-  executed.
+* **Pilot campaign `20260812T013848Z`: COMPLETE.** P4.2 later completed its
+  three separate final campaigns without changing the P4.1 execution path.
 * **No publishable result exists**, and none is claimed. Every artifact this
   unit can ever write records `publishable=false`.
-* **P4.2 has completed its pilot and still requires three independent final
-  campaigns.**
+* **P4.2 is now closed as `YES / YES / YES`.** Its three final campaigns and
+  read-only cross-campaign validation passed after this P4.1 closure.
 * **P4.3 will perform integrated analysis and publication review**, the final
   tables and figures, and the closing audit.
 
@@ -549,7 +549,8 @@ then-truthful frontier `P4.1 | Orchestrator | YES | NO | NO`. This documentary
 closure advances the P4.1-owned assertions in the `Makefile`, the P3.5 checker,
 and the P4.1 checker to `YES | YES | YES`. Nothing is weakened: every
 closed-unit regression is preserved, stale and impossible partial states are
-rejected, and **P4.2 and P4.3 must still be recorded unimplemented**.
+rejected, and **at that P4.1 closure P4.2 and P4.3 were still recorded
+unimplemented**. Later units advance only their own rows.
 
 ## 10. Make targets
 
@@ -672,9 +673,10 @@ was rewritten and no manifest revision was appended. P4.1 was verified on
 GB300. The same campaign satisfies P4.2's single pilot requirement. Every
 artifact remains `publishable=false`.
 
-### 12.4 What has not been run
+### 12.4 State at P4.1 closure
 
-No final campaign has been executed. No cross-campaign statistical treatment,
+At P4.1 closure no final campaign had been executed. No cross-campaign
+statistical treatment,
 cross-experiment interpretation, integrated table, final figure, or publication
 review has been produced, and no existing result row has been promoted out of
 its recorded `publishable=false` status. The pilot raw tree remains ignored and
@@ -696,21 +698,22 @@ change; or any commit, push, merge, or pull request.
 
 ```text
 P4.1 | Orchestrator                                | YES | YES | YES
-P4.2 | Pilot plus three final campaigns            | YES | NO  | NO
+P4.2 | Pilot plus three final campaigns            | YES | YES | YES
 P4.3 | Integrated analysis, documentation, audit   | NO  | NO  | NO
 ```
 
 `P4.1 = YES / YES / YES`. The independent audit and GB300 verification passed.
 Pilot campaign `20260812T013848Z` is terminally `COMPLETE` and remains
-non-publishable. P4.2 still requires three independent final campaigns, P4.3
-remains unimplemented, and no publishable result exists anywhere in this
-repository.
+non-publishable. P4.2 has since completed three independent final campaigns and
+closed as `YES / YES / YES`; P4.3 remains unimplemented, and no publishable
+result exists anywhere in this repository.
 
 P4.2 has since landed its frozen protocol and its GPU-free cross-campaign
 checker (`src/phase4/P4_2_PROTOCOL.md`,
-`scripts/check_phase4_campaigns_p42.py`), which is why the P4.2 row above now
-reads `YES | NO | NO`. That unit is implemented only: the independent P4.2
-audit remains pending, GB300 verification of P4.2 remains pending, and no final
-campaign has been executed. **Nothing in this document's P4.1 implementation,
-audit, remediation, or GB300 record changed**, and P4.2 changed neither
-`scripts/run_all.sh` nor `scripts/phase4_orchestrator.py`.
+`scripts/check_phase4_campaigns_p42.py`). Its final independent review accepted
+execution commit `b08e45c2636a3ac17c94ad8b1368084914196d7a`; final campaigns
+`20260817T110330Z`, `20260817T111310Z`, and `20260817T112011Z` then completed
+and passed terminal and cross-campaign revalidation, which is why the P4.2 row
+above now reads `YES | YES | YES`. **Nothing in this document's P4.1
+implementation, audit, remediation, or GB300 record changed**, and P4.2 changed
+neither `scripts/run_all.sh` nor `scripts/phase4_orchestrator.py`.

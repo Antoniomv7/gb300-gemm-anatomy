@@ -192,7 +192,7 @@ GEMM_P35_ARCH_FLAGS := -arch=compute_$(patsubst sm_%,%,$(CUDA_ARCH)) -code=$(CUD
 # dependency or version pin and marks nothing publishable: every artifact it
 # can write records publishable=false. P4.1 closed as YES / YES / YES after
 # independent audit and GB300 verification through P4.2 pilot
-# 20260812T013848Z. P4.2 still requires three independent final campaigns;
+# 20260812T013848Z. P4.2 later closed its three independent final campaigns;
 # P4.3 will perform the integrated analysis, documentation, and audit. See
 # src/phase4/P4_1_PROTOCOL.md.
 PHASE4_P41_ENTRYPOINT := scripts/run_all.sh
@@ -213,9 +213,9 @@ PHASE4_P41_PLAN_CAMPAIGN_ID := 20990101T000000Z
 # no dependency, no version pin, no schema change, and no provenance field, and
 # it computes no statistic, threshold, ranking, table, or figure -- those belong
 # exclusively to P4.3. The accepted pilot 20260812T013848Z stays
-# publishable=false and is never one of the three final replicates. As of this
-# commit P4.2 is implemented but NOT independently audited and NOT verified on
-# GB300, and no final campaign has been executed. See
+# publishable=false and is never one of the three final replicates. P4.2 is
+# closed as YES / YES / YES after independent audit, three full final campaigns,
+# terminal revalidation, and the read-only cross-campaign check. See
 # src/phase4/P4_2_PROTOCOL.md.
 PHASE4_P42_CHECKER := scripts/check_phase4_campaigns_p42.py
 PHASE4_P42_PROTOCOL := src/phase4/P4_2_PROTOCOL.md
@@ -583,7 +583,7 @@ help:
 	@echo "     targets and reimplements no kernel, matrix, statistic, profiler plan,"
 	@echo "     correctness rule, schema, or execution parameter. Experiment 3 is ONE"
 	@echo "     atomic 'gemm' stage: there is no --only cublaslt and no --only cutedsl."
-	@echo "     P4.2 has completed its pilot and still requires three final campaigns;"
+	@echo "     P4.2 has completed its pilot and three final campaigns;"
 	@echo "     P4.3 will do the integrated analysis, documentation, and audit.) --"
 	@echo "  GPU-free P4.1 planning/checking (no GPU, no Docker, no network):"
 	@echo "  make phase4-p41-plan          Print the deterministic full-campaign stage"
@@ -598,9 +598,10 @@ help:
 	@echo "                                container runtime at all."
 	@echo ""
 	@echo "  -- P4.2 one accepted pilot plus three final campaigns (see"
-	@echo "     src/phase4/P4_2_PROTOCOL.md; IMPLEMENTED but NOT independently audited"
-	@echo "     and NOT verified on GB300: P4.2 = YES / NO / NO. Zero of three final"
-	@echo "     campaigns have been executed and no publishable result exists. P4.2 is"
+	@echo "     src/phase4/P4_2_PROTOCOL.md; CLOSED after independent audit and GB300"
+	@echo "     verification: P4.2 = YES / YES / YES. Three of three final campaigns"
+	@echo "     passed terminal and cross-campaign revalidation. No publishable result"
+	@echo "     exists. P4.2 is"
 	@echo "     frozen policy plus one GPU-free cross-campaign checker; it adds no"
 	@echo "     runner and no target that could start a campaign, and it computes no"
 	@echo "     statistic, threshold, ranking, table, or figure -- those belong"
@@ -610,11 +611,8 @@ help:
 	@echo "                                P4.2 repository-contract check. No Docker, no"
 	@echo "                                nvidia-smi, no CUDA, no preflight, no network,"
 	@echo "                                and no raw campaign evidence required."
-	@echo "  GPU-executing Phase 4 campaigns are P4.2 work; the pilot is complete and"
-	@echo "  the three independent final campaigns remain pending, and must not start"
-	@echo "  before the independent P4.2 audit and the execution-commit freeze:"
-	@echo "  BLACKWELL_GPU_INDEX=<i> scripts/run_all.sh --campaign-id <YYYYMMDDTHHMMSSZ> \\"
-	@echo "      --campaign-kind <pilot|final> [--only <memory|umma|gemm>] [--resume]"
+	@echo "  P4.2 execution is closed. Do not create a fourth or replacement final"
+	@echo "  campaign; the next work is P4.3 integrated analysis and documentation."
 	@echo ""
 	@echo "Pinned global contract (VERSIONS.env, unchanged since Phase 0 and consumed"
 	@echo "unmodified by the closed P1/P2 aggregators): CUDA $(CUDA_VERSION), CUTLASS"
@@ -1414,13 +1412,12 @@ check-static:
 	@grep -Fq 'P3.5: CLOSED' README.md
 	@grep -Fq 'Phase 3: CLOSED' README.md
 	@echo "== P3.5 introduces no Phase 4 functionality and no statistical treatment =="
-	@# P4.1 is closed after independent audit and GB300 verification. P4.2 is now
-	@# implemented but neither audited nor GB300-verified, so only the P4.2-owned
-	@# row advanced to YES | NO | NO; P4.3 must still be recorded unimplemented.
-	@# No closed assertion is weakened, and every impossible or premature P4.2
+	@# P4.1 and P4.2 are closed after independent audit and GB300 verification;
+	@# P4.3 must still be recorded unimplemented. No closed assertion is weakened,
+	@# and every stale or impossible P4.2
 	@# state is still rejected below.
 	@grep -Fq 'P4.1 | Orchestrator | YES | YES | YES |' PLAN.md
-	@grep -Fq 'P4.2 | Pilot plus three final campaigns | YES | NO | NO |' PLAN.md
+	@grep -Fq 'P4.2 | Pilot plus three final campaigns | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |' PLAN.md
 	@! grep -nE '^(P4|P41|P42|P43)_' $(GEMM_P35_WRAPPER)
 	@echo "   (the tokenized identifier ban for confidence intervals, bootstraps, outlier"
@@ -1513,23 +1510,25 @@ check-static:
 	@echo "== P4.2 adds no key to either version contract and no new dependency =="
 	@! grep -nE '^(PHASE4_|P42_)' PHASE3_VERSIONS.env VERSIONS.env
 	@echo "== truthful P4.2 status assertions =="
-	@grep -Fq 'P4.2 = YES / NO / NO' $(PHASE4_P42_PROTOCOL)
-	@grep -Fq 'Independent audit: PENDING' $(PHASE4_P42_PROTOCOL)
-	@grep -Fq 'GB300 verification: PENDING' $(PHASE4_P42_PROTOCOL)
-	@grep -Fq 'No final campaign has been executed' $(PHASE4_P42_PROTOCOL)
-	@grep -Fq 'not an independent audit' $(PHASE4_P42_PROTOCOL)
+	@grep -Fq 'P4.2 = YES / YES / YES' $(PHASE4_P42_PROTOCOL)
+	@grep -Fq 'Independent audit: PASSED' $(PHASE4_P42_PROTOCOL)
+	@grep -Fq 'GB300 verification: PASSED' $(PHASE4_P42_PROTOCOL)
+	@grep -Fq '20260817T110330Z' $(PHASE4_P42_PROTOCOL)
+	@grep -Fq '20260817T111310Z' $(PHASE4_P42_PROTOCOL)
+	@grep -Fq '20260817T112011Z' $(PHASE4_P42_PROTOCOL)
+	@grep -Fq 'b08e45c2636a3ac17c94ad8b1368084914196d7a' $(PHASE4_P42_PROTOCOL)
 	@grep -Fq '20260812T013848Z' $(PHASE4_P42_PROTOCOL)
-	@# Every impossible or premature P4.2 state, and the now-stale unimplemented
-	@# row, stay rejected. P4.3 must still be recorded unimplemented.
+	@# Every stale or impossible P4.2 state stays rejected. P4.3 must still be
+	@# recorded unimplemented.
 	@! grep -nF 'P4.2 | Pilot plus three final campaigns | NO | NO | NO |' PLAN.md
 	@! grep -nF 'P4.2 | Pilot plus three final campaigns | NO | YES | NO |' PLAN.md
 	@! grep -nF 'P4.2 | Pilot plus three final campaigns | NO | NO | YES |' PLAN.md
 	@! grep -nF 'P4.2 | Pilot plus three final campaigns | NO | YES | YES |' PLAN.md
+	@! grep -nF 'P4.2 | Pilot plus three final campaigns | YES | NO | NO |' PLAN.md
 	@! grep -nF 'P4.2 | Pilot plus three final campaigns | YES | YES | NO |' PLAN.md
 	@! grep -nF 'P4.2 | Pilot plus three final campaigns | YES | NO | YES |' PLAN.md
-	@! grep -nF 'P4.2 | Pilot plus three final campaigns | YES | YES | YES |' PLAN.md
 	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |' PLAN.md
-	@! grep -rnF 'P4.2: CLOSED' README.md PLAN.md results/README.md $(PHASE4_P42_PROTOCOL)
+	@grep -Fq 'P4.2: CLOSED' README.md
 	@echo "check-static: OK"
 
 build-image:
@@ -3193,10 +3192,10 @@ phase4-p41-check: memory-paths-p14-check compute-umma-p24-check-gpu-free
 # nvidia-smi, or a CUDA compiler, or if a Docker-backed or GPU-backed gate
 # becomes reachable through a new dependency edge.
 #
-# There is deliberately no Make target that starts a final campaign; real
-# campaigns continue to use scripts/run_all.sh explicitly, with an explicit
-# BLACKWELL_GPU_INDEX, and only after the independent P4.2 audit and the
-# execution-commit freeze. See src/phase4/P4_2_PROTOCOL.md.
+# There is deliberately no Make target that starts a final campaign. The three
+# accepted finals used scripts/run_all.sh explicitly from the frozen audited
+# commit; no fourth or replacement final belongs to this closed unit. See
+# src/phase4/P4_2_PROTOCOL.md.
 phase4-p42-check:
 	@echo "== P4.2 files present, executable, and syntactically valid =="
 	@test -f $(PHASE4_P42_CHECKER)
@@ -3212,6 +3211,6 @@ phase4-p42-check:
 	@rm -rf scripts/__pycache__
 	@echo "== P4.2 created no campaign directory of its own =="
 	@! test -e $(PHASE4_P41_RAW_ROOT)/$(PHASE4_P41_PLAN_CAMPAIGN_ID)
-	@echo "phase4-p42-check: OK (P4.2 = YES / NO / NO: implemented, audit pending, GB300"
-	@echo "                   verification pending; no final campaign executed; no"
-	@echo "                   publishable result exists)"
+	@echo "phase4-p42-check: OK (P4.2 = YES / YES / YES: independently audited and"
+	@echo "                   verified on GB300; three finals accepted; no publishable"
+	@echo "                   result exists; P4.3 remains unimplemented)"
