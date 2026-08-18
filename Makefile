@@ -239,6 +239,10 @@ PHASE4_P42_PROTOCOL := src/phase4/P4_2_PROTOCOL.md
 PHASE4_P43_ANALYZER := scripts/analyze_phase4_p43.py
 PHASE4_P43_CHECKER := scripts/check_phase4_integration_p43.py
 PHASE4_P43_PROTOCOL := src/phase4/P4_3_PROTOCOL.md
+# The external acceptance attestation. It is NOT produced by the analyzer, is
+# not part of the nine-artifact inventory, and must not exist while P4.3 is
+# YES / NO / NO; check-static and phase4-p43-check both assert its absence.
+PHASE4_P43_ACCEPTANCE := src/phase4/P4_3_ACCEPTANCE.json
 # The frozen population, restated here so the production target can never
 # analyse a campaign outside it. These are literals, never a discovered
 # "latest" campaign, a glob, or a modification-time ranking.
@@ -1639,6 +1643,15 @@ check-static:
 	@grep -Fq 'no publishable result exists' $(PHASE4_P43_PROTOCOL)
 	@grep -Fq 'Phase 4 and the complete TFM are not closed' $(PHASE4_P43_PROTOCOL)
 	@grep -Fq 'P4.3: IMPLEMENTED; independent audit: NO; production analysis: NO' README.md
+	@echo "== the P4.3 candidate bundle has not been produced or accepted =="
+	@test ! -e $(PHASE4_P43_OUTPUT_ROOT)
+	@test ! -e $(PHASE4_P43_ACCEPTANCE)
+	@grep -Fq 'candidate_pending_independent_output_review' $(PHASE4_P43_ANALYZER)
+	@grep -Fq 'p43.acceptance.v1' $(PHASE4_P43_PROTOCOL)
+	@grep -Fq '$(PHASE4_P43_ACCEPTANCE)' $(PHASE4_P43_PROTOCOL)
+	@echo "== the P4.3 remediation is recorded and still unaudited =="
+	@grep -Fq 'awaiting a new independent audit' $(PHASE4_P43_PROTOCOL)
+	@grep -Fq 'This remediation has not been independently audited' $(PHASE4_P43_PROTOCOL)
 	@# Every stale or impossible P4.3 state stays rejected.
 	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |' PLAN.md
 	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | NO | YES | NO |' PLAN.md
@@ -3357,6 +3370,9 @@ phase4-p43-check:
 	@echo "   no container, no GPU, no network) =="
 	python3 $(PHASE4_P43_CHECKER) .
 	@rm -rf scripts/__pycache__
+	@echo "== no P4.3 candidate bundle and no acceptance attestation exist =="
+	@test ! -e $(PHASE4_P43_OUTPUT_ROOT)
+	@test ! -e $(PHASE4_P43_ACCEPTANCE)
 	@# This recipe deliberately names no raw campaign path at all: the gate must
 	@# run on a checkout that has never seen a campaign. The checker enforces
 	@# that by scanning this recipe's own text.

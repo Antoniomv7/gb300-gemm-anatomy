@@ -34,8 +34,10 @@ Exit codes: 0 OK; 1 at least one check failed; 2 usage error.
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib.util
 import inspect
+import io
 import json
 import linecache
 import os
@@ -122,9 +124,24 @@ FORBIDDEN_DOCUMENT_CLAIMS = (
     "publishable: true",
     "publishable = true",
     "P4.3 independent audit: PASSED",
+    "P4.3 is accepted for publication",
+    "P4.3 has been accepted for publication",
+    "publication_state: accepted",
+    "publication_state=accepted",
     "the P4.3 analysis has been independently audited",
     "the production analysis has been run",
 )
+# Claims that are legitimate for the closed P4.1 and P4.2 protocols -- both of
+# which really did pass an independent audit -- but untrue in the P4.3 protocol,
+# which owns the P4.3 status. They are therefore banned only there.
+FORBIDDEN_P43_PROTOCOL_CLAIMS = (
+    "Independent audit: PASSED",
+    "Independent audit: YES",
+    "Production analysis: RUN",
+    "Production analysis: PERFORMED",
+    "P4.3 = YES / YES",
+)
+
 # Every project-level narrative must keep the honest P4.3 boundary.
 REQUIRED_DOCUMENT_STATEMENTS = (
     (r"no\s+publishable\s+(phase\s+4\s+)?result", "no publishable result exists"),
@@ -169,8 +186,9 @@ REQUIRED_P43_PROTOCOL_TOKENS = (
 # The Python standard library modules P4.3 may import. It adds no external
 # dependency and no version pin.
 STDLIB_IMPORT_ALLOWLIST = frozenset({
-    "__future__", "argparse", "csv", "errno", "importlib", "inspect", "io", "json",
-    "linecache", "math", "os", "re", "shutil", "stat", "sys", "tempfile", "pathlib",
+    "__future__", "argparse", "csv", "errno", "hashlib", "importlib", "inspect", "io",
+    "json", "linecache", "math", "os", "re", "shutil", "stat", "struct", "sys",
+    "tempfile", "zlib", "pathlib",
 })
 
 # Calls that would execute something. P4.3 runs no child process at all, so a
@@ -208,6 +226,36 @@ FORBIDDEN_STATISTICAL_TOKENS = (
     r"\boutlier\w*\b",
     r"\bwinner\b",
 )
+
+# The evidence class each metric must carry. The pre-remediation implementation
+# classified the first five of these as directly measured quantities.
+EXPECTED_METRIC_EVIDENCE = {
+    "median_effective_gbps": "within_campaign_derived_estimate",
+    "dram_read_ratio": "within_campaign_derived_estimate",
+    "hbm_classification": "within_campaign_derived_estimate",
+    "median_flops_per_cycle": "within_campaign_derived_estimate",
+    "median_flops_per_cycle_per_sm": "within_campaign_derived_estimate",
+    "tma_to_ldgsts_ratio": "within_campaign_derived_estimate",
+    "speedup_2sm_over_1sm": "within_campaign_derived_estimate",
+    "scaling_efficiency_percent": "within_campaign_derived_estimate",
+    "earliest_tested_candidate_saturation_bif_kib": "within_campaign_derived_estimate",
+    "earliest_tested_candidate_saturation_depth": "within_campaign_derived_estimate",
+    "tflops": "within_campaign_derived_estimate",
+    "throughput_ratio_vs_cublaslt": "within_campaign_derived_estimate",
+    "gap_to_cublaslt_pct": "within_campaign_derived_estimate",
+    "best_cutedsl_variant": "within_campaign_derived_estimate",
+    "estimated_tflops_per_sm": "modeled_estimate",
+    "estimated_device_equivalent_tflops": "modeled_estimate",
+    "kernel_time_ms": "measured_source_observation",
+    "within_campaign_cv_percent": "source_diagnostic",
+    "within_campaign_stability_review": "source_diagnostic",
+    "within_campaign_sample_count": "source_diagnostic",
+    "surprising_value_flag": "source_diagnostic",
+    "diagnostic_flags": "source_diagnostic",
+    "ncu_coverage": "source_diagnostic",
+}
+
+P43_ACCEPTANCE_RELATIVE_PATH = "src/phase4/P4_3_ACCEPTANCE.json"
 
 P43_CHECK_TARGET = "phase4-p43-check"
 P43_ANALYZE_TARGET = "phase4-p43-analyze"
@@ -288,6 +336,10 @@ def _check_truthful_claims(reporter: Reporter, documents: dict[str, str]) -> Non
         for claim in FORBIDDEN_DOCUMENT_CLAIMS:
             reporter.check(f"{relative} does not claim {claim!r}",
                            claim.lower() not in text.lower(), "")
+    protocol_text = documents[P43_PROTOCOL_RELATIVE_PATH]
+    for claim in FORBIDDEN_P43_PROTOCOL_CLAIMS:
+        reporter.check(f"{P43_PROTOCOL_RELATIVE_PATH} does not claim {claim!r}",
+                       claim.lower() not in protocol_text.lower(), "")
     for relative in ("PLAN.md", "README.md", "results/README.md",
                      P43_PROTOCOL_RELATIVE_PATH):
         text = documents[relative]
@@ -393,7 +445,6 @@ def _check_reuses_closed_units(reporter: Reporter, analyzer_source: str) -> None
                         ("open_dir_chain", "P4.1"),
                         ("read_file_nofollow", "P4.1"),
                         ("write_file_exclusive", "P4.1"),
-                        ("mkdir_component", "P4.1"),
                         ("sha256_bytes", "P4.1"),
                         ("canonical_json_bytes", "P4.1"),
                         ("COMPARABLE_EVIDENCE_FIELDS", "P4.1"),
@@ -423,17 +474,30 @@ def _check_statistical_policy(reporter: Reporter, analyzer) -> None:
                    str(analyzer.CV_REVIEW_THRESHOLD_PERCENT))
 
     summary = analyzer.summarize_metric([1.0, 2.0, 3.0], metric="median_effective_gbps")
+    required = {"stdev_sample", "mean", "median", "minimum", "maximum",
+                "cross_campaign_cv_percent", "cross_campaign_cv_review_flag",
+                "campaign_values", "campaign_count"}
+    if not required <= set(summary):
+        reporter.check("a summarized metric carries every frozen statistic field, with the "
+                       "cross-campaign ones unambiguously named", False,
+                       str(sorted(required - set(summary))))
+        return
     reporter.check("the sample standard deviation uses the n-1 denominator",
                    abs(summary["stdev_sample"] - 1.0) < 1e-12, str(summary["stdev_sample"]))
     reporter.check("mean, median, minimum, and maximum are the plain descriptive values",
                    (summary["mean"], summary["median"], summary["minimum"],
                     summary["maximum"]) == (2.0, 2.0, 1.0, 3.0), str(summary))
-    reporter.check("the coefficient of variation is 100 x stdev / mean",
-                   abs(summary["cv_percent"] - 50.0) < 1e-12, str(summary["cv_percent"]))
-    reporter.check("a coefficient of variation above the threshold flags for review and "
-                   "keeps every campaign value",
-                   summary["cv_review_flag"] == "REVIEW"
+    reporter.check("the cross-campaign coefficient of variation is 100 x stdev / mean",
+                   abs(summary["cross_campaign_cv_percent"] - 50.0) < 1e-12,
+                   str(summary["cross_campaign_cv_percent"]))
+    reporter.check("a cross-campaign coefficient of variation above the threshold flags "
+                   "for review and keeps every campaign value",
+                   summary["cross_campaign_cv_review_flag"] == "REVIEW"
                    and len(summary["campaign_values"]) == 3, str(summary))
+    reporter.check("the cross-campaign statistic is named so it can never be read as a "
+                   "within-campaign one",
+                   "cv_percent" not in summary and "cv_review_flag" not in summary,
+                   str(sorted(summary)))
 
     def rejects(label: str, call) -> None:
         try:
@@ -452,8 +516,9 @@ def _check_statistical_policy(reporter: Reporter, analyzer) -> None:
                                               metric="median_effective_gbps"))
     signed = analyzer.summarize_metric([-5.0, 0.0, 5.0], metric="gap_to_cublaslt_pct")
     reporter.check("no coefficient of variation is computed for the signed GEMM gap",
-                   signed["cv_percent"] is None
-                   and signed["cv_review_flag"] == analyzer.NOT_APPLICABLE, str(signed))
+                   signed["cross_campaign_cv_percent"] is None
+                   and signed["cross_campaign_cv_review_flag"] == analyzer.NOT_APPLICABLE,
+                   str(signed))
     reporter.check("a negative GEMM gap is preserved without clamping",
                    signed["minimum"] == -5.0, str(signed))
     reporter.check("gap_to_cublaslt_pct is declared signed or zero-centred",
@@ -461,7 +526,7 @@ def _check_statistical_policy(reporter: Reporter, analyzer) -> None:
     zero = analyzer.summarize_metric([0.0, 0.0, 0.0],
                                      metric="throughput_ratio_vs_cublaslt")
     reporter.check("a zero denominator never yields a coefficient of variation",
-                   zero["cv_percent"] is None, str(zero))
+                   zero["cross_campaign_cv_percent"] is None, str(zero))
     agree = analyzer.consensus(["a", "a", "a"], label="x")
     disagree = analyzer.consensus(["a", "b", "a"], label="x")
     reporter.check("a consensus is reported only when all three campaigns agree, and a "
@@ -499,11 +564,16 @@ def _check_artifact_contract(reporter: Reporter, analyzer, protocol: str) -> Non
                                "_p43_check_orchestrator")
     try:
         first = analyzer.build_documents(orchestrator, analyzer._StubP35(),
-                                         analyzer._fixture_records())
+                                         analyzer._fixture_records(),
+                                         analyzer._fixture_provenance())
         second = analyzer.build_documents(orchestrator, analyzer._StubP35(),
-                                          analyzer._fixture_records())
-    except analyzer.P43Error as exc:
-        reporter.check("a complete synthetic analysis runs end to end", False, str(exc))
+                                          analyzer._fixture_records(),
+                                          analyzer._fixture_provenance())
+    except (analyzer.P43Error, KeyError, TypeError, AttributeError, ValueError) as exc:
+        # A broken or tampered analyzer must be reported as a failure here, not
+        # escape as a traceback that hides every remaining check.
+        reporter.check("a complete synthetic analysis runs end to end", False,
+                       f"{type(exc).__name__}: {exc}")
         return
     reporter.check("the analysis is deterministic: identical evidence gives identical bytes",
                    first == second, "")
@@ -539,6 +609,418 @@ def _check_artifact_contract(reporter: Reporter, analyzer, protocol: str) -> Non
     blob = b"\n".join(payload for _, payload in first).decode("utf-8", errors="replace")
     for leak in (str(Path.home()), "/home/", "/Users/", "USER=", "HOSTNAME=", "SSH_"):
         reporter.check(f"no output artifact leaks {leak!r}", leak not in blob, "")
+
+
+def _check_evidence_taxonomy(reporter: Reporter, analyzer, protocol: str) -> None:
+    """3.1 -- every reported quantity is classified, and no derived, modeled, or
+    cross-campaign quantity is presented as a direct measurement."""
+    classes = set(analyzer.EVIDENCE_CLASSES)
+    reporter.check("the analyzer declares the frozen evidence taxonomy",
+                   classes == {analyzer.EVIDENCE_MEASURED,
+                               analyzer.EVIDENCE_WITHIN_CAMPAIGN,
+                               analyzer.EVIDENCE_CROSS_CAMPAIGN,
+                               analyzer.EVIDENCE_MODELED,
+                               analyzer.EVIDENCE_INTERPRETATION,
+                               analyzer.EVIDENCE_UNAVAILABLE,
+                               analyzer.EVIDENCE_DIAGNOSTIC},
+                   str(sorted(classes)))
+    for name in sorted(classes):
+        reporter.check(f"{P43_PROTOCOL_RELATIVE_PATH} freezes the evidence class {name!r}",
+                       name in protocol, "")
+    for metric, expected in EXPECTED_METRIC_EVIDENCE.items():
+        declared = analyzer.METRIC_EVIDENCE.get(metric)
+        reporter.check(f"{metric} is classified {expected}, not as a direct measurement",
+                       declared is not None and declared[0] == expected,
+                       str(declared))
+    reporter.check("only the closed protocols' own measured inputs are called measured",
+                   {metric for metric, entry in analyzer.METRIC_EVIDENCE.items()
+                    if entry[0] == analyzer.EVIDENCE_MEASURED} == {"kernel_time_ms"},
+                   str(sorted(metric for metric, entry in analyzer.METRIC_EVIDENCE.items()
+                              if entry[0] == analyzer.EVIDENCE_MEASURED)))
+    reporter.check("effective GB/s is documented as a timing-derived effective rate and "
+                   "explicitly not HBM/DRAM bandwidth",
+                   "not hbm/dram bandwidth"
+                   in analyzer.METRIC_EVIDENCE["median_effective_gbps"][1].lower(), "")
+    reporter.check("FLOP/cycle is documented as derived from a validated operation count "
+                   "and measured cycles",
+                   "operation count"
+                   in analyzer.METRIC_EVIDENCE["median_flops_per_cycle"][1]
+                   and "measured %clock64"
+                   in analyzer.METRIC_EVIDENCE["median_flops_per_cycle"][1], "")
+    reporter.check("dram_read_ratio and hbm_classification are documented as derived from "
+                   "profiler evidence rather than as raw counters",
+                   all("not a raw profiler counter"
+                       in analyzer.METRIC_EVIDENCE[metric][1]
+                       for metric in ("dram_read_ratio", "hbm_classification")), "")
+    reporter.check("every metric emitted by the analyzer carries a classification and a "
+                   "basis sentence",
+                   all(entry[0] in classes and len(entry[1]) > 40
+                       for entry in analyzer.METRIC_EVIDENCE.values()), "")
+    try:
+        analyzer.evidence_class_for("an_undeclared_metric")
+    except analyzer.P43Error:
+        reporter.check("an unclassified quantity can never be emitted", True)
+    else:
+        reporter.check("an unclassified quantity can never be emitted", False, "accepted")
+    reporter.check("the analyzer states that the memory benchmark is a dedicated streaming "
+                   "microbenchmark rather than GEMM traffic",
+                   "streaming" in analyzer.METRIC_EVIDENCE["median_effective_gbps"][1]
+                   or "streaming" in inspect.getsource(analyzer.build_interpretation), "")
+    reporter.check("the analyzer names the min-max range a whisker, never a bar",
+                   "whisker" in analyzer.WHISKER_CAPTION
+                   and re.search(r"\bbars?\b", analyzer.WHISKER_CAPTION) is None,
+                   analyzer.WHISKER_CAPTION)
+    reporter.check("the figure caption states that it summarizes exactly three "
+                   "campaign-level values",
+                   f"exactly {analyzer.CAMPAIGN_COUNT} campaign-level values"
+                   in analyzer.WHISKER_CAPTION, analyzer.WHISKER_CAPTION)
+
+
+def _check_preserved_diagnostics(reporter: Reporter, analyzer, orchestrator) -> None:
+    """3.2 -- diagnostics that are parsed must reach the curated artifacts, in
+    the frozen campaign order, and must never be conflated with the
+    cross-campaign statistics."""
+    records = analyzer._fixture_records(**{
+        analyzer.FINAL_CAMPAIGN_IDS[1]: {
+            "ncu_diagnostic_flags": "READ_AMPLIFICATION",
+            "memory_stability_review": "REVIEW", "memory_cv_percent": 9.5,
+            "umma_stability_review": "REVIEW", "surprising_value_flag": "True"},
+    })
+    documents = dict(analyzer.build_documents(orchestrator, analyzer._StubP35(), records,
+                                              analyzer._fixture_provenance()))
+    memory = documents["memory_paths.csv"].decode("utf-8")
+    umma = documents["umma_throughput.csv"].decode("utf-8")
+    summary = documents["integrated_summary.json"].decode("utf-8")
+    report = documents["report.md"].decode("utf-8")
+
+    reporter.check("a parsed NCU diagnostic flag is never dropped between parsing and "
+                   "publication",
+                   all("READ_AMPLIFICATION" in text for text in (memory, summary, report)),
+                   "")
+    for metric, table in (("within_campaign_sample_count", memory),
+                          ("within_campaign_cv_percent", memory),
+                          ("within_campaign_stability_review", memory),
+                          ("hbm_classification", memory),
+                          ("diagnostic_flags", memory),
+                          ("ncu_coverage", memory),
+                          ("within_campaign_sample_count", umma),
+                          ("within_campaign_cv_percent", umma),
+                          ("within_campaign_stability_review", umma),
+                          ("surprising_value_flag", umma)):
+        reporter.check(f"{metric} survives into the curated CSV representation",
+                       f",{metric}," in table, metric)
+        reporter.check(f"{metric} survives into the machine-readable JSON",
+                       f'"{metric}"' in summary, metric)
+    # The values themselves must survive, in the right campaign position: a row
+    # that keeps the metric name but replaces every value with not_applicable
+    # has still lost the diagnostic.
+    for table, name, metric, expected in (
+            (memory, "memory_paths.csv", "diagnostic_flags",
+             (analyzer.NOT_APPLICABLE, "READ_AMPLIFICATION", analyzer.NOT_APPLICABLE)),
+            (memory, "memory_paths.csv", "within_campaign_stability_review",
+             ("ok", "REVIEW", "ok")),
+            (memory, "memory_paths.csv", "within_campaign_cv_percent",
+             ("0.1", "9.5", "0.1")),
+            (umma, "umma_throughput.csv", "within_campaign_stability_review",
+             ("ok", "REVIEW", "ok")),
+            (umma, "umma_throughput.csv", "surprising_value_flag",
+             ("False", "True", "False"))):
+        rows = [row for row in csv.DictReader(io.StringIO(table))
+                if row["metric"] == metric]
+        reporter.check(f"{name}: every {metric} value survives in the frozen campaign "
+                       f"order",
+                       rows and all((row["campaign_1_value"], row["campaign_2_value"],
+                                     row["campaign_3_value"]) == expected
+                                    for row in rows),
+                       str(rows[:1]))
+        reporter.check(f"{name}: {metric} never carries a cross-campaign statistic",
+                       all(row["cross_campaign_cv_percent"] == analyzer.NOT_APPLICABLE
+                           and row["mean"] == analyzer.NOT_APPLICABLE for row in rows), "")
+    reporter.check("the twelve unprofiled configurations are marked not_profiled and their "
+                   "HBM traffic is declared unavailable",
+                   analyzer.NCU_NOT_PROFILED in memory
+                   and "unavailable from the collected evidence" in summary, "")
+    reporter.check("within-campaign and cross-campaign variability carry different names",
+                   "within_campaign_cv_percent" in summary
+                   and "cross_campaign_cv_percent" in summary
+                   and "within_campaign_stability_review" in summary
+                   and "cross_campaign_cv_review_flag" in summary, "")
+    reporter.check("a cross-campaign review flag never excludes a campaign or changes a "
+                   "value",
+                   "never excludes a campaign" in summary, "")
+    reporter.check("the report summarizes the source diagnostic warnings and the review "
+                   "conditions",
+                   "Source diagnostic warnings" in report
+                   and "Cross-campaign variability review conditions" in report, "")
+
+
+def _check_metadata_ownership(reporter: Reporter, analyzer, orchestrator,
+                              documents: list, repo_root: Path) -> None:
+    """3.3 -- the manifest is the authoritative envelope, and the documentation
+    says exactly that instead of claiming every file embeds everything."""
+    payloads = dict(documents)
+    manifest = json.loads(payloads[analyzer.MANIFEST_RELATIVE_PATH].decode("utf-8"))
+    siblings = [relative for relative in analyzer.ARTIFACT_RELATIVE_PATHS
+                if relative != analyzer.MANIFEST_RELATIVE_PATH]
+    reporter.check("exactly nine artifacts are generated",
+                   len(documents) == 9, str(len(documents)))
+    reporter.check("the manifest binds all eight siblings by path and SHA-256",
+                   sorted(manifest["artifact_sha256"]) == sorted(siblings), "")
+    reporter.check("every recomputed sibling hash matches the manifest",
+                   all(manifest["artifact_sha256"][relative]
+                       == orchestrator.sha256_bytes(payloads[relative])
+                       for relative in siblings), "")
+    reporter.check("the manifest states precisely that it cannot contain its own byte hash",
+                   manifest["self_hash"]["value"] == analyzer.NOT_APPLICABLE
+                   and "cannot contain its own byte hash"
+                   in manifest["self_hash"]["reason"], "")
+    reporter.check("the manifest maps every campaign value column to its campaign ID",
+                   manifest["campaign_value_column_map"]
+                   == {f"campaign_{index + 1}_value": campaign_id
+                       for index, campaign_id
+                       in enumerate(analyzer.FINAL_CAMPAIGN_IDS)}, "")
+    reporter.check("the manifest records the analysis-code commit and its clean-worktree "
+                   "verification, distinct from the final execution commit",
+                   manifest["analysis_code_commit"] != manifest["final_execution_commit"]
+                   and manifest["analysis_code_worktree_clean"] is True, "")
+    reporter.check("the manifest records the candidate publication state",
+                   manifest["publishable"] is False
+                   and manifest["publication_state"] == analyzer.PUBLICATION_STATE, "")
+    for relative in siblings:
+        if relative.endswith((".csv", ".svg")):
+            text = payloads[relative].decode("utf-8")
+            reporter.check(f"{relative} is a data or visual artifact, not a duplicated "
+                           f"provenance envelope",
+                           all(campaign_id not in text
+                               for campaign_id in analyzer.FINAL_CAMPAIGN_IDS), relative)
+    results_readme = read_text(repo_root, "results/README.md")
+    reporter.check("results/README.md no longer claims that every file embeds the "
+                   "campaigns, commit, provenance, and publishable flag",
+                   "Every file carries schema version" not in results_readme, "")
+    for document in ("results/README.md", P43_PROTOCOL_RELATIVE_PATH):
+        text = read_text(repo_root, document)
+        reporter.check(f"{document} states that a detached CSV or SVG is not a standalone "
+                       f"provenance envelope",
+                       "not a standalone provenance envelope" in text
+                       or "not standalone provenance envelopes" in text, "")
+        reporter.check(f"{document} names analysis_manifest.json the authoritative binding",
+                       "authoritative" in text and "analysis_manifest.json" in text, "")
+
+
+def _check_output_containment(reporter: Reporter, analyzer, orchestrator) -> None:
+    """3.4 -- production output is limited to the one logical destination and is
+    reached only through descriptor-anchored, symlink-rejecting traversal."""
+    source = inspect.getsource(analyzer.open_output_tree)
+    component = inspect.getsource(analyzer._open_output_component)
+    # Scan executable code only: the docstrings name these flags in order to
+    # explain them, and a docstring is not a guarantee.
+    executable_tree = _strip(source)
+    executable_component = _strip(component)
+    for token in ("O_DIRECTORY", "O_NOFOLLOW"):
+        reporter.check(f"the repository root is opened with {token}",
+                       token in executable_tree, token)
+    for token in ("O_DIRECTORY", "O_NOFOLLOW", "dir_fd"):
+        reporter.check(f"every output path component is opened with {token}",
+                       token in executable_component, token)
+    reporter.check("a missing output directory is created relative to the validated "
+                   "parent descriptor",
+                   re.search(r"os\.mkdir\([^)]*dir_fd=parent_fd", component) is not None,
+                   "")
+    reporter.check("the output root components are frozen to results/phase4",
+                   analyzer.OUTPUT_ROOT_COMPONENTS == ("results", "phase4"),
+                   str(analyzer.OUTPUT_ROOT_COMPONENTS))
+    executable = _strip(source) + _strip(inspect.getsource(analyzer._open_output_component))
+    reporter.check("the safety decision is not a resolve(), abspath(), or string prefix",
+                   not re.search(r"\bresolve\b|\babspath\b|\bstartswith\b|"
+                                 r"\brelative_to\b", executable), executable[:200])
+    reporter.check("the exact-tree verification never follows a symlink",
+                   "follow_symlinks=False"
+                   in inspect.getsource(analyzer.assert_output_tree_exact), "")
+    reporter.check("publication creates artifacts exclusively and never replaces one",
+                   "write_file_exclusive" in inspect.getsource(analyzer.publish_documents)
+                   and "os.replace" not in inspect.getsource(analyzer.publish_documents),
+                   "")
+    with tempfile.TemporaryDirectory(prefix="p43-check-containment-") as temporary:
+        root = Path(temporary)
+        outside = root / "outside"
+        outside.mkdir()
+        documents = analyzer.build_documents(orchestrator, analyzer._StubP35(),
+                                             analyzer._fixture_records(),
+                                             analyzer._fixture_provenance())
+
+        def escapes(name: str, build) -> None:
+            repo = root / name
+            repo.mkdir()
+            build(repo)
+            try:
+                analyzer.resolve_output_root(repo / analyzer.DEFAULT_OUTPUT_ROOT_REL, repo)
+                tree = analyzer.open_output_tree(repo, create=True)
+                try:
+                    analyzer.publish_documents(orchestrator, tree, documents, write=True)
+                finally:
+                    analyzer.close_output_tree(tree)
+            except analyzer.P43Error:
+                reporter.check(f"the {name} escape is refused", True)
+                return
+            reporter.check(f"the {name} escape is refused", False, "it was accepted")
+
+        def link_results(repo: Path) -> None:
+            os.symlink(outside, repo / "results")
+
+        def link_phase4(repo: Path) -> None:
+            (repo / "results").mkdir()
+            os.symlink(outside, repo / "results" / "phase4")
+
+        def link_figures(repo: Path) -> None:
+            (repo / "results" / "phase4").mkdir(parents=True)
+            os.symlink(outside, repo / "results" / "phase4" / "figures")
+
+        escapes("ancestor-results-symlink", link_results)
+        escapes("phase4-symlink", link_phase4)
+        escapes("figures-symlink", link_figures)
+        reporter.check("no P4.3 artifact was written outside the fixture repositories",
+                       not os.listdir(outside), str(os.listdir(outside)))
+        arbitrary = root / "arbitrary"
+        arbitrary.mkdir()
+        for candidate in ("results/elsewhere", "analysis", "results/raw/phase4",
+                          "results/preflight"):
+            try:
+                analyzer.resolve_output_root(arbitrary / candidate, arbitrary)
+            except analyzer.P43Error:
+                reporter.check(f"an output root at {candidate} is refused", True)
+            else:
+                reporter.check(f"an output root at {candidate} is refused", False,
+                               "accepted")
+
+
+def _check_candidate_and_acceptance(reporter: Reporter, analyzer, orchestrator,
+                                    documents: list, repo_root: Path,
+                                    protocol: str) -> None:
+    """3.5 -- an immutable candidate plus an external acceptance attestation
+    that does not exist yet and must not."""
+    payloads = dict(documents)
+    reporter.check("candidate artifacts record publishable=false and the candidate "
+                   "publication state",
+                   analyzer.PUBLISHABLE is False
+                   and analyzer.PUBLICATION_STATE
+                   == "candidate_pending_independent_output_review", "")
+    reporter.check("the candidate publication state appears in the bundle",
+                   analyzer.PUBLICATION_STATE
+                   in payloads["integrated_summary.json"].decode("utf-8")
+                   and analyzer.PUBLICATION_STATE
+                   in payloads[analyzer.MANIFEST_RELATIVE_PATH].decode("utf-8"), "")
+    publication = inspect.getsource(analyzer.publish_documents)
+    reporter.check("the analyzer has no promotion, overwrite, or delete route for a "
+                   "candidate",
+                   analyzer.PUBLISHABLE is False
+                   and "refusing to overwrite" in publication
+                   and not re.search(r"\bos\.(replace|rename|remove|unlink|truncate)\b|"
+                                     r"\bshutil\.", _strip(publication)), "")
+    acceptance = repo_root / analyzer.ACCEPTANCE_RELATIVE_PATH
+    reporter.check("no acceptance attestation exists: P4.3 is not accepted",
+                   not acceptance.exists() and not acceptance.is_symlink(),
+                   str(acceptance))
+    reporter.check("the acceptance attestation is not part of the nine-artifact inventory",
+                   analyzer.ACCEPTANCE_RELATIVE_PATH
+                   not in analyzer.ARTIFACT_RELATIVE_PATHS, "")
+    reporter.check("the analyzer never writes the acceptance attestation",
+                   not re.search(
+                       r"P4_3_ACCEPTANCE\.json[^\n]*(write|create|open)",
+                       inspect.getsource(analyzer)), "")
+    for token in (analyzer.ACCEPTANCE_SCHEMA_VERSION, analyzer.ACCEPTANCE_RELATIVE_PATH,
+                  analyzer.ACCEPTANCE_STATUS_ACCEPTED,
+                  "analysis_manifest_sha256", "accepted_for_publication"):
+        reporter.check(f"{P43_PROTOCOL_RELATIVE_PATH} freezes the acceptance field {token!r}",
+                       token in protocol, "")
+    for step in analyzer.ACCEPTANCE_LIFECYCLE:
+        reporter.check(f"{P43_PROTOCOL_RELATIVE_PATH} documents the lifecycle step {step!r}",
+                       step in protocol, "")
+
+    manifest_sha256 = orchestrator.sha256_bytes(
+        payloads[analyzer.MANIFEST_RELATIVE_PATH])
+    artifact_sha256 = {relative: orchestrator.sha256_bytes(payload)
+                       for relative, payload in documents
+                       if relative != analyzer.MANIFEST_RELATIVE_PATH}
+    commit = json.loads(payloads[analyzer.MANIFEST_RELATIVE_PATH].decode(
+        "utf-8"))["analysis_code_commit"]
+    template = analyzer.build_acceptance_template(manifest_sha256, artifact_sha256, commit)
+    reporter.check("a well-formed future acceptance attestation validates",
+                   not analyzer.validate_acceptance_document(
+                       template, manifest_sha256=manifest_sha256,
+                       artifact_sha256=artifact_sha256, analysis_code_commit=commit), "")
+    for label, mutate in (
+            ("one wrong artifact hash",
+             lambda doc: doc["artifact_sha256"].__setitem__("report.md", "0" * 64)),
+            ("a wrong manifest hash",
+             lambda doc: doc.__setitem__("analysis_manifest_sha256", "0" * 64)),
+            ("a different analyzer commit",
+             lambda doc: doc.__setitem__("analysis_code_commit", "f" * 40)),
+            ("a missing field", lambda doc: doc.pop("artifact_sha256")),
+            ("a substituted population",
+             lambda doc: doc.__setitem__("final_campaign_ids", [])),
+            ("a malformed status", lambda doc: doc.__setitem__("status", "MAYBE"))):
+        document = json.loads(json.dumps(template))
+        mutate(document)
+        reporter.check(f"an acceptance attestation with {label} is rejected",
+                       bool(analyzer.validate_acceptance_document(
+                           document, manifest_sha256=manifest_sha256,
+                           artifact_sha256=artifact_sha256,
+                           analysis_code_commit=commit)), "")
+
+
+def _check_analysis_code_commit(reporter: Reporter, analyzer) -> None:
+    """3.6 -- the analysis-code commit is resolved and verified at runtime,
+    never hard-coded and never bypassed."""
+    reporter.check("the analysis-code commit is not hard-coded anywhere",
+                   not re.search(r"analysis_code_commit\s*=\s*[\"'][0-9a-f]{40}[\"']",
+                                 inspect.getsource(analyzer)), "")
+    reporter.check("the frozen final execution commit is never reused as the analysis-code "
+                   "commit",
+                   "FINAL_EXECUTION_COMMIT"
+                   in _strip(inspect.getsource(analyzer.validate_analysis_provenance)), "")
+    source = inspect.getsource(analyzer.resolve_git_provenance)
+    for expectation in ("head", "cache-tree", "worktree"):
+        reporter.check(f"the provenance reader verifies the {expectation}",
+                       expectation in source.lower(), expectation)
+    reporter.check("provenance resolution runs no child process and needs no network",
+                   not re.search(r"\bsubprocess\b|\bos\.system\b|\bsocket\b|\burllib\b",
+                                 _strip(inspect.getsource(analyzer))), "")
+    reporter.check("every Git provenance helper is read-only",
+                   not [name for name in analyzer.GIT_PROVENANCE_FUNCTION_NAMES
+                        if any(re.search(pattern,
+                                         inspect.getsource(getattr(analyzer, name)))
+                               for pattern in FORBIDDEN_EVIDENCE_MODE_CALLS)],
+                   str([name for name in analyzer.GIT_PROVENANCE_FUNCTION_NAMES
+                        if any(re.search(pattern,
+                                         inspect.getsource(getattr(analyzer, name)))
+                               for pattern in FORBIDDEN_EVIDENCE_MODE_CALLS)]))
+
+    def rejects(label: str, provenance) -> None:
+        try:
+            analyzer.validate_analysis_provenance(provenance)
+        except analyzer.P43Error:
+            reporter.check(label, True)
+        else:
+            reporter.check(label, False, "accepted")
+
+    rejects("a missing analysis-code commit is rejected", {})
+    rejects("an abbreviated analysis-code commit is rejected",
+            analyzer._fixture_provenance(analysis_code_commit="1234567"))
+    rejects("an uppercase analysis-code commit is rejected",
+            analyzer._fixture_provenance(analysis_code_commit="A" * 40))
+    rejects("a dirty analysis-code worktree is rejected",
+            analyzer._fixture_provenance(worktree_clean=False))
+    rejects("an analysis-code commit equal to the execution commit is rejected",
+            analyzer._fixture_provenance(
+                analysis_code_commit=analyzer.FINAL_EXECUTION_COMMIT))
+    reporter.check("production analysis takes the provenance resolver by injection and "
+                   "defaults to the real verifier",
+                   "git_provenance=resolve_git_provenance"
+                   in inspect.getsource(analyzer.run_analysis), "")
+    reporter.check("there is no production flag that skips provenance verification",
+                   not any("provenance" in option.lower() or "commit" in option.lower()
+                           for action in analyzer.build_parser()._actions
+                           for option in action.option_strings), "")
 
 
 def _check_make_targets(reporter: Reporter, repo_root: Path, makefile: str, p41) -> None:
@@ -715,6 +1197,37 @@ def check_repository(repo_root: Path) -> int:
     _check_statistical_policy(reporter, analyzer)
     _check_artifact_contract(reporter, analyzer,
                              documents[P43_PROTOCOL_RELATIVE_PATH])
+    try:
+        _check_evidence_taxonomy(reporter, analyzer,
+                                 documents[P43_PROTOCOL_RELATIVE_PATH])
+    except (analyzer.P43Error, KeyError, TypeError, AttributeError, ValueError) as exc:
+        reporter.check("the scientific evidence taxonomy contract holds", False,
+                       f"{type(exc).__name__}: {exc}")
+    try:
+        _check_preserved_diagnostics(reporter, analyzer, orchestrator)
+        bundle = analyzer.build_documents(orchestrator, analyzer._StubP35(),
+                                          analyzer._fixture_records(),
+                                          analyzer._fixture_provenance())
+    except (analyzer.P43Error, KeyError, TypeError, AttributeError, ValueError) as exc:
+        reporter.check("the analyzer produces its own candidate bundle end to end",
+                       False, f"{type(exc).__name__}: {exc}")
+        bundle = None
+    if bundle is not None:
+        try:
+            _check_metadata_ownership(reporter, analyzer, orchestrator, bundle, repo_root)
+            _check_output_containment(reporter, analyzer, orchestrator)
+            _check_candidate_and_acceptance(reporter, analyzer, orchestrator, bundle,
+                                            repo_root,
+                                            documents[P43_PROTOCOL_RELATIVE_PATH])
+        except (analyzer.P43Error, KeyError, TypeError, AttributeError,
+                ValueError, OSError) as exc:
+            reporter.check("the bundle, containment, and acceptance contracts hold",
+                           False, f"{type(exc).__name__}: {exc}")
+    try:
+        _check_analysis_code_commit(reporter, analyzer)
+    except (analyzer.P43Error, KeyError, TypeError, AttributeError, ValueError) as exc:
+        reporter.check("the analysis-code provenance contract holds", False,
+                       f"{type(exc).__name__}: {exc}")
     _check_cli_surfaces(reporter, analyzer)
     _check_make_targets(reporter, repo_root, makefile, p41)
     _check_make_frozen_ids(reporter, makefile, analyzer)
@@ -829,7 +1342,8 @@ def run_self_test() -> int:
                "a protocol that promotes an artifact to publishable is rejected",
                every=True)
         mutate(P43_PROTOCOL_RELATIVE_PATH, "figures/memory_paths.svg", "figures/other.svg",
-               "a protocol whose artifact inventory disagrees with the analyzer is rejected")
+               "a protocol whose artifact inventory disagrees with the analyzer is rejected",
+               every=True)
         mutate("Makefile", "PHASE4_P43_FINAL_CAMPAIGN_1 := 20260817T110330Z",
                "PHASE4_P43_FINAL_CAMPAIGN_1 := 20260818T000000Z",
                "a Makefile that analyses a campaign outside the frozen population is "
@@ -870,6 +1384,116 @@ def run_self_test() -> int:
                 reporter.check(label, check_repository(clone) == 1, "")
             finally:
                 rewrite(analyzer_path, original)
+        # The seven audit findings, as mutations of the remediated analyzer.
+        # Every one of them describes the pre-remediation implementation, so
+        # each of these checks would have failed on that implementation.
+        for old, new, label in (
+            ('"median_effective_gbps": (\n        EVIDENCE_WITHIN_CAMPAIGN,',
+             '"median_effective_gbps": (\n        EVIDENCE_MEASURED,',
+             "an analyzer that classifies the timing-derived effective transfer rate as a "
+             "direct measurement is rejected"),
+            ('"median_flops_per_cycle": (\n        EVIDENCE_WITHIN_CAMPAIGN,',
+             '"median_flops_per_cycle": (\n        EVIDENCE_MEASURED,',
+             "an analyzer that presents FLOP/cycle as directly measured is rejected"),
+            ('"dram_read_ratio": (\n        EVIDENCE_WITHIN_CAMPAIGN,',
+             '"dram_read_ratio": (\n        EVIDENCE_MEASURED,',
+             "an analyzer that presents the profiler-derived DRAM ratio as a raw "
+             "measurement is rejected"),
+            ('"estimated_tflops_per_sm": (\n        EVIDENCE_MODELED,',
+             '"estimated_tflops_per_sm": (\n        EVIDENCE_MEASURED,',
+             "an analyzer that presents the modeled clock conversion as measured is "
+             "rejected"),
+            ('("diagnostic_flags", [flag or NOT_APPLICABLE\n'
+             '                                                    for flag in flags])',
+             '("diagnostic_flags", [NOT_APPLICABLE for flag in flags])',
+             "an analyzer that parses NCU diagnostic flags and then drops them is "
+             "rejected"),
+            ('("within_campaign_stability_review",\n'
+             '                 [source["within_campaign_stability_review"] '
+             'for source in sources])):',
+             '("within_campaign_stability_review",\n'
+             '                 [NOT_APPLICABLE for source in sources])):',
+             "an analyzer that discards P2.4's within-campaign stability review is "
+             "rejected"),
+            ('"cross_campaign_cv_percent": cv_percent,',
+             '"cv_percent": cv_percent,',
+             "an analyzer that stops distinguishing cross-campaign from within-campaign "
+             "variability is rejected"),
+            ('"artifact_sha256": sibling_hashes,', '"artifact_sha256": {},',
+             "an analyzer whose manifest does not bind its eight siblings is rejected"),
+            ('"analysis_code_commit": provenance["analysis_code_commit"],',
+             '"analysis_code_commit": records[0]["git_commit"],',
+             "an analyzer that records the execution commit as the analysis-code commit "
+             "is rejected"),
+            ('    if provenance["worktree_clean"] is not True:',
+             '    if provenance["worktree_clean"] is None:',
+             "an analyzer that accepts a dirty analysis-code worktree is rejected"),
+            ('OUTPUT_ROOT_COMPONENTS = ("results", "phase4")',
+             'OUTPUT_ROOT_COMPONENTS = ("results",)',
+             "an analyzer whose production output root drifts from results/phase4 is "
+             "rejected"),
+            ('    if parts != OUTPUT_ROOT_COMPONENTS:',
+             '    if parts[:0] != OUTPUT_ROOT_COMPONENTS[:0]:',
+             "an analyzer that accepts an arbitrary in-repository output directory is "
+             "rejected"),
+            ('    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW\n'
+             '    if hasattr(os, "O_CLOEXEC"):\n'
+             '        flags |= os.O_CLOEXEC\n'
+             '    try:\n'
+             '        root_fd = os.open(str(repo_root), flags)',
+             '    flags = os.O_RDONLY | os.O_DIRECTORY\n'
+             '    if hasattr(os, "O_CLOEXEC"):\n'
+             '        flags |= os.O_CLOEXEC\n'
+             '    try:\n'
+             '        root_fd = os.open(str(repo_root), flags)',
+             "an analyzer that opens the output tree without O_NOFOLLOW is rejected"),
+            ('f"the vertical line is the min-max whisker over exactly {CAMPAIGN_COUNT} "',
+             'f"the bar is min..max over exactly {CAMPAIGN_COUNT} "',
+             "an analyzer that calls the min-max whisker a bar is rejected"),
+            ('ACCEPTANCE_SCHEMA_VERSION = "p43.acceptance.v1"',
+             'ACCEPTANCE_SCHEMA_VERSION = "p43.acceptance.v2"',
+             "an analyzer whose acceptance schema drifts from the frozen version is "
+             "rejected"),
+            ('PUBLICATION_STATE = "candidate_pending_independent_output_review"',
+             'PUBLICATION_STATE = "accepted"',
+             "an analyzer that promotes its candidate publication state is rejected"),
+        ):
+            if old not in original:
+                reporter.check(label, False, f"{old!r} not found in the analyzer")
+                continue
+            rewrite(analyzer_path, original.replace(old, new, 1))
+            try:
+                reporter.check(label, check_repository(clone) == 1, "")
+            finally:
+                rewrite(analyzer_path, original)
+
+        # Documentation regressions.
+        mutate("results/README.md",
+               "All nine artifacts record schema version",
+               "Every file carries schema version",
+               "a results/README.md that claims each individual file embeds all metadata "
+               "is rejected")
+        mutate("results/README.md", "not a standalone provenance envelope",
+               "a complete standalone provenance envelope",
+               "a results/README.md that calls a detached CSV a provenance envelope is "
+               "rejected", every=True)
+        mutate(P43_PROTOCOL_RELATIVE_PATH, "p43.acceptance.v1", "p43.acceptance.v9",
+               "a protocol whose frozen acceptance schema disagrees with the analyzer is "
+               "rejected", every=True)
+        mutate(P43_PROTOCOL_RELATIVE_PATH, "Independent audit: NOT PERFORMED",
+               "Independent audit: YES",
+               "a protocol that claims the P4.3 audit happened is rejected", every=True)
+
+        # The real acceptance attestation must not exist while P4.3 is not accepted.
+        acceptance = clone / P43_ACCEPTANCE_RELATIVE_PATH
+        acceptance.write_text("{}\n", encoding="utf-8")
+        try:
+            reporter.check("a repository that already carries the acceptance attestation "
+                           "is rejected while P4.3 is not accepted",
+                           check_repository(clone) == 1, "")
+        finally:
+            acceptance.unlink()
+
         reporter.check("the restored clone passes again", check_repository(clone) == 0, "")
 
     reporter.check("the frozen status frontier records P4.3 as implemented only",

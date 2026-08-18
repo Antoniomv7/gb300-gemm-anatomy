@@ -48,11 +48,17 @@ population through P4.2's own checker, reads the canonical terminal P1.4, P2.4,
 and P3.5 artifacts each final campaign's manifest pins, and aggregates across
 the three finals with **one complete final campaign as the independent
 replicate**. The accepted pilot `20260812T013848Z` is recorded only as excluded
-qualification provenance and never enters a statistic. **The P4.3 independent
-audit has not been performed**, no production analysis of the three final
-campaigns has been run, and **no P4.3 curated result has been accepted for
-publication**. The directory `results/phase4/` described below is therefore the
-declared destination of that future analysis, not an existing result.
+qualification provenance and never enters a statistic. The implementation has
+since received a remediation after a first independent audit — a corrected
+scientific evidence taxonomy, preserved NCU and within-campaign stability
+diagnostics, a truthful central metadata contract, descriptor-anchored output
+containment, an immutable candidate-to-acceptance workflow, a verified
+analysis-code commit, and corrected figure terminology — and **that remediation
+is itself awaiting a new independent audit**. **The P4.3 independent audit has
+not been performed**, no production analysis of the three final campaigns has
+been run, and **no P4.3 curated result has been accepted for publication**. The
+directory `results/phase4/` described below is therefore the declared
+destination of that future analysis, not an existing result.
 
 ## Trust model
 
@@ -469,18 +475,50 @@ results/phase4/
     └── gemm_comparison.svg
 ```
 
-Every file carries schema version `p43.v1`, deterministic row order, key order,
-decimal formatting, and bytes; the three final campaign IDs in the order the
-`campaign_1_value` / `campaign_2_value` / `campaign_3_value` columns follow; the
-pilot ID only as excluded qualification provenance; the final execution commit,
-the common GPU identity, and the comparable provenance; exact
-repository-relative source paths and SHA-256 hashes for everything read; and
-`publishable=false`. `analysis_manifest.json` pins an exact SHA-256 for every
-other artifact — it is the one file it cannot hash from inside itself, and
-`make phase4-p43-verify` recomputes and compares every byte of it too.
-Publication is no-clobber: an existing byte-identical artifact is verified
-rather than rewritten, an existing different artifact is fatal, and a symlink,
-an unexpected file type, or any artifact outside this inventory fails closed.
+All nine artifacts record schema version `p43.v1` and are byte-deterministic:
+row order, JSON key order, decimal formatting, Markdown, and SVG bytes are
+reproducible, and two runs over identical evidence are byte-identical. Beyond
+that, **metadata ownership is central, not duplicated**:
+
+* `analysis_manifest.json` is the **authoritative binding** for the whole
+  bundle. It alone records the three ordered final campaign IDs and their
+  explicit mapping to the `campaign_1_value` / `campaign_2_value` /
+  `campaign_3_value` columns, the pilot ID as excluded qualification provenance,
+  the final execution commit, the P4.3 analysis-code commit and its
+  clean-worktree verification, the common GPU identity, the comparable
+  provenance, the exact repository-relative source paths and SHA-256 hashes of
+  everything read, the candidate publication state, and an exact SHA-256 for
+  each of the other eight artifacts.
+* It **cannot contain its own byte hash** — writing the value would change the
+  bytes it describes. It says so explicitly in a `self_hash` object.
+  `make phase4-p43-verify` recomputes every byte of it, and the later external
+  acceptance attestation records `analysis_manifest_sha256`, which covers all
+  nine artifacts without any self-reference.
+* The three CSV files carry their own schema, key and data fields, the
+  `evidence_class` of every row, and the three campaign-level values in the
+  frozen campaign order. The three SVG files are deterministic visual artifacts.
+  Neither duplicates the global provenance.
+* `integrated_summary.json` and `report.md` carry the scientific context needed
+  to interpret the bundle.
+* **A detached CSV or SVG is not a standalone provenance envelope.** These files
+  must be distributed together with `analysis_manifest.json`; on their own they
+  carry no campaign identity, no commit, and no publication state.
+
+Production output is limited to the single logical destination
+`<repo-root>/results/phase4`, reached by opening `results`, `phase4`, and
+`figures` component by component from an already opened repository descriptor
+with `O_DIRECTORY | O_NOFOLLOW`; a symlink at any level, including an ancestor,
+is rejected before a byte is written. Publication is no-clobber: an existing
+byte-identical artifact is verified rather than rewritten, an existing different
+artifact is fatal, and a symlink, an unexpected file type, or any artifact
+outside this inventory fails closed.
+
+Every artifact is a **candidate**, recording `publishable=false` and
+`publication_state=candidate_pending_independent_output_review`. Nothing
+promotes, overwrites, or deletes a candidate: acceptance is a separate external
+attestation at `src/phase4/P4_3_ACCEPTANCE.json`, written only after an
+independent review of the complete bundle. That file does not exist, and the
+P4.3 checker fails if it does.
 
 **This tree does not exist yet.** No production P4.3 analysis has been run, and
 no P4.3 curated result has been accepted for publication.

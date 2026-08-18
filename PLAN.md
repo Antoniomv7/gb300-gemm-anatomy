@@ -701,9 +701,10 @@ implemented, independently audited, and verified on GB300: accepted pilot
 `20260812T013848Z` plus final campaigns `20260817T110330Z`,
 `20260817T111310Z`, and `20260817T112011Z` passed terminal revalidation and the
 read-only cross-campaign validator. All evidence remains non-publishable. P4.3
-is implemented; **The P4.3 independent audit has not been performed** and
-**no production analysis of the three final campaigns has been run**, so Phase 4
-is not closed.
+is implemented and has been remediated after a first independent audit, and that
+remediation is itself awaiting a new independent audit; **The P4.3 independent
+audit has not been performed** and **no production analysis of the three final
+campaigns has been run**, so Phase 4 is not closed.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
@@ -956,14 +957,60 @@ P4.3 state, and the P4.2 checker still proves on its own source that **P4.2
 itself computes no statistic, threshold, ranking, or figure** even though the
 separate P4.3 analyzer now exists. No closed P1–P4.2 assertion was weakened.
 
-**The P4.3 independent audit has not been performed**, and **no production
-analysis of the three final campaigns has been run** in this repository: no
-curated P4.3 artifact exists, no P4.3 result has been accepted for publication,
-and no publishable result exists anywhere here. The implementation-time GPU-free
-checks in `src/phase4/P4_3_PROTOCOL.md` section 12 are the author's own
-self-checks; they are not an independent audit and a GPU-free check is never
-GB300 verification. Phase 4 and the complete TFM stay open until the independent
-audit of this analysis layer, a production run from that audited commit, fresh
-read-only validation of all three final campaigns, byte-for-byte deterministic
-recomputation, and an independent review of the resulting outputs have all
-passed.
+A first independent audit of that implementation found seven defects that its
+then-passing test suite did not detect, and all seven have since been
+remediated in the working tree (`src/phase4/P4_3_PROTOCOL.md` section 14):
+
+1. **the scientific evidence taxonomy** — `effective_gbps` is now stated as a
+   timing-derived effective transfer rate of a dedicated streaming
+   microbenchmark and explicitly not HBM/DRAM bandwidth; `dram_read_ratio` and
+   `hbm_classification` as derived from profiler evidence rather than raw
+   counters; `flops_per_cycle` and `flops_per_cycle_per_sm` as derived from
+   validated operation counts and measured cycles; `estimated_tflops_per_sm` as
+   a modeled clock conversion; and every ratio, speedup, scaling efficiency,
+   cuBLASLt-relative quantity, saturation and best-variant selection, and
+   cross-campaign statistic as derived. Seven frozen evidence classes are
+   carried consistently in the CSV rows, the JSON summary, the Markdown report,
+   and the SVG captions, and the twelve non-profiled memory configurations now
+   state explicitly that actual HBM traffic is unavailable;
+2. **preserved diagnostics** — the P1.4 NCU `diagnostic_flags` that were parsed
+   and then dropped, the P1.4 and P2.4 within-campaign sample counts, CVs, and
+   stability reviews, the P2.4 surprising-value flag, and an explicit NCU
+   coverage status are all preserved per campaign in the frozen campaign order,
+   under `within_campaign_*` names that can never be confused with the
+   `cross_campaign_*` statistics;
+3. **a truthful metadata contract** — `analysis_manifest.json` is the
+   authoritative provenance envelope binding all eight siblings by path and
+   SHA-256, states precisely why it cannot contain its own hash, and the
+   documentation no longer claims that each individual file embeds every piece
+   of metadata;
+4. **output containment** — production output is limited to the single logical
+   destination `<repo-root>/results/phase4`, reached by descriptor-anchored
+   `O_DIRECTORY | O_NOFOLLOW` traversal that rejects a symlink at any level,
+   closing the reproduced escape in which `results` pointed outside the
+   repository;
+5. **an immutable candidate-to-acceptance workflow** — candidates record
+   `publication_state=candidate_pending_independent_output_review`, are never
+   promoted, overwritten, or deleted, and acceptance is a separate external
+   attestation whose `p43.acceptance.v1` schema and validation rules are frozen
+   now;
+6. **the analysis-code commit** — resolved and verified at production runtime,
+   distinct from the final execution commit, with no production bypass; and
+7. **figure terminology** — the min-max range is a whisker, not a bar.
+
+**That remediation has not been independently audited.** It is prepared for a
+separate audit and nothing else: nothing was committed, pushed, merged, or
+proposed as a pull request.
+
+**The P4.3 independent audit has not been performed**, and
+**no production analysis of the three final campaigns has been run** in this
+repository: `results/phase4/` does not exist, `src/phase4/P4_3_ACCEPTANCE.json` does not
+exist, no curated P4.3 artifact exists, no P4.3 result has been accepted for
+publication, and no publishable result exists anywhere here. The
+implementation-time GPU-free checks in `src/phase4/P4_3_PROTOCOL.md` section 12
+are the author's own self-checks; they are not an independent audit and a
+GPU-free check is never GB300 verification. Phase 4 and the complete TFM stay
+open until the independent audit of this analysis layer, a production run from
+that audited commit, fresh read-only validation of all three final campaigns,
+byte-for-byte deterministic recomputation, an independent review of the
+resulting outputs, and the external acceptance attestation have all passed.
