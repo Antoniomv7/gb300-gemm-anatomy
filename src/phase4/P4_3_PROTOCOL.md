@@ -6,15 +6,20 @@ Status: `P4.3 = YES / NO / NO` (Implemented / Audited / Verified on GB300).
   accepted GB300 evidence. It executes no GPU command and starts no Docker
   container, `nvidia-smi`, CUDA compilation, Nsight Compute run, preflight, or
   campaign, and it starts no child process at all.
-* **The implementation has received remediation after a first independent
-  audit.** That audit found seven defects: an incorrect scientific evidence
+* **The implementation has received remediation after two independent
+  audits.** The first audit found seven defects: an incorrect scientific evidence
   taxonomy, parsed-then-dropped NCU diagnostics and within-campaign stability
   evidence, an untruthful metadata contract, an ancestor-symlink escape from the
   output tree, no immutable candidate-to-acceptance workflow, a missing
   analysis-code commit, and incorrect figure terminology. All seven are
-  remediated here; section 14 records them.
-* **The remediation itself is awaiting a new independent audit.**
-* **Independent audit: NOT PERFORMED.**
+  remediated here; section 14 records them. A second audit found seven further
+  release blockers in that remediation: time-dependent lifecycle metadata,
+  incomplete Python/import provenance, an incomplete trusted acceptance map,
+  documentation/metadata contradictions, clipped or overlapping SVG content,
+  omitted terminal diagnostics, and an unsafe partial-output contract. Section
+  15 records the corrections.
+* **The present remediation is awaiting a new independent audit.**
+* **Independent audit: NOT PERFORMED for the present remediation.**
 * **Production analysis: NOT RUN.** No P4.3 run against the three real final
   campaigns has been performed in this repository, and `results/phase4/` does
   not exist.
@@ -367,18 +372,24 @@ conclusion.**
 
 ### 5.4 Preserved diagnostics and the two kinds of variability
 
-Every terminal trust signal the closed units recorded is preserved in the
-curated outputs, per campaign, **in the frozen campaign order**, as its own
-long-format row and as a machine-readable JSON object:
+Every terminal diagnostic that P4.3 relies on to interpret a reported quantity
+is preserved in the curated outputs, per campaign, **in the frozen campaign
+order**, as its own long-format row and as a machine-readable JSON object:
 
 ```text
 P1.4  within_campaign_sample_count, within_campaign_cv_percent,
-      within_campaign_stability_review              per configuration (18)
+      within_campaign_stability_review,
+      within_campaign_iqr_flagged_count             per configuration (18)
 P1.4  hbm_classification, diagnostic_flags          per profiled case (6)
 P1.4  ncu_coverage (ncu_profiled | not_profiled)    per configuration (18)
 P2.4  within_campaign_sample_count,
       within_campaign_cv_percent (flops_per_cycle),
-      within_campaign_stability_review              per configuration (24)
+      within_campaign_stability_review,
+      within_campaign_flops_per_cycle_per_sm_cv_percent,
+      within_campaign_flops_per_cycle_iqr_flagged_count,
+      within_campaign_flops_per_cycle_per_sm_iqr_flagged_count,
+      profile_sm_clock_status,
+      profile_diagnostic_metrics_resolved_count     per configuration (24)
 P2.4  surprising_value_flag                         per scaling pair (12)
 ```
 
@@ -537,23 +548,34 @@ carry no campaign identity, no commit, and no publication state.
 * no overwrite of an existing different artifact — publication is
   `O_CREAT | O_EXCL | O_NOFOLLOW` and never `os.replace()`;
 * an existing byte-identical output is verified rather than rewritten;
-* symlinks and unexpected file types fail closed, and the output tree must
-  contain exactly this inventory — a partial, conflicting, or unexpected
-  artifact is fatal;
+* symlinks and unexpected file types fail closed, and the completed output tree
+  must contain exactly this inventory;
+* a partial retry is safe only after a first, write-free pass has verified
+  every existing artifact byte for byte and rejected every unexpected path;
+  only then may a second pass create missing artifacts exclusively. A
+  conflicting or unsafe partial tree fails before any missing artifact is
+  written, while verification always rejects an incomplete tree;
 * output verification recomputes the complete analysis and compares byte for
   byte.
 
 ### 7.3 The immutable candidate-to-acceptance workflow
 
 Publication is **never** solved by overwriting, deleting, or regenerating a
-candidate artifact. The analyzer writes nine **immutable candidate** artifacts,
-each recording:
+candidate artifact. The analyzer writes nine **immutable candidate** artifacts.
+`analysis_manifest.json` records authoritatively, and the JSON summary and
+Markdown report repeat for readers:
 
 ```text
 publishable=false
-publication_state=candidate_pending_independent_output_review
+publication_state=immutable_candidate_requires_external_attestation
 analysis_code_commit=<full audited commit>
 ```
+
+The CSV and SVG siblings deliberately carry no mutable publication progress or
+commit claim; the manifest binds them by path and hash. The candidate state is
+an invariant property of the bytes, not a clock-dependent statement about
+whether verification, review, or attestation is currently pending or complete.
+Those facts live outside the immutable bundle.
 
 The lifecycle, in this exact order, is:
 
@@ -566,7 +588,8 @@ audited clean analysis-code commit
 -> final documentation/status commit
 ```
 
-which the analyzer records verbatim as:
+The analyzer records the required order verbatim as a lifecycle contract, not
+as a progress log:
 
 ```text
 an independently audited, clean analysis-code commit
@@ -577,8 +600,9 @@ an external acceptance attestation at src/phase4/P4_3_ACCEPTANCE.json
 a final documentation and status commit
 ```
 
-**None of the steps after candidate production has been performed, and the
-candidate itself has not been produced either.** No P4.3 result is accepted.
+The repository's current status is recorded separately in sections 11 and 12:
+the production candidate has not been produced and no P4.3 result is accepted.
+Future candidate bytes will not need to change as those external steps occur.
 
 Only after the independent output review may a **separate** file be created:
 
@@ -618,7 +642,8 @@ Frozen validation rules, implemented by
 `validate_acceptance_document()` in `scripts/analyze_phase4_p43.py` and
 exercised against temporary fixtures by both self-tests:
 
-* every field above is mandatory; a missing field is fatal;
+* the object must contain exactly the eleven top-level fields above; a missing
+  or additional field is fatal;
 * `schema_version` must be exactly `p43.acceptance.v1`, `unit` exactly `P4.3`,
   `status` exactly `ACCEPTED`, and `accepted_for_publication` exactly `true`;
 * `analysis_code_commit` must equal the commit recorded in the bundle's own
@@ -627,8 +652,14 @@ exercised against temporary fixtures by both self-tests:
   `pilot_campaign_id_excluded` the accepted pilot;
 * `analysis_manifest_sha256` must equal the manifest's own SHA-256 — this is
   what makes the attestation cover all nine artifacts without self-reference;
-* `artifact_sha256` must cover exactly the nine inventory paths, each a
-  canonical SHA-256, each equal to the reviewed bytes;
+* the trusted validator inputs are exactly a canonical manifest hash, the full
+  lowercase analysis-code commit, and canonical hashes for exactly the eight
+  non-manifest siblings; an incomplete or extra trusted map is rejected before
+  it can authorize anything;
+* the attestation's `artifact_sha256` must cover exactly the nine inventory
+  paths, each a canonical SHA-256, each equal to the reviewed bytes; its
+  `analysis_manifest.json` entry must equal the separately trusted
+  `analysis_manifest_sha256`;
 * `verification_outcome` and `independent_output_review_outcome` must be exactly
   the frozen tokens above;
 * any difference in a campaign ID, a commit, a path, an inventory entry, or a
@@ -696,6 +727,11 @@ pure-Python reader of `.git` that **starts no child process** and needs no
 network: HEAD and refs are resolved from loose refs and `packed-refs`, and Git
 objects from loose files or from a version-2 pack index.
 
+This provenance gate runs before the analyzer imports or executes any other
+repository-owned Python module and before P4.2 evidence revalidation. Thus a
+dirty dependency cannot execute before the clean-commit refusal; the later P4.2
+gate still runs before any scientific value is read or output byte is written.
+
 Production analysis fails if:
 
 * HEAD does not resolve to one full 40-character lowercase commit;
@@ -709,9 +745,20 @@ Production analysis fails if:
   analysis code did not exist).
 
 The exact clean-worktree definition is recorded inside the manifest. Untracked
-paths are deliberately **not** treated as dirty, and the manifest says so: they
-cannot change the content of any tracked file, and the analyzer's own candidate
-output tree is itself untracked until it is committed.
+paths are rejected everywhere except the three descriptor-relative data roots
+`results/raw`, `results/preflight`, and `results/phase4`. Their contents are
+validated later by the evidence or candidate contracts; allowing them is what
+permits accepted raw evidence and the analyzer's own output tree to coexist
+with a clean tracked-code claim. An untracked importable file such as
+`scripts/csv.py`, a repository-root `sitecustomize.py`, or any other untracked
+path outside those roots is fatal.
+
+Production additionally requires an isolated Python runtime: `python3 -I -B`
+(`-I` implies isolated environment/import handling and user-site suppression;
+`-B` forbids bytecode writes). The analyzer checks those runtime flags itself,
+so calling its production modes without them is a usage error. Together with
+the untracked-path policy, this prevents repository-local import shadowing from
+escaping the analysis-code provenance claim.
 
 There is **no production bypass**: no flag skips or supplies this verification.
 The self-tests stay deterministic by injecting the resolver
@@ -729,9 +776,9 @@ check prevents the incorrect caption from returning.
 ## 8. Public interface
 
 ```text
-python3 scripts/analyze_phase4_p43.py --self-test
+python3 -I -B scripts/analyze_phase4_p43.py --self-test
 
-python3 scripts/analyze_phase4_p43.py --analyze \
+python3 -I -B scripts/analyze_phase4_p43.py --analyze \
   --campaign-root results/raw/phase4 \
   --pilot-campaign-id 20260812T013848Z \
   --final-campaign-id 20260817T110330Z \
@@ -739,10 +786,10 @@ python3 scripts/analyze_phase4_p43.py --analyze \
   --final-campaign-id 20260817T112011Z \
   --output-root results/phase4
 
-python3 scripts/analyze_phase4_p43.py --verify   (identical options)
+python3 -I -B scripts/analyze_phase4_p43.py --verify   (identical options)
 
-python3 scripts/check_phase4_integration_p43.py --self-test
-python3 scripts/check_phase4_integration_p43.py .
+python3 -I -B scripts/check_phase4_integration_p43.py --self-test
+python3 -I -B scripts/check_phase4_integration_p43.py .
 ```
 
 Exit codes: `0` OK, `1` at least one check failed, `2` a usage error. There is
@@ -791,21 +838,22 @@ class; a missing `evidence_class` column; the absence of the explicit
 `not_profiled` status or of the statement that actual HBM traffic is unavailable
 for the twelve unprofiled configurations.
 
-**Diagnostics (audit finding 2).** NCU diagnostics being parsed and then
-dropped; `READ_AMPLIFICATION` disappearing from the CSV, the JSON, or the
+**Diagnostics (audit findings 2 and 13).** NCU diagnostics being parsed and
+then dropped; `READ_AMPLIFICATION` disappearing from the CSV, the JSON, or the
 report; different campaigns carrying different diagnostic flags; loss of a
-within-campaign sample count, CV, or stability review; loss of the
-surprising-value flag; conflation of within-campaign and cross-campaign
-variability; a campaign-order permutation of any preserved diagnostic; a
-cross-campaign REVIEW coexisting with calm within-campaign reviews and the
-reverse.
+within-campaign sample count, either reported within-campaign CV, any reported
+IQR-flag count, a stability review, a profile SM-clock status, a profile
+diagnostic-resolution count, or the surprising-value flag; conflation of
+within-campaign and cross-campaign variability; a campaign-order permutation of
+any preserved diagnostic; a cross-campaign REVIEW coexisting with calm
+within-campaign reviews and the reverse.
 
-**Metadata contract (audit finding 3).** A bundle that is not exactly nine
+**Metadata contract (audit findings 3 and 11).** A bundle that is not exactly nine
 artifacts; a manifest that does not bind all eight siblings; a recomputed
 sibling hash that does not match; a manifest that is not reproduced byte for
 byte; a campaign value column with no campaign ID mapping; documentation that
 claims each individual file embeds the campaigns, commit, provenance, and
-publishable flag.
+publishable flag; an SVG that duplicates mutable lifecycle or commit metadata.
 
 **Output containment (audit finding 4).** `repo/results` symlinked to a
 directory outside the repository; `repo/results/phase4` symlinked outside;
@@ -816,27 +864,34 @@ belongs; an output path other than `results/phase4`; an output root under
 output tree. Every case proves that the analyzer fails **before writing any byte
 outside the temporary fixture repository**.
 
-**Candidate and acceptance (audit finding 5).** An attempt to overwrite a
+**Candidate and acceptance (audit findings 5, 8, 10, and 14).** An attempt to overwrite a
 differing candidate artifact; verification against a tampered or missing
 artifact; a missing or malformed future acceptance attestation; an attestation
 with one wrong artifact hash; an attestation with a wrong manifest hash; an
 attestation bound to a different analyzer commit; an incomplete inventory; a
 substituted population; a status other than `ACCEPTED`; the real acceptance file
-being present at all.
+being present at all; any extra top-level attestation field; a malformed or
+incomplete trusted sibling-hash map; a time-dependent progress claim inside
+candidate bytes; and a partial retry that writes a missing early artifact before
+discovering a later conflict.
 
-**Analysis-code commit (audit finding 6).** A missing analysis-code commit; an
+**Analysis-code commit (audit findings 6 and 9).** A missing analysis-code commit; an
 abbreviated or uppercase commit; a dirty worktree; a modified, deleted, or
 mode-changed tracked file; a staged change; an index with no valid cache-tree;
 an index failing its own checksum; an index tree that differs from HEAD's tree;
 an unborn HEAD; an in-progress merge or cherry-pick; a directory that is not a
-repository; an analysis-code commit equal to the frozen execution commit; and
-the proof that an untracked path is *not* dirty. The Git blob object id is
-anchored against Git's own value for known bytes so that the fixture writer and
-the reader cannot be symmetrically wrong.
+repository; an analysis-code commit equal to the frozen execution commit; an
+untracked `scripts/csv.py`, repository-root `sitecustomize.py`, or other path
+outside the three frozen data roots; and a production invocation without the
+isolated, bytecode-free Python runtime. The Git blob object id is anchored
+against Git's own value for known bytes so that the fixture writer and the
+reader cannot be symmetrically wrong.
 
-**Figure terminology (audit finding 7).** The incorrect "bar" caption returning
-in any figure, and the absence of the "summarizes exactly three campaign-level
-values" statement.
+**Figures (audit findings 7 and 12).** The incorrect "bar" caption returning in
+any figure; the absence of the "summarizes exactly three campaign-level values"
+statement; clipped title/caption content; footer lines beyond the frozen wrap
+limit; an undersized canvas; overlapping GEMM labels; a missing visible title,
+focused-scale cue, or direct abbreviation mapping.
 
 
 ## 11. Status
@@ -848,8 +903,8 @@ P4.3 | Integrated analysis, documentation, audit | YES | NO  | NO
 ```
 
 `P4.3 = YES / NO / NO`. The implementation exists and has been remediated after
-a first independent audit; **that remediation is itself awaiting a new
-independent audit**. **Independent audit: NOT PERFORMED. Production analysis:
+two independent audits; **the present remediation is awaiting a new independent
+audit**. **Independent audit: NOT PERFORMED for this revision. Production analysis:
 NOT RUN.** `results/phase4/` does not exist, `src/phase4/P4_3_ACCEPTANCE.json`
 does not exist, no curated P4.3 artifact has been produced from the real
 evidence, no P4.3 result has been accepted for publication, **no publishable
@@ -859,12 +914,12 @@ are not closed**.
 ## 12. Implementation-time GPU-free checks performed by the author
 
 ```bash
-python3 -m py_compile \
+python3 -I -B -m py_compile \
   scripts/analyze_phase4_p43.py \
   scripts/check_phase4_integration_p43.py
-python3 scripts/analyze_phase4_p43.py --self-test
-python3 scripts/check_phase4_integration_p43.py --self-test
-python3 scripts/check_phase4_integration_p43.py .
+python3 -I -B scripts/analyze_phase4_p43.py --self-test
+python3 -I -B scripts/check_phase4_integration_p43.py --self-test
+python3 -I -B scripts/check_phase4_integration_p43.py .
 make phase4-p43-check
 make phase4-p42-check
 make phase4-p41-check
@@ -877,12 +932,23 @@ and no GPU command and no production analysis against the real campaigns was
 run.** `make phase4-p43-analyze` and `make phase4-p43-verify` were deliberately
 **not** executed against the real evidence.
 
+## 13. Non-goals
+
+P4.3 adds none of: a campaign runner, a second public execution entry point, or
+a Make target that could start or resume a campaign; a new CUDA, CuTe DSL, or
+cuBLASLt implementation; a new shape, candidate, layout, dtype, tile, cluster,
+or algorithm; a new Nsight Compute case, metric, or profiler route; a change to
+any raw or existing analysis schema; automatic GPU selection; a new external
+dependency or version pin; a p-value, significance test, cross-campaign
+bootstrap, or outlier filter; a fourth or replacement final campaign; a
+publication decision; a merge or pull request.
+
 ## 14. Remediation after the first independent audit
 
 The first independent audit of the P4.3 implementation found seven defects that
-the then-passing test suite did not detect. All seven are remediated in the
-working tree, and each carries new regression coverage that fails on the
-pre-remediation implementation:
+the then-passing test suite did not detect. All seven were remediated in commit
+`3b101c2cfb45ffbd50910cb108d2dabffb26c081`, and each carries regression
+coverage that fails on the pre-remediation implementation:
 
 | # | Defect | Remediation |
 |---|--------|-------------|
@@ -894,21 +960,30 @@ pre-remediation implementation:
 | 6 | The bundle recorded no analysis-code commit and could not distinguish it from the execution commit | Section 7.5's runtime resolution and verification, with no production bypass and injected resolvers in the self-tests |
 | 7 | The SVG captions called the min-max whisker a "bar" | Section 7.6, plus a regression check |
 
-**This remediation has not been independently audited.** It is prepared for that
-separate audit and for nothing else: nothing was committed, pushed, merged, or
-proposed as a pull request, no campaign was created or rerun, no file under
-`results/raw/` was touched, no kernel, runner, shape, candidate, measurement
-parameter, closed-unit schema, dependency, or version pin was changed, and no
-production analysis was executed.
+That remediation was committed and pushed for a separate audit. It did not
+create or rerun a campaign, touch `results/raw/`, change a kernel, runner,
+shape, candidate, measurement parameter, closed-unit schema, dependency, or
+version pin, or execute the production analysis.
 
+## 15. Remediation after the second independent audit
 
-## 13. Non-goals
+The second independent audit examined commit
+`3b101c2cfb45ffbd50910cb108d2dabffb26c081` and found seven additional release
+blockers. The present implementation revision corrects all seven and adds
+regressions that exercise their failure modes:
 
-P4.3 adds none of: a campaign runner, a second public execution entry point, or
-a Make target that could start or resume a campaign; a new CUDA, CuTe DSL, or
-cuBLASLt implementation; a new shape, candidate, layout, dtype, tile, cluster,
-or algorithm; a new Nsight Compute case, metric, or profiler route; a change to
-any raw or existing analysis schema; automatic GPU selection; a new external
-dependency or version pin; a p-value, significance test, cross-campaign
-bootstrap, or outlier filter; a fourth or replacement final campaign; a
-publication decision; and any commit, push, merge, or pull request.
+| # | Defect | Remediation |
+|---|--------|-------------|
+| 8 | Immutable candidate bytes encoded a clock-dependent “pending review” state | The invariant `immutable_candidate_requires_external_attestation` state; candidate bytes never claim external workflow progress |
+| 9 | The clean tracked tree did not cover untracked Python/import shadowing | The Git provenance gate now precedes every other repository-module import; descriptor-relative rejection covers every untracked path outside the three frozen data roots; production requires `python3 -I -B` |
+| 10 | Acceptance validation trusted a caller-supplied hash map without proving it was complete | Exact canonical trusted inputs: one manifest hash, one analysis-code commit, and exactly eight non-manifest sibling hashes; the attestation itself still binds all nine artifacts |
+| 11 | Metadata ownership contradicted itself across manifest, report, CSV, and SVG | The manifest is authoritative; summary/report repeat reader context; CSV/SVG remain detached siblings with no mutable publication or commit claim |
+| 12 | SVG titles/captions could be clipped and GEMM labels overlapped | A larger frozen canvas, visible neutral title and focused-scale subtitle, wrapped reserved footer, short direct labels, and a complete abbreviation mapping |
+| 13 | P1.4/P2.4 terminal diagnostics were still omitted | P1.4 IQR counts; P2.4 per-SM CV, both reported IQR counts, profile SM-clock status, and resolved-profile-diagnostic counts are validated and preserved per campaign |
+| 14 | The prose declared every partial tree fatal while the writer could mutate an incomplete tree before discovering a later conflict | A two-pass retry: validate every existing byte and all paths first, then exclusively create missing artifacts; verification remains exact and rejects partial output |
+
+**This remediation has not been independently audited.** It is prepared for a
+new separate audit and for nothing else. No campaign was created or rerun, no
+file under `results/raw/` was touched, no kernel, runner, shape, candidate,
+measurement parameter, closed-unit schema, dependency, or version pin was
+changed, and no production analysis was executed.

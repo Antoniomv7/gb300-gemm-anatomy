@@ -1145,8 +1145,8 @@ and no publishable Phase 4 result exists.
 **P4.3: IMPLEMENTED; independent audit: NO; production analysis: NO.**
 **The P4.3 independent audit has not been performed**, and no production
 analysis of the three final campaigns has been run in this repository. The
-implementation has received a remediation after a first independent audit, and
-**that remediation is itself awaiting a new independent audit**.
+implementation has received remediation after two independent audits, and
+**the present revision is awaiting a new independent audit**.
 `results/phase4/` does not exist, `src/phase4/P4_3_ACCEPTANCE.json` does not
 exist, no curated P4.3 artifact exists, no P4.3 result has been accepted for
 publication, and no publishable result exists anywhere here. Phase 4 and the
@@ -1214,8 +1214,9 @@ is checked byte for byte by a full recomputation.
 #### Remediation after the first independent audit
 
 A first independent audit of the P4.3 implementation found seven defects that
-its then-passing test suite did not detect. All seven are remediated in the
-working tree and are recorded in `src/phase4/P4_3_PROTOCOL.md` section 14:
+its then-passing test suite did not detect. All seven were remediated in commit
+`3b101c2cfb45ffbd50910cb108d2dabffb26c081` and are recorded in
+`src/phase4/P4_3_PROTOCOL.md` section 14:
 
 1. **the scientific evidence taxonomy** was incorrect — several derived
    quantities were classified as directly measured. Seven frozen evidence
@@ -1229,10 +1230,10 @@ working tree and are recorded in `src/phase4/P4_3_PROTOCOL.md` section 14:
    a modeled clock conversion; and for the twelve memory configurations without
    Nsight Compute the outputs state that actual HBM traffic is unavailable;
 2. **diagnostics were parsed and then dropped** — the P1.4 NCU
-   `diagnostic_flags`, the P1.4 and P2.4 within-campaign sample counts, CVs, and
-   stability reviews, the P2.4 surprising-value flag, and an explicit NCU
-   coverage status are now preserved per campaign in the frozen campaign order,
-   under `within_campaign_*` names that can never be confused with the
+   `diagnostic_flags`, sample counts, CVs, stability reviews, IQR counts, NCU
+   coverage, and the P2.4 per-SM CV, both reported IQR counts, profile clock and
+   metric-resolution status, and surprising-value flag are now preserved per
+   campaign in frozen order, under names that cannot be confused with the
    `cross_campaign_*` statistics;
 3. **the metadata contract was untruthful** — `analysis_manifest.json` is the
    authoritative provenance envelope binding all eight siblings by path and
@@ -1242,17 +1243,29 @@ working tree and are recorded in `src/phase4/P4_3_PROTOCOL.md` section 14:
    repository — production output is now limited to
    `<repo-root>/results/phase4` and reached by descriptor-anchored
    `O_DIRECTORY | O_NOFOLLOW` traversal;
-5. **there was no immutable candidate-to-acceptance workflow** — candidates
-   record `publication_state=candidate_pending_independent_output_review` and
-   are never promoted, overwritten, or deleted; acceptance is a separate
-   external attestation whose `p43.acceptance.v1` schema is frozen now and whose
-   file must not exist;
+5. **there was no immutable candidate-to-acceptance workflow** — the manifest
+   records the invariant
+   `publication_state=immutable_candidate_requires_external_attestation`,
+   candidates are never promoted, overwritten, or deleted, and acceptance is a
+   separate hash-bound external attestation whose `p43.acceptance.v1` schema is
+   frozen now and whose file must not exist;
 6. **the analysis-code commit was missing** — it is now resolved and verified at
    production runtime, distinct from the final execution commit, with no
-   production bypass;
+   production bypass and before any other repository module loads; untracked
+   paths outside the three frozen data roots are rejected and production
+   requires isolated `python3 -I -B` execution;
 7. **the figure captions called the min-max whisker a "bar"**.
 
-**This remediation has not been independently audited.**
+A second independent audit of that commit found seven further blockers. The
+present revision corrects them: candidate metadata no longer encodes mutable
+workflow progress; Python/import provenance is isolated; acceptance validates
+an exact trusted hash map; metadata ownership is consistent; SVG content is
+visible and non-overlapping; all required terminal diagnostics survive; and a
+partial retry performs a complete write-free preflight before creating any
+missing artifact. The full finding-to-fix mapping is in
+`src/phase4/P4_3_PROTOCOL.md` section 15.
+
+**This present remediation has not been independently audited.**
 
 The implementation-time GPU-free checks in `src/phase4/P4_3_PROTOCOL.md`
 section 12 are the author's own self-checks. **They are not an independent

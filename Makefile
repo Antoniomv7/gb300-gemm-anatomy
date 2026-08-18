@@ -1607,12 +1607,12 @@ check-static:
 	@test -x $(PHASE4_P43_ANALYZER)
 	@test -x $(PHASE4_P43_CHECKER)
 	@! grep -nE '^(import|from|def|class) ' $(PHASE4_P43_PROTOCOL)
-	python3 -m py_compile $(PHASE4_P43_ANALYZER) $(PHASE4_P43_CHECKER)
+	python3 -I -B -m py_compile $(PHASE4_P43_ANALYZER) $(PHASE4_P43_CHECKER)
 	@rm -rf scripts/__pycache__
 	@echo "== P4.3 GPU-free self-tests and the full frozen-contract check =="
-	python3 $(PHASE4_P43_ANALYZER) --self-test
-	python3 $(PHASE4_P43_CHECKER) --self-test
-	python3 $(PHASE4_P43_CHECKER) .
+	python3 -I -B $(PHASE4_P43_ANALYZER) --self-test
+	python3 -I -B $(PHASE4_P43_CHECKER) --self-test
+	python3 -I -B $(PHASE4_P43_CHECKER) .
 	@rm -rf scripts/__pycache__
 	@echo "== P4.3 adds no runner: scripts/run_all.sh stays the only Phase 4 entry point =="
 	@# The rigorous comment- and literal-stripped scan for a child process, a
@@ -1646,7 +1646,7 @@ check-static:
 	@echo "== the P4.3 candidate bundle has not been produced or accepted =="
 	@test ! -e $(PHASE4_P43_OUTPUT_ROOT)
 	@test ! -e $(PHASE4_P43_ACCEPTANCE)
-	@grep -Fq 'candidate_pending_independent_output_review' $(PHASE4_P43_ANALYZER)
+	@grep -Fq 'immutable_candidate_requires_external_attestation' $(PHASE4_P43_ANALYZER)
 	@grep -Fq 'p43.acceptance.v1' $(PHASE4_P43_PROTOCOL)
 	@grep -Fq '$(PHASE4_P43_ACCEPTANCE)' $(PHASE4_P43_PROTOCOL)
 	@echo "== the P4.3 remediation is recorded and still unaudited =="
@@ -3360,15 +3360,15 @@ phase4-p43-check:
 	@test -x $(PHASE4_P43_ANALYZER)
 	@test -x $(PHASE4_P43_CHECKER)
 	@! grep -nE '^(import|from|def|class) ' $(PHASE4_P43_PROTOCOL)
-	python3 -m py_compile $(PHASE4_P43_ANALYZER) $(PHASE4_P43_CHECKER)
+	python3 -I -B -m py_compile $(PHASE4_P43_ANALYZER) $(PHASE4_P43_CHECKER)
 	@rm -rf scripts/__pycache__
 	@echo "== P4.3 analyzer self-test (temporary fixtures only) =="
-	python3 $(PHASE4_P43_ANALYZER) --self-test
+	python3 -I -B $(PHASE4_P43_ANALYZER) --self-test
 	@echo "== P4.3 checker self-test (temporary fixtures only) =="
-	python3 $(PHASE4_P43_CHECKER) --self-test
+	python3 -I -B $(PHASE4_P43_CHECKER) --self-test
 	@echo "== P4.3 frozen-contract check against this repository (no campaign evidence,"
 	@echo "   no container, no GPU, no network) =="
-	python3 $(PHASE4_P43_CHECKER) .
+	python3 -I -B $(PHASE4_P43_CHECKER) .
 	@rm -rf scripts/__pycache__
 	@echo "== no P4.3 candidate bundle and no acceptance attestation exist =="
 	@test ! -e $(PHASE4_P43_OUTPUT_ROOT)
@@ -3376,10 +3376,10 @@ phase4-p43-check:
 	@# This recipe deliberately names no raw campaign path at all: the gate must
 	@# run on a checkout that has never seen a campaign. The checker enforces
 	@# that by scanning this recipe's own text.
-	@echo "phase4-p43-check: OK (P4.3 = YES / NO / NO: implemented; the independent audit"
-	@echo "                   has NOT been performed and the production analysis of the"
-	@echo "                   three final campaigns has NOT been run; no publishable"
-	@echo "                   result exists and neither Phase 4 nor the TFM is closed)"
+	@echo "phase4-p43-check: OK (GPU-free implementation self-check only; repository status"
+	@echo "                   remains P4.3 = YES / NO / NO. This target establishes neither"
+	@echo "                   an independent audit nor a production run, output review,"
+	@echo "                   acceptance, publication, GB300 verification, or closure.)"
 
 # P4.3 -- the GPU-free production analysis. It requires the real accepted raw
 # evidence to already exist, names exactly the frozen campaign IDs, and starts
@@ -3393,7 +3393,7 @@ phase4-p43-analyze:
 		echo "phase4-p43-analyze: $(PHASE4_P41_RAW_ROOT) does not exist; the real accepted" >&2; \
 		echo "                    Phase 4 evidence must be present. Nothing is created." >&2; \
 		exit 2; }
-	python3 $(PHASE4_P43_ANALYZER) --analyze \
+	python3 -I -B $(PHASE4_P43_ANALYZER) --analyze \
 		--campaign-root $(PHASE4_P41_RAW_ROOT) \
 		--pilot-campaign-id $(PHASE4_P43_PILOT_CAMPAIGN_ID) \
 		--final-campaign-id $(PHASE4_P43_FINAL_CAMPAIGN_1) \
@@ -3401,8 +3401,8 @@ phase4-p43-analyze:
 		--final-campaign-id $(PHASE4_P43_FINAL_CAMPAIGN_3) \
 		--output-root $(PHASE4_P43_OUTPUT_ROOT)
 	@echo "phase4-p43-analyze: OK (curated artifacts under $(PHASE4_P43_OUTPUT_ROOT);"
-	@echo "                    publishable=false pending the independent P4.3 audit and"
-	@echo "                    the review of these outputs)"
+	@echo "                    immutable candidate bytes remain publishable=false;"
+	@echo "                    external acceptance requires verification and review)"
 
 # P4.3 -- deterministic verification. It recomputes the complete analysis from
 # the same evidence and compares every output byte for byte. It writes nothing.
@@ -3412,7 +3412,7 @@ phase4-p43-verify:
 		echo "phase4-p43-verify: $(PHASE4_P41_RAW_ROOT) does not exist; the real accepted" >&2; \
 		echo "                   Phase 4 evidence must be present." >&2; \
 		exit 2; }
-	python3 $(PHASE4_P43_ANALYZER) --verify \
+	python3 -I -B $(PHASE4_P43_ANALYZER) --verify \
 		--campaign-root $(PHASE4_P41_RAW_ROOT) \
 		--pilot-campaign-id $(PHASE4_P43_PILOT_CAMPAIGN_ID) \
 		--final-campaign-id $(PHASE4_P43_FINAL_CAMPAIGN_1) \

@@ -21,10 +21,10 @@ that contract a reviewer should not have to re-derive by hand:
 
 Two modes::
 
-    python3 scripts/check_phase4_integration_p43.py --self-test
+    python3 -I -B scripts/check_phase4_integration_p43.py --self-test
         Focused synthetic suite over temporary fixtures only.
 
-    python3 scripts/check_phase4_integration_p43.py <repo-root>
+    python3 -I -B scripts/check_phase4_integration_p43.py <repo-root>
         The frozen P4.3 repository contract. Needs no results/raw/, no cluster
         evidence, no container runtime, and no network.
 
@@ -250,6 +250,12 @@ EXPECTED_METRIC_EVIDENCE = {
     "within_campaign_cv_percent": "source_diagnostic",
     "within_campaign_stability_review": "source_diagnostic",
     "within_campaign_sample_count": "source_diagnostic",
+    "within_campaign_iqr_flagged_count": "source_diagnostic",
+    "within_campaign_flops_per_cycle_per_sm_cv_percent": "source_diagnostic",
+    "within_campaign_flops_per_cycle_iqr_flagged_count": "source_diagnostic",
+    "within_campaign_flops_per_cycle_per_sm_iqr_flagged_count": "source_diagnostic",
+    "profile_sm_clock_status": "source_diagnostic",
+    "profile_diagnostic_metrics_resolved_count": "source_diagnostic",
     "surprising_value_flag": "source_diagnostic",
     "diagnostic_flags": "source_diagnostic",
     "ncu_coverage": "source_diagnostic",
@@ -584,6 +590,27 @@ def _check_artifact_contract(reporter: Reporter, analyzer, protocol: str) -> Non
         reporter.check(f"{relative} never carries the excluded pilot as data",
                        analyzer.PILOT_CAMPAIGN_ID not in payloads[relative].decode("utf-8"),
                        "")
+    for relative in ("figures/memory_paths.svg", "figures/umma_throughput.svg",
+                     "figures/gemm_comparison.svg"):
+        svg = payloads[relative].decode("utf-8")
+        footer_lines = re.findall(r"<tspan\s+[^>]*>(.*?)</tspan>", svg)
+        reporter.check(f"{relative} has a visible title and focused-scale subtitle",
+                       '<text x="24" y="25"' in svg
+                       and "Focused y-scale" in svg, "")
+        reporter.check(f"{relative} reserves a multiline footer inside the 1080x480 canvas",
+                       'viewBox="0 0 1080 480"' in svg
+                       and len(footer_lines) >= 2
+                       and all(len(line) <= analyzer._SVG_FOOTER_WRAP
+                               for line in footer_lines), str(footer_lines))
+        reporter.check(f"{relative} does not duplicate mutable publication progress",
+                       analyzer.PUBLICATION_STATE not in svg
+                       and "analysis_code_commit" not in svg
+                       and "time-dependent audit" not in svg, "")
+    gemm_svg = payloads["figures/gemm_comparison.svg"].decode("utf-8")
+    reporter.check("the GEMM SVG labels all four candidates directly",
+                   all(label in gemm_svg for label in
+                       ("NP1=nonpersistent_1cta", "P1=persistent_1cta",
+                        "P2=persistent_2cta", "BL=cuBLASLt")), "")
     manifest = json.loads(payloads["analysis_manifest.json"].decode("utf-8"))
     reporter.check("analysis_manifest.json records all three final campaign IDs",
                    manifest["final_campaign_ids"] == list(analyzer.FINAL_CAMPAIGN_IDS), "")
@@ -684,7 +711,13 @@ def _check_preserved_diagnostics(reporter: Reporter, analyzer, orchestrator) -> 
         analyzer.FINAL_CAMPAIGN_IDS[1]: {
             "ncu_diagnostic_flags": "READ_AMPLIFICATION",
             "memory_stability_review": "REVIEW", "memory_cv_percent": 9.5,
-            "umma_stability_review": "REVIEW", "surprising_value_flag": "True"},
+            "memory_iqr_flagged_count": 2,
+            "umma_stability_review": "REVIEW",
+            "umma_per_sm_cv_percent": 8.5,
+            "umma_flops_iqr_flagged_count": 1,
+            "umma_per_sm_iqr_flagged_count": 3,
+            "profile_diagnostic_metrics_resolved_count": 4,
+            "surprising_value_flag": "True"},
     })
     documents = dict(analyzer.build_documents(orchestrator, analyzer._StubP35(), records,
                                               analyzer._fixture_provenance()))
@@ -700,12 +733,18 @@ def _check_preserved_diagnostics(reporter: Reporter, analyzer, orchestrator) -> 
     for metric, table in (("within_campaign_sample_count", memory),
                           ("within_campaign_cv_percent", memory),
                           ("within_campaign_stability_review", memory),
+                          ("within_campaign_iqr_flagged_count", memory),
                           ("hbm_classification", memory),
                           ("diagnostic_flags", memory),
                           ("ncu_coverage", memory),
                           ("within_campaign_sample_count", umma),
                           ("within_campaign_cv_percent", umma),
                           ("within_campaign_stability_review", umma),
+                          ("within_campaign_flops_per_cycle_per_sm_cv_percent", umma),
+                          ("within_campaign_flops_per_cycle_iqr_flagged_count", umma),
+                          ("within_campaign_flops_per_cycle_per_sm_iqr_flagged_count", umma),
+                          ("profile_sm_clock_status", umma),
+                          ("profile_diagnostic_metrics_resolved_count", umma),
                           ("surprising_value_flag", umma)):
         reporter.check(f"{metric} survives into the curated CSV representation",
                        f",{metric}," in table, metric)
@@ -721,8 +760,22 @@ def _check_preserved_diagnostics(reporter: Reporter, analyzer, orchestrator) -> 
              ("ok", "REVIEW", "ok")),
             (memory, "memory_paths.csv", "within_campaign_cv_percent",
              ("0.1", "9.5", "0.1")),
+            (memory, "memory_paths.csv", "within_campaign_iqr_flagged_count",
+             ("0", "2", "0")),
             (umma, "umma_throughput.csv", "within_campaign_stability_review",
              ("ok", "REVIEW", "ok")),
+            (umma, "umma_throughput.csv",
+             "within_campaign_flops_per_cycle_per_sm_cv_percent",
+             ("0.01", "8.5", "0.01")),
+            (umma, "umma_throughput.csv",
+             "within_campaign_flops_per_cycle_iqr_flagged_count", ("0", "1", "0")),
+            (umma, "umma_throughput.csv",
+             "within_campaign_flops_per_cycle_per_sm_iqr_flagged_count",
+             ("0", "3", "0")),
+            (umma, "umma_throughput.csv", "profile_sm_clock_status",
+             ("OK", "OK", "OK")),
+            (umma, "umma_throughput.csv",
+             "profile_diagnostic_metrics_resolved_count", ("2", "4", "2")),
             (umma, "umma_throughput.csv", "surprising_value_flag",
              ("False", "True", "False"))):
         rows = [row for row in csv.DictReader(io.StringIO(table))
@@ -786,13 +839,21 @@ def _check_metadata_ownership(reporter: Reporter, analyzer, orchestrator,
     reporter.check("the manifest records the candidate publication state",
                    manifest["publishable"] is False
                    and manifest["publication_state"] == analyzer.PUBLICATION_STATE, "")
+    reporter.check("the reader-facing summary and report repeat the invariant candidate "
+                   "state without becoming authoritative envelopes",
+                   analyzer.PUBLICATION_STATE
+                   in payloads["integrated_summary.json"].decode("utf-8")
+                   and analyzer.PUBLICATION_STATE
+                   in payloads["report.md"].decode("utf-8"), "")
     for relative in siblings:
         if relative.endswith((".csv", ".svg")):
             text = payloads[relative].decode("utf-8")
             reporter.check(f"{relative} is a data or visual artifact, not a duplicated "
                            f"provenance envelope",
                            all(campaign_id not in text
-                               for campaign_id in analyzer.FINAL_CAMPAIGN_IDS), relative)
+                               for campaign_id in analyzer.FINAL_CAMPAIGN_IDS)
+                           and analyzer.PUBLICATION_STATE not in text
+                           and "analysis_code_commit" not in text, relative)
     results_readme = read_text(repo_root, "results/README.md")
     reporter.check("results/README.md no longer claims that every file embeds the "
                    "campaigns, commit, provenance, and publishable flag",
@@ -835,10 +896,17 @@ def _check_output_containment(reporter: Reporter, analyzer, orchestrator) -> Non
                                  r"\brelative_to\b", executable), executable[:200])
     reporter.check("the exact-tree verification never follows a symlink",
                    "follow_symlinks=False"
-                   in inspect.getsource(analyzer.assert_output_tree_exact), "")
+                   in inspect.getsource(analyzer._scan_output_tree), "")
     reporter.check("publication creates artifacts exclusively and never replaces one",
                    "write_file_exclusive" in inspect.getsource(analyzer.publish_documents)
                    and "os.replace" not in inspect.getsource(analyzer.publish_documents),
+                   "")
+    publication = inspect.getsource(analyzer.publish_documents)
+    reporter.check("a partial retry validates every existing byte and unexpected path "
+                   "before creating a missing artifact",
+                   "assert_output_tree_compatible(tree)" in publication
+                   and publication.index("for relative, payload in documents")
+                   < publication.index("for relative, payload, directory_fd, name in missing"),
                    "")
     with tempfile.TemporaryDirectory(prefix="p43-check-containment-") as temporary:
         root = Path(temporary)
@@ -903,12 +971,20 @@ def _check_candidate_and_acceptance(reporter: Reporter, analyzer, orchestrator,
                    "publication state",
                    analyzer.PUBLISHABLE is False
                    and analyzer.PUBLICATION_STATE
-                   == "candidate_pending_independent_output_review", "")
+                   == "immutable_candidate_requires_external_attestation", "")
     reporter.check("the candidate publication state appears in the bundle",
                    analyzer.PUBLICATION_STATE
                    in payloads["integrated_summary.json"].decode("utf-8")
                    and analyzer.PUBLICATION_STATE
                    in payloads[analyzer.MANIFEST_RELATIVE_PATH].decode("utf-8"), "")
+    report = payloads["report.md"].decode("utf-8")
+    manifest = json.loads(payloads[analyzer.MANIFEST_RELATIVE_PATH].decode("utf-8"))
+    reporter.check("immutable candidate bytes make no time-dependent audit, production, "
+                   "review, or attestation-progress assertion",
+                   "are all pending" not in analyzer.PUBLICATION_STATUS
+                   and "No step after the production" not in report
+                   and "P4.3 | Integrated analysis" not in report
+                   and "exists" not in manifest["acceptance"], "")
     publication = inspect.getsource(analyzer.publish_documents)
     reporter.check("the analyzer has no promotion, overwrite, or delete route for a "
                    "candidate",
@@ -956,6 +1032,7 @@ def _check_candidate_and_acceptance(reporter: Reporter, analyzer, orchestrator,
             ("a different analyzer commit",
              lambda doc: doc.__setitem__("analysis_code_commit", "f" * 40)),
             ("a missing field", lambda doc: doc.pop("artifact_sha256")),
+            ("an unexpected field", lambda doc: doc.__setitem__("mutable_note", "x")),
             ("a substituted population",
              lambda doc: doc.__setitem__("final_campaign_ids", [])),
             ("a malformed status", lambda doc: doc.__setitem__("status", "MAYBE"))):
@@ -966,6 +1043,14 @@ def _check_candidate_and_acceptance(reporter: Reporter, analyzer, orchestrator,
                            document, manifest_sha256=manifest_sha256,
                            artifact_sha256=artifact_sha256,
                            analysis_code_commit=commit)), "")
+    incomplete_reference = dict(artifact_sha256)
+    incomplete_reference.pop("memory_paths.csv")
+    reporter.check("an incomplete trusted reference hash map cannot validate an otherwise "
+                   "well-formed attestation",
+                   bool(analyzer.validate_acceptance_document(
+                       template, manifest_sha256=manifest_sha256,
+                       artifact_sha256=incomplete_reference,
+                       analysis_code_commit=commit)), "")
 
 
 def _check_analysis_code_commit(reporter: Reporter, analyzer) -> None:
@@ -994,6 +1079,39 @@ def _check_analysis_code_commit(reporter: Reporter, analyzer) -> None:
                         if any(re.search(pattern,
                                          inspect.getsource(getattr(analyzer, name)))
                                for pattern in FORBIDDEN_EVIDENCE_MODE_CALLS)]))
+    reporter.check("untracked content is allowed only below the three frozen data roots",
+                   analyzer.GIT_ALLOWED_UNTRACKED_ROOTS
+                   == (("results", "raw"), ("results", "preflight"),
+                       ("results", "phase4")),
+                   str(analyzer.GIT_ALLOWED_UNTRACKED_ROOTS))
+    reporter.check("the production interpreter is currently isolated from checkout and "
+                   "environment import injection",
+                   sys.flags.isolated == 1 and sys.flags.ignore_environment == 1
+                   and sys.flags.no_user_site == 1 and sys.dont_write_bytecode, "")
+    try:
+        analyzer.validate_production_python_runtime()
+    except analyzer.P43Error as exc:
+        reporter.check("the analyzer accepts the required -I -B runtime", False, str(exc))
+    else:
+        reporter.check("the analyzer accepts the required -I -B runtime", True)
+
+    with tempfile.TemporaryDirectory(prefix="p43-check-untracked-") as temporary:
+        fixture = Path(temporary) / "repo"
+        fixture.mkdir()
+        analyzer._git_fixture_repository(
+            fixture, files={"README.md": (b"fixture\n", analyzer.GIT_MODE_REGULAR)})
+        (fixture / "scripts").mkdir()
+        (fixture / "scripts" / "csv.py").write_text(
+            "raise SystemExit(99)\n", encoding="utf-8")
+        try:
+            analyzer.resolve_git_provenance(fixture)
+        except analyzer.GitProvenanceError as exc:
+            reporter.check("an untracked scripts/csv.py cannot retain clean provenance",
+                           "untracked path outside the allowed data roots" in str(exc),
+                           str(exc))
+        else:
+            reporter.check("an untracked scripts/csv.py cannot retain clean provenance",
+                           False, "accepted")
 
     def rejects(label: str, provenance) -> None:
         try:
@@ -1017,6 +1135,12 @@ def _check_analysis_code_commit(reporter: Reporter, analyzer) -> None:
                    "defaults to the real verifier",
                    "git_provenance=resolve_git_provenance"
                    in inspect.getsource(analyzer.run_analysis), "")
+    run_source = inspect.getsource(analyzer.run_analysis)
+    reporter.check("the clean checkout is verified before repository-owned dependency "
+                   "modules or the evidence revalidator execute",
+                   run_source.index("provenance = git_provenance")
+                   < run_source.index("load_repository_modules")
+                   < run_source.index("status = revalidator"), "")
     reporter.check("there is no production flag that skips provenance verification",
                    not any("provenance" in option.lower() or "commit" in option.lower()
                            for action in analyzer.build_parser()._actions
@@ -1062,6 +1186,13 @@ def _check_make_targets(reporter: Reporter, repo_root: Path, makefile: str, p41)
         reporter.check(f"{target} never starts or resumes a campaign",
                        "--resume" not in text
                        and not re.search(r"run_all\.sh", text), "")
+        python_invocations = [line.strip() for line in rules[target][1]
+                              if re.search(r"\bpython3\b", line)]
+        reporter.check(f"{target} isolates every Python invocation with -I -B",
+                       python_invocations
+                       and all(re.search(r"\bpython3\s+-I\s+-B\b", line)
+                               for line in python_invocations),
+                       str(python_invocations))
     for target, flag in ((P43_ANALYZE_TARGET, "--analyze"), (P43_VERIFY_TARGET, "--verify")):
         if target not in rules:
             continue
@@ -1243,8 +1374,9 @@ def check_repository(repo_root: Path) -> int:
               file=sys.stderr)
         return 1
     print("check_phase4_integration_p43: OK "
-          "(P4.3 = YES / NO / NO; implemented, not audited, production analysis not run; "
-          "no publishable result)")
+          "(P4.3 implementation contract passed; this GPU-free self-check does not itself "
+          "establish an independent audit, production analysis, output review, or "
+          "acceptance)")
     return 0
 
 
@@ -1408,11 +1540,8 @@ def run_self_test() -> int:
              '("diagnostic_flags", [NOT_APPLICABLE for flag in flags])',
              "an analyzer that parses NCU diagnostic flags and then drops them is "
              "rejected"),
-            ('("within_campaign_stability_review",\n'
-             '                 [source["within_campaign_stability_review"] '
-             'for source in sources])):',
-             '("within_campaign_stability_review",\n'
-             '                 [NOT_APPLICABLE for source in sources])):',
+            ('[source["within_campaign_stability_review"] for source in sources]',
+             '[NOT_APPLICABLE for source in sources]',
              "an analyzer that discards P2.4's within-campaign stability review is "
              "rejected"),
             ('"cross_campaign_cv_percent": cv_percent,',
@@ -1454,7 +1583,7 @@ def run_self_test() -> int:
              'ACCEPTANCE_SCHEMA_VERSION = "p43.acceptance.v2"',
              "an analyzer whose acceptance schema drifts from the frozen version is "
              "rejected"),
-            ('PUBLICATION_STATE = "candidate_pending_independent_output_review"',
+            ('PUBLICATION_STATE = "immutable_candidate_requires_external_attestation"',
              'PUBLICATION_STATE = "accepted"',
              "an analyzer that promotes its candidate publication state is rejected"),
         ):

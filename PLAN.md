@@ -701,10 +701,10 @@ implemented, independently audited, and verified on GB300: accepted pilot
 `20260812T013848Z` plus final campaigns `20260817T110330Z`,
 `20260817T111310Z`, and `20260817T112011Z` passed terminal revalidation and the
 read-only cross-campaign validator. All evidence remains non-publishable. P4.3
-is implemented and has been remediated after a first independent audit, and that
-remediation is itself awaiting a new independent audit; **The P4.3 independent
-audit has not been performed** and **no production analysis of the three final
-campaigns has been run**, so Phase 4 is not closed.
+is implemented and has been remediated after two independent audits; the present
+revision is awaiting a new independent audit. **The P4.3 independent audit has
+not been performed** on this revision and **no production analysis of the three
+final campaigns has been run**, so Phase 4 is not closed.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
@@ -958,8 +958,9 @@ itself computes no statistic, threshold, ranking, or figure** even though the
 separate P4.3 analyzer now exists. No closed P1–P4.2 assertion was weakened.
 
 A first independent audit of that implementation found seven defects that its
-then-passing test suite did not detect, and all seven have since been
-remediated in the working tree (`src/phase4/P4_3_PROTOCOL.md` section 14):
+then-passing test suite did not detect, and all seven were remediated in commit
+`3b101c2cfb45ffbd50910cb108d2dabffb26c081`
+(`src/phase4/P4_3_PROTOCOL.md` section 14):
 
 1. **the scientific evidence taxonomy** — `effective_gbps` is now stated as a
    timing-derived effective transfer rate of a dedicated streaming
@@ -973,12 +974,10 @@ remediated in the working tree (`src/phase4/P4_3_PROTOCOL.md` section 14):
    carried consistently in the CSV rows, the JSON summary, the Markdown report,
    and the SVG captions, and the twelve non-profiled memory configurations now
    state explicitly that actual HBM traffic is unavailable;
-2. **preserved diagnostics** — the P1.4 NCU `diagnostic_flags` that were parsed
-   and then dropped, the P1.4 and P2.4 within-campaign sample counts, CVs, and
-   stability reviews, the P2.4 surprising-value flag, and an explicit NCU
-   coverage status are all preserved per campaign in the frozen campaign order,
-   under `within_campaign_*` names that can never be confused with the
-   `cross_campaign_*` statistics;
+2. **preserved diagnostics** — the P1.4 NCU flags, sample counts, CVs,
+   stability reviews, IQR counts and NCU coverage, plus the P2.4 per-SM CV,
+   both reported IQR counts, profile clock and metric-resolution status, and
+   surprising-value flag are preserved per campaign in the frozen order;
 3. **a truthful metadata contract** — `analysis_manifest.json` is the
    authoritative provenance envelope binding all eight siblings by path and
    SHA-256, states precisely why it cannot contain its own hash, and the
@@ -989,18 +988,26 @@ remediated in the working tree (`src/phase4/P4_3_PROTOCOL.md` section 14):
    `O_DIRECTORY | O_NOFOLLOW` traversal that rejects a symlink at any level,
    closing the reproduced escape in which `results` pointed outside the
    repository;
-5. **an immutable candidate-to-acceptance workflow** — candidates record
-   `publication_state=candidate_pending_independent_output_review`, are never
-   promoted, overwritten, or deleted, and acceptance is a separate external
-   attestation whose `p43.acceptance.v1` schema and validation rules are frozen
-   now;
+5. **an immutable candidate-to-acceptance workflow** — the manifest records
+   `publication_state=immutable_candidate_requires_external_attestation`,
+   candidates never encode mutable progress and are never promoted,
+   overwritten, or deleted, and acceptance is a separate external attestation
+   whose `p43.acceptance.v1` schema and validation rules are frozen now;
 6. **the analysis-code commit** — resolved and verified at production runtime,
-   distinct from the final execution commit, with no production bypass; and
+   distinct from the final execution commit, with no production bypass,
+   before any other repository module loads, with untracked importable paths
+   rejected and isolated `python3 -I -B` required; and
 7. **figure terminology** — the min-max range is a whisker, not a bar.
 
-**That remediation has not been independently audited.** It is prepared for a
-separate audit and nothing else: nothing was committed, pushed, merged, or
-proposed as a pull request.
+A second independent audit of that commit found seven further blockers. The
+present revision corrects its time-dependent candidate state, untracked
+Python/import provenance, incomplete trusted acceptance-map validation,
+metadata contradictions, clipped/overlapping SVGs, omitted terminal
+diagnostics, and unsafe partial-output semantics. Section 15 of the P4.3
+protocol records the exact corrections and regressions.
+
+**This present remediation has not been independently audited.** It is prepared
+for a separate audit and nothing else; it does not merge or open a pull request.
 
 **The P4.3 independent audit has not been performed**, and
 **no production analysis of the three final campaigns has been run** in this

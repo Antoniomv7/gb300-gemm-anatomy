@@ -49,14 +49,16 @@ and P3.5 artifacts each final campaign's manifest pins, and aggregates across
 the three finals with **one complete final campaign as the independent
 replicate**. The accepted pilot `20260812T013848Z` is recorded only as excluded
 qualification provenance and never enters a statistic. The implementation has
-since received a remediation after a first independent audit — a corrected
-scientific evidence taxonomy, preserved NCU and within-campaign stability
-diagnostics, a truthful central metadata contract, descriptor-anchored output
-containment, an immutable candidate-to-acceptance workflow, a verified
-analysis-code commit, and corrected figure terminology — and **that remediation
-is itself awaiting a new independent audit**. **The P4.3 independent audit has
-not been performed**, no production analysis of the three final campaigns has
-been run, and **no P4.3 curated result has been accepted for publication**. The
+received remediation after two independent audits: the first corrected the
+scientific taxonomy, preserved diagnostics, central metadata contract, output
+containment, candidate/acceptance workflow, analysis-code provenance, and
+figure terminology; the second corrected immutable lifecycle state,
+Python/import provenance, trusted acceptance inputs, metadata ownership, SVG
+layout, remaining terminal diagnostics, and partial-output safety. **The
+present revision is awaiting a new independent audit.** **The P4.3 independent
+audit has not been performed** on this revision, no production analysis of the
+three final campaigns has been run, and **no P4.3 curated result has been
+accepted for publication**. The
 directory `results/phase4/` described below is therefore the declared
 destination of that future analysis, not an existing result.
 
@@ -511,14 +513,22 @@ with `O_DIRECTORY | O_NOFOLLOW`; a symlink at any level, including an ancestor,
 is rejected before a byte is written. Publication is no-clobber: an existing
 byte-identical artifact is verified rather than rewritten, an existing different
 artifact is fatal, and a symlink, an unexpected file type, or any artifact
-outside this inventory fails closed.
+outside this inventory fails closed. A partial retry first validates every
+existing byte and every path without writing; only after that complete preflight
+may it exclusively create missing artifacts. Verification rejects every partial
+tree.
 
-Every artifact is a **candidate**, recording `publishable=false` and
-`publication_state=candidate_pending_independent_output_review`. Nothing
-promotes, overwrites, or deletes a candidate: acceptance is a separate external
-attestation at `src/phase4/P4_3_ACCEPTANCE.json`, written only after an
-independent review of the complete bundle. That file does not exist, and the
-P4.3 checker fails if it does.
+The complete bundle is an **immutable candidate**. Its authoritative manifest,
+with reader-facing repetition in the JSON summary and Markdown report, records
+`publishable=false` and
+`publication_state=immutable_candidate_requires_external_attestation`. This is
+an invariant property, never a time-dependent claim about review progress. CSV
+and SVG siblings carry no publication or commit claim; the manifest binds them
+by path and hash. Nothing promotes, overwrites, or deletes a candidate:
+acceptance is a separate external attestation at
+`src/phase4/P4_3_ACCEPTANCE.json`, written only after an independent review of
+the complete bundle. That file does not exist, and the P4.3 checker fails if it
+does.
 
 **This tree does not exist yet.** No production P4.3 analysis has been run, and
 no P4.3 curated result has been accepted for publication.

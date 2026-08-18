@@ -15,12 +15,12 @@ schema, or version pin.
 
 Three modes::
 
-    python3 scripts/analyze_phase4_p43.py --self-test
+    python3 -I -B scripts/analyze_phase4_p43.py --self-test
         Synthetic acceptance tests over temporary directories only. Nothing in
         this repository is read as evidence and nothing is written outside the
         temporary tree.
 
-    python3 scripts/analyze_phase4_p43.py --analyze \\
+    python3 -I -B scripts/analyze_phase4_p43.py --analyze \\
         --campaign-root results/raw/phase4 \\
         --pilot-campaign-id <PILOT> \\
         --final-campaign-id <FINAL_1> --final-campaign-id <FINAL_2> \\
@@ -32,7 +32,7 @@ Three modes::
         final campaign's manifest pins, aggregate across the three campaigns,
         and publish the frozen artifact inventory no-clobber.
 
-    python3 scripts/analyze_phase4_p43.py --verify   (same options)
+    python3 -I -B scripts/analyze_phase4_p43.py --verify   (same options)
         Recompute the complete analysis from the same evidence and compare
         every output byte for byte. Writes nothing.
 
@@ -41,11 +41,15 @@ repetition. The accepted pilot is orchestration qualification evidence only and
 never enters a statistic, ranking, variability estimate, table, figure, or
 conclusion.
 
-Everything this module publishes is a **candidate**: the nine artifacts record
-``publishable=false`` and ``publication_state=candidate_pending_independent_
-output_review``. Nothing here promotes, overwrites, or deletes a candidate. The
-later acceptance attestation (``src/phase4/P4_3_ACCEPTANCE.json``) is an
-external file this module never writes and only knows how to validate.
+Everything this module publishes is an immutable **candidate**. Bundle-level
+publication state and analysis-code provenance live authoritatively in
+``analysis_manifest.json`` and are repeated for readers in the JSON summary and
+Markdown report; detached CSV and SVG siblings are bound by the manifest and
+are not standalone provenance envelopes. Candidate bytes never claim whether a
+time-dependent external audit, review, or attestation has already happened.
+Nothing here promotes, overwrites, or deletes a candidate. The later acceptance
+attestation (``src/phase4/P4_3_ACCEPTANCE.json``) is an external file this
+module never writes and only knows how to validate.
 
 Exit codes: 0 OK; 1 at least one check failed; 2 usage error.
 """
@@ -79,15 +83,16 @@ P35_CHECKER_RELATIVE_PATH = "scripts/check_gemm_comparison_p35.py"
 SCHEMA_VERSION = "p43.v1"
 UNIT = "P4.3"
 PUBLISHABLE = False
-# Every artifact this module writes is a candidate awaiting an independent
-# review of the outputs themselves. There is no route that promotes, rewrites,
-# or deletes a candidate: acceptance is an external, separate attestation.
-PUBLICATION_STATE = "candidate_pending_independent_output_review"
+# The state is an invariant property of the immutable candidate bytes, not a
+# clock-dependent claim about which external workflow step is currently pending.
+# There is no route that promotes, rewrites, or deletes a candidate: publication
+# authority always comes from a separate, hash-bound acceptance attestation.
+PUBLICATION_STATE = "immutable_candidate_requires_external_attestation"
 PUBLICATION_STATUS = (
     "publishable=false; publication_state="
-    "candidate_pending_independent_output_review; the P4.3 independent audit, "
-    "the production analysis of the three real final campaigns, and the "
-    "independent review of its outputs are all pending"
+    "immutable_candidate_requires_external_attestation; candidate bytes do not record "
+    "time-dependent audit, verification, review, or attestation progress; publication "
+    "authority requires a separate hash-bound external acceptance attestation"
 )
 
 # ---------------------------------------------------------------------------
@@ -117,7 +122,8 @@ ACCEPTANCE_REQUIRED_FIELDS = (
     "independent_output_review_outcome",
 )
 # The frozen lifecycle. Every step is a separate, explicitly authorized action;
-# none of the steps after candidate production has been performed.
+# the immutable candidate records the required order, never a mutable progress
+# assertion about which external step has happened.
 ACCEPTANCE_LIFECYCLE = (
     "an independently audited, clean analysis-code commit",
     "candidate production analysis from exactly that commit",
@@ -246,6 +252,30 @@ METRIC_EVIDENCE: dict[str, tuple[str, str]] = {
         EVIDENCE_DIAGNOSTIC,
         "the closed unit's own within-campaign stability diagnostic (CV > 5% inside "
         "one campaign); a diagnostic only, it never filtered a sample"),
+    "within_campaign_iqr_flagged_count": (
+        EVIDENCE_DIAGNOSTIC,
+        "the closed unit's own count of retained repetitions outside its Tukey IQR "
+        "fences; diagnostic only, because no flagged observation was removed"),
+    "within_campaign_flops_per_cycle_per_sm_cv_percent": (
+        EVIDENCE_DIAGNOSTIC,
+        "P2.4's within-campaign coefficient of variation for the retained "
+        "flops_per_cycle_per_sm repetitions; never the P4.3 cross-campaign CV"),
+    "within_campaign_flops_per_cycle_iqr_flagged_count": (
+        EVIDENCE_DIAGNOSTIC,
+        "P2.4's count of retained flops_per_cycle repetitions outside its Tukey IQR "
+        "fences; diagnostic only, with no sample removal"),
+    "within_campaign_flops_per_cycle_per_sm_iqr_flagged_count": (
+        EVIDENCE_DIAGNOSTIC,
+        "P2.4's count of retained flops_per_cycle_per_sm repetitions outside its "
+        "Tukey IQR fences; diagnostic only, with no sample removal"),
+    "profile_sm_clock_status": (
+        EVIDENCE_DIAGNOSTIC,
+        "P2.4's terminal per-configuration validation status for the profiled SM-clock "
+        "metric used by modeled clock conversions"),
+    "profile_diagnostic_metrics_resolved_count": (
+        EVIDENCE_DIAGNOSTIC,
+        "P2.4's terminal per-configuration count of optional profiler diagnostic "
+        "metrics that were resolved; preserved without inventing a pass threshold"),
     "surprising_value_flag": (
         EVIDENCE_DIAGNOSTIC,
         "the closed unit's own diagnostic that a scaling efficiency fell outside "
@@ -835,11 +865,15 @@ def require_row_keys(records: list[dict], *, label: str, expected_keys: tuple,
 def parse_p14_pilot_statistics(text: str, *, label: str) -> dict:
     records = read_table(text, label=label, required_fields=(
         "method", "stages", "bytes_in_flight_kib", "sample_count", "median_gbps",
-        "cv_percent", "stability_review"))
+        "cv_percent", "stability_review", "iqr_flagged_count"))
     require_row_keys(records, label=label, expected_keys=P14_CONFIG_KEYS,
                      key_fields=("method", "stages", "bytes_in_flight_kib"))
     parsed = {}
     for record, key in zip(records, P14_CONFIG_KEYS):
+        iqr_flagged = to_int(record["iqr_flagged_count"],
+                             f"{label}: {key}: iqr_flagged_count")
+        if iqr_flagged < 0:
+            raise P43Error(f"{label}: {key}: iqr_flagged_count={iqr_flagged} is negative")
         parsed[key] = {
             "median_gbps": to_float(record["median_gbps"], f"{label}: {key}: median_gbps",
                                     strictly_positive=True),
@@ -848,6 +882,7 @@ def parse_p14_pilot_statistics(text: str, *, label: str) -> dict:
             "within_campaign_sample_count": to_int(
                 record["sample_count"], f"{label}: {key}: sample_count"),
             "within_campaign_stability_review": record["stability_review"].strip(),
+            "within_campaign_iqr_flagged_count": iqr_flagged,
         }
     return parsed
 
@@ -903,7 +938,10 @@ def parse_p24_configuration_statistics(text: str, *, label: str) -> dict:
     records = read_table(text, label=label, required_fields=(
         "method", "n", "depth", "cta_group", "sample_count",
         "flops_per_cycle_median", "flops_per_cycle_per_sm_median",
-        "flops_per_cycle_cv_percent", "flops_per_cycle_stability_review"))
+        "flops_per_cycle_cv_percent", "flops_per_cycle_stability_review",
+        "flops_per_cycle_iqr_flagged_count",
+        "flops_per_cycle_per_sm_cv_percent",
+        "flops_per_cycle_per_sm_iqr_flagged_count"))
     require_row_keys(records, label=label, expected_keys=P24_CONFIG_KEYS,
                      key_fields=("method", "n", "depth"))
     parsed = {}
@@ -911,6 +949,13 @@ def parse_p24_configuration_statistics(text: str, *, label: str) -> dict:
         cta_group = to_int(record["cta_group"], f"{label}: {key}: cta_group")
         if cta_group != P24_CTA_GROUP[key[0]]:
             raise P43Error(f"{label}: {key}: cta_group={cta_group} contradicts the method")
+        flops_iqr = to_int(record["flops_per_cycle_iqr_flagged_count"],
+                           f"{label}: {key}: flops_per_cycle_iqr_flagged_count")
+        per_sm_iqr = to_int(record["flops_per_cycle_per_sm_iqr_flagged_count"],
+                            f"{label}: {key}: "
+                            f"flops_per_cycle_per_sm_iqr_flagged_count")
+        if flops_iqr < 0 or per_sm_iqr < 0:
+            raise P43Error(f"{label}: {key}: an IQR-flagged count is negative")
         parsed[key] = {
             "cta_group": cta_group,
             "median_flops_per_cycle": to_float(
@@ -922,6 +967,9 @@ def parse_p24_configuration_statistics(text: str, *, label: str) -> dict:
             "within_campaign_cv_percent": to_float(
                 record["flops_per_cycle_cv_percent"],
                 f"{label}: {key}: flops_per_cycle_cv_percent"),
+            "within_campaign_flops_per_cycle_per_sm_cv_percent": to_float(
+                record["flops_per_cycle_per_sm_cv_percent"],
+                f"{label}: {key}: flops_per_cycle_per_sm_cv_percent"),
             "within_campaign_sample_count": to_int(
                 record["sample_count"], f"{label}: {key}: sample_count"),
             # P2.4's own within-campaign stability diagnostic. It is parsed and
@@ -929,6 +977,8 @@ def parse_p24_configuration_statistics(text: str, *, label: str) -> dict:
             # with, replaced by, or overridden by the cross-campaign CV.
             "within_campaign_stability_review": record[
                 "flops_per_cycle_stability_review"].strip(),
+            "within_campaign_flops_per_cycle_iqr_flagged_count": flops_iqr,
+            "within_campaign_flops_per_cycle_per_sm_iqr_flagged_count": per_sm_iqr,
         }
     return parsed
 
@@ -969,21 +1019,36 @@ def parse_p24_saturation(text: str, *, label: str) -> dict:
 
 def parse_p24_profile_validation(text: str, *, label: str) -> dict:
     records = read_table(text, label=label, required_fields=(
-        "index", "case_name", "method", "n", "depth", "sm_clock_status"))
+        "index", "case_name", "method", "n", "depth", "sm_clock_status",
+        "diagnostic_metrics_resolved_count"))
     if len(records) != P24_PROFILE_CASE_COUNT:
         raise P43Error(f"{label}: has {len(records)} row(s), expected "
                        f"{P24_PROFILE_CASE_COUNT}")
     observed_configurations = []
+    cases = {}
     for number, record in enumerate(records):
         index = to_int(record["index"], f"{label}: row {number + 1}: index")
         if index != number:
             raise P43Error(f"{label}: row {number + 1} carries index {index}; the profile "
                            f"rows must be 0..{P24_PROFILE_CASE_COUNT - 1} in order")
-        observed_configurations.append((
+        key = (
             record["method"].strip(),
             to_int(record["n"], f"{label}: row {number + 1}: n"),
             to_int(record["depth"], f"{label}: row {number + 1}: depth"),
-        ))
+        )
+        observed_configurations.append(key)
+        diagnostic_count = to_int(
+            record["diagnostic_metrics_resolved_count"],
+            f"{label}: row {number + 1}: diagnostic_metrics_resolved_count")
+        if diagnostic_count < 0:
+            raise P43Error(f"{label}: row {number + 1}: "
+                           f"diagnostic_metrics_resolved_count={diagnostic_count} is negative")
+        cases[key] = {
+            "index": index,
+            "case_name": record["case_name"].strip(),
+            "sm_clock_status": record["sm_clock_status"].strip(),
+            "diagnostic_metrics_resolved_count": diagnostic_count,
+        }
     if sorted(observed_configurations) != sorted(P24_CONFIG_KEYS):
         raise P43Error(f"{label}: the profiled configurations are not the frozen "
                        f"{P24_PROFILE_CASE_COUNT}-configuration plan exactly once each")
@@ -992,6 +1057,7 @@ def parse_p24_profile_validation(text: str, *, label: str) -> dict:
         "case_count": len(records),
         "sm_clock_ok_count": sum(1 for status in statuses if status == "OK"),
         "sm_clock_statuses_distinct": sorted(set(statuses)),
+        "cases": cases,
     }
 
 
@@ -1408,6 +1474,8 @@ def aggregate_experiment_1(records: list[dict]) -> tuple[list[list[str]], dict]:
                  [entry["within_campaign_cv_percent"] for entry in entries]),
                 ("within_campaign_stability_review",
                  [entry["within_campaign_stability_review"] for entry in entries]),
+                ("within_campaign_iqr_flagged_count",
+                 [entry["within_campaign_iqr_flagged_count"] for entry in entries]),
                 ("ncu_coverage", [coverage] * CAMPAIGN_COUNT)):
             rows.append(prefix + [metric, NOT_APPLICABLE, evidence_class_for(metric)]
                         + diagnostic_cells(cells, metric=metric,
@@ -1422,6 +1490,16 @@ def aggregate_experiment_1(records: list[dict]) -> tuple[list[list[str]], dict]:
                     "section": "experiment_1_configuration",
                     "method": method, "stages": stages, "bytes_in_flight_kib": bif,
                     "within_campaign_stability_review": review,
+                })
+            iqr_flagged = entry["within_campaign_iqr_flagged_count"]
+            if iqr_flagged:
+                warnings.append({
+                    "campaign_id": records[campaign_index]["campaign_id"],
+                    "campaign_position": campaign_index + 1,
+                    "section": "experiment_1_configuration",
+                    "method": method, "stages": stages, "bytes_in_flight_kib": bif,
+                    "within_campaign_iqr_flagged_count": iqr_flagged,
+                    "effect": "diagnostic_only_no_observation_removed",
                 })
         configurations.append({
             "method": method, "stages": stages, "bytes_in_flight_kib": bif,
@@ -1587,16 +1665,33 @@ def aggregate_experiment_2(records: list[dict]) -> tuple[list[list[str]], dict]:
                                      notes="clock_independent_operation_and_cycle_"
                                            "derived_campaign_level_median"))
             entry["metrics"][metric] = summary_json(summary, metric=metric)
-        # P2.4's own within-campaign stability evidence for flops_per_cycle,
-        # preserved per campaign beside the value it qualifies.
+        # P2.4's own terminal diagnostics for the two throughput quantities
+        # P4.3 reports, plus the profiler-validation row for this exact
+        # configuration. Every value is preserved per campaign beside the
+        # quantity it qualifies.
         diagnostics = {}
+        profile_cases = [record["umma"]["profile_validation"]["cases"][key]
+                         for record in records]
         for metric, cells in (
                 ("within_campaign_sample_count",
                  [source["within_campaign_sample_count"] for source in sources]),
                 ("within_campaign_cv_percent",
                  [source["within_campaign_cv_percent"] for source in sources]),
                 ("within_campaign_stability_review",
-                 [source["within_campaign_stability_review"] for source in sources])):
+                 [source["within_campaign_stability_review"] for source in sources]),
+                ("within_campaign_flops_per_cycle_per_sm_cv_percent",
+                 [source["within_campaign_flops_per_cycle_per_sm_cv_percent"]
+                  for source in sources]),
+                ("within_campaign_flops_per_cycle_iqr_flagged_count",
+                 [source["within_campaign_flops_per_cycle_iqr_flagged_count"]
+                  for source in sources]),
+                ("within_campaign_flops_per_cycle_per_sm_iqr_flagged_count",
+                 [source["within_campaign_flops_per_cycle_per_sm_iqr_flagged_count"]
+                  for source in sources]),
+                ("profile_sm_clock_status",
+                 [case["sm_clock_status"] for case in profile_cases]),
+                ("profile_diagnostic_metrics_resolved_count",
+                 [case["diagnostic_metrics_resolved_count"] for case in profile_cases])):
             rows.append(prefix + [metric, NOT_APPLICABLE, evidence_class_for(metric)]
                         + diagnostic_cells(cells, metric=metric,
                                            notes="preserved_source_diagnostic"))
@@ -1610,6 +1705,28 @@ def aggregate_experiment_2(records: list[dict]) -> tuple[list[list[str]], dict]:
                     "section": "experiment_2_configuration",
                     "method": method, "n": n, "depth": depth,
                     "within_campaign_stability_review": review,
+                })
+            for field in (
+                    "within_campaign_flops_per_cycle_iqr_flagged_count",
+                    "within_campaign_flops_per_cycle_per_sm_iqr_flagged_count"):
+                flagged = source[field]
+                if flagged:
+                    warnings.append({
+                        "campaign_id": records[campaign_index]["campaign_id"],
+                        "campaign_position": campaign_index + 1,
+                        "section": "experiment_2_configuration",
+                        "method": method, "n": n, "depth": depth,
+                        field: flagged,
+                        "effect": "diagnostic_only_no_observation_removed",
+                    })
+            profile_status = profile_cases[campaign_index]["sm_clock_status"]
+            if profile_status != "OK":
+                warnings.append({
+                    "campaign_id": records[campaign_index]["campaign_id"],
+                    "campaign_position": campaign_index + 1,
+                    "section": "experiment_2_profile_validation",
+                    "method": method, "n": n, "depth": depth,
+                    "profile_sm_clock_status": profile_status,
                 })
         entry["within_campaign_diagnostics"] = diagnostics
         configurations.append(entry)
@@ -2123,10 +2240,10 @@ def build_limitations(experiment_1: dict, experiment_2: dict, experiment_3: dict
         f"{MANIFEST_RELATIVE_PATH}, which is the authoritative provenance envelope. A "
         f"detached CSV or SVG is not a standalone provenance envelope and must be "
         f"distributed with the manifest",
-        "no P4.3 result is publishable: the independent audit of this analysis layer, the "
-        "production run against the three real final campaigns, the byte-for-byte "
-        "verification, the independent review of the resulting outputs, and the external "
-        "acceptance attestation are all still pending",
+        "no candidate artifact self-authorizes publication: candidate bytes remain "
+        "publishable=false and publication authority, if later granted, exists only in a "
+        "separate attestation that binds the exact manifest and sibling hashes after the "
+        "required verification and independent review",
     ]
 
 
@@ -2238,10 +2355,11 @@ def build_summary_document(records: list[dict], sections: dict, interpretation: 
                 "a campaign, never changes a result, and never replaces a closed unit's "
                 "own within-campaign stability review"),
             "within_campaign_diagnostics": (
-                "each closed unit's own sample_count, cv_percent, stability review, "
-                "surprising-value flag, and Nsight Compute diagnostic flags are preserved "
-                "per campaign, in the frozen campaign order, under their own "
-                "within_campaign_* and source-diagnostic names"),
+                "each reported configuration preserves the closed unit's own sample "
+                "count, CV, stability review, Tukey-IQR flagged count, profile SM-clock "
+                "status, resolved-diagnostic count, surprising-value flag, and Nsight "
+                "Compute diagnostic flags where those fields exist upstream; all remain "
+                "per campaign, in the frozen order, under source-diagnostic names"),
             "pooling_of_internal_repetitions": "forbidden",
             "ratio_policy": ("ratios are computed inside each campaign and only then "
                              "summarized; a ratio is never formed from two aggregates"),
@@ -2540,18 +2658,21 @@ def render_report(document: dict) -> bytes:
 
     lines.append("## 6. Preserved source diagnostics and review conditions")
     lines.append("")
-    lines.append("Every within-campaign diagnostic the closed units recorded is preserved "
+    lines.append("Every terminal diagnostic enumerated by this P4.3 contract is preserved "
                  "per campaign, in the frozen campaign order, in the CSV tables and in "
-                 "`integrated_summary.json`. Nothing below excluded a campaign, removed an "
-                 "observation, or changed a value.")
+                 "`integrated_summary.json`: sample counts, relevant within-campaign CVs "
+                 "and stability reviews, Tukey-IQR flagged counts, per-case SM-clock and "
+                 "resolved-profiler-metric diagnostics, scaling flags, NCU coverage, HBM "
+                 "classification, and NCU diagnostic flags. Nothing below excluded a "
+                 "campaign, removed an observation, or changed a value.")
     lines.append("")
     warnings = document["source_diagnostic_warnings"]
     lines.append(f"### Source diagnostic warnings ({len(warnings)})")
     lines.append("")
     if not warnings:
-        lines.append("* None: no campaign recorded a non-empty Nsight Compute diagnostic "
-                     "flag, a within-campaign stability review, or a surprising-value flag "
-                     "in any configuration.")
+        lines.append("* None: no campaign recorded a non-empty warning condition among the "
+                     "preserved stability, IQR, profile-validation, scaling, or Nsight "
+                     "Compute diagnostics.")
     else:
         for entry in warnings:
             detail = ", ".join(f"{key}={entry[key]}" for key in sorted(entry)
@@ -2625,26 +2746,20 @@ def render_report(document: dict) -> bytes:
                  f"{document['analysis_provenance']['analysis_code_commit']}")
     lines.append("```")
     lines.append("")
-    lines.append("The remaining lifecycle is, in this exact order:")
+    lines.append("The complete required lifecycle is, in this exact order:")
     lines.append("")
     for index, step in enumerate(ACCEPTANCE_LIFECYCLE, start=1):
         lines.append(f"{index}. {step}")
     lines.append("")
-    lines.append(f"No step after the production of this candidate has been performed. "
-                 f"Acceptance is an external attestation at `{ACCEPTANCE_RELATIVE_PATH}` "
-                 f"that binds this bundle's `{MANIFEST_RELATIVE_PATH}` hash; it is never "
-                 f"written by the analyzer, and no candidate artifact is ever promoted, "
-                 f"rewritten, or deleted to record it.")
+    lines.append(f"Candidate bytes deliberately make no claim about which external "
+                 f"lifecycle steps have occurred. Acceptance is an external attestation "
+                 f"at `{ACCEPTANCE_RELATIVE_PATH}` that binds this bundle's "
+                 f"`{MANIFEST_RELATIVE_PATH}` hash; it is never written by the analyzer, "
+                 f"and no candidate artifact is ever promoted, rewritten, or deleted to "
+                 f"record workflow progress.")
     lines.append("")
-    lines.append("## 10. Status")
-    lines.append("")
-    lines.append("```text")
-    lines.append("P4.1 | Orchestrator                              | YES | YES | YES")
-    lines.append("P4.2 | Pilot plus three final campaigns          | YES | YES | YES")
-    lines.append("P4.3 | Integrated analysis, documentation, audit | YES | NO  | NO")
-    lines.append("```")
-    lines.append("")
-    lines.append(f"`publishable = {str(PUBLISHABLE).lower()}`. {PUBLICATION_STATUS}.")
+    lines.append(f"`publishable = {str(PUBLISHABLE).lower()}` inside the immutable "
+                 f"candidate. {PUBLICATION_STATUS}.")
     lines.append("")
     return ("\n".join(lines)).encode("utf-8")
 
@@ -2652,7 +2767,9 @@ def render_report(document: dict) -> bytes:
 # --- Deterministic SVG ------------------------------------------------------
 
 _SVG_WIDTH = 1080
-_SVG_HEIGHT = 400
+_SVG_HEIGHT = 480
+_SVG_FOOTER_WRAP = 148
+_SVG_FOOTER_LINE_HEIGHT = 13
 _SVG_COLORS = ("#1f4e79", "#c05621", "#2f855a", "#6b46c1")
 
 
@@ -2661,18 +2778,22 @@ def _xml_escape(text: object) -> str:
             .replace('"', "&quot;"))
 
 
-def _svg_open(title: str) -> list[str]:
+def _svg_open(title: str, subtitle: str) -> list[str]:
     return [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {_SVG_WIDTH} {_SVG_HEIGHT}" '
         f'width="{_SVG_WIDTH}" height="{_SVG_HEIGHT}" font-family="monospace" '
         f'font-size="11">',
         f"<title>{_xml_escape(title)}</title>",
         f"<metadata>schema_version={_xml_escape(SCHEMA_VERSION)}; unit={_xml_escape(UNIT)}; "
-        f"{_xml_escape(PUBLICATION_STATUS)}; this figure is a deterministic visual artifact "
-        f"of the {MANIFEST_RELATIVE_PATH} bundle and is not a standalone provenance "
+        f"role=deterministic visual sibling; authoritative_bundle_envelope="
+        f"{_xml_escape(MANIFEST_RELATIVE_PATH)}; not a standalone provenance "
         f"envelope</metadata>",
         f'<rect x="0" y="0" width="{_SVG_WIDTH}" height="{_SVG_HEIGHT}" fill="#ffffff" '
         f'stroke="none"/>',
+        f'<text x="24" y="25" font-size="16" font-weight="bold" fill="#1f2937">'
+        f'{_xml_escape(title)}</text>',
+        f'<text x="24" y="44" font-size="10" fill="#4b5563">'
+        f'{_xml_escape(subtitle)}</text>',
     ]
 
 
@@ -2731,16 +2852,38 @@ def _svg_panel(*, x0: float, y0: float, x1: float, y1: float, title: str,
         for px, py in points:
             out.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="4" fill="{color}" '
                        f'stroke="#ffffff" stroke-width="1"/>')
-        out.append(f'<rect x="{x0 + 6:.1f}" y="{y0 + 6 + order * 14:.1f}" width="10" '
-                   f'height="10" fill="{color}"/>')
-        out.append(f'<text x="{x0 + 20:.1f}" y="{y0 + 15 + order * 14:.1f}">'
-                   f'{_xml_escape(entry["label"])}</text>')
+        if entry.get("label"):
+            out.append(f'<rect x="{x0 + 6:.1f}" y="{y0 + 6 + order * 14:.1f}" width="10" '
+                       f'height="10" fill="{color}"/>')
+            out.append(f'<text x="{x0 + 20:.1f}" y="{y0 + 15 + order * 14:.1f}">'
+                       f'{_xml_escape(entry["label"])}</text>')
     return out
 
 
 def _svg_close(footer: str) -> list[str]:
-    return [f'<text x="12" y="{_SVG_HEIGHT - 8}" font-size="10" fill="#666666">'
-            f'{_xml_escape(footer)}</text>', "</svg>"]
+    words = footer.split()
+    lines: list[str] = []
+    current: list[str] = []
+    for word in words:
+        proposed = " ".join(current + [word])
+        if current and len(proposed) > _SVG_FOOTER_WRAP:
+            lines.append(" ".join(current))
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        lines.append(" ".join(current))
+    if not lines:
+        lines = [""]
+    start_y = _SVG_HEIGHT - 10 - _SVG_FOOTER_LINE_HEIGHT * (len(lines) - 1)
+    if start_y < _SVG_HEIGHT - 68:
+        raise P43Error("the SVG footer needs more than the reserved caption area")
+    out = [f'<text x="18" y="{start_y}" font-size="10" fill="#4b5563">']
+    for index, line in enumerate(lines):
+        y = start_y + index * _SVG_FOOTER_LINE_HEIGHT
+        out.append(f'<tspan x="18" y="{y}">{_xml_escape(line)}</tspan>')
+    out.extend(["</text>", "</svg>"])
+    return out
 
 
 def _panel_geometry(count: int) -> list[tuple[float, float, float, float]]:
@@ -2749,7 +2892,7 @@ def _panel_geometry(count: int) -> list[tuple[float, float, float, float]]:
     width = usable / count
     for index in range(count):
         x0 = 62 + index * width
-        panels.append((x0, 46.0, x0 + width - 22, float(_SVG_HEIGHT - 60)))
+        panels.append((x0, 82.0, x0 + width - 22, float(_SVG_HEIGHT - 108)))
     return panels
 
 
@@ -2759,8 +2902,10 @@ def render_memory_svg(section: dict) -> bytes:
     values = [entry["mean"] for entry in section["configurations"]]
     minimums = [entry["minimum"] for entry in section["configurations"]]
     maximums = [entry["maximum"] for entry in section["configurations"]]
-    out = _svg_open("Cross-campaign mean of the campaign-level median timing-derived "
-                    "effective transfer rate")
+    out = _svg_open(
+        "Memory paths: timing-derived effective transfer rate",
+        f"Focused y-scale; dot = cross-campaign mean; whisker = min-max; "
+        f"n={CAMPAIGN_COUNT} final campaigns; x = bytes in flight")
     for index, (x0, y0, x1, y1) in enumerate(_panel_geometry(len(P14_STAGES))):
         stages = P14_STAGES[index]
         series = []
@@ -2791,8 +2936,10 @@ def render_umma_svg(section: dict) -> bytes:
     values = [entry["metrics"][metric]["mean"] for entry in section["configurations"]]
     minimums = [entry["metrics"][metric]["minimum"] for entry in section["configurations"]]
     maximums = [entry["metrics"][metric]["maximum"] for entry in section["configurations"]]
-    out = _svg_open("Cross-campaign mean of the campaign-level median "
-                    "operation-and-cycle-derived FLOP/cycle/SM")
+    out = _svg_open(
+        "UMMA throughput: operation-and-cycle-derived FLOP/cycle/SM",
+        f"Focused y-scale; dot = cross-campaign mean; whisker = min-max; "
+        f"n={CAMPAIGN_COUNT} final campaigns; x = tested depth")
     for index, (x0, y0, x1, y1) in enumerate(_panel_geometry(len(P24_N_VALUES))):
         n_value = P24_N_VALUES[index]
         series = []
@@ -2825,12 +2972,20 @@ def render_gemm_svg(section: dict) -> bytes:
             values.append(candidate["metrics"]["tflops"]["mean"])
             minimums.append(candidate["metrics"]["tflops"]["minimum"])
             maximums.append(candidate["metrics"]["tflops"]["maximum"])
-    out = _svg_open("Cross-campaign mean of the campaign-level derived TFLOP/s per shape "
-                    "and candidate")
+    out = _svg_open(
+        "GEMM comparison: derived TFLOP/s by shape and candidate",
+        f"Focused y-scale shared by all shape panels; dot = cross-campaign mean; "
+        f"whisker = min-max; n={CAMPAIGN_COUNT} final campaigns")
+    short_labels = {
+        "nonpersistent_1cta": "NP1",
+        "persistent_1cta": "P1",
+        "persistent_2cta": "P2",
+        "heuristic_first_supported": "BL",
+    }
     for index, (x0, y0, x1, y1) in enumerate(_panel_geometry(len(section["shapes"]))):
         shape = section["shapes"][index]
         series = [{
-            "label": "candidates",
+            "label": "",
             "values": [candidate["metrics"]["tflops"]["mean"]
                        for candidate in shape["candidates"]],
             "minimums": [candidate["metrics"]["tflops"]["minimum"]
@@ -2840,16 +2995,16 @@ def render_gemm_svg(section: dict) -> bytes:
         }]
         out.extend(_svg_panel(
             x0=x0, y0=y0, x1=x1, y1=y1, title=shape["shape_id"],
-            x_labels=[str(candidate["candidate_index"])
+            x_labels=[short_labels.get(candidate["variant"],
+                                      f"C{candidate['candidate_index']}")
                       for candidate in shape["candidates"]],
             y_label="TFLOP/s", series=series,
             y_min=min(minimums), y_max=max(maximums)))
-    order = ", ".join(f"{index + 1}={name}"
-                      for index, name in enumerate(section["candidate_order"]))
     out.extend(_svg_close(
-        f"n={CAMPAIGN_COUNT} final campaigns; {WHISKER_CAPTION}. Candidate order: {order}. "
-        f"TFLOP/s is derived from the exact operation count and the measured kernel time; "
-        f"hot cache; beating cuBLASLt is not a success criterion."))
+        f"n={CAMPAIGN_COUNT} final campaigns; {WHISKER_CAPTION}. Candidate labels: "
+        f"NP1=nonpersistent_1cta; P1=persistent_1cta; P2=persistent_2cta; "
+        f"BL=cuBLASLt. TFLOP/s is derived from exact operation count and measured kernel "
+        f"time; hot cache; beating cuBLASLt is not a success criterion."))
     return ("\n".join(out) + "\n").encode("utf-8")
 
 
@@ -2968,13 +3123,14 @@ def build_manifest(orchestrator, records: list[dict], sources: list[dict],
         "acceptance": {
             "attestation_path": ACCEPTANCE_RELATIVE_PATH,
             "attestation_schema_version": ACCEPTANCE_SCHEMA_VERSION,
-            "exists": False,
+            "presence_is_external_to_candidate_bytes": True,
             "note": (
-                "acceptance is an external attestation created only by a later, explicitly "
-                "authorized closing action, after an independent reviewer has inspected "
-                "this complete bundle. The analyzer never writes it, it is not part of the "
-                "artifact inventory, and no candidate artifact is ever promoted, "
-                "overwritten, or deleted to record it"),
+                "publication authority is an external attestation created only by an "
+                "explicitly authorized closing action after verification and independent "
+                "review. Candidate bytes never assert whether that external file currently "
+                "exists. The analyzer never writes it, it is not part of the artifact "
+                "inventory, and no candidate artifact is promoted, overwritten, or "
+                "deleted to record workflow progress"),
             "lifecycle": list(ACCEPTANCE_LIFECYCLE),
         },
     }
@@ -3027,11 +3183,45 @@ def validate_acceptance_document(document: object, *, manifest_sha256: str,
     errors: list[str] = []
     if not isinstance(document, dict):
         return ["the acceptance attestation is not a JSON object"]
+    required_fields = set(ACCEPTANCE_REQUIRED_FIELDS)
+    if set(document) != required_fields:
+        errors.append(
+            "the acceptance attestation must contain exactly the frozen top-level fields; "
+            f"symmetric_difference={sorted(set(document) ^ required_fields)}")
     for field in ACCEPTANCE_REQUIRED_FIELDS:
         if field not in document:
             errors.append(f"the acceptance attestation has no {field!r}")
     if errors:
         return errors
+    expected_siblings = set(ARTIFACT_RELATIVE_PATHS) - {MANIFEST_RELATIVE_PATH}
+    trusted_reference_valid = True
+    if not isinstance(manifest_sha256, str) or not _SHA256_RE.fullmatch(manifest_sha256):
+        errors.append("the trusted manifest_sha256 reference is not a canonical SHA-256")
+        trusted_reference_valid = False
+    if not isinstance(analysis_code_commit, str) \
+            or not GIT_COMMIT_RE.fullmatch(analysis_code_commit):
+        errors.append("the trusted analysis_code_commit reference is not a full lowercase "
+                      "40-character commit")
+        trusted_reference_valid = False
+    if not isinstance(artifact_sha256, dict):
+        errors.append("the trusted artifact_sha256 reference is not an object")
+        trusted_reference_valid = False
+        expected: dict[str, str] = {}
+    else:
+        expected = dict(artifact_sha256)
+        if set(expected) != expected_siblings:
+            errors.append(
+                "the trusted artifact_sha256 reference must cover exactly the eight "
+                "non-manifest artifacts; symmetric_difference="
+                f"{sorted(set(expected) ^ expected_siblings)}")
+            trusted_reference_valid = False
+        for relative, digest in sorted(expected.items()):
+            if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+                errors.append(f"the trusted artifact_sha256 reference for {relative!r} is "
+                              f"not a canonical SHA-256")
+                trusted_reference_valid = False
+    if trusted_reference_valid:
+        expected[MANIFEST_RELATIVE_PATH] = manifest_sha256
     if document["schema_version"] != ACCEPTANCE_SCHEMA_VERSION:
         errors.append(f"schema_version={document['schema_version']!r}, expected "
                       f"{ACCEPTANCE_SCHEMA_VERSION!r}")
@@ -3061,19 +3251,17 @@ def validate_acceptance_document(document: object, *, manifest_sha256: str,
     if not isinstance(hashes, dict):
         errors.append("artifact_sha256 is not an object")
     else:
-        expected = dict(artifact_sha256)
-        expected[MANIFEST_RELATIVE_PATH] = manifest_sha256
         if set(hashes) != set(ARTIFACT_RELATIVE_PATHS):
             errors.append(
                 f"artifact_sha256 must cover exactly the "
                 f"{len(ARTIFACT_RELATIVE_PATHS)} P4.3 artifacts; got "
                 f"{sorted(set(hashes) ^ set(ARTIFACT_RELATIVE_PATHS))} in symmetric "
                 f"difference")
-        for relative in sorted(set(hashes) & set(expected)):
+        for relative in sorted(set(hashes) & set(ARTIFACT_RELATIVE_PATHS)):
             value = hashes[relative]
             if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
                 errors.append(f"artifact_sha256[{relative!r}] is not a canonical SHA-256")
-            elif value != expected[relative]:
+            elif relative in expected and value != expected[relative]:
                 errors.append(
                     f"artifact_sha256[{relative!r}] does not match the reviewed bytes; the "
                     f"attestation never authorizes a modified or partially regenerated "
@@ -3098,6 +3286,23 @@ def build_acceptance_template(manifest_sha256: str, artifact_sha256: dict,
     disk, and the repository checker requires the real file to be absent for as
     long as P4.3 is not accepted.
     """
+    expected_siblings = set(ARTIFACT_RELATIVE_PATHS) - {MANIFEST_RELATIVE_PATH}
+    if not isinstance(manifest_sha256, str) or not _SHA256_RE.fullmatch(manifest_sha256):
+        raise P43Error("cannot build an acceptance template from a malformed manifest hash")
+    if not isinstance(analysis_code_commit, str) \
+            or not GIT_COMMIT_RE.fullmatch(analysis_code_commit):
+        raise P43Error("cannot build an acceptance template from a malformed analysis-code "
+                       "commit")
+    if not isinstance(artifact_sha256, dict) or set(artifact_sha256) != expected_siblings:
+        got = set(artifact_sha256) if isinstance(artifact_sha256, dict) else set()
+        raise P43Error(
+            "cannot build an acceptance template unless the trusted artifact hash map "
+            "covers exactly the eight non-manifest artifacts; symmetric_difference="
+            f"{sorted(got ^ expected_siblings)}")
+    if any(not isinstance(value, str) or not _SHA256_RE.fullmatch(value)
+           for value in artifact_sha256.values()):
+        raise P43Error("cannot build an acceptance template from a non-canonical artifact "
+                       "hash")
     hashes = dict(artifact_sha256)
     hashes[MANIFEST_RELATIVE_PATH] = manifest_sha256
     return {
@@ -3135,16 +3340,19 @@ def build_acceptance_template(manifest_sha256: str, artifact_sha256: dict,
 #     root OID equals the commit's tree OID), so nothing is staged;
 #   * every tracked path exists in the worktree with exactly the indexed blob
 #     content and mode, so nothing tracked is modified or deleted;
-#   * no entry is unmerged, skip-worktree, or assume-unchanged, so nothing is
-#     masked from that comparison;
+#   * no entry is unmerged, skip-worktree, or intent-to-add, so nothing is
+#     masked from that comparison; every indexed file is read regardless of
+#     advisory assume-unchanged hints;
 #   * no repository operation (merge, rebase, cherry-pick, revert, bisect) is
 #     in progress.
 #
-# What it deliberately does not treat as dirty: an *untracked* path. The
-# analyzer's own output tree is untracked until someone commits it, so
-# requiring its absence would make `--verify` unable to run after `--analyze`.
-# Untracked files cannot change the content of any tracked file, which is the
-# property that binds this bundle to the audited code.
+# Untracked content is allowed only below the three data roots that production
+# legitimately needs: immutable raw evidence, preflight evidence, and the
+# curated P4.3 output tree. Any untracked path elsewhere -- especially under
+# `scripts/`, `src/`, or the repository root -- is fatal. In addition, the
+# production CLI requires Python isolated mode (`-I -B`), so the checkout,
+# PYTHONPATH, user site, and bytecode caches cannot inject an uncommitted module
+# before provenance verification.
 # ===========================================================================
 
 GIT_DIR_NAME = ".git"
@@ -3169,15 +3377,22 @@ GIT_PACK_MAGIC = b"PACK"
 GIT_OBJ_COMMIT, GIT_OBJ_TREE, GIT_OBJ_BLOB, GIT_OBJ_TAG = 1, 2, 3, 4
 GIT_OBJ_OFS_DELTA, GIT_OBJ_REF_DELTA = 6, 7
 GIT_MAX_DELTA_CHAIN = 64
+GIT_ALLOWED_UNTRACKED_ROOTS = (
+    ("results", "raw"),
+    ("results", "preflight"),
+    OUTPUT_ROOT_COMPONENTS,
+)
 
 WORKTREE_CLEAN_DEFINITION = (
     "HEAD is one full 40-character commit; the index equals that commit's tree, so "
     "nothing is staged; every tracked path exists in the worktree with exactly the "
     "committed blob content and mode; no index entry is unmerged, skip-worktree, or "
-    "assume-unchanged; and no merge, rebase, cherry-pick, revert, or bisect is in "
-    "progress. Untracked paths are permitted and are recorded as such: they cannot "
-    "change any tracked file, and the analyzer's own candidate output tree is itself "
-    "untracked until it is committed"
+    "intent-to-add; every indexed path is read regardless of assume-unchanged hints; "
+    "and no merge, rebase, cherry-pick, revert, or bisect is in "
+    "progress. Untracked content is permitted only below results/raw, "
+    "results/preflight, and results/phase4; every untracked path elsewhere is rejected. "
+    "Production also requires Python -I -B isolated mode, preventing checkout, "
+    "PYTHONPATH, user-site, or bytecode-cache import injection"
 )
 
 
@@ -3592,6 +3807,67 @@ def _git_blob_oid(payload: bytes) -> str:
                         + payload).hexdigest()
 
 
+def _git_reject_unsafe_untracked(root_fd: int, tracked_paths: set[tuple[str, ...]]) -> None:
+    """Reject every untracked path outside the frozen data roots.
+
+    Git tracks files rather than directories, so parent directories are derived
+    from the verified index. Traversal is descriptor-relative and never follows
+    a symlink. The allowed roots themselves must be real directories; their
+    potentially large contents are deliberately not traversed because evidence
+    and candidate bytes are validated by their own contracts later.
+    """
+    tracked_directories: set[tuple[str, ...]] = {()}
+    for path in tracked_paths:
+        for length in range(1, len(path)):
+            tracked_directories.add(path[:length])
+
+    allowed = set(GIT_ALLOWED_UNTRACKED_ROOTS)
+
+    def is_parent_of_allowed(path: tuple[str, ...]) -> bool:
+        return any(root[:len(path)] == path for root in allowed)
+
+    def walk(directory_fd: int, prefix: tuple[str, ...]) -> None:
+        for name in sorted(os.listdir(directory_fd)):
+            path = prefix + (name,)
+            label = "/".join(path)
+            if path == (GIT_DIR_NAME,):
+                continue
+            try:
+                info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise GitProvenanceError(f"{label}: cannot inspect the worktree: {exc}") from exc
+            if path in allowed:
+                if not stat.S_ISDIR(info.st_mode):
+                    raise GitProvenanceError(
+                        f"{label}: an allowed untracked data root is not a real directory")
+                continue
+            if path in tracked_paths:
+                continue
+            may_contain_tracked = path in tracked_directories
+            may_contain_allowed = is_parent_of_allowed(path)
+            if stat.S_ISDIR(info.st_mode) and (may_contain_tracked or may_contain_allowed):
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                if hasattr(os, "O_CLOEXEC"):
+                    flags |= os.O_CLOEXEC
+                try:
+                    child_fd = os.open(name, flags, dir_fd=directory_fd)
+                except OSError as exc:
+                    raise GitProvenanceError(
+                        f"{label}: cannot traverse the worktree without following a "
+                        f"symlink: {exc}") from exc
+                try:
+                    walk(child_fd, path)
+                finally:
+                    os.close(child_fd)
+                continue
+            raise GitProvenanceError(
+                f"{label}: is an untracked path outside the allowed data roots "
+                f"results/raw, results/preflight, and results/phase4; the worktree is "
+                f"unsafe for analysis-code provenance")
+
+    walk(root_fd, ())
+
+
 def resolve_git_provenance(repo_root: Path) -> dict:
     """The analysis-code commit of this run, verified, never assumed."""
     try:
@@ -3624,6 +3900,7 @@ def resolve_git_provenance(repo_root: Path) -> dict:
                 f"the index tree {cache_tree} differs from the tree of HEAD "
                 f"({head_tree}): the index is dirty (something is staged)")
         tracked = 0
+        tracked_paths: set[tuple[str, ...]] = set()
         for entry in entries:
             label = entry["path"].decode("utf-8", errors="replace")
             if entry["stage"] != 0:
@@ -3633,6 +3910,7 @@ def resolve_git_provenance(repo_root: Path) -> dict:
                     f"{label}: is marked skip-worktree or intent-to-add, which would hide a "
                     f"difference from the worktree comparison")
             parts = tuple(entry["path"].decode("utf-8").split("/"))
+            tracked_paths.add(parts)
             if entry["mode"] == GIT_MODE_SYMLINK:
                 raise GitProvenanceError(
                     f"{label}: is a tracked symlink; this repository tracks none, and "
@@ -3653,6 +3931,7 @@ def resolve_git_provenance(repo_root: Path) -> dict:
                 raise GitProvenanceError(f"{label}: its executable bit differs from the "
                                          f"committed mode; the worktree is dirty")
             tracked += 1
+        _git_reject_unsafe_untracked(_git_root_fd_cache(repo_root), tracked_paths)
         return {
             "analysis_code_commit": head_commit,
             "analysis_code_tree": head_tree,
@@ -3662,7 +3941,8 @@ def resolve_git_provenance(repo_root: Path) -> dict:
             "verification_method": (
                 "pure-Python read of .git: HEAD and refs resolved without a child process, "
                 "the index's cache-tree root compared to the HEAD commit's tree, and every "
-                "tracked path's blob SHA-1 and mode recomputed from the worktree"),
+                "tracked path's blob SHA-1 and mode recomputed from the worktree; every "
+                "untracked path outside the three frozen data roots was rejected"),
         }
     finally:
         os.close(git_fd)
@@ -3689,6 +3969,7 @@ GIT_PROVENANCE_FUNCTION_NAMES = (
     "_git_parse_index",
     "_git_parse_cache_tree_root",
     "_git_blob_oid",
+    "_git_reject_unsafe_untracked",
     "resolve_git_provenance",
 )
 
@@ -3859,10 +4140,15 @@ def publish_documents(orchestrator, tree: dict, documents: list[tuple[str, bytes
     Nothing is ever overwritten. Every artifact is created with
     ``O_CREAT | O_EXCL | O_NOFOLLOW``; an artifact that already exists must be
     byte-identical, in which case it is verified rather than rewritten, and a
-    different existing artifact is fatal. There is no promotion path and no
-    deletion path: a candidate is immutable once written.
+    different existing artifact is fatal. A resumable partial tree is safe only
+    because the whole existing subset is checked first; no missing artifact is
+    created until every existing byte and the absence of unexpected paths have
+    passed. There is no promotion path and no deletion path: a candidate is
+    immutable once written.
     """
+    assert_output_tree_compatible(tree)
     outcomes: dict[str, str] = {}
+    missing: list[tuple[str, bytes, int, str]] = []
     for relative, payload in documents:
         parts = split_relative_path(relative)
         if len(parts) == 1:
@@ -3882,17 +4168,23 @@ def publish_documents(orchestrator, tree: dict, documents: list[tuple[str, bytes
                 raise P43Error(f"{relative}: {exc}") from exc
             if not write:
                 raise P43Error(f"{relative}: is missing; nothing to verify") from exc
-            try:
-                orchestrator.write_file_exclusive(name, payload, dir_fd=directory_fd)
-            except orchestrator.OrchestratorError as inner:
-                raise P43Error(f"{relative}: {inner}") from inner
-            outcomes[relative] = "written"
+            missing.append((relative, payload, directory_fd, name))
             continue
         if existing != payload:
             raise P43Error(
                 f"{relative}: already exists with different content; refusing to overwrite "
                 f"a candidate artifact")
         outcomes[relative] = "verified_byte_identical"
+    # Second pass: every pre-existing artifact is now known byte-identical and
+    # the tree contains nothing unexpected. Exclusive writes make a race fail
+    # closed; a later retry may verify bytes already created by an interrupted
+    # attempt but can never replace them.
+    for relative, payload, directory_fd, name in missing:
+        try:
+            orchestrator.write_file_exclusive(name, payload, dir_fd=directory_fd)
+        except orchestrator.OrchestratorError as exc:
+            raise P43Error(f"{relative}: {exc}") from exc
+        outcomes[relative] = "written"
     return outcomes
 
 
@@ -3908,15 +4200,8 @@ def _is_missing(exc: Exception) -> bool:
     return "No such file or directory" in str(exc)
 
 
-def assert_output_tree_exact(tree: dict) -> None:
-    """The output tree must contain exactly the frozen inventory.
-
-    The scan runs entirely on the already validated descriptors and lstats every
-    name relative to them, so no path is re-resolved and no symlink is ever
-    followed. A partial, conflicting, or unexpected artifact, a symlink, a
-    directory where a file belongs, and any other file type are all fatal.
-    """
-    expected_files = set(ARTIFACT_RELATIVE_PATHS)
+def _scan_output_tree(tree: dict) -> set[str]:
+    """Return existing regular artifacts, rejecting every unsafe entry."""
     observed_files: set[str] = set()
     for subdirectory, directory_fd in tree.items():
         for entry in sorted(os.listdir(directory_fd)):
@@ -3930,6 +4215,29 @@ def assert_output_tree_exact(tree: dict) -> None:
                 raise P43Error(f"{label}: is not a regular file (symlinks and special "
                                f"files are rejected)")
             observed_files.add(label)
+    return observed_files
+
+
+def assert_output_tree_compatible(tree: dict) -> None:
+    """A partial tree may contain only frozen artifact paths."""
+    expected_files = set(ARTIFACT_RELATIVE_PATHS)
+    observed_files = _scan_output_tree(tree)
+    unexpected = observed_files - expected_files
+    if unexpected:
+        raise P43Error(f"the output tree contains unexpected artifacts: "
+                       f"{sorted(unexpected)}")
+
+
+def assert_output_tree_exact(tree: dict) -> None:
+    """The completed output tree must contain exactly the frozen inventory.
+
+    The scan runs entirely on the already validated descriptors and lstats every
+    name relative to them, so no path is re-resolved and no symlink is ever
+    followed. A partial, conflicting, or unexpected artifact, a symlink, a
+    directory where a file belongs, and any other file type are all fatal.
+    """
+    expected_files = set(ARTIFACT_RELATIVE_PATHS)
+    observed_files = _scan_output_tree(tree)
     if observed_files != expected_files:
         raise P43Error(
             f"the output tree is not exactly the frozen inventory: "
@@ -3960,11 +4268,22 @@ def run_analysis(repo_root: Path, campaign_root: Path, pilot_ids: list[str],
     except P43Error as exc:
         print(f"{prefix}: FAILED: {exc}", file=sys.stderr)
         return 1
+
+    # Verify the checkout before importing or executing any other repository-
+    # owned Python module. Python -I -B protects the initial standard-library
+    # imports; this gate then proves the tracked dependency modules themselves
+    # come from the recorded clean commit and rejects unsafe untracked content.
+    try:
+        provenance = git_provenance(repo_root)
+        validate_analysis_provenance(provenance)
+    except P43Error as exc:
+        print(f"{prefix}: FAILED: {exc}", file=sys.stderr)
+        return 1
+
     orchestrator, p42, p35 = load_repository_modules(repo_root)
 
-    # The authoritative gate runs first: not one scientific value is read and not
-    # one byte is written until the whole frozen population has passed P4.2's
-    # own strictly read-only revalidation.
+    # After the local code-provenance gate, the authoritative evidence gate runs
+    # before one scientific value is read or one output byte is written.
     status = revalidator(orchestrator, p42, campaign_root, list(pilot_ids), list(final_ids))
     if status != 0:
         print(f"{prefix}: FAILED: the frozen Phase 4 population did not pass P4.2's "
@@ -3974,12 +4293,6 @@ def run_analysis(repo_root: Path, campaign_root: Path, pilot_ids: list[str],
 
     tree = None
     try:
-        # Which commit's code is producing this candidate, verified before any
-        # value is read. There is no flag that skips this and no default that
-        # stands in for it: a candidate that cannot name its own clean
-        # analysis-code commit is never produced.
-        provenance = git_provenance(repo_root)
-        validate_analysis_provenance(provenance)
         resolve_output_root(output_root, repo_root)
         repo_from_campaigns = p42.campaign_root_to_repo_root(campaign_root, orchestrator)
         if Path(os.path.abspath(str(repo_from_campaigns))) != Path(
@@ -4051,9 +4364,14 @@ def _fixture_record(campaign_id: str, *, gbps_scale: float = 1.0,
                     memory_cv_percent: float = 0.1,
                     memory_stability_review: str = "ok",
                     memory_sample_count: int = 30,
+                    memory_iqr_flagged_count: int = 0,
                     ncu_diagnostic_flags: str = "",
                     umma_cv_percent: float = 0.01,
+                    umma_per_sm_cv_percent: float = 0.01,
                     umma_stability_review: str = "ok",
+                    umma_flops_iqr_flagged_count: int = 0,
+                    umma_per_sm_iqr_flagged_count: int = 0,
+                    profile_diagnostic_metrics_resolved_count: int = 2,
                     surprising_value_flag: str = "False") -> dict:
     """One synthetic, obviously fake campaign record shaped exactly like a
     parsed one. No real evidence is involved."""
@@ -4064,6 +4382,7 @@ def _fixture_record(campaign_id: str, *, gbps_scale: float = 1.0,
             "within_campaign_cv_percent": memory_cv_percent,
             "within_campaign_sample_count": memory_sample_count,
             "within_campaign_stability_review": memory_stability_review,
+            "within_campaign_iqr_flagged_count": memory_iqr_flagged_count,
         }
     pairwise = {key: {"tma_to_ldgsts_ratio": (0.97 + 0.001 * index) * ratio_scale,
                       "interpretation": "ldgsts_higher"}
@@ -4081,8 +4400,14 @@ def _fixture_record(campaign_id: str, *, gbps_scale: float = 1.0,
             "median_flops_per_cycle": total,
             "median_flops_per_cycle_per_sm": total / P24_CTA_GROUP[key[0]],
             "within_campaign_cv_percent": umma_cv_percent,
+            "within_campaign_flops_per_cycle_per_sm_cv_percent":
+                umma_per_sm_cv_percent,
             "within_campaign_sample_count": 30,
             "within_campaign_stability_review": umma_stability_review,
+            "within_campaign_flops_per_cycle_iqr_flagged_count":
+                umma_flops_iqr_flagged_count,
+            "within_campaign_flops_per_cycle_per_sm_iqr_flagged_count":
+                umma_per_sm_iqr_flagged_count,
         }
     scaling = {key: {"speedup_2sm_over_1sm": 1.5 + 0.01 * index,
                      "scaling_efficiency_percent": 75.0 + 0.5 * index,
@@ -4099,6 +4424,9 @@ def _fixture_record(campaign_id: str, *, gbps_scale: float = 1.0,
     # fixture exercises a ratio above one and an unclamped negative gap;
     # candidate 4 is the baseline itself, with ratio exactly one and gap zero.
     fixture_ratios = (0.5, 0.9, 1.2, 1.0)
+    fixture_variants = (
+        "nonpersistent_1cta", "persistent_1cta", "persistent_2cta",
+        "heuristic_first_supported")
     for shape_index in range(1, 6):
         for candidate_index in range(1, 5):
             base = 100.0 * shape_index + 10.0 * candidate_index
@@ -4106,7 +4434,7 @@ def _fixture_record(campaign_id: str, *, gbps_scale: float = 1.0,
             gemm_rows[(shape_index, candidate_index)] = {
                 "shape_id": f"shape{shape_index}",
                 "m": 4096, "n": 4096, "k": 4096, "l": 1,
-                "variant": f"variant{candidate_index}",
+                "variant": fixture_variants[candidate_index - 1],
                 "method": "cublaslt" if candidate_index == 4 else "cutedsl",
                 "kernel_time_ms": 0.1 * candidate_index,
                 "tflops": base * gemm_scale,
@@ -4131,7 +4459,17 @@ def _fixture_record(campaign_id: str, *, gbps_scale: float = 1.0,
                  "saturation": umma_saturation,
                  "profile_validation": {"case_count": P24_PROFILE_CASE_COUNT,
                                         "sm_clock_ok_count": P24_PROFILE_CASE_COUNT,
-                                        "sm_clock_statuses_distinct": ["OK"]},
+                                        "sm_clock_statuses_distinct": ["OK"],
+                                        "cases": {
+                                            key: {
+                                                "index": index,
+                                                "case_name": f"fixture_{index:02d}",
+                                                "sm_clock_status": "OK",
+                                                "diagnostic_metrics_resolved_count":
+                                                    profile_diagnostic_metrics_resolved_count,
+                                            }
+                                            for index, key in enumerate(P24_CONFIG_KEYS)
+                                        }},
                  "ceiling": {"selected_configuration": {
                                  "method": "umma_1sm", "n": 256, "depth": ceiling_depth,
                                  "case_name": f"23_umma_1sm_n256_d{ceiling_depth}"},
@@ -4178,7 +4516,9 @@ class _StubP35:
     EXPECTED_SHAPE_IDS = tuple(f"shape{index + 1}" for index in range(5))
     EXPECTED_SHAPE_COUNT = 5
     EXPECTED_CANDIDATE_COUNT = 4
-    EXPECTED_CANDIDATE_ORDER = ("variant1", "variant2", "variant3", "variant4")
+    EXPECTED_CANDIDATE_ORDER = (
+        "nonpersistent_1cta", "persistent_1cta", "persistent_2cta",
+        "heuristic_first_supported")
     EXPECTED_ROW_COUNT = 20
 
     @staticmethod
@@ -4251,9 +4591,9 @@ def _self_test_statistics(reporter: _Reporter) -> None:
 
 def _self_test_parsers(reporter: _Reporter) -> None:
     header = ("method,stages,bytes_in_flight_kib,sample_count,median_gbps,cv_percent,"
-              "stability_review")
+              "stability_review,iqr_flagged_count")
     good_lines = [header] + [
-        f"{method},{stages},{bif},30,{3000 + index}.5,0.1,ok"
+        f"{method},{stages},{bif},30,{3000 + index}.5,0.1,ok,0"
         for index, (method, stages, bif) in enumerate(P14_CONFIG_KEYS)]
     good = "\n".join(good_lines) + "\n"
     parsed = parse_p14_pilot_statistics(good, label="fixture")
@@ -4289,6 +4629,44 @@ def _self_test_parsers(reporter: _Reporter) -> None:
                      lambda: parse_p14_pilot_statistics(
                          good.replace("cv_percent", "median_gbps"), label="fixture"),
                      "repeats a field name")
+    reporter.rejects("a negative IQR-flagged count is rejected",
+                     lambda: parse_p14_pilot_statistics(
+                         good.replace("ok,0", "ok,-1", 1), label="fixture"),
+                     "is negative")
+
+    p24_header = (
+        "method,n,depth,cta_group,sample_count,flops_per_cycle_median,"
+        "flops_per_cycle_per_sm_median,flops_per_cycle_cv_percent,"
+        "flops_per_cycle_stability_review,flops_per_cycle_iqr_flagged_count,"
+        "flops_per_cycle_per_sm_cv_percent,"
+        "flops_per_cycle_per_sm_iqr_flagged_count")
+    p24_lines = [p24_header] + [
+        f"{method},{n},{depth},{P24_CTA_GROUP[method]},30,{2000 + index}.0,"
+        f"{1000 + index}.0,0.5,ok,1,0.75,2"
+        for index, (method, n, depth) in enumerate(P24_CONFIG_KEYS)]
+    parsed_p24 = parse_p24_configuration_statistics(
+        "\n".join(p24_lines) + "\n", label="p24 fixture")
+    reporter.check("P2.4 configuration diagnostics parse for every frozen configuration",
+                   len(parsed_p24) == len(P24_CONFIG_KEYS)
+                   and all(entry[
+                       "within_campaign_flops_per_cycle_iqr_flagged_count"] == 1
+                           and entry[
+                               "within_campaign_flops_per_cycle_per_sm_iqr_flagged_count"]
+                           == 2 for entry in parsed_p24.values()), "")
+
+    profile_header = (
+        "index,case_name,method,n,depth,sm_clock_status,"
+        "diagnostic_metrics_resolved_count")
+    profile_lines = [profile_header] + [
+        f"{index},case_{index:02d},{method},{n},{depth},OK,{index % 3}"
+        for index, (method, n, depth) in enumerate(P24_CONFIG_KEYS)]
+    parsed_profile = parse_p24_profile_validation(
+        "\n".join(profile_lines) + "\n", label="profile fixture")
+    reporter.check("P2.4 per-case profile diagnostics survive parsing",
+                   parsed_profile["case_count"] == P24_PROFILE_CASE_COUNT
+                   and len(parsed_profile["cases"]) == P24_PROFILE_CASE_COUNT
+                   and parsed_profile["cases"][P24_CONFIG_KEYS[2]][
+                       "diagnostic_metrics_resolved_count"] == 2, "")
 
     ceiling = {
         "status": "ANALYZED", "publishable": False,
@@ -4391,7 +4769,7 @@ def _self_test_aggregation(reporter: _Reporter, orchestrator) -> None:
     reporter.check("the memory table carries the value row plus every preserved diagnostic "
                    "row for each frozen configuration, ratio pair, saturation group, and "
                    "profiled case",
-                   len(text.strip().split("\n")) == 1 + 5 * len(P14_CONFIG_KEYS)
+                   len(text.strip().split("\n")) == 1 + 6 * len(P14_CONFIG_KEYS)
                    + len(P14_PAIR_KEYS) + len(P14_SATURATION_KEYS)
                    + 3 * len(P14_NCU_CASES), str(len(text.strip().split("\n"))))
 
@@ -4636,12 +5014,18 @@ def _self_test_diagnostics(reporter: _Reporter, orchestrator, p35) -> None:
         FINAL_CAMPAIGN_IDS[0]: {"ncu_diagnostic_flags": "",
                                 "memory_stability_review": "ok",
                                 "memory_cv_percent": 0.10,
+                                "memory_iqr_flagged_count": 0,
                                 "umma_stability_review": "ok",
                                 "surprising_value_flag": "False"},
         FINAL_CAMPAIGN_IDS[1]: {"ncu_diagnostic_flags": "READ_AMPLIFICATION",
                                 "memory_stability_review": "REVIEW",
                                 "memory_cv_percent": 7.25,
+                                "memory_iqr_flagged_count": 2,
                                 "umma_stability_review": "REVIEW",
+                                "umma_per_sm_cv_percent": 8.5,
+                                "umma_flops_iqr_flagged_count": 1,
+                                "umma_per_sm_iqr_flagged_count": 3,
+                                "profile_diagnostic_metrics_resolved_count": 4,
                                 "surprising_value_flag": "True"},
         FINAL_CAMPAIGN_IDS[2]: {"ncu_diagnostic_flags": "SOME_OTHER_FLAG",
                                 "memory_stability_review": "ok",
@@ -4695,12 +5079,25 @@ def _self_test_diagnostics(reporter: _Reporter, orchestrator, p35) -> None:
                    and all(row["campaign_2_value"] == "7.25"
                            and row["cross_campaign_cv_percent"] == NOT_APPLICABLE
                            for row in cv_rows), "")
+    iqr_rows = [row for row in memory_rows
+                if row["metric"] == "within_campaign_iqr_flagged_count"]
+    reporter.check("P1.4's IQR-flagged counts survive without removing a repetition",
+                   len(iqr_rows) == len(P14_CONFIG_KEYS)
+                   and all((row["campaign_1_value"], row["campaign_2_value"],
+                            row["campaign_3_value"]) == ("0", "2", "0")
+                           for row in iqr_rows), "")
 
     umma_rows = list(csv.DictReader(io.StringIO(
         payloads["umma_throughput.csv"].decode("utf-8"))))
     for metric, expected in (("within_campaign_sample_count", "30"),
                              ("within_campaign_cv_percent", "0.01"),
-                             ("within_campaign_stability_review", "REVIEW")):
+                             ("within_campaign_stability_review", "REVIEW"),
+                             ("within_campaign_flops_per_cycle_per_sm_cv_percent", "8.5"),
+                             ("within_campaign_flops_per_cycle_iqr_flagged_count", "1"),
+                             ("within_campaign_flops_per_cycle_per_sm_iqr_flagged_count",
+                              "3"),
+                             ("profile_sm_clock_status", "OK"),
+                             ("profile_diagnostic_metrics_resolved_count", "4")):
         rows = [row for row in umma_rows if row["metric"] == metric]
         reporter.check(f"P2.4's {metric} is preserved per campaign",
                        len(rows) == len(P24_CONFIG_KEYS)
@@ -4810,7 +5207,9 @@ def _self_test_metadata_contract(reporter: _Reporter, orchestrator,
     reporter.check("the manifest records the candidate publication state",
                    manifest["publishable"] is False
                    and manifest["publication_state"] == PUBLICATION_STATE
-                   and manifest["acceptance"]["exists"] is False, "")
+                   and manifest["acceptance"][
+                       "presence_is_external_to_candidate_bytes"] is True
+                   and "exists" not in manifest["acceptance"], "")
 
     # Metadata ownership: the detached data artifacts deliberately do NOT
     # duplicate the global provenance, and the documentation says so.
@@ -4819,7 +5218,9 @@ def _self_test_metadata_contract(reporter: _Reporter, orchestrator,
                      "figures/gemm_comparison.svg"):
         text = payloads[relative].decode("utf-8")
         reporter.check(f"{relative} is not claimed to embed the campaign IDs",
-                       all(campaign_id not in text for campaign_id in FINAL_CAMPAIGN_IDS),
+                       all(campaign_id not in text for campaign_id in FINAL_CAMPAIGN_IDS)
+                       and PUBLICATION_STATE not in text
+                       and "analysis_code_commit" not in text,
                        relative)
     reporter.check("the two context documents carry the scientific context needed to read "
                    "the bundle",
@@ -4832,6 +5233,23 @@ def _self_test_metadata_contract(reporter: _Reporter, orchestrator,
                    in payloads["report.md"].decode("utf-8")
                    and "not a standalone provenance envelope"
                    in json.dumps(summary), "")
+    for relative in ("figures/memory_paths.svg", "figures/umma_throughput.svg",
+                     "figures/gemm_comparison.svg"):
+        svg = payloads[relative].decode("utf-8")
+        spans = re.findall(r"<tspan\s+[^>]*>(.*?)</tspan>", svg)
+        reporter.check(f"{relative} has a visible title, focused-scale cue, and wrapped "
+                       "footer inside its enlarged canvas",
+                       'viewBox="0 0 1080 480"' in svg
+                       and '<text x="24" y="25"' in svg
+                       and "Focused y-scale" in svg
+                       and len(spans) >= 2
+                       and all(len(line) <= _SVG_FOOTER_WRAP for line in spans),
+                       str(spans))
+    reporter.check("the GEMM figure labels every candidate directly rather than using "
+                   "unmapped numeric indices",
+                   all(label in payloads["figures/gemm_comparison.svg"].decode("utf-8")
+                       for label in ("NP1=nonpersistent_1cta", "P1=persistent_1cta",
+                                     "P2=persistent_2cta", "BL=cuBLASLt")), "")
     reporter.rejects("a manifest that does not bind all eight siblings is rejected",
                      lambda: build_manifest(orchestrator, _fixture_records(), [],
                                             _fixture_provenance(),
@@ -4937,10 +5355,22 @@ def _self_test_acceptance(reporter: _Reporter, orchestrator,
         ("an unreviewed bundle",
          lambda doc: doc.__setitem__("independent_output_review_outcome", "skipped"),
          "independent_output_review_outcome="),
+        ("an unexpected top-level field",
+         lambda doc: doc.__setitem__("mutable_note", "not allowed"),
+         "exactly the frozen top-level fields"),
     ):
         found = errors(mutate)
         reporter.check(f"an acceptance attestation with {label} is rejected",
                        any(fragment in item for item in found), str(found))
+    incomplete_reference = dict(artifact_sha256)
+    incomplete_reference.pop("memory_paths.csv")
+    reference_errors = validate_acceptance_document(
+        template, manifest_sha256=manifest_sha256,
+        artifact_sha256=incomplete_reference, analysis_code_commit=commit)
+    reporter.check("an incomplete trusted artifact-hash reference is rejected before an "
+                   "attestation can validate",
+                   any("trusted artifact_sha256 reference must cover exactly"
+                       in item for item in reference_errors), str(reference_errors))
     reporter.check("the acceptance attestation is not part of the analysis inventory and "
                    "is never produced by the analyzer",
                    ACCEPTANCE_RELATIVE_PATH not in ARTIFACT_RELATIVE_PATHS
@@ -5057,12 +5487,27 @@ def _self_test_git_provenance(reporter: _Reporter, root: Path) -> None:
                    and provenance["worktree_clean"] is True
                    and provenance["tracked_paths_verified"] == 2, str(provenance))
 
-    # An untracked file is deliberately not dirty: the candidate output tree is
-    # itself untracked until someone commits it.
-    (clean / "results").mkdir()
-    (clean / "results" / "untracked.txt").write_text("x\n", encoding="utf-8")
-    reporter.check("an untracked path does not make the analysis-code worktree dirty",
+    # Untracked evidence/output bytes are legitimate data, but untracked code
+    # anywhere else would invalidate the analysis-code provenance.
+    (clean / "results" / "phase4").mkdir(parents=True)
+    (clean / "results" / "phase4" / "candidate.txt").write_text(
+        "x\n", encoding="utf-8")
+    reporter.check("untracked candidate bytes under results/phase4 are allowed",
                    resolve_git_provenance(clean)["worktree_clean"] is True, "")
+
+    (clean / "scripts").mkdir()
+    (clean / "scripts" / "csv.py").write_text("raise SystemExit(99)\n", encoding="utf-8")
+    reporter.rejects("an untracked Python module under scripts invalidates provenance",
+                     lambda: resolve_git_provenance(clean),
+                     "untracked path outside the allowed data roots")
+    (clean / "scripts" / "csv.py").unlink()
+    (clean / "scripts").rmdir()
+
+    (clean / "sitecustomize.py").write_text("raise SystemExit(98)\n", encoding="utf-8")
+    reporter.rejects("an untracked repository-root import hook invalidates provenance",
+                     lambda: resolve_git_provenance(clean),
+                     "untracked path outside the allowed data roots")
+    (clean / "sitecustomize.py").unlink()
 
     (clean / "README.md").write_text("two\n", encoding="utf-8")
     reporter.rejects("a modified tracked file is a dirty worktree",
@@ -5244,6 +5689,22 @@ def _self_test_publication(reporter: _Reporter, orchestrator, root: Path) -> Non
                        "overwrite, or delete route",
                        all(value != "written" for value in outcomes.values()), "")
 
+        # A partial retry is two-pass: a conflict anywhere in the existing
+        # subset is found before an earlier missing artifact can be created.
+        expected_report = dict(documents)["report.md"]
+        (output / "memory_paths.csv").unlink()
+        (output / "report.md").write_text("tampered\n", encoding="utf-8")
+        reporter.rejects("a conflicting partial tree fails before any missing artifact is "
+                         "created",
+                         lambda: publish_documents(orchestrator, tree, documents,
+                                                   write=True),
+                         "refusing to overwrite a candidate artifact")
+        reporter.check("the failed partial retry wrote no earlier missing artifact",
+                       not (output / "memory_paths.csv").exists(), "")
+        (output / "report.md").write_bytes(expected_report)
+        publish_documents(orchestrator, tree, documents, write=True)
+        assert_output_tree_exact(tree)
+
         (output / "report.md").write_text("tampered\n", encoding="utf-8")
         reporter.rejects("a differing existing artifact is never overwritten",
                          lambda: publish_documents(orchestrator, tree, documents,
@@ -5291,39 +5752,48 @@ def _self_test_publication(reporter: _Reporter, orchestrator, root: Path) -> Non
 
 
 def _self_test_pipeline(reporter: _Reporter, root: Path) -> None:
-    """The evidence seam: a failed population revalidation must abort before a
-    single scientific value is read or a single byte is written."""
+    """The provenance and evidence seams both fail before scientific output."""
     repo = root / "pipeline"
     (repo / "results" / "raw" / "phase4").mkdir(parents=True)
-    calls: list[tuple] = []
+    events: list[tuple] = []
+
+    def clean_provenance(_repo_root):
+        events.append(("provenance",))
+        return _fixture_provenance()
 
     def refusing(orchestrator, p42, campaign_root, pilot_ids, final_ids):
-        calls.append((tuple(pilot_ids), tuple(final_ids)))
+        events.append(("revalidation", tuple(pilot_ids), tuple(final_ids)))
         return 1
-
-    def unreachable_provenance(_repo_root):
-        raise AssertionError("provenance must not be consulted before revalidation passes")
 
     status = run_analysis(DEFAULT_REPO_ROOT, repo / "results" / "raw" / "phase4",
                           [PILOT_CAMPAIGN_ID], list(FINAL_CAMPAIGN_IDS),
                           repo / "results" / "phase4", write=True, revalidator=refusing,
-                          git_provenance=unreachable_provenance)
+                          git_provenance=clean_provenance)
     reporter.check("a failed P4.2 population revalidation aborts the whole analysis before "
-                   "any provenance, evidence, or byte is touched",
+                   "any scientific value or output byte is touched",
                    status == 1, str(status))
-    reporter.check("the revalidation received the declared pilot and the three finals",
-                   calls == [((PILOT_CAMPAIGN_ID,), FINAL_CAMPAIGN_IDS)], str(calls))
+    reporter.check("clean code provenance is established before repository modules and "
+                   "the evidence revalidator are used",
+                   events == [("provenance",),
+                              ("revalidation", (PILOT_CAMPAIGN_ID,), FINAL_CAMPAIGN_IDS)],
+                   str(events))
     reporter.check("nothing was written when revalidation failed",
                    not (repo / "results" / "phase4").exists(), "")
+
+    def unreachable_provenance(_repo_root):
+        raise AssertionError("provenance must not be consulted for an invalid population")
 
     status = run_analysis(DEFAULT_REPO_ROOT, repo / "results" / "raw" / "phase4",
                           [PILOT_CAMPAIGN_ID], list(FINAL_CAMPAIGN_IDS)[:2],
                           repo / "results" / "phase4", write=True, revalidator=refusing,
                           git_provenance=unreachable_provenance)
     reporter.check("an incomplete declared population is refused before any revalidation",
-                   status == 1 and len(calls) == 1, str(calls))
+                   status == 1 and len(events) == 2, str(events))
+
+    accepted_revalidations: list[bool] = []
 
     def accepting(orchestrator, p42, campaign_root, pilot_ids, final_ids):
+        accepted_revalidations.append(True)
         return 0
 
     def dirty_provenance(_repo_root):
@@ -5334,8 +5804,10 @@ def _self_test_pipeline(reporter: _Reporter, root: Path) -> None:
                           repo / "results" / "phase4", write=True, revalidator=accepting,
                           git_provenance=dirty_provenance)
     reporter.check("a dirty or unverifiable analysis-code provenance aborts before any "
-                   "evidence is read or any byte is written",
-                   status == 1 and not (repo / "results" / "phase4").exists(), str(status))
+                   "repository dependency or evidence is used and before any byte is "
+                   "written",
+                   status == 1 and not accepted_revalidations
+                   and not (repo / "results" / "phase4").exists(), str(status))
 
     status = run_analysis(DEFAULT_REPO_ROOT, repo / "results" / "raw" / "phase4",
                           [PILOT_CAMPAIGN_ID], list(FINAL_CAMPAIGN_IDS),
@@ -5499,6 +5971,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def validate_production_python_runtime() -> None:
+    """Production must be immune to uncommitted import-path injection."""
+    safe_path = getattr(sys.flags, "safe_path", 1)
+    if not (sys.flags.isolated and sys.flags.ignore_environment
+            and sys.flags.no_user_site and safe_path and sys.dont_write_bytecode):
+        raise P43Error(
+            "production modes require 'python3 -I -B scripts/analyze_phase4_p43.py': "
+            "isolated mode, ignored Python environment variables, no user site, a safe "
+            "module path, and disabled bytecode writes are mandatory")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -5528,6 +6011,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"analyze_phase4_p43: the production modes require {missing}; the real raw "
               f"evidence and the frozen campaign IDs are always declared explicitly",
               file=sys.stderr)
+        return 2
+    try:
+        validate_production_python_runtime()
+    except P43Error as exc:
+        print(f"analyze_phase4_p43: {exc}", file=sys.stderr)
         return 2
     return run_analysis(DEFAULT_REPO_ROOT, Path(args.campaign_root),
                         list(args.pilot_campaign_id), list(args.final_campaign_id),
