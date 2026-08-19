@@ -261,6 +261,18 @@ EXPECTED_METRIC_EVIDENCE = {
     "ncu_coverage": "source_diagnostic",
 }
 
+# The frozen size of that taxonomy. Protocol section 5.1, the analyzer's
+# METRIC_EVIDENCE, and the table above must all be exactly this many metrics.
+EXPECTED_METRIC_COUNT = 29
+
+# The deterministic monospace text metrics the figures are laid out with,
+# restated here as frozen expectations so that a collision can never be
+# "resolved" by quietly shrinking the constant the layout reserves space with.
+EXPECTED_CHAR_ADVANCE = 0.62
+EXPECTED_BASE_FONT = 11.0
+EXPECTED_TEXT_ASCENT = 0.80
+EXPECTED_TEXT_DESCENT = 0.20
+
 P43_ACCEPTANCE_RELATIVE_PATH = "src/phase4/P4_3_ACCEPTANCE.json"
 
 P43_CHECK_TARGET = "phase4-p43-check"
@@ -606,6 +618,52 @@ def _check_artifact_contract(reporter: Reporter, analyzer, protocol: str) -> Non
                        analyzer.PUBLICATION_STATE not in svg
                        and "analysis_code_commit" not in svg
                        and "time-dependent audit" not in svg, "")
+        # An independent spatial re-derivation of finding M1, computed here from
+        # the emitted coordinates rather than by calling the analyzer's own
+        # geometry helper, so that a defect in that helper cannot hide a defect
+        # in the layout. Each panel's y-axis decorations must lie strictly
+        # inside the clear gap between the preceding plot rectangle and its own.
+        panels = sorted((float(match.group(1)),
+                         float(match.group(1)) + float(match.group(2)))
+                        for match in re.finditer(
+                            r'<rect x="([\d.]+)" y="[\d.]+" width="([\d.]+)" '
+                            r'height="[\d.]+" fill="none"', svg))
+        ticks = [(float(x) - len(label) * EXPECTED_BASE_FONT * EXPECTED_CHAR_ADVANCE,
+                  float(x))
+                 for x, label in re.findall(
+                     r'<text x="([\d.]+)" y="[\d.]+" text-anchor="end">([^<]*)</text>',
+                     svg)]
+        titles = [(float(x) - EXPECTED_TEXT_ASCENT * EXPECTED_BASE_FONT,
+                   float(x) + EXPECTED_TEXT_DESCENT * EXPECTED_BASE_FONT)
+                  for x in re.findall(
+                      r'<text x="([\d.]+)" y="[\d.]+" text-anchor="middle" '
+                      r'transform="rotate\(-90 ', svg)]
+        reporter.check(f"{relative} emits one y-axis title and five tick labels per panel",
+                       len(panels) >= 3 and len(titles) == len(panels)
+                       and len(ticks) == 5 * len(panels),
+                       f"panels={len(panels)} titles={len(titles)} ticks={len(ticks)}")
+        intruding = [decoration for decoration in ticks + titles
+                     for index, (left, right) in enumerate(panels)
+                     if decoration[0] < right - 0.05 and decoration[1] > left + 0.05]
+        reporter.check(f"{relative} draws no y-axis decoration inside any plot rectangle",
+                       not intruding, str(intruding[:3]))
+        outside = [decoration for decoration in ticks + titles
+                   if decoration[0] < 0.0 or decoration[1] > float(analyzer._SVG_WIDTH)]
+        reporter.check(f"{relative} clips no y-axis decoration at the canvas edge",
+                       not outside, str(outside[:3]))
+    reporter.check("the layout still reserves space with the frozen text metrics",
+                   (analyzer._SVG_CHAR_ADVANCE, analyzer._SVG_BASE_FONT,
+                    analyzer._SVG_TEXT_ASCENT, analyzer._SVG_TEXT_DESCENT)
+                   == (EXPECTED_CHAR_ADVANCE, EXPECTED_BASE_FONT,
+                       EXPECTED_TEXT_ASCENT, EXPECTED_TEXT_DESCENT),
+                   f"{analyzer._SVG_CHAR_ADVANCE} {analyzer._SVG_BASE_FONT}")
+    for relative in ("figures/memory_paths.svg", "figures/umma_throughput.svg",
+                     "figures/gemm_comparison.svg"):
+        reporter.check(f"{relative} passes the analyzer's own collision regression",
+                       not analyzer.svg_geometry_findings(
+                           payloads[relative].decode("utf-8")),
+                       "; ".join(analyzer.svg_geometry_findings(
+                           payloads[relative].decode("utf-8")))[:300])
     gemm_svg = payloads["figures/gemm_comparison.svg"].decode("utf-8")
     reporter.check("the GEMM SVG labels all four candidates directly",
                    all(label in gemm_svg for label in
@@ -638,6 +696,27 @@ def _check_artifact_contract(reporter: Reporter, analyzer, protocol: str) -> Non
         reporter.check(f"no output artifact leaks {leak!r}", leak not in blob, "")
 
 
+def _protocol_metric_table(protocol: str) -> dict[str, str]:
+    """The frozen section 5.1 classification table, read from the protocol itself.
+
+    Parsed rather than restated so that the bidirectional equality assertion
+    below compares the document a reader actually sees against the
+    classifications the analyzer actually applies (second independent audit,
+    finding M5)."""
+    marker = "### 5.1 The frozen classification"
+    if marker not in protocol:
+        return {}
+    start = protocol.index(marker)
+    opening = protocol.index("```text", start) + len("```text")
+    closing = protocol.index("```", opening)
+    table: dict[str, str] = {}
+    for line in protocol[opening:closing].splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            table[parts[0]] = parts[1]
+    return table
+
+
 def _check_evidence_taxonomy(reporter: Reporter, analyzer, protocol: str) -> None:
     """3.1 -- every reported quantity is classified, and no derived, modeled, or
     cross-campaign quantity is presented as a direct measurement."""
@@ -654,6 +733,33 @@ def _check_evidence_taxonomy(reporter: Reporter, analyzer, protocol: str) -> Non
     for name in sorted(classes):
         reporter.check(f"{P43_PROTOCOL_RELATIVE_PATH} freezes the evidence class {name!r}",
                        name in protocol, "")
+    # The frozen table and the implementation must agree exactly, in both
+    # directions. Before this assertion existed the protocol listed 23
+    # classifications while the analyzer applied 29, and nothing noticed.
+    table = _protocol_metric_table(protocol)
+    implemented = {metric: entry[0]
+                   for metric, entry in analyzer.METRIC_EVIDENCE.items()}
+    reporter.check(f"{P43_PROTOCOL_RELATIVE_PATH} section 5.1 classifies exactly the "
+                   f"{EXPECTED_METRIC_COUNT} metrics the analyzer classifies",
+                   len(table) == len(implemented) == EXPECTED_METRIC_COUNT,
+                   f"protocol={len(table)} implementation={len(implemented)} "
+                   f"expected={EXPECTED_METRIC_COUNT}")
+    reporter.check("no metric is classified in the implementation but missing from the "
+                   "frozen protocol table",
+                   not set(implemented) - set(table),
+                   str(sorted(set(implemented) - set(table))))
+    reporter.check("no metric is listed in the frozen protocol table but absent from the "
+                   "implementation",
+                   not set(table) - set(implemented),
+                   str(sorted(set(table) - set(implemented))))
+    mismatched = {metric: (table[metric], implemented[metric])
+                  for metric in set(table) & set(implemented)
+                  if table[metric] != implemented[metric]}
+    reporter.check("every metric carries the same evidence class in the protocol and in "
+                   "the implementation", not mismatched, str(mismatched))
+    reporter.check("the checker's own frozen expectation is the same table",
+                   EXPECTED_METRIC_EVIDENCE == table == implemented,
+                   str(sorted(set(EXPECTED_METRIC_EVIDENCE) ^ set(implemented))))
     for metric, expected in EXPECTED_METRIC_EVIDENCE.items():
         declared = analyzer.METRIC_EVIDENCE.get(metric)
         reporter.check(f"{metric} is classified {expected}, not as a direct measurement",
@@ -1484,6 +1590,23 @@ def run_self_test() -> int:
                "PHASE4_P43_OUTPUT_ROOT := results/raw/phase4-analysis",
                "a Makefile that writes the analysis under results/raw/ is rejected")
 
+        # Second independent audit, finding M5: the frozen taxonomy table and
+        # the implementation must stay equal in both directions.
+        mutate(P43_PROTOCOL_RELATIVE_PATH,
+               "profile_sm_clock_status                        source_diagnostic\n", "",
+               "a protocol whose section 5.1 table omits a classified metric is rejected")
+        mutate(P43_PROTOCOL_RELATIVE_PATH,
+               "ncu_coverage                                   source_diagnostic",
+               "ncu_coverage                                   source_diagnostic\n"
+               "an_invented_metric                             source_diagnostic",
+               "a protocol whose section 5.1 table invents a metric the analyzer does "
+               "not classify is rejected")
+        mutate(P43_PROTOCOL_RELATIVE_PATH,
+               "profile_sm_clock_status                        source_diagnostic",
+               "profile_sm_clock_status                        modeled_estimate",
+               "a protocol whose section 5.1 table disagrees with the analyzer about an "
+               "evidence class is rejected")
+
         analyzer_path = clone / P43_ANALYZER_RELATIVE_PATH
         original = analyzer_path.read_text(encoding="utf-8")
         for old, new, label in (
@@ -1493,6 +1616,17 @@ def run_self_test() -> int:
              "an analyzer using the population standard deviation is rejected"),
             ("CV_REVIEW_THRESHOLD_PERCENT = 5.0", "CV_REVIEW_THRESHOLD_PERCENT = 50.0",
              "an analyzer that weakens the strict CV review threshold is rejected"),
+            # Second independent audit, finding M1: a layout that lets a panel's
+            # axis decorations reach back into the preceding panel, and the two
+            # ways that defect could be hidden rather than fixed.
+            ("_SVG_PANEL_SEPARATION = 14.0", "_SVG_PANEL_SEPARATION = -60.0",
+             "an analyzer whose panels overlap their neighbour's gutter is rejected"),
+            ("_SVG_GUTTER_PAD = 3.0", "_SVG_GUTTER_PAD = -55.0",
+             "an analyzer that pushes an axis title back into the preceding panel is "
+             "rejected"),
+            ("_SVG_CHAR_ADVANCE = 0.62", "_SVG_CHAR_ADVANCE = 0.10",
+             "an analyzer that under-reserves the gutter by shrinking its text metric "
+             "is rejected"),
             ('SIGNED_OR_ZERO_CENTRED_METRICS = frozenset({"gap_to_cublaslt_pct"})',
              "SIGNED_OR_ZERO_CENTRED_METRICS = frozenset()",
              "an analyzer that would compute a CV for the signed GEMM gap is rejected"),
@@ -1535,9 +1669,8 @@ def run_self_test() -> int:
              '"estimated_tflops_per_sm": (\n        EVIDENCE_MEASURED,',
              "an analyzer that presents the modeled clock conversion as measured is "
              "rejected"),
-            ('("diagnostic_flags", [flag or NOT_APPLICABLE\n'
-             '                                                    for flag in flags])',
-             '("diagnostic_flags", [NOT_APPLICABLE for flag in flags])',
+            ('("diagnostic_flags", [flag or NOT_APPLICABLE for flag in flags],',
+             '("diagnostic_flags", [NOT_APPLICABLE for flag in flags],',
              "an analyzer that parses NCU diagnostic flags and then drops them is "
              "rejected"),
             ('[source["within_campaign_stability_review"] for source in sources]',

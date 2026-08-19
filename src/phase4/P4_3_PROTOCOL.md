@@ -182,6 +182,28 @@ Source: each final campaign's canonical P1.4 terminal artifacts
   validation covers exactly **six predefined cases** and is never extrapolated
   to the other twelve configurations.
 
+#### 4.1.1 Reading a candidate that sits at the tested grid boundary
+
+The bytes-in-flight grid is exactly `16, 32, 64` KiB and the depth grid of
+experiment 2 is exactly `4, 16, 64, 256`. A *candidate saturation point* is an
+upstream selection made strictly **within** that grid; it is never a measured
+architectural limit and never a universal saturation threshold. When the
+selected candidate equals the largest tested value, the selection has reached
+the boundary of the evaluated range, and the tested grid cannot distinguish a
+genuine saturation point there from one lying beyond the largest value tested.
+
+Because every campaign evaluates the same frozen grid, agreement between the
+three campaigns on a boundary candidate is **not by itself** evidence that a
+saturation point was independently located. Both experiments therefore emit,
+beside every candidate list, a deterministic `saturation_boundary_interpretation`
+recording the tested grid, its upper bound, whether every candidate sits at that
+bound, and whether the summarized quantity was still rising across the final
+tested step — that is, whether any plateau was observed at all. The report
+repeats that reading in prose next to the candidates. This is the second
+independent audit's finding M2. It adds no measurement, no metric name, and no
+evidence class; the candidate values, metric names, and CSV columns are
+unchanged.
+
 ### 4.2 Experiment 2 — BF16 UMMA throughput
 
 Source: each final campaign's canonical P2.4 terminal artifacts
@@ -297,10 +319,25 @@ estimated_device_equivalent_tflops             modeled_estimate
 within_campaign_sample_count                   source_diagnostic
 within_campaign_cv_percent                     source_diagnostic
 within_campaign_stability_review               source_diagnostic
+within_campaign_iqr_flagged_count              source_diagnostic
+within_campaign_flops_per_cycle_per_sm_cv_percent  source_diagnostic
+within_campaign_flops_per_cycle_iqr_flagged_count  source_diagnostic
+within_campaign_flops_per_cycle_per_sm_iqr_flagged_count  source_diagnostic
+profile_sm_clock_status                        source_diagnostic
+profile_diagnostic_metrics_resolved_count      source_diagnostic
 surprising_value_flag                          source_diagnostic
 diagnostic_flags                               source_diagnostic
 ncu_coverage                                   source_diagnostic
 ```
+
+This table is the frozen taxonomy: it lists **exactly 29 metrics**, the same 29
+that `METRIC_EVIDENCE` classifies in `scripts/analyze_phase4_p43.py`, with the
+same class for every one. `check_phase4_integration_p43.py` asserts that
+equality in both directions -- no metric classified only in the code, none
+listed only here, and no class mismatch -- so the table cannot silently drift
+behind the implementation again, as it had for the six `source_diagnostic`
+entries added by remediation 13 and recorded by the second independent audit as
+finding M5.
 
 `kernel_time_ms` is the only metric described as a measured input, because P3.5
 section 7 step 9 explicitly measures it with CUDA events on the candidate's own
@@ -414,6 +451,56 @@ not resolved.
 `report.md` summarizes **every** non-empty warning (for example
 `READ_AMPLIFICATION`) and **every** cross-campaign review condition in two
 dedicated sections; nothing is silently discarded.
+
+#### 5.4.1 A zero cross-campaign spread is degenerate, not remarkable
+
+The experiment 2 primary metric is derived from integer-cycle-quantized
+`%clock64` measurements whose within-campaign variation is approximately zero.
+The campaign-level medians therefore frequently land on identical values, and
+the cross-campaign sample standard deviation and coefficient of variation are
+frequently **exactly zero**, with a calm `ok` review flag and a zero-length
+min-max whisker.
+
+Those statistics are mathematically valid and are preserved exactly as
+computed. What the outputs must not let a reader infer is the stronger claim:
+a zero coefficient of variation here reports that **no cross-campaign review
+threshold was exceeded**, and it is a property of a cycle-quantized instrument
+— not a demonstration of extraordinary independent reproducibility. The UMMA
+section of `report.md`, the `cross_campaign_variability_interpretation` field of
+`integrated_summary.json`, and the UMMA figure caption all state this, and all
+three add that a whisker spanning zero, or spanning less than the plotted
+marker, is still drawn at its true length and is simply hidden by the marker.
+
+This is the second independent audit's finding M3. No artificial uncertainty,
+jitter, minimum whisker length, invented precision, or new review flag is
+introduced; every statistic, flag, threshold, marker, and zero span is
+unchanged.
+
+#### 5.4.2 An empty diagnostic set is an observed result, not missing data
+
+For a profiled Nsight Compute case the upstream `diagnostic_flags` field is
+always present. An empty flag set therefore means the profiler recorded the
+field and raised nothing — a clean result — which differs categorically from a
+quantity that could not be collected at all. The canonical CSV serialization of
+an empty set stays `not_applicable`, because the serialized representation is
+frozen, so three states are named explicitly instead:
+
+```text
+present_and_empty          the field was present and its flag set was empty;
+                           rendered "none recorded" in report.md
+present_and_non_empty      a flag such as READ_AMPLIFICATION was recorded and
+                           is surfaced verbatim
+unavailable_not_profiled   one of the twelve never-profiled configurations,
+                           whose actual HBM/DRAM traffic is unavailable from
+                           the collected evidence
+```
+
+The per-campaign state accompanies every profiled case in
+`integrated_summary.json`, the `diagnostic_flags` CSV row note records that the
+upstream field was present, and `report.md` renders `none recorded` with an
+adjacent footnote. An empty flag set is **never** converted into a warning, and
+the regressions assert that the three states stay mutually distinguishable. This
+is the second independent audit's finding M4; no scientific result changes.
 
 
 ## 6. Files
@@ -887,11 +974,36 @@ isolated, bytecode-free Python runtime. The Git blob object id is anchored
 against Git's own value for known bytes so that the fixture writer and the
 reader cannot be symmetrically wrong.
 
-**Figures (audit findings 7 and 12).** The incorrect "bar" caption returning in
-any figure; the absence of the "summarizes exactly three campaign-level values"
-statement; clipped title/caption content; footer lines beyond the frozen wrap
-limit; an undersized canvas; overlapping GEMM labels; a missing visible title,
-focused-scale cue, or direct abbreviation mapping.
+**Figures (audit findings 7 and 12, and second-audit finding M1).** The
+incorrect "bar" caption returning in any figure; the absence of the "summarizes
+exactly three campaign-level values" statement; clipped title/caption content;
+footer lines beyond the frozen wrap limit; an undersized canvas; a missing
+visible title, focused-scale cue, or direct abbreviation mapping.
+
+Those checks are textual. The overlap coverage is **spatial**: for each of the
+three figures the regression re-parses the emitted SVG, reconstructs a real
+bounding box for every plot rectangle, tick label, rotated axis title, panel
+title, x-axis label, caption, footer, data marker, min-max whisker, and series
+line, and then asserts, by rectangle intersection, that
+
+* every plot rectangle lies inside the 1080x480 canvas;
+* consecutive panels are separated by a positive gutter;
+* all six y-axis decorations of panels 2..N lie inside that panel's **own**
+  allocated gutter;
+* no axis decoration intersects any plot rectangle, and in particular none
+  reaches back into a preceding one;
+* no axis decoration, panel title, or axis label overprints a data marker,
+  min-max whisker, or series line;
+* no text of any kind is clipped by the canvas edge; and
+* the base font stays at its readable size, so a collision can never be
+  "resolved" by shrinking, hiding, or clipping a label.
+
+A frozen pre-remediation fixture -- three panels at the old 22 px inter-panel
+gap with tick labels at `x0 - 5` and a rotated axis title at `x0 - 52` -- is
+asserted to be **rejected** by that regression, so the geometric coverage cannot
+become vacuous. The bounding boxes come from one deterministic monospace advance
+constant shared by the layout and the regression; no font library, renderer, or
+other new dependency is involved.
 
 
 ## 11. Status
@@ -987,3 +1099,44 @@ new separate audit and for nothing else. No campaign was created or rerun, no
 file under `results/raw/` was touched, no kernel, runner, shape, candidate,
 measurement parameter, closed-unit schema, dependency, or version pin was
 changed, and no production analysis was executed.
+
+
+## 16. Remediation after the second independent audit
+
+The second independent audit returned **ACCEPT WITH NON-BLOCKING
+OBSERVATIONS**: zero BLOCKER findings, zero MAJOR findings, five MINOR findings,
+and eleven observations. It confirmed artifact integrity, provenance, and every
+one of the 186 recomputed cross-campaign statistics. The five MINOR findings
+were presentation, semantic-documentation, and regression-coverage gaps that
+changed no reported value; they are corrected here.
+
+| # | Second-audit finding | Correction in this remediation |
+|---|----------------------|--------------------------------|
+| M1 | The y-axis tick labels and rotated axis titles of panels 2..N were drawn inside the preceding panel's plot rectangle, overprinting data in two figures, because a 22 px inter-panel gap was set against a 52 px axis-title offset; the figure regressions were textual and could not see it | Every panel now owns a cell whose leftmost region is a deterministic gutter sized from that figure's own widest tick label, with clear separation after each plot rectangle; a real bounding-box collision regression covers all three figures and is itself pinned against a frozen pre-remediation fixture |
+| M2 | The saturation candidates (64 KiB, depth 256) coincide with the largest tested grid points and no output disclosed it | `saturation_boundary_interpretation` in both experiments, prose beside every candidate list in `report.md`, and section 4.1.1 above state the tested grid, its upper bound, that a candidate is an in-grid selection rather than a measured limit, whether any plateau was observed, and that agreement at a grid boundary does not locate a saturation point |
+| M3 | 72 of 73 UMMA cross-campaign rows report `SD = 0`, `CV = 0.000000%`, `ok`, and a zero-length whisker, presented without explanation | `cross_campaign_variability_interpretation`, a paragraph in the UMMA section of `report.md`, the UMMA figure caption, and section 5.4.1 above explain the cycle quantization, state that no review threshold was exceeded rather than that reproducibility was proved, and warn that a sub-marker whisker is hidden by the marker |
+| M4 | An empty upstream NCU `diagnostic_flags` set serialized to the same `not_applicable` token used for genuinely unavailable quantities | The canonical token is preserved; the three states `present_and_empty`, `present_and_non_empty`, and `unavailable_not_profiled` are named in the summary, recorded in the CSV row note, rendered as `none recorded` with a footnote in `report.md`, and frozen in section 5.4.2 above |
+| M5 | Section 5.1 listed 23 classifications while `METRIC_EVIDENCE` classified 29 | The six `source_diagnostic` metrics added by remediation 13 are listed; the checker now asserts exact bidirectional equality between the table and `METRIC_EVIDENCE` |
+
+Nothing scientific moved. The excluded pilot, the three final campaign IDs, the
+frozen execution commit, every formula, statistical population, sample-SD
+convention, CV threshold, rounding rule, unit, row ordering, missing-data
+policy, evidence class, and every numerical measurement are unchanged, as is the
+nine-artifact candidate contract and the deterministic byte-for-byte
+verification design. The corrections are confined to figure layout, generated
+explanatory text, structured explanatory metadata, protocol documentation, and
+regression coverage.
+
+Three of the corrections change **generated bytes** — the three SVGs (layout),
+`report.md` and `integrated_summary.json` (explanatory text and metadata), and
+`memory_paths.csv` (the `diagnostic_flags` row note only, never a value) — so
+`analysis_manifest.json` will pin different sibling hashes. The candidate
+delivered to the second audit is therefore superseded and **must be
+regenerated from the frozen campaigns** before any acceptance attestation is
+created.
+
+**This remediation has not been independently audited.** It is prepared for a
+new separate audit and for nothing else. No campaign was created or rerun, no
+file under `results/raw/` was touched, no kernel, runner, shape, candidate,
+measurement parameter, closed-unit schema, dependency, or version pin was
+changed, and no production analysis or verification was executed.

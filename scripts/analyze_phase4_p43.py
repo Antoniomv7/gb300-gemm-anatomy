@@ -338,6 +338,64 @@ NOT_APPLICABLE = "not_applicable"
 CV_FLAG_OK = "ok"
 CV_FLAG_REVIEW = "REVIEW"
 
+# The three distinguishable states of a profiled case's diagnostic flag set
+# (second independent audit, finding M4). The canonical CSV token for an empty
+# flag set stays `not_applicable`, because the serialized representation is
+# frozen; these states carry the semantics the bare token cannot, so that "the
+# profiler recorded the field and raised nothing" is never read as "the quantity
+# could not be collected at all".
+NCU_FLAGS_PRESENT_EMPTY = "present_and_empty"
+NCU_FLAGS_PRESENT_NON_EMPTY = "present_and_non_empty"
+NCU_FLAGS_UNAVAILABLE = "unavailable_not_profiled"
+NCU_FLAGS_EMPTY_LABEL = "none recorded"
+NCU_FLAGS_SEMANTICS_NOTE = (
+    f"diagnostic_flags is a preserved upstream P1.4 field, not a P4.3 computation. "
+    f"For a profiled case the field is always present: {NCU_FLAGS_PRESENT_EMPTY!r} "
+    f"means it was present and its flag set was empty -- the profiler raised no "
+    f"diagnostic, rendered '{NCU_FLAGS_EMPTY_LABEL}' -- and "
+    f"{NCU_FLAGS_PRESENT_NON_EMPTY!r} means a flag such as READ_AMPLIFICATION was "
+    f"recorded and is surfaced verbatim. An empty flag set is a clean result and is "
+    f"never converted into a warning. {NCU_FLAGS_UNAVAILABLE!r} is the distinct state "
+    f"of the twelve configurations that were never profiled, whose actual HBM/DRAM "
+    f"traffic is unavailable from the collected evidence. The canonical "
+    f"'{NOT_APPLICABLE}' statistic cells of an empty flag set therefore record an "
+    f"observed absence of diagnostics, never an unavailable quantity")
+
+# The boundary-saturation interpretation (second independent audit, finding M2)
+# and the degenerate-variability interpretation (finding M3). Both are frozen
+# prose about how an existing number must be read; neither introduces, renames,
+# reclassifies, or recomputes any value.
+SATURATION_CANDIDATE_MEANING = (
+    "a candidate saturation point is an upstream selection made strictly within the "
+    "tested grid, never a measured architectural limit and never a universal "
+    "saturation threshold")
+SATURATION_BOUNDARY_MEANING = (
+    "when the selected candidate equals the largest tested grid point, the selection "
+    "has reached the boundary of the evaluated range: the tested grid cannot "
+    "distinguish a genuine saturation point there from one that lies beyond the "
+    "largest value tested")
+SATURATION_AGREEMENT_CAVEAT = (
+    "every campaign evaluates the same frozen grid, so agreement between the three "
+    "campaigns on a candidate that sits at that grid's upper boundary is not by "
+    "itself evidence that a saturation point was independently located")
+UMMA_DEGENERATE_VARIABILITY_NOTE = (
+    "How to read the UMMA cross-campaign spread. The primary metric is derived from "
+    "integer-cycle-quantized %clock64 measurements whose within-campaign variation is "
+    "approximately zero, so the campaign-level medians frequently land on identical "
+    "values and the cross-campaign sample standard deviation and coefficient of "
+    "variation are frequently exactly zero. Those statistics are mathematically valid "
+    "and are preserved unchanged, and no cross-campaign coefficient of variation "
+    "exceeded the frozen review threshold. A zero coefficient of variation here is "
+    "nevertheless a property of a cycle-quantized instrument and must not be read as "
+    "proof of extraordinary independent reproducibility: it reports that no review "
+    "threshold was exceeded, not that reproducibility was demonstrated under strain. "
+    "Where the min-max whisker spans zero, or spans less than the plotted marker, the "
+    "whisker is still drawn at its true length and is hidden by the marker")
+UMMA_DEGENERATE_VARIABILITY_CAPTION = (
+    "The metric is cycle-quantized, so a zero cross-campaign spread is an instrument "
+    "property and not proof of reproducibility; a zero-length or sub-marker min-max "
+    "whisker is drawn at its true length and is hidden by the marker.")
+
 # Serialization precision. Full precision is retained throughout the
 # computation; these decimals are applied only when a value is serialized.
 DECIMALS_DEFAULT = 6
@@ -1443,6 +1501,48 @@ STATISTICAL_FUNCTIONS = (
 # ===========================================================================
 
 
+def saturation_boundary_interpretation(*, tested_grid: tuple,
+                                       candidate_values: list,
+                                       marginal_rises: list[bool],
+                                       quantity: str, rising_label: str) -> dict:
+    """How a candidate saturation point at the grid boundary must be read.
+
+    Reports only what the frozen grid and the already-aggregated values imply:
+    whether every selected candidate equals the largest tested value, and
+    whether the quantity was still rising across the final tested step. It
+    introduces no measurement, no metric name, and no evidence class, and it
+    never renames a candidate as an architectural limit (second independent
+    audit, finding M2)."""
+    upper = max(tested_grid)
+    at_boundary = bool(candidate_values) and all(value == upper
+                                                 for value in candidate_values)
+    plateau = not all(marginal_rises)
+    if at_boundary and not plateau:
+        observation = (
+            f"every group's candidate equals {upper}, the largest tested {quantity}, "
+            f"and {rising_label} is still rising across the final tested step in every "
+            f"group, so no plateau was observed within the tested range")
+    elif at_boundary:
+        observation = (
+            f"every group's candidate equals {upper}, the largest tested {quantity}, "
+            f"while {rising_label} stops rising across the final tested step in at "
+            f"least one group")
+    else:
+        observation = (
+            f"at least one group's candidate lies strictly inside the tested grid "
+            f"rather than at its upper boundary of {upper}")
+    return {
+        "tested_grid": list(tested_grid),
+        "grid_upper_bound": upper,
+        "all_candidates_at_grid_upper_bound": at_boundary,
+        "plateau_observed_within_tested_range": plateau,
+        "observation": observation,
+        "meaning_of_candidate_saturation": SATURATION_CANDIDATE_MEANING,
+        "boundary_meaning": SATURATION_BOUNDARY_MEANING,
+        "cross_campaign_agreement_caveat": SATURATION_AGREEMENT_CAVEAT,
+    }
+
+
 def aggregate_experiment_1(records: list[dict]) -> tuple[list[list[str]], dict]:
     rows: list[list[str]] = []
     warnings: list[dict] = []
@@ -1570,13 +1670,21 @@ def aggregate_experiment_1(records: list[dict]) -> tuple[list[list[str]], dict]:
         # are the closed unit's own terminal evidence. They are preserved per
         # campaign, in the frozen campaign order, and a non-empty flag such as
         # READ_AMPLIFICATION is surfaced rather than discarded.
+        #
+        # A profiled case always carries the field, so an empty flag set is an
+        # observed absence of diagnostics and never an unavailable quantity. The
+        # canonical `not_applicable` cell is kept, and the row note records
+        # which of the two present states produced it (finding M4).
+        flag_states = [NCU_FLAGS_PRESENT_NON_EMPTY if flag else NCU_FLAGS_PRESENT_EMPTY
+                       for flag in flags]
         diagnostics = {}
-        for metric, cells in (("hbm_classification", classifications),
-                              ("diagnostic_flags", [flag or NOT_APPLICABLE
-                                                    for flag in flags])):
+        for metric, cells, note_text in (
+                ("hbm_classification", classifications, "preserved_source_diagnostic"),
+                ("diagnostic_flags", [flag or NOT_APPLICABLE for flag in flags],
+                 "preserved_source_diagnostic;diagnostic_field_present;flag_set="
+                 + ",".join(flag_states))):
             rows.append(prefix + [metric, NOT_APPLICABLE, evidence_class_for(metric)]
-                        + diagnostic_cells(cells, metric=metric,
-                                           notes="preserved_source_diagnostic"))
+                        + diagnostic_cells(cells, metric=metric, notes=note_text))
             diagnostics[metric] = diagnostic_json(cells, metric=metric)
         for campaign_index, flag in enumerate(flags):
             if flag:
@@ -1594,9 +1702,23 @@ def aggregate_experiment_1(records: list[dict]) -> tuple[list[list[str]], dict]:
                     "campaign_hbm_classifications": classifications,
                     "hbm_classification_consensus": agreement["consensus"],
                     "campaign_diagnostic_flags": list(flags),
+                    "campaign_diagnostic_flag_states": flag_states,
+                    "diagnostic_flags_rendered": [flag or NCU_FLAGS_EMPTY_LABEL
+                                                  for flag in flags],
                     "source_diagnostics": diagnostics})
 
     saturation_stable = all(entry["stable_across_campaigns"] for entry in saturation)
+    config_means = {(entry["method"], entry["stages"], entry["bytes_in_flight_kib"]):
+                    entry["mean"] for entry in configurations}
+    last_bif, previous_bif = P14_BIF_KIB[-1], P14_BIF_KIB[-2]
+    saturation_boundary = saturation_boundary_interpretation(
+        tested_grid=P14_BIF_KIB,
+        candidate_values=[entry["consensus_kib"] for entry in saturation],
+        marginal_rises=[config_means[(method, stages, last_bif)]
+                        > config_means[(method, stages, previous_bif)]
+                        for method, stages in P14_SATURATION_KEYS],
+        quantity="bytes-in-flight value in KiB",
+        rising_label="the timing-derived effective transfer rate")
     unprofiled = [{"method": entry["method"], "stages": entry["stages"],
                    "bytes_in_flight_kib": entry["bytes_in_flight_kib"]}
                   for entry in configurations
@@ -1618,7 +1740,9 @@ def aggregate_experiment_1(records: list[dict]) -> tuple[list[list[str]], dict]:
             "measured quantity, not a winner, and not a significance claim"),
         "saturation_candidates": saturation,
         "saturation_consensus_available": saturation_stable,
+        "saturation_boundary_interpretation": saturation_boundary,
         "ncu_validation": ncu,
+        "ncu_diagnostic_flag_semantics": NCU_FLAGS_SEMANTICS_NOTE,
         "ncu_coverage": {
             "profiled_cases": len(P14_NCU_CASES),
             "total_configurations": len(P14_CONFIG_KEYS),
@@ -1785,6 +1909,19 @@ def aggregate_experiment_2(records: list[dict]) -> tuple[list[list[str]], dict]:
                            "consensus_depth": agreement["consensus"],
                            "note": agreement["note"]})
 
+    metric_mean = {(entry["method"], entry["n"], entry["depth"]):
+                   entry["metrics"]["median_flops_per_cycle_per_sm"]["mean"]
+                   for entry in configurations}
+    last_depth, previous_depth = P24_DEPTH_VALUES[-1], P24_DEPTH_VALUES[-2]
+    depth_boundary = saturation_boundary_interpretation(
+        tested_grid=P24_DEPTH_VALUES,
+        candidate_values=[entry["consensus_depth"] for entry in saturation],
+        marginal_rises=[metric_mean[(method, n, last_depth)]
+                        > metric_mean[(method, n, previous_depth)]
+                        for method, n in P24_SATURATION_KEYS],
+        quantity="depth",
+        rising_label="the operation-and-cycle-derived FLOP/cycle/SM")
+
     selections = [record["umma"]["ceiling"]["selected_configuration"] for record in records]
     selection = consensus(selections, label="empirical per-SM ceiling selection")
     tflops_values = [record["umma"]["ceiling"]["estimated_tflops_per_sm"]
@@ -1826,6 +1963,8 @@ def aggregate_experiment_2(records: list[dict]) -> tuple[list[list[str]], dict]:
         "depth_saturation": saturation,
         "depth_saturation_consensus_available": all(
             entry["stable_across_campaigns"] for entry in saturation),
+        "depth_saturation_boundary_interpretation": depth_boundary,
+        "cross_campaign_variability_interpretation": UMMA_DEGENERATE_VARIABILITY_NOTE,
         "empirical_per_sm_ceiling": {
             "campaign_selections": selections,
             "selection_stable_across_campaigns": selection["stable_across_campaigns"],
@@ -2393,6 +2532,23 @@ def _markdown_table(header: list[str], rows: list[list[str]]) -> list[str]:
     return lines
 
 
+def _boundary_note_lines(boundary: dict, *, grid_unit: str) -> list[str]:
+    """The adjacent, unambiguous reading of a grid-boundary saturation candidate.
+
+    Emitted beside every list of candidates so that a reader meeting the value
+    cannot take it for a measured architectural limit (finding M2)."""
+    grid = ", ".join(str(value) for value in boundary["tested_grid"])
+    return [
+        "",
+        f"**How to read these candidates.** The tested grid is exactly {grid} "
+        f"{grid_unit}, so `{boundary['grid_upper_bound']}` is the **upper boundary of "
+        f"the evaluated grid**, not a measured architectural limit: "
+        f"{boundary['meaning_of_candidate_saturation']}. Here "
+        f"{boundary['observation']}. {boundary['boundary_meaning'].capitalize()}, and "
+        f"{boundary['cross_campaign_agreement_caveat']}.",
+    ]
+
+
 def render_report(document: dict) -> bytes:
     population = document["population"]
     exp1 = document["experiment_1_memory_paths"]
@@ -2492,6 +2648,8 @@ def render_report(document: dict) -> bytes:
             lines.append(f"* `{entry['method']}` stages `{entry['stages']}`: **no single "
                          f"cross-campaign consensus candidate exists**; the three campaigns "
                          f"report {entry['campaign_values_kib']} KiB.")
+    lines.extend(_boundary_note_lines(exp1["saturation_boundary_interpretation"],
+                                      grid_unit="KiB of bytes in flight"))
     lines.append("")
     coverage = exp1["ncu_coverage"]
     lines.append(f"Nsight Compute HBM/DRAM traffic validation covers exactly "
@@ -2516,11 +2674,20 @@ def render_report(document: dict) -> bytes:
                      str(entry["bytes_in_flight_kib"]), format_decimal(entry["mean"], 9),
                      format_decimal(entry["minimum"], 9), format_decimal(entry["maximum"], 9),
                      str(entry["hbm_classification_consensus"]),
-                     " / ".join(flag or "--"
-                                for flag in entry["campaign_diagnostic_flags"])])
+                     " / ".join(entry["diagnostic_flags_rendered"])])
     lines.extend(_markdown_table(
         ["case", "method", "stages", "bif_kib", "dram_read_ratio mean", "min", "max",
          "classification", "diagnostic flags (c1 / c2 / c3)"], rows))
+    lines.append("")
+    empty_cases = [entry for entry in exp1["ncu_validation"]
+                   if all(state == NCU_FLAGS_PRESENT_EMPTY
+                          for state in entry["campaign_diagnostic_flag_states"])]
+    lines.append(f"`{NCU_FLAGS_EMPTY_LABEL}` in the column above is an observed result, "
+                 f"not missing data: for {len(empty_cases)} of the "
+                 f"{len(exp1['ncu_validation'])} profiled cases the upstream "
+                 f"`diagnostic_flags` field was **present and its flag set was empty** in "
+                 f"every campaign, so the profiler recorded no diagnostic. "
+                 f"{exp1['ncu_diagnostic_flag_semantics']}.")
     lines.append("")
 
     lines.append("## 4. Experiment 2 — BF16 UMMA throughput")
@@ -2530,6 +2697,8 @@ def render_report(document: dict) -> bytes:
     lines.append("Clock-independent, operation-and-cycle-derived campaign-level medians "
                  f"(a `{evidence_class_for('median_flops_per_cycle')}`), summarized across "
                  "the three final campaigns.")
+    lines.append("")
+    lines.append(f"**{exp2['cross_campaign_variability_interpretation']}.**")
     lines.append("")
     rows = []
     for entry in exp2["configurations"]:
@@ -2576,6 +2745,8 @@ def render_report(document: dict) -> bytes:
             lines.append(f"* `{entry['method']}` N `{entry['n']}`: **the selection is not "
                          f"stable across campaigns**; the three campaigns select "
                          f"{entry['campaign_values_depth']}.")
+    lines.extend(_boundary_note_lines(exp2["depth_saturation_boundary_interpretation"],
+                                      grid_unit="tested depths"))
     lines.append("")
     ceiling = exp2["empirical_per_sm_ceiling"]
     lines.append("Empirical per-SM BF16 Tensor Core ceiling candidate "
@@ -2772,6 +2943,30 @@ _SVG_FOOTER_WRAP = 148
 _SVG_FOOTER_LINE_HEIGHT = 13
 _SVG_COLORS = ("#1f4e79", "#c05621", "#2f855a", "#6b46c1")
 
+# Deterministic monospace text metrics (second independent audit, finding M1).
+# The figures declare font-family="monospace"; every common monospace face
+# (DejaVu Sans Mono 0.602, Liberation Mono 0.600, Courier New 0.600) advances
+# 0.60 em per glyph, so 0.62 em deliberately over-reserves without depending on
+# any font-measuring library. The layout and the geometry regression read this
+# one constant, so the space a panel reserves and the space its text occupies
+# can never disagree.
+_SVG_CHAR_ADVANCE = 0.62
+_SVG_BASE_FONT = 11.0
+# A rotated -90 text anchored middle occupies, horizontally, the line box it
+# would occupy vertically when upright: ascent to the left of the anchor,
+# descent to the right.
+_SVG_TEXT_ASCENT = 0.80
+_SVG_TEXT_DESCENT = 0.20
+_SVG_TICK_GAP = 5.0           # plot rectangle -> right edge of the tick labels
+_SVG_AXIS_TITLE_GAP = 6.0     # tick labels -> the rotated axis-title band
+_SVG_GUTTER_PAD = 3.0         # cell edge -> the rotated axis-title band
+_SVG_PANEL_SEPARATION = 14.0  # plot rectangle -> the next panel's cell
+_SVG_LEFT_MARGIN = 14.0
+_SVG_RIGHT_MARGIN = 18.0
+_SVG_PANEL_MIN_WIDTH = 96.0
+_SVG_PANEL_TOP = 82.0
+_SVG_PANEL_BOTTOM = float(_SVG_HEIGHT - 108)
+
 
 def _xml_escape(text: object) -> str:
     return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -2797,32 +2992,64 @@ def _svg_open(title: str, subtitle: str) -> list[str]:
     ]
 
 
-def _svg_panel(*, x0: float, y0: float, x1: float, y1: float, title: str,
-               x_labels: list[str], y_label: str, series: list[dict],
-               y_min: float, y_max: float) -> list[str]:
-    out: list[str] = []
+def _svg_text_width(text: str, font_size: float = _SVG_BASE_FONT) -> float:
+    """Deterministic monospace advance width of `text`, in px."""
+    return len(text) * font_size * _SVG_CHAR_ADVANCE
+
+
+def _svg_axis(y_min: float, y_max: float) -> tuple[float, float, list[str]]:
+    """The focused y-scale and the exact five tick labels drawn against it.
+
+    The layout (which must reserve a gutter wide enough for the widest label)
+    and the renderer (which draws it) both read the scale from here, so the
+    reserved width and the drawn text are derived from one computation."""
     if y_max <= y_min:
         y_max = y_min + 1.0
     span = y_max - y_min
     lo = y_min - 0.08 * span
     hi = y_max + 0.08 * span
+    labels = [f"{lo + (hi - lo) * tick / 4.0:.4g}" for tick in range(5)]
+    return lo, hi, labels
+
+
+def _svg_axis_gutter(tick_labels: list[str]) -> float:
+    """Left-side allowance one panel needs for its own y-axis decorations.
+
+    Reserved per panel rather than once for the figure, so that the tick labels
+    and the rotated axis title of panels 2..N stay in their own panel's gutter
+    instead of reaching back into the preceding plot rectangle (second
+    independent audit, finding M1)."""
+    widest = max([_svg_text_width(label) for label in tick_labels] + [0.0])
+    return (_SVG_GUTTER_PAD + _SVG_BASE_FONT + _SVG_AXIS_TITLE_GAP
+            + widest + _SVG_TICK_GAP)
+
+
+def _svg_panel(*, x0: float, y0: float, x1: float, y1: float, title: str,
+               x_labels: list[str], y_label: str, series: list[dict],
+               y_min: float, y_max: float, gutter: float) -> list[str]:
+    out: list[str] = []
+    lo, hi, tick_labels = _svg_axis(y_min, y_max)
 
     def scale_y(value: float) -> float:
         return y1 - (value - lo) / (hi - lo) * (y1 - y0)
 
+    # Every y-axis decoration is placed relative to this panel's own gutter,
+    # which begins at `x0 - gutter` and is free space owned by this panel.
+    axis_title_x = x0 - gutter + _SVG_GUTTER_PAD + _SVG_TEXT_ASCENT * _SVG_BASE_FONT
     out.append(f'<text x="{(x0 + x1) / 2:.1f}" y="{y0 - 12:.1f}" text-anchor="middle" '
                f'font-weight="bold">{_xml_escape(title)}</text>')
     out.append(f'<rect x="{x0:.1f}" y="{y0:.1f}" width="{x1 - x0:.1f}" '
                f'height="{y1 - y0:.1f}" fill="none" stroke="#333333" stroke-width="1"/>')
-    for tick in range(5):
+    for tick, label in enumerate(tick_labels):
         value = lo + (hi - lo) * tick / 4.0
         y_px = scale_y(value)
         out.append(f'<line x1="{x0:.1f}" y1="{y_px:.1f}" x2="{x1:.1f}" y2="{y_px:.1f}" '
                    f'stroke="#e0e0e0" stroke-width="1"/>')
-        out.append(f'<text x="{x0 - 5:.1f}" y="{y_px + 3:.1f}" text-anchor="end">'
-                   f'{_xml_escape(f"{value:.4g}")}</text>')
-    out.append(f'<text x="{x0 - 52:.1f}" y="{(y0 + y1) / 2:.1f}" text-anchor="middle" '
-               f'transform="rotate(-90 {x0 - 52:.1f} {(y0 + y1) / 2:.1f})">'
+        out.append(f'<text x="{x0 - _SVG_TICK_GAP:.1f}" y="{y_px + 3:.1f}" '
+                   f'text-anchor="end">{_xml_escape(label)}</text>')
+    out.append(f'<text x="{axis_title_x:.1f}" y="{(y0 + y1) / 2:.1f}" '
+               f'text-anchor="middle" '
+               f'transform="rotate(-90 {axis_title_x:.1f} {(y0 + y1) / 2:.1f})">'
                f'{_xml_escape(y_label)}</text>')
 
     count = max(len(x_labels), 1)
@@ -2886,14 +3113,204 @@ def _svg_close(footer: str) -> list[str]:
     return out
 
 
-def _panel_geometry(count: int) -> list[tuple[float, float, float, float]]:
+def _panel_geometry(count: int, gutter: float) -> list[tuple[float, float, float, float]]:
+    """Plot rectangles for `count` panels, each preceded by its own `gutter`.
+
+    Every panel owns a cell of identical width. The leftmost `gutter` px of a
+    cell hold that panel's y-axis decorations and nothing else, and
+    `_SVG_PANEL_SEPARATION` px of clear space follow its plot rectangle before
+    the next cell begins. A panel's decorations therefore cannot reach the
+    preceding plot rectangle, which is exactly what the pre-remediation layout
+    (a fixed 22 px inter-panel gap against a 52 px axis-title offset) allowed."""
+    usable = _SVG_WIDTH - _SVG_LEFT_MARGIN - _SVG_RIGHT_MARGIN
+    cell = usable / max(count, 1)
+    width = cell - gutter - _SVG_PANEL_SEPARATION
+    if width < _SVG_PANEL_MIN_WIDTH:
+        raise P43Error(
+            f"a {count}-panel figure cannot reserve a {gutter:.1f}px y-axis gutter per "
+            f"panel and still keep a readable {_SVG_PANEL_MIN_WIDTH:.0f}px plot "
+            f"rectangle; the figure is never emitted with overlapping decorations")
     panels = []
-    usable = _SVG_WIDTH - 70
-    width = usable / count
     for index in range(count):
-        x0 = 62 + index * width
-        panels.append((x0, 82.0, x0 + width - 22, float(_SVG_HEIGHT - 108)))
+        x0 = _SVG_LEFT_MARGIN + index * cell + gutter
+        panels.append((x0, _SVG_PANEL_TOP, x0 + width, _SVG_PANEL_BOTTOM))
     return panels
+
+
+# --- The spatial figure regression (second independent audit, finding M1) ---
+#
+# The pre-remediation figures were checked only for caption wording, footer
+# wrap, and canvas size, so a purely geometric defect -- the y-axis decorations
+# of panels 2..N drawn inside the preceding plot rectangle, overprinting data
+# marks -- survived every existing assertion. The helpers below re-read the
+# emitted bytes and compute real bounding boxes. They deliberately consult no
+# layout variable other than the canvas size, so they measure the figure that
+# was actually written rather than restating the code that wrote it.
+
+_SVG_ELEMENT_RE = re.compile(
+    r"<(rect|circle|line|polyline|text)\b([^>]*?)(/>|>(.*?)</\1>)", re.DOTALL)
+_SVG_ATTR_RE = re.compile(r'([\w:-]+)="([^"]*)"')
+_SVG_TSPAN_RE = re.compile(r"<tspan\b([^>]*?)>(.*?)</tspan>", re.DOTALL)
+_SVG_EPSILON = 0.05
+
+
+def _svg_parse(svg_text: str) -> list[dict]:
+    """Every drawn element of an emitted figure, with its attributes and text."""
+    elements = []
+    for match in _SVG_ELEMENT_RE.finditer(svg_text):
+        tag, raw_attrs, _, content = match.groups()
+        attrs = dict(_SVG_ATTR_RE.findall(raw_attrs))
+        elements.append({"tag": tag, "attrs": attrs, "content": content or ""})
+    return elements
+
+
+def _svg_number(attrs: dict, name: str, default: float = 0.0) -> float:
+    try:
+        return float(attrs.get(name, default))
+    except ValueError:
+        return default
+
+
+def _svg_unescape(text: str) -> str:
+    return (text.replace("&quot;", '"').replace("&gt;", ">").replace("&lt;", "<")
+            .replace("&amp;", "&"))
+
+
+def _svg_text_boxes(element: dict) -> list[tuple[float, float, float, float]]:
+    """Rendered (x0, y0, x1, y1) boxes of one <text>, honouring anchor and rotation.
+
+    A rotate(-90) text anchored middle occupies horizontally the line box it
+    would occupy vertically when upright, and vertically its own advance width.
+    """
+    attrs = element["attrs"]
+    font = _svg_number(attrs, "font-size", _SVG_BASE_FONT)
+    ascent, descent = _SVG_TEXT_ASCENT * font, _SVG_TEXT_DESCENT * font
+    spans = _SVG_TSPAN_RE.findall(element["content"])
+    if spans:
+        pieces = [(dict(_SVG_ATTR_RE.findall(raw)), _svg_unescape(text))
+                  for raw, text in spans]
+    else:
+        pieces = [(attrs, _svg_unescape(re.sub(r"<[^>]*>", "", element["content"])))]
+    boxes = []
+    for piece_attrs, text in pieces:
+        if not text:
+            continue
+        x = _svg_number(piece_attrs, "x", _svg_number(attrs, "x"))
+        y = _svg_number(piece_attrs, "y", _svg_number(attrs, "y"))
+        width = _svg_text_width(text, font)
+        anchor = piece_attrs.get("text-anchor", attrs.get("text-anchor", "start"))
+        if attrs.get("transform", "").startswith("rotate(-90"):
+            boxes.append((x - ascent, y - width / 2.0, x + descent, y + width / 2.0))
+            continue
+        if anchor == "end":
+            left = x - width
+        elif anchor == "middle":
+            left = x - width / 2.0
+        else:
+            left = x
+        boxes.append((left, y - ascent, left + width, y + descent))
+    return boxes
+
+
+def _svg_boxes_intersect(first: tuple, second: tuple) -> bool:
+    return (first[0] < second[2] - _SVG_EPSILON and second[0] < first[2] - _SVG_EPSILON
+            and first[1] < second[3] - _SVG_EPSILON and second[1] < first[3] - _SVG_EPSILON)
+
+
+def svg_geometry_findings(svg_text: str) -> list[str]:
+    """Every spatial defect in one emitted figure. An empty list means clean.
+
+    Fails loudly against the pre-remediation layout, in which the tick labels
+    and rotated axis title of panels 2..N were drawn at `x0 - 5` and `x0 - 52`
+    against an inter-panel gap of only 22 px."""
+    findings: list[str] = []
+    canvas = (0.0, 0.0, float(_SVG_WIDTH), float(_SVG_HEIGHT))
+    elements = _svg_parse(svg_text)
+
+    plots, marks, furniture = [], [], []
+    for element in elements:
+        tag, attrs = element["tag"], element["attrs"]
+        if tag == "rect" and attrs.get("fill") == "none":
+            x, y = _svg_number(attrs, "x"), _svg_number(attrs, "y")
+            plots.append((x, y, x + _svg_number(attrs, "width"),
+                          y + _svg_number(attrs, "height")))
+        elif tag == "circle":
+            cx, cy, r = (_svg_number(attrs, "cx"), _svg_number(attrs, "cy"),
+                         _svg_number(attrs, "r"))
+            marks.append(("data marker", (cx - r, cy - r, cx + r, cy + r)))
+        elif tag == "line" and attrs.get("stroke-width") == "1.5":
+            x1, y1 = _svg_number(attrs, "x1"), _svg_number(attrs, "y1")
+            x2, y2 = _svg_number(attrs, "x2"), _svg_number(attrs, "y2")
+            marks.append(("min-max whisker", (min(x1, x2), min(y1, y2),
+                                              max(x1, x2), max(y1, y2))))
+        elif tag == "polyline":
+            points = [tuple(float(part) for part in pair.split(","))
+                      for pair in attrs.get("points", "").split() if "," in pair]
+            if points:
+                marks.append(("series line", (min(p[0] for p in points),
+                                              min(p[1] for p in points),
+                                              max(p[0] for p in points),
+                                              max(p[1] for p in points))))
+        elif tag == "text":
+            anchor = attrs.get("text-anchor", "start")
+            rotated = attrs.get("transform", "").startswith("rotate(-90")
+            if rotated:
+                kind = "rotated y-axis title"
+            elif anchor == "end":
+                kind = "y-axis tick label"
+            elif anchor == "middle" and attrs.get("font-weight") == "bold":
+                kind = "panel title"
+            elif anchor == "middle":
+                kind = "x-axis tick label"
+            else:
+                kind = "figure text"
+            for box in _svg_text_boxes(element):
+                furniture.append((kind, box, _svg_number(attrs, "x")))
+    plots.sort()
+
+    if not plots:
+        return ["no plot rectangle was emitted"]
+    for index, plot in enumerate(plots):
+        if not (canvas[0] <= plot[0] and canvas[1] <= plot[1]
+                and plot[2] <= canvas[2] and plot[3] <= canvas[3]):
+            findings.append(f"plot rectangle {index + 1} {plot} leaves the "
+                            f"{_SVG_WIDTH}x{_SVG_HEIGHT} canvas")
+
+    for kind, box, _anchor_x in furniture:
+        if not (canvas[0] <= box[0] and canvas[1] <= box[1]
+                and box[2] <= canvas[2] and box[3] <= canvas[3]):
+            findings.append(f"{kind} {box} is clipped by the canvas")
+
+    axis_kinds = ("y-axis tick label", "rotated y-axis title")
+    for kind, box, _anchor_x in furniture:
+        if kind not in axis_kinds:
+            continue
+        # An axis decoration lives in its own panel's gutter: entirely left of
+        # the plot rectangle it annotates, and entirely right of every earlier
+        # plot rectangle.
+        owner = next((index for index, plot in enumerate(plots)
+                      if plot[0] >= box[2] - _SVG_EPSILON), None)
+        if owner is None:
+            findings.append(f"{kind} {box} is not left of any plot rectangle")
+            continue
+        for index, plot in enumerate(plots[:owner]):
+            if box[0] < plot[2] - _SVG_EPSILON:
+                findings.append(
+                    f"{kind} {box} of panel {owner + 1} reaches back into the gutter "
+                    f"or plot rectangle of panel {index + 1} {plot}")
+                break
+
+    for kind, box, _anchor_x in furniture:
+        if kind == "figure text":
+            continue
+        for index, plot in enumerate(plots):
+            if kind in axis_kinds and _svg_boxes_intersect(box, plot):
+                findings.append(f"{kind} {box} intersects plot rectangle "
+                                f"{index + 1} {plot}")
+        for mark_kind, mark in marks:
+            if _svg_boxes_intersect(box, mark):
+                findings.append(f"{kind} {box} overprints a {mark_kind} {mark}")
+    return findings
 
 
 def render_memory_svg(section: dict) -> bytes:
@@ -2906,7 +3323,9 @@ def render_memory_svg(section: dict) -> bytes:
         "Memory paths: timing-derived effective transfer rate",
         f"Focused y-scale; dot = cross-campaign mean; whisker = min-max; "
         f"n={CAMPAIGN_COUNT} final campaigns; x = bytes in flight")
-    for index, (x0, y0, x1, y1) in enumerate(_panel_geometry(len(P14_STAGES))):
+    y_min, y_max = min(minimums + values), max(maximums + values)
+    gutter = _svg_axis_gutter(_svg_axis(y_min, y_max)[2])
+    for index, (x0, y0, x1, y1) in enumerate(_panel_geometry(len(P14_STAGES), gutter)):
         stages = P14_STAGES[index]
         series = []
         for method in P14_METHODS:
@@ -2920,7 +3339,7 @@ def render_memory_svg(section: dict) -> bytes:
             x0=x0, y0=y0, x1=x1, y1=y1, title=f"stages={stages}",
             x_labels=[f"{bif} KiB" for bif in P14_BIF_KIB],
             y_label="GB/s", series=series,
-            y_min=min(minimums + values), y_max=max(maximums + values)))
+            y_min=y_min, y_max=y_max, gutter=gutter))
     out.extend(_svg_close(
         f"n={CAMPAIGN_COUNT} final campaigns; {WHISKER_CAPTION}. Derived effective "
         f"transfer rate of a streaming microbenchmark (logical useful_bytes / measured "
@@ -2940,7 +3359,9 @@ def render_umma_svg(section: dict) -> bytes:
         "UMMA throughput: operation-and-cycle-derived FLOP/cycle/SM",
         f"Focused y-scale; dot = cross-campaign mean; whisker = min-max; "
         f"n={CAMPAIGN_COUNT} final campaigns; x = tested depth")
-    for index, (x0, y0, x1, y1) in enumerate(_panel_geometry(len(P24_N_VALUES))):
+    y_min, y_max = min(minimums + values), max(maximums + values)
+    gutter = _svg_axis_gutter(_svg_axis(y_min, y_max)[2])
+    for index, (x0, y0, x1, y1) in enumerate(_panel_geometry(len(P24_N_VALUES), gutter)):
         n_value = P24_N_VALUES[index]
         series = []
         for method in P24_METHODS:
@@ -2957,11 +3378,12 @@ def render_umma_svg(section: dict) -> bytes:
             x0=x0, y0=y0, x1=x1, y1=y1, title=f"N={n_value}",
             x_labels=[f"d{depth}" for depth in P24_DEPTH_VALUES],
             y_label="FLOP/cycle/SM", series=series,
-            y_min=min(minimums + values), y_max=max(maximums + values)))
+            y_min=y_min, y_max=y_max, gutter=gutter))
     out.extend(_svg_close(
         f"n={CAMPAIGN_COUNT} final campaigns; {WHISKER_CAPTION}. Derived from validated "
         f"operation counts and measured cycles; clock-independent but not directly "
-        f"measured. A one-/two-SM microbenchmark, never an architectural peak."))
+        f"measured. A one-/two-SM microbenchmark, never an architectural peak. "
+        f"{UMMA_DEGENERATE_VARIABILITY_CAPTION}"))
     return ("\n".join(out) + "\n").encode("utf-8")
 
 
@@ -2982,7 +3404,10 @@ def render_gemm_svg(section: dict) -> bytes:
         "persistent_2cta": "P2",
         "heuristic_first_supported": "BL",
     }
-    for index, (x0, y0, x1, y1) in enumerate(_panel_geometry(len(section["shapes"]))):
+    y_min, y_max = min(minimums), max(maximums)
+    gutter = _svg_axis_gutter(_svg_axis(y_min, y_max)[2])
+    for index, (x0, y0, x1, y1) in enumerate(
+            _panel_geometry(len(section["shapes"]), gutter)):
         shape = section["shapes"][index]
         series = [{
             "label": "",
@@ -2999,7 +3424,7 @@ def render_gemm_svg(section: dict) -> bytes:
                                       f"C{candidate['candidate_index']}")
                       for candidate in shape["candidates"]],
             y_label="TFLOP/s", series=series,
-            y_min=min(minimums), y_max=max(maximums)))
+            y_min=y_min, y_max=y_max, gutter=gutter))
     out.extend(_svg_close(
         f"n={CAMPAIGN_COUNT} final campaigns; {WHISKER_CAPTION}. Candidate labels: "
         f"NP1=nonpersistent_1cta; P1=persistent_1cta; P2=persistent_2cta; "
@@ -4862,9 +5287,287 @@ def _self_test_aggregation(reporter: _Reporter, orchestrator) -> None:
 
     _self_test_taxonomy(reporter, documents, summary)
     _self_test_diagnostics(reporter, orchestrator, p35)
+    _self_test_figure_geometry(reporter, documents)
+    _self_test_boundary_and_variability(reporter, orchestrator, p35, documents, summary)
     _self_test_metadata_contract(reporter, orchestrator, documents, summary)
     _self_test_analysis_provenance(reporter, orchestrator, p35, records)
     _self_test_acceptance(reporter, orchestrator, documents)
+
+
+# --- 3.1b The spatial figure regression (second audit, finding M1) ----------
+
+# A verbatim reconstruction of the pre-remediation layout: three panel
+# rectangles at the old 22 px inter-panel gap, with the tick labels of panel 2
+# drawn at `x0 - 5` and its rotated axis title at `x0 - 52`, exactly as the old
+# `_svg_panel` emitted them. The detector must reject it. Frozen here so the
+# regression keeps failing against the old geometry without needing the old
+# code, and so the checks can never quietly become vacuous.
+_PRE_REMEDIATION_FIGURE = """<svg xmlns="http://www.w3.org/2000/svg" \
+viewBox="0 0 1080 480" width="1080" height="480" font-family="monospace" font-size="11">
+<rect x="0" y="0" width="1080" height="480" fill="#ffffff" stroke="none"/>
+<rect x="62.0" y="82.0" width="314.7" height="290.0" fill="none" stroke="#333333" \
+stroke-width="1"/>
+<circle cx="345.6" cy="227.0" r="4" fill="#1f4e79" stroke="#ffffff" stroke-width="1"/>
+<rect x="398.7" y="82.0" width="314.7" height="290.0" fill="none" stroke="#333333" \
+stroke-width="1"/>
+<text x="393.7" y="230.0" text-anchor="end">7024</text>
+<text x="346.7" y="227.0" text-anchor="middle" transform="rotate(-90 346.7 227.0)">\
+GB/s</text>
+</svg>
+"""
+
+
+def _self_test_figure_geometry(reporter: _Reporter,
+                               documents: list[tuple[str, bytes]]) -> None:
+    """Real bounding-box collision checks over the three emitted figures.
+
+    The pre-remediation figure regressions asserted caption wording, footer
+    wrap, and canvas size only, so a purely spatial defect survived them all.
+    Every check here is geometric."""
+    payloads = dict(documents)
+    findings = svg_geometry_findings(_PRE_REMEDIATION_FIGURE)
+    reporter.check("the geometry regression rejects the pre-remediation panel layout",
+                   bool(findings), "the old x0-5 / x0-52 layout was accepted")
+    reporter.check("the geometry regression names the preceding panel it reaches into",
+                   any("reaches back into" in finding for finding in findings),
+                   str(findings))
+    reporter.check("the geometry regression detects a decoration overprinting a data mark",
+                   any("overprints" in finding for finding in findings), str(findings))
+
+    for relative in (name for name in ARTIFACT_RELATIVE_PATHS if name.endswith(".svg")):
+        svg = payloads[relative].decode("utf-8")
+        reporter.check(f"{relative} has no spatial collision anywhere on the canvas",
+                       not svg_geometry_findings(svg),
+                       "; ".join(svg_geometry_findings(svg))[:400])
+        elements = _svg_parse(svg)
+        plots = sorted((_svg_number(element["attrs"], "x"),
+                        _svg_number(element["attrs"], "x")
+                        + _svg_number(element["attrs"], "width"))
+                       for element in elements
+                       if element["tag"] == "rect"
+                       and element["attrs"].get("fill") == "none")
+        reporter.check(f"{relative} draws more than one panel to separate",
+                       len(plots) >= 3, str(len(plots)))
+        reporter.check(f"{relative} keeps every plot rectangle inside the canvas",
+                       all(0.0 <= left and right <= float(_SVG_WIDTH)
+                           for left, right in plots), str(plots))
+        reporter.check(f"{relative} leaves a positive gutter between consecutive panels",
+                       all(second[0] - first[1] > 0.0
+                           for first, second in zip(plots, plots[1:])), str(plots))
+        decorations = [(kind, box) for element in elements if element["tag"] == "text"
+                       for kind, box in (
+                           ("rotated y-axis title"
+                            if element["attrs"].get("transform", "").startswith("rotate(-90")
+                            else "y-axis tick label"
+                            if element["attrs"].get("text-anchor") == "end" else "other",
+                            box)
+                           for box in _svg_text_boxes(element))
+                       if kind != "other"]
+        reporter.check(f"{relative} still draws a full y-axis decoration set per panel",
+                       len(decorations) == len(plots) * 6, str(len(decorations)))
+        for index, (left, right) in enumerate(plots[1:], start=1):
+            gutter_left, gutter_right = plots[index - 1][1], left
+            owned = [box for _kind, box in decorations
+                     if gutter_left <= box[0] and box[2] <= gutter_right]
+            reporter.check(f"{relative} panel {index + 1} keeps all six y-axis "
+                           f"decorations inside its own gutter "
+                           f"[{gutter_left:.1f}, {gutter_right:.1f}]",
+                           len(owned) == 6, str(len(owned)))
+        reporter.check(f"{relative} keeps every tick label, title, caption, and footer "
+                       f"inside the canvas",
+                       all(0.0 <= box[0] and box[2] <= float(_SVG_WIDTH)
+                           and 0.0 <= box[1] and box[3] <= float(_SVG_HEIGHT)
+                           for element in elements if element["tag"] == "text"
+                           for box in _svg_text_boxes(element)), "")
+        reporter.check(f"{relative} keeps a readable {_SVG_BASE_FONT:.0f}px base font "
+                       f"and never shrinks a label to hide a collision",
+                       'font-size="11"' in svg
+                       and not re.search(r'font-size="([0-9](\.\d+)?)"', svg), "")
+    reporter.rejects("a figure whose panels cannot hold their own axis gutter is never "
+                     "emitted",
+                     lambda: _panel_geometry(9, 220.0), "readable")
+
+    # The synthetic fixtures label shapes "shape1".."shape5", but production
+    # labels them "{m}x{n}x{k}x{l}" -- up to 16 characters. The five-panel
+    # figure is the narrowest, so the production label length is pinned here
+    # rather than left to be discovered by a production run.
+    production_ids = ("4096x4096x4096x1", "8192x8192x8192x1", "16384x512x4096x1",
+                      "32768x512x4096x1", "512x16384x4096x1")
+    production_gemm = render_gemm_svg({"shapes": [
+        {"shape_id": shape_id, "candidates": [
+            {"variant": variant, "candidate_index": index + 1,
+             "metrics": {"tflops": {"mean": value, "minimum": value * 0.999,
+                                    "maximum": value * 1.001}}}
+            for index, (variant, value) in enumerate(zip(
+                ("nonpersistent_1cta", "persistent_1cta", "persistent_2cta",
+                 "heuristic_first_supported"), values))]}
+        for shape_id, values in zip(production_ids,
+                                    ([95.1, 120.4, 140.8, 2118.7],
+                                     [60.2, 70.1, 80.5, 1504.4],
+                                     [300.0, 320.0, 340.0, 1432.7],
+                                     [400.0, 420.0, 440.0, 1500.0],
+                                     [500.0, 520.0, 540.0, 1600.0]))]}).decode("utf-8")
+    reporter.check("the five-panel GEMM figure stays collision-free with production-length "
+                   "shape labels",
+                   not svg_geometry_findings(production_gemm),
+                   "; ".join(svg_geometry_findings(production_gemm))[:400])
+    reporter.check("a production-length panel title never reaches the preceding panel",
+                   all(0.0 <= float(x) - _svg_text_width(title) / 2.0
+                       and float(x) + _svg_text_width(title) / 2.0 <= float(_SVG_WIDTH)
+                       for x, title in re.findall(
+                           r'<text x="([\d.]+)" y="[\d.]+" text-anchor="middle" '
+                           r'font-weight="bold">([^<]*)</text>', production_gemm)), "")
+
+
+# --- 3.1c Boundary saturation, degenerate spread, empty diagnostics --------
+
+
+def _self_test_boundary_and_variability(reporter: _Reporter, orchestrator, p35,
+                                        documents: list[tuple[str, bytes]],
+                                        summary: dict) -> None:
+    """Findings M2, M3, and M4: the reader-facing semantics of a boundary
+    candidate, of a degenerate zero spread, and of an empty diagnostic set."""
+    payloads = dict(documents)
+    report_text = payloads["report.md"].decode("utf-8")
+
+    # M2 -- a candidate that equals the largest tested grid point.
+    exp1 = summary["experiment_1_memory_paths"]["saturation_boundary_interpretation"]
+    exp2 = summary["experiment_2_umma_throughput"][
+        "depth_saturation_boundary_interpretation"]
+    reporter.check("the memory saturation metadata records the tested grid and its "
+                   "upper bound",
+                   exp1["tested_grid"] == list(P14_BIF_KIB)
+                   and exp1["grid_upper_bound"] == max(P14_BIF_KIB), str(exp1))
+    reporter.check("the depth saturation metadata records the tested grid and its "
+                   "upper bound",
+                   exp2["tested_grid"] == list(P24_DEPTH_VALUES)
+                   and exp2["grid_upper_bound"] == max(P24_DEPTH_VALUES), str(exp2))
+    for name, boundary in (("memory", exp1), ("depth", exp2)):
+        reporter.check(f"the {name} candidate is reported at the tested grid boundary "
+                       f"with no plateau observed",
+                       boundary["all_candidates_at_grid_upper_bound"] is True
+                       and boundary["plateau_observed_within_tested_range"] is False,
+                       str(boundary))
+        reporter.check(f"the {name} metadata states that candidate saturation is an "
+                       f"upstream selection inside the tested range",
+                       "within the tested grid"
+                       in boundary["meaning_of_candidate_saturation"]
+                       and "never a measured architectural limit"
+                       in boundary["meaning_of_candidate_saturation"], "")
+        reporter.check(f"the {name} metadata denies that cross-campaign agreement at the "
+                       f"grid boundary locates a saturation point",
+                       "not by itself evidence"
+                       in boundary["cross_campaign_agreement_caveat"], "")
+    for phrase in ("upper boundary of the evaluated grid",
+                   "not a measured architectural limit",
+                   "no plateau was observed within the tested range",
+                   "is not by itself evidence that a saturation point was independently "
+                   "located"):
+        reporter.check(f"the report states {phrase!r} beside the candidates",
+                       phrase in report_text, "")
+    reporter.check("the report never renames a candidate a measured saturation point",
+                   "measured saturation point" not in report_text.lower()
+                   and "architectural saturation limit" not in report_text.lower(), "")
+    reporter.check("the frozen saturation metric names and candidate values are unchanged",
+                   all(entry["consensus_kib"] == max(P14_BIF_KIB)
+                       for entry in summary["experiment_1_memory_paths"][
+                           "saturation_candidates"])
+                   and "earliest_tested_candidate_saturation_bif_kib"
+                   in payloads["memory_paths.csv"].decode("utf-8"), "")
+
+    # The other two branches of the same interpretation must also be reachable,
+    # so the wording can never be a constant dressed up as a finding.
+    inside = saturation_boundary_interpretation(
+        tested_grid=P14_BIF_KIB, candidate_values=[16, 16, 16],
+        marginal_rises=[True] * len(P14_SATURATION_KEYS),
+        quantity="bytes-in-flight value in KiB", rising_label="the rate")
+    plateaued = saturation_boundary_interpretation(
+        tested_grid=P14_BIF_KIB, candidate_values=[max(P14_BIF_KIB)] * 6,
+        marginal_rises=[True, True, False, True, True, True],
+        quantity="bytes-in-flight value in KiB", rising_label="the rate")
+    reporter.check("a candidate strictly inside the grid is not reported at the boundary",
+                   inside["all_candidates_at_grid_upper_bound"] is False
+                   and "strictly inside the tested grid" in inside["observation"],
+                   str(inside))
+    reporter.check("a group that stops rising at the last step is reported as a plateau",
+                   plateaued["plateau_observed_within_tested_range"] is True
+                   and "no plateau" not in plateaued["observation"], str(plateaued))
+
+    # M3 -- the degenerate UMMA cross-campaign spread.
+    note = summary["experiment_2_umma_throughput"][
+        "cross_campaign_variability_interpretation"]
+    for phrase in ("cycle-quantized", "must not be read as proof of extraordinary "
+                   "independent reproducibility", "no cross-campaign coefficient of "
+                   "variation exceeded the frozen review threshold",
+                   "hidden by the marker"):
+        reporter.check(f"the UMMA variability note states {phrase!r}", phrase in note, "")
+        reporter.check(f"the report carries the UMMA variability note {phrase!r}",
+                       phrase in report_text, "")
+    umma_svg = payloads["figures/umma_throughput.svg"].decode("utf-8")
+    reporter.check("the UMMA figure caption warns that a sub-marker whisker is hidden",
+                   "hidden by the marker" in umma_svg
+                   and "cycle-quantized" in umma_svg, "")
+    umma_rows = list(csv.DictReader(io.StringIO(
+        payloads["umma_throughput.csv"].decode("utf-8"))))
+    degenerate = [row for row in umma_rows
+                  if row["cross_campaign_cv_percent"] not in ("", NOT_APPLICABLE)
+                  and float(row["cross_campaign_cv_percent"]) == 0.0]
+    reporter.check("a mathematically correct zero spread is preserved, still flagged ok, "
+                   "and never given artificial uncertainty",
+                   bool(degenerate)
+                   and all(row["cross_campaign_cv_review_flag"] == CV_FLAG_OK
+                           and float(row["stdev_sample"]) == 0.0
+                           and row["minimum"] == row["maximum"]
+                           for row in degenerate), str(len(degenerate)))
+    reporter.check("no new review flag was invented for the degenerate rows",
+                   {row["cross_campaign_cv_review_flag"] for row in umma_rows}
+                   <= {CV_FLAG_OK, CV_FLAG_REVIEW, NOT_APPLICABLE}, "")
+
+    # M4 -- present-and-empty, present-and-non-empty, and genuinely unavailable.
+    mixed = build_documents(orchestrator, p35, _fixture_records(**{
+        FINAL_CAMPAIGN_IDS[1]: {"ncu_diagnostic_flags": "READ_AMPLIFICATION"}}),
+        _fixture_provenance())
+    mixed_summary = json.loads(dict(mixed)["integrated_summary.json"].decode("utf-8"))
+    states = [state for entry in mixed_summary["experiment_1_memory_paths"][
+        "ncu_validation"] for state in entry["campaign_diagnostic_flag_states"]]
+    reporter.check("an empty and a non-empty diagnostic set are distinct states",
+                   NCU_FLAGS_PRESENT_EMPTY in states
+                   and NCU_FLAGS_PRESENT_NON_EMPTY in states
+                   and set(states) == {NCU_FLAGS_PRESENT_EMPTY,
+                                       NCU_FLAGS_PRESENT_NON_EMPTY}, str(sorted(set(states))))
+    rendered = [value for entry in mixed_summary["experiment_1_memory_paths"][
+        "ncu_validation"] for value in entry["diagnostic_flags_rendered"]]
+    reporter.check("an empty flag set renders as an observed absence, a non-empty one "
+                   "verbatim",
+                   NCU_FLAGS_EMPTY_LABEL in rendered and "READ_AMPLIFICATION" in rendered,
+                   str(sorted(set(rendered))))
+    reporter.check("an empty flag set is never promoted to a source warning",
+                   all(entry["diagnostic_flags"] for entry in
+                       mixed_summary["experiment_1_memory_paths"]["source_warnings"]), "")
+    unavailable = [entry for entry in summary["experiment_1_memory_paths"][
+        "configurations"] if entry["ncu_coverage"] == NCU_NOT_PROFILED]
+    reporter.check("a never-profiled configuration stays a third, genuinely unavailable "
+                   "state",
+                   len(unavailable) == len(P14_CONFIG_KEYS) - len(P14_NCU_CASES)
+                   and EVIDENCE_UNAVAILABLE in NCU_UNAVAILABLE_NOTE.replace(
+                       "unavailable from the collected evidence",
+                       EVIDENCE_UNAVAILABLE), str(len(unavailable)))
+    memory_rows = list(csv.DictReader(io.StringIO(
+        payloads["memory_paths.csv"].decode("utf-8"))))
+    flag_rows = [row for row in memory_rows if row["metric"] == "diagnostic_flags"]
+    reporter.check("the canonical empty-flag cell is preserved and its row note records "
+                   "that the upstream field was present",
+                   len(flag_rows) == len(P14_NCU_CASES)
+                   and all(row["campaign_1_value"] == NOT_APPLICABLE
+                           and "diagnostic_field_present" in row["notes"]
+                           and NCU_FLAGS_PRESENT_EMPTY in row["notes"]
+                           for row in flag_rows), str(flag_rows[:1]))
+    reporter.check("the report explains the empty diagnostic set as an observed result",
+                   f"`{NCU_FLAGS_EMPTY_LABEL}` in the column above is an observed result"
+                   in report_text
+                   and "present and its flag set was empty" in report_text, "")
+    reporter.check("the report keeps the unavailable state distinct from the empty one",
+                   "actual HBM/DRAM traffic is unavailable" in report_text, "")
 
 
 # --- 3.1 The scientific evidence taxonomy ----------------------------------
