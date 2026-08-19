@@ -239,9 +239,10 @@ PHASE4_P42_PROTOCOL := src/phase4/P4_2_PROTOCOL.md
 PHASE4_P43_ANALYZER := scripts/analyze_phase4_p43.py
 PHASE4_P43_CHECKER := scripts/check_phase4_integration_p43.py
 PHASE4_P43_PROTOCOL := src/phase4/P4_3_PROTOCOL.md
-# The external acceptance attestation. It is NOT produced by the analyzer, is
-# not part of the nine-artifact inventory, and must not exist while P4.3 is
-# YES / NO / NO; check-static and phase4-p43-check both assert its absence.
+# The external acceptance attestation. It is NOT produced by the analyzer and
+# is not part of the nine-artifact inventory. P4.3 is now accepted, so it must
+# exist and bind the exact accepted bytes; check-static and phase4-p43-check
+# both assert its presence, and $(PHASE4_P43_CHECKER) parses and validates it.
 PHASE4_P43_ACCEPTANCE := src/phase4/P4_3_ACCEPTANCE.json
 # The frozen population, restated here so the production target can never
 # analyse a campaign outside it. These are literals, never a discovered
@@ -279,7 +280,8 @@ REQUIRED_FILES := \
 	$(PHASE4_P41_ENTRYPOINT) $(PHASE4_P41_ORCHESTRATOR) $(PHASE4_P41_CHECKER) \
 	$(PHASE4_P41_PROTOCOL) \
 	$(PHASE4_P42_CHECKER) $(PHASE4_P42_PROTOCOL) \
-	$(PHASE4_P43_ANALYZER) $(PHASE4_P43_CHECKER) $(PHASE4_P43_PROTOCOL)
+	$(PHASE4_P43_ANALYZER) $(PHASE4_P43_CHECKER) $(PHASE4_P43_PROTOCOL) \
+	$(PHASE4_P43_ACCEPTANCE)
 
 .DEFAULT_GOAL := help
 .PHONY: help check-static build-image check-env preflight \
@@ -641,8 +643,8 @@ help:
 	@echo "     frozen policy plus one GPU-free cross-campaign checker; it adds no"
 	@echo "     runner and no target that could start a campaign, and it computes no"
 	@echo "     statistic, threshold, ranking, table, or figure -- those belong"
-	@echo "     exclusively to P4.3, whose offline analysis layer is now implemented"
-	@echo "     but neither audited nor run against the real evidence.) --"
+	@echo "     exclusively to P4.3, whose offline analysis layer has since been"
+	@echo "     audited, run against the real evidence, and accepted.) --"
 	@echo "  make phase4-p42-check         Fast and GPU-free: syntax checks for the P4.2"
 	@echo "                                files, the focused P4.2 self-test, and the"
 	@echo "                                P4.2 repository-contract check. No Docker, no"
@@ -652,11 +654,12 @@ help:
 	@echo "  campaign."
 	@echo ""
 	@echo "  -- P4.3 integrated analysis, documentation, and closing audit preparation"
-	@echo "     (see src/phase4/P4_3_PROTOCOL.md; P4.3 = YES / NO / NO. The"
-	@echo "     implementation exists; the independent audit has NOT been performed and"
-	@echo "     the production analysis of the three final campaigns has NOT been run,"
-	@echo "     so no curated P4.3 result is accepted for publication and neither"
-	@echo "     Phase 4 nor the TFM is closed. P4.3 is an offline, read-only analysis"
+	@echo "     (see src/phase4/P4_3_PROTOCOL.md; P4.3 = YES / YES / YES. The"
+	@echo "     independent audit returned ACCEPT WITH NON-BLOCKING OBSERVATIONS, the"
+	@echo "     production analysis of the three final campaigns ran and was verified"
+	@echo "     byte-for-byte, and $(PHASE4_P43_ACCEPTANCE)"
+	@echo "     accepts the curated bundle, so Phase 4 and the experimental phase of"
+	@echo "     the TFM are closed. P4.3 is an offline, read-only analysis"
 	@echo "     layer over already accepted GB300 evidence: it runs no GPU command and"
 	@echo "     starts no Docker, nvidia-smi, CUDA, NCU, preflight, or campaign, adds no"
 	@echo "     kernel, shape, candidate, measurement parameter, profiler case, schema,"
@@ -1484,14 +1487,15 @@ check-static:
 	@grep -Fq 'Phase 3: CLOSED' README.md
 	@echo "== P3.5 introduces no Phase 4 functionality and no statistical treatment =="
 	@# P4.1 and P4.2 are closed after independent audit and GB300 verification.
-	@# P4.3 now owns its own row: its implementation exists, so the previously
-	@# asserted "NO | NO | NO" became false and was advanced -- by exactly one
-	@# step -- to the truthful "YES | NO | NO". Nothing is weakened: no closed
+	@# P4.3 now owns its own row: it has been independently audited and verified
+	@# against the real GB300 evidence, so the previously asserted
+	@# "YES | NO | NO" became false and was advanced -- by exactly one step --
+	@# to the truthful "YES | YES | YES". Nothing is weakened: no closed
 	@# assertion changed, and every stale or impossible P4.2 and P4.3 state is
 	@# still rejected below.
 	@grep -Fq 'P4.1 | Orchestrator | YES | YES | YES |' PLAN.md
 	@grep -Fq 'P4.2 | Pilot plus three final campaigns | YES | YES | YES |' PLAN.md
-	@grep -Fq 'P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |' PLAN.md
+	@grep -Fq 'P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |' PLAN.md
 	@! grep -nE '^(P4|P41|P42|P43)_' $(GEMM_P35_WRAPPER)
 	@echo "   (the tokenized identifier ban for confidence intervals, bootstraps, outlier"
 	@echo "    removal, rooflines, bandwidth, utilization, Nsight Compute, autotuning,"
@@ -1559,7 +1563,13 @@ check-static:
 	@! grep -nF 'P4.1 | Orchestrator | YES | YES | NO |' PLAN.md
 	@! grep -nF 'P4.1 | Orchestrator | YES | NO | YES |' PLAN.md
 	@! grep -nF 'P4.1 | Orchestrator | YES | NO | NO |' PLAN.md
-	@! grep -rnF 'Phase 4: CLOSED' README.md PLAN.md $(PHASE4_P41_PROTOCOL)
+	@# Phase 4 closure is now truthful, but it is legal only because the P4.3
+	@# acceptance attestation exists: P4.1's own protocol still must not claim
+	@# it, and the closure claim and the attestation must travel together.
+	@test -f $(PHASE4_P43_ACCEPTANCE)
+	@grep -Fq 'Phase 4: CLOSED' README.md
+	@grep -Fq 'Phase 4: CLOSED' PLAN.md
+	@! grep -nF 'Phase 4: CLOSED' $(PHASE4_P41_PROTOCOL)
 	@echo "== P4.2 files present, executable, and syntactically valid =="
 	@test -f $(PHASE4_P42_CHECKER)
 	@test -f $(PHASE4_P42_PROTOCOL)
@@ -1637,30 +1647,42 @@ check-static:
 	@! grep -nE '^$(PHASE4_P43_OUTPUT_ROOT)/?$$' .gitignore
 	@case '$(PHASE4_P43_OUTPUT_ROOT)' in results/raw*|results/preflight*) exit 1 ;; esac
 	@echo "== truthful P4.3 status assertions =="
-	@grep -Fq 'P4.3 = YES / NO / NO' $(PHASE4_P43_PROTOCOL)
-	@grep -Fq 'Independent audit: NOT PERFORMED' $(PHASE4_P43_PROTOCOL)
-	@grep -Fq 'Production analysis: NOT RUN' $(PHASE4_P43_PROTOCOL)
-	@grep -Fq 'no publishable result exists' $(PHASE4_P43_PROTOCOL)
-	@grep -Fq 'Phase 4 and the complete TFM are not closed' $(PHASE4_P43_PROTOCOL)
-	@grep -Fq 'P4.3: IMPLEMENTED; independent audit: NO; production analysis: NO' README.md
-	@echo "== the P4.3 candidate bundle has not been produced or accepted =="
-	@test ! -e $(PHASE4_P43_OUTPUT_ROOT)
-	@test ! -e $(PHASE4_P43_ACCEPTANCE)
+	@grep -Fq 'P4.3 = YES / YES / YES' $(PHASE4_P43_PROTOCOL)
+	@grep -Fq 'Independent audit: ACCEPT WITH NON-BLOCKING OBSERVATIONS' $(PHASE4_P43_PROTOCOL)
+	@grep -Fq 'Production analysis: RUN' $(PHASE4_P43_PROTOCOL)
+	@grep -Fq 'P4.2 itself produced no publishable Phase 4 result' $(PHASE4_P43_PROTOCOL)
+	@grep -Fq 'the experimental phase of the TFM is closed' $(PHASE4_P43_PROTOCOL)
+	@grep -Fq 'P4.3: CLOSED; independent audit: YES; production analysis: YES' README.md
+	@echo "== the accepted P4.3 candidate bundle and its acceptance attestation exist =="
+	@test -d $(PHASE4_P43_OUTPUT_ROOT)
+	@test -f $(PHASE4_P43_ACCEPTANCE)
 	@grep -Fq 'immutable_candidate_requires_external_attestation' $(PHASE4_P43_ANALYZER)
 	@grep -Fq 'p43.acceptance.v1' $(PHASE4_P43_PROTOCOL)
 	@grep -Fq '$(PHASE4_P43_ACCEPTANCE)' $(PHASE4_P43_PROTOCOL)
-	@echo "== the P4.3 remediation is recorded and still unaudited =="
-	@grep -Fq 'awaiting a new independent audit' $(PHASE4_P43_PROTOCOL)
-	@grep -Fq 'This remediation has not been independently audited' $(PHASE4_P43_PROTOCOL)
-	@# Every stale or impossible P4.3 state stays rejected.
+	@# The structural validation of the attestation -- exact frozen field set,
+	@# 40-hex commits, 64-hex digests, the three distinct provenance commits,
+	@# and equality with the committed bundle's recomputed hashes -- lives in
+	@# $(PHASE4_P43_CHECKER), which parses it as JSON instead of grepping it.
+	@echo "== the accepted P4.3 provenance chain is recorded in every status document =="
+	@for f in README.md PLAN.md results/README.md $(PHASE4_P43_PROTOCOL); do \
+		grep -Fq 'b08e45c2636a3ac17c94ad8b1368084914196d7a' "$$f" || exit 1; \
+		grep -Fq '2ef1ac52907c407dd43c41661382fc8d5673cce4' "$$f" || exit 1; \
+		grep -Fq '577fbe229eb1b857d82f23aacb305136014ec7b0' "$$f" || exit 1; \
+		grep -Fq 'b95d17910f8384187ddc94afacc9081507858de1fb69292f5f3d73bf4cc2d6ac' "$$f" || exit 1; \
+		grep -Fq 'ACCEPT WITH NON-BLOCKING OBSERVATIONS' "$$f" || exit 1; \
+	done
+	@echo "== every stale or impossible P4.3 state stays rejected =="
 	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |' PLAN.md
 	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | NO | YES | NO |' PLAN.md
 	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | NO | NO | YES |' PLAN.md
 	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | NO | YES | YES |' PLAN.md
+	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |' PLAN.md
 	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | YES | YES | NO |' PLAN.md
 	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | YES | NO | YES |' PLAN.md
-	@! grep -nF 'P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |' PLAN.md
-	@! grep -rnF 'P4.3: CLOSED' README.md PLAN.md results/README.md $(PHASE4_P43_PROTOCOL)
+	@! grep -rnF 'Independent audit: NOT PERFORMED' README.md PLAN.md results/README.md $(PHASE4_P43_PROTOCOL)
+	@! grep -rnF 'Production analysis: NOT RUN' README.md PLAN.md results/README.md $(PHASE4_P43_PROTOCOL)
+	@! grep -rnF 'awaiting a new independent audit' README.md PLAN.md results/README.md $(PHASE4_P43_PROTOCOL)
+	@! grep -rnF 'the TFM is complete' README.md PLAN.md results/README.md $(PHASE4_P43_PROTOCOL)
 	@echo "check-static: OK"
 
 build-image:
@@ -3370,16 +3392,17 @@ phase4-p43-check:
 	@echo "   no container, no GPU, no network) =="
 	python3 -I -B $(PHASE4_P43_CHECKER) .
 	@rm -rf scripts/__pycache__
-	@echo "== no P4.3 candidate bundle and no acceptance attestation exist =="
-	@test ! -e $(PHASE4_P43_OUTPUT_ROOT)
-	@test ! -e $(PHASE4_P43_ACCEPTANCE)
+	@echo "== the accepted P4.3 candidate bundle and acceptance attestation exist =="
+	@test -d $(PHASE4_P43_OUTPUT_ROOT)
+	@test -f $(PHASE4_P43_ACCEPTANCE)
 	@# This recipe deliberately names no raw campaign path at all: the gate must
-	@# run on a checkout that has never seen a campaign. The checker enforces
-	@# that by scanning this recipe's own text.
-	@echo "phase4-p43-check: OK (GPU-free implementation self-check only; repository status"
-	@echo "                   remains P4.3 = YES / NO / NO. This target establishes neither"
-	@echo "                   an independent audit nor a production run, output review,"
-	@echo "                   acceptance, publication, GB300 verification, or closure.)"
+	@# run on a checkout that has never seen a campaign. The curated bundle is
+	@# committed, so binding the attestation to it needs no raw evidence. The
+	@# checker enforces that by scanning this recipe's own text.
+	@echo "phase4-p43-check: OK (GPU-free contract check; repository status is"
+	@echo "                   P4.3 = YES / YES / YES. This target RE-READS a recorded"
+	@echo "                   acceptance; it performs no independent audit, production"
+	@echo "                   run, or output review of its own.)"
 
 # P4.3 -- the GPU-free production analysis. It requires the real accepted raw
 # evidence to already exist, names exactly the frozen campaign IDs, and starts

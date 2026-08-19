@@ -533,11 +533,13 @@ FORBIDDEN_P35_STATUS_LINES = (
 # itself had to correct for P3.4. See src/phase4/P4_1_PROTOCOL.md section 9.1.
 # The P4.2 row was advanced the same way, and only that row: see
 # src/phase4/P4_2_PROTOCOL.md section 9.1. The P4.3 row was advanced by exactly
-# one step for the same reason: see src/phase4/P4_3_PROTOCOL.md section 6.1.)
+# one step for the same reason -- see src/phase4/P4_3_PROTOCOL.md section 6.1 --
+# and, on P4.3's acceptance, by exactly one further step to the closed
+# "YES | YES | YES": see src/phase4/P4_3_PROTOCOL.md section 17.)
 PHASE4_STATUS_LINES = (
     "| P4.1 | Orchestrator | YES | YES | YES |",
     "| P4.2 | Pilot plus three final campaigns | YES | YES | YES |",
-    "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |",
+    "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |",
 )
 FORBIDDEN_PHASE4_STATUS_LINES = (
     "| P4.1 | Orchestrator | NO | NO | NO |",
@@ -555,9 +557,9 @@ FORBIDDEN_PHASE4_STATUS_LINES = (
     "| P4.3 | Integrated analysis, documentation, audit | NO | YES | NO |",
     "| P4.3 | Integrated analysis, documentation, audit | NO | NO | YES |",
     "| P4.3 | Integrated analysis, documentation, audit | NO | YES | YES |",
+    "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |",
     "| P4.3 | Integrated analysis, documentation, audit | YES | YES | NO |",
     "| P4.3 | Integrated analysis, documentation, audit | YES | NO | YES |",
-    "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |",
 )
 
 _GUARD_PRELUDE = """
@@ -3654,7 +3656,7 @@ def run_self_test() -> int:
         "| P3.5 | Five shapes and comparison | YES | YES | YES |\n"
         "| P4.1 | Orchestrator | YES | YES | YES |\n"
         "| P4.2 | Pilot plus three final campaigns | YES | YES | YES |\n"
-        "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |\n"
+        "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |\n"
     )
     good_protocol = (
         "Status: `P3.5 = YES / YES / YES`.\n"
@@ -3690,16 +3692,16 @@ def run_self_test() -> int:
                 good_plan.replace("| P4.2 | Pilot plus three final campaigns | YES | YES | YES |",
                                   "| P4.2 | Pilot plus three final campaigns | YES | NO | NO |"),
                 good_protocol, good_readme), "Phase 4 frontier row")
-    rejects("a PLAN.md that claims P4.3 is audited and verified is rejected",
+    rejects("a PLAN.md that reopens accepted P4.3 to implemented-only is rejected",
             validate_status_documents(
                 good_plan.replace(
-                    "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |",
-                    "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |"),
+                    "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |",
+                    "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |"),
                 good_protocol, good_readme), "Phase 4 frontier row")
     rejects("a PLAN.md that still calls P4.3 unimplemented is rejected",
             validate_status_documents(
                 good_plan.replace(
-                    "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |",
+                    "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |",
                     "| P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |"),
                 good_protocol, good_readme), "Phase 4 frontier row")
     # Each stale or impossible Phase 4 row is substituted for the row it owns,
@@ -3710,7 +3712,7 @@ def run_self_test() -> int:
         elif "| P4.2 |" in premature:
             owned = "| P4.2 | Pilot plus three final campaigns | YES | YES | YES |"
         else:
-            owned = "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |"
+            owned = "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |"
         rejects(f"a PLAN.md recording the stale or invalid Phase 4 status {premature!r} "
                 f"is rejected",
                 validate_status_documents(

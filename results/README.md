@@ -1,6 +1,9 @@
 # results/
 
-No publishable experimental performance results exist yet. Phase 0's
+The one accepted, publishable experimental result in this repository is the
+curated P4.3 bundle under `results/phase4/`, accepted by
+`src/phase4/P4_3_ACCEPTANCE.json`. Nothing else here is a publishable
+experimental performance result. Phase 0's
 diagnostic preflight, and the P1.1/P1.2 GB300 self-test plus one-shot
 `run_kind=smoke` runs, completed successfully as *functional* verification.
 P1.3 joint smoke campaign `20260728T103315Z` also completed both full-binary
@@ -24,8 +27,11 @@ read-only `--resume` revalidated every stage without rewriting an artifact or
 appending a manifest revision. The raw tree remains deliberately ignored and
 uncommitted, and every artifact records `publishable=false`. P4.2 has since
 completed and independently validated its three final campaigns, and P4.3's
-offline integrated-analysis layer is implemented.
-No publishable Phase 4 result exists.
+offline integrated-analysis layer has been audited, run, verified, and
+accepted.
+No publishable Phase 4 result exists in the raw campaign trees: publication
+authority for the curated P4.3 bundle is the external acceptance attestation
+alone.
 
 P4.2's frozen protocol (`src/phase4/P4_2_PROTOCOL.md`) and its GPU-free
 cross-campaign validator (`scripts/check_phase4_campaigns_p42.py`) are
@@ -39,28 +45,61 @@ strictly read-only population check accepted one pilot plus exactly those
 three finals, their shared plan, commit, stage order, GPU identity, and
 comparable provenance, and found no undeclared final. All four campaign trees
 remain raw, ignored, and uncommitted; every artifact records
-`publishable=false`. P4.2 is closed and no publishable Phase 4 result exists.
+`publishable=false`. P4.2 is closed, and **P4.2 itself produced no publishable
+Phase 4 result**.
 
-P4.3 is implemented (`scripts/analyze_phase4_p43.py`,
-`scripts/check_phase4_integration_p43.py`, `src/phase4/P4_3_PROTOCOL.md`): an
-offline, read-only analysis layer that revalidates the frozen four-campaign
+**P4.3 is closed** (`scripts/analyze_phase4_p43.py`,
+`scripts/check_phase4_integration_p43.py`, `src/phase4/P4_3_PROTOCOL.md`,
+`src/phase4/P4_3_ACCEPTANCE.json`): an offline, read-only analysis layer that
+revalidates the frozen four-campaign
 population through P4.2's own checker, reads the canonical terminal P1.4, P2.4,
 and P3.5 artifacts each final campaign's manifest pins, and aggregates across
 the three finals with **one complete final campaign as the independent
 replicate**. The accepted pilot `20260812T013848Z` is recorded only as excluded
-qualification provenance and never enters a statistic. The implementation has
+qualification provenance and never enters a statistic. The implementation
 received remediation after two independent audits: the first corrected the
 scientific taxonomy, preserved diagnostics, central metadata contract, output
 containment, candidate/acceptance workflow, analysis-code provenance, and
 figure terminology; the second corrected immutable lifecycle state,
 Python/import provenance, trusted acceptance inputs, metadata ownership, SVG
-layout, remaining terminal diagnostics, and partial-output safety. **The
-present revision is awaiting a new independent audit.** **The P4.3 independent
-audit has not been performed** on this revision, no production analysis of the
-three final campaigns has been run, and **no P4.3 curated result has been
-accepted for publication**. The
-directory `results/phase4/` described below is therefore the declared
-destination of that future analysis, not an existing result.
+layout, remaining terminal diagnostics, and partial-output safety. A third
+independent audit of the corrected candidate returned
+**ACCEPT WITH NON-BLOCKING OBSERVATIONS**, the production analysis ran, the
+raw-to-candidate check returned **PASS** by **byte-for-byte** recomputation,
+the independent output review passed, and
+**the P4.3 curated result is accepted for publication**. The directory
+`results/phase4/` described below therefore holds the accepted bundle.
+
+The provenance chain behind that bundle has three distinct commits, plus the
+closure commit that carries the acceptance documentation:
+
+| Role | Commit | What it identifies |
+|------|--------|--------------------|
+| Experimental execution | `b08e45c2636a3ac17c94ad8b1368084914196d7a` | the commit the three GB300 final campaigns ran from — the experimental evidence |
+| Analyzer | `2ef1ac52907c407dd43c41661382fc8d5673cce4` | the commit whose analysis code produced this bundle |
+| Accepted candidate | `577fbe229eb1b857d82f23aacb305136014ec7b0` | the commit containing the accepted bytes under `results/phase4/` |
+| Closure | the acceptance/documentation commit | acceptance metadata only; it produced no evidence and contains no candidate byte |
+
+The analyzer and candidate commits are **not** expected to be equal: the
+analyzer is committed and audited before it runs, its output is committed
+afterwards, and `analysis_manifest.json` records both the execution and the
+analyzer commit under separate names. The accepted evidence:
+
+```text
+manifest algorithm       SHA-256
+manifest digest          b95d17910f8384187ddc94afacc9081507858de1fb69292f5f3d73bf4cc2d6ac
+raw-to-candidate check   PASS
+comparison method        byte-for-byte
+independent audit        ACCEPT WITH NON-BLOCKING OBSERVATIONS
+final gate state         P4.3 = YES / YES / YES
+```
+
+The byte-for-byte result covers the raw-data scope the verifier defines — the
+frozen population's terminal P1.4, P2.4, and P3.5 artifacts and the nine
+curated artifacts recomputed from them — not an equality of two Git trees. The
+verdict was an acceptance carrying non-blocking observations, not one with no
+observations; section 16 of `src/phase4/P4_3_PROTOCOL.md` records them and
+section 17 is the closure addendum.
 
 ## Trust model
 
@@ -456,7 +495,7 @@ replace this checkout's exact root with the stable token `<repo-root>`. Ordinary
 child diagnostics remain unchanged; P3.5's scientific CSV stdout is copied byte
 for byte and no scientific content is rewritten.
 
-### `results/phase4/` (curated P4.3 output — declared, not yet produced)
+### `results/phase4/` (curated P4.3 output — produced and accepted)
 
 This is the only tree P4.3 may write, and it is deliberately **not** under
 `results/raw/`: the analyzer refuses any output root under `results/raw/` or
@@ -493,9 +532,12 @@ that, **metadata ownership is central, not duplicated**:
   each of the other eight artifacts.
 * It **cannot contain its own byte hash** — writing the value would change the
   bytes it describes. It says so explicitly in a `self_hash` object.
-  `make phase4-p43-verify` recomputes every byte of it, and the later external
-  acceptance attestation records `analysis_manifest_sha256`, which covers all
-  nine artifacts without any self-reference.
+  `make phase4-p43-verify` recomputes every byte of it, and the external
+  acceptance attestation records
+  `analysis_manifest_sha256 = b95d17910f8384187ddc94afacc9081507858de1fb69292f5f3d73bf4cc2d6ac`,
+  which covers all nine artifacts without any self-reference. `make
+  check-static` recomputes all nine digests and re-validates the attestation
+  against them.
 * The three CSV files carry their own schema, key and data fields, the
   `evidence_class` of every row, and the three campaign-level values in the
   frozen campaign order. The three SVG files are deterministic visual artifacts.
@@ -522,16 +564,19 @@ The complete bundle is an **immutable candidate**. Its authoritative manifest,
 with reader-facing repetition in the JSON summary and Markdown report, records
 `publishable=false` and
 `publication_state=immutable_candidate_requires_external_attestation`. This is
-an invariant property, never a time-dependent claim about review progress. CSV
-and SVG siblings carry no publication or commit claim; the manifest binds them
-by path and hash. Nothing promotes, overwrites, or deletes a candidate:
-acceptance is a separate external attestation at
+an invariant property, never a time-dependent claim about review progress, and
+acceptance did not change it: no candidate artifact was promoted, overwritten,
+or deleted to record that acceptance happened. CSV and SVG siblings carry no
+publication or commit claim; the manifest binds them by path and hash.
+Publication authority is the separate external attestation at
 `src/phase4/P4_3_ACCEPTANCE.json`, written only after an independent review of
-the complete bundle. That file does not exist, and the P4.3 checker fails if it
-does.
+the complete bundle. That file exists, and the P4.3 checker parses it, validates
+every frozen field, and re-binds it to the recomputed hashes of these nine
+files.
 
-**This tree does not exist yet.** No production P4.3 analysis has been run, and
-no P4.3 curated result has been accepted for publication.
+**This tree holds the accepted P4.3 result.** The production analysis ran, the
+byte-for-byte verification returned `PASS`, and
+**the P4.3 curated result is accepted for publication**.
 
 ## Safe public metadata
 

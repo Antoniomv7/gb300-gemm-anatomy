@@ -464,20 +464,23 @@ push, merge, or pull request.
 ```text
 P4.1 | Orchestrator                                | YES | YES | YES
 P4.2 | Pilot plus three final campaigns            | YES | YES | YES
-P4.3 | Integrated analysis, documentation, audit   | YES | NO  | NO
+P4.3 | Integrated analysis, documentation, audit   | YES | YES | YES
 ```
 
 `P4.2 = YES / YES / YES`. The policy and cross-campaign validator are
 implemented, the independent audit passed, and the accepted pilot plus all
 three declared final campaigns passed terminal GB300 revalidation and the
 read-only population check. P4.2 is closed. Every campaign remains
-non-publishable, and no publishable result exists anywhere in this repository.
+non-publishable and, within P4.2's own scope, no publishable result exists:
+P4.2 itself produced no publishable Phase 4 result, and publication authority
+for the curated P4.3 bundle is the external acceptance attestation alone.
 
-P4.3's offline, read-only analysis layer is now implemented
+P4.3's offline, read-only analysis layer
 (`scripts/analyze_phase4_p43.py`,
-`scripts/check_phase4_integration_p43.py`, `src/phase4/P4_3_PROTOCOL.md`); its
-independent audit has not been performed and its production analysis of the
-three final campaigns has not been run. P4.3 consumes this unit rather than
+`scripts/check_phase4_integration_p43.py`, `src/phase4/P4_3_PROTOCOL.md`) has
+since been independently audited, run against the real evidence, verified, and
+accepted, and closed as `YES / YES / YES`; its acceptance record is
+`src/phase4/P4_3_ACCEPTANCE.json`. P4.3 consumes this unit rather than
 changing it: it calls `check_campaign_evidence()` in evidence mode before
 reading any value, and `scripts/run_all.sh` and
 `scripts/phase4_orchestrator.py` remain byte-identical to the content pinned in

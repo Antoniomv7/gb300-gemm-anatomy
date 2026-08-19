@@ -59,37 +59,64 @@ P42_PROTOCOL_RELATIVE_PATH = "src/phase4/P4_2_PROTOCOL.md"
 P43_ANALYZER_RELATIVE_PATH = "scripts/analyze_phase4_p43.py"
 P43_CHECKER_RELATIVE_PATH = "scripts/check_phase4_integration_p43.py"
 P43_PROTOCOL_RELATIVE_PATH = "src/phase4/P4_3_PROTOCOL.md"
+P43_ACCEPTANCE_RELATIVE_PATH = "src/phase4/P4_3_ACCEPTANCE.json"
+
+# The accepted candidate bundle. It is small, curated, and committed, so the
+# repository-contract check can bind the acceptance attestation to the exact
+# reviewed bytes without reading one byte of raw campaign evidence. The order
+# is the analyzer's frozen inventory order, and a check below proves it.
+ACCEPTED_BUNDLE_ROOT = "results/phase4"
+ACCEPTED_BUNDLE_ARTIFACTS = (
+    "memory_paths.csv",
+    "umma_throughput.csv",
+    "gemm_comparison.csv",
+    "integrated_summary.json",
+    "report.md",
+    "figures/memory_paths.svg",
+    "figures/umma_throughput.svg",
+    "figures/gemm_comparison.svg",
+    "analysis_manifest.json",
+)
+ACCEPTED_BUNDLE_RELATIVE_PATHS = tuple(
+    f"{ACCEPTED_BUNDLE_ROOT}/{name}" for name in ACCEPTED_BUNDLE_ARTIFACTS)
 
 REQUIRED_P43_FILES = (
     P43_ANALYZER_RELATIVE_PATH,
     P43_CHECKER_RELATIVE_PATH,
     P43_PROTOCOL_RELATIVE_PATH,
+    P43_ACCEPTANCE_RELATIVE_PATH,
     ORCHESTRATOR_RELATIVE_PATH,
     P42_CHECKER_RELATIVE_PATH,
     P42_PROTOCOL_RELATIVE_PATH,
     P41_CHECKER_RELATIVE_PATH,
     P41_PROTOCOL_RELATIVE_PATH,
     RUN_ALL_RELATIVE_PATH,
-)
+) + ACCEPTED_BUNDLE_RELATIVE_PATHS
 
 # ---------------------------------------------------------------------------
 # The truthful status frontier this unit is allowed to record. P4.3 is
-# implemented; it is neither independently audited nor run against the real
-# evidence, and this checker refuses every stronger claim.
+# implemented, independently audited, and verified against the real GB300
+# evidence: the production analysis ran from the audited analyzer commit, the
+# curated bundle was recomputed byte for byte, an independent review accepted
+# it, and the external acceptance attestation exists and validates. The row
+# P4.3 owns advanced by exactly one step to "YES | YES | YES"; every other
+# P4.3 state -- including the stale "YES | NO | NO" this checker used to
+# require -- stays rejected, and no closed P1-P4.2 assertion was weakened.
+# See src/phase4/P4_3_PROTOCOL.md section 17.
 # ---------------------------------------------------------------------------
 EXPECTED_STATUS_LINES = (
     "| P4.1 | Orchestrator | YES | YES | YES |",
     "| P4.2 | Pilot plus three final campaigns | YES | YES | YES |",
-    "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |",
+    "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |",
 )
 FORBIDDEN_P43_STATUS_LINES = (
     "| P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |",
     "| P4.3 | Integrated analysis, documentation, audit | NO | YES | NO |",
     "| P4.3 | Integrated analysis, documentation, audit | NO | NO | YES |",
     "| P4.3 | Integrated analysis, documentation, audit | NO | YES | YES |",
+    "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |",
     "| P4.3 | Integrated analysis, documentation, audit | YES | YES | NO |",
     "| P4.3 | Integrated analysis, documentation, audit | YES | NO | YES |",
-    "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |",
 )
 FORBIDDEN_CLOSED_UNIT_REGRESSIONS = (
     "| P4.1 | Orchestrator | NO | NO | NO |",
@@ -108,65 +135,123 @@ STATUS_DOCUMENTS = ("PLAN.md", "README.md", "results/README.md",
                     P41_PROTOCOL_RELATIVE_PATH, P42_PROTOCOL_RELATIVE_PATH,
                     P43_PROTOCOL_RELATIVE_PATH)
 
-# No document may close Phase 4, close the TFM, claim a P4.3 audit, claim a
-# P4.3 production result, or promote anything to publishable.
+# ---------------------------------------------------------------------------
+# The frozen closure facts. P4.3 is accepted, and these are the exact
+# identities the acceptance record and the status documents must carry. The
+# three commits are three different facts about three different events and are
+# never interchangeable:
+#
+#   ACCEPTED_EXECUTION_COMMIT  the commit the three GB300 campaigns RAN from,
+#                              so it identifies the experimental evidence;
+#   ACCEPTED_ANALYZER_COMMIT   the commit whose analysis code PRODUCED the
+#                              candidate bundle;
+#   ACCEPTED_CANDIDATE_COMMIT  the commit that CONTAINS the accepted candidate
+#                              bytes.
+#
+# The later documentation/closure commit is none of the three, and it is
+# deliberately absent from the attestation: a file cannot carry the hash of the
+# commit that adds it.
+# ---------------------------------------------------------------------------
+ACCEPTED_EXECUTION_COMMIT = "b08e45c2636a3ac17c94ad8b1368084914196d7a"
+ACCEPTED_ANALYZER_COMMIT = "2ef1ac52907c407dd43c41661382fc8d5673cce4"
+ACCEPTED_CANDIDATE_COMMIT = "577fbe229eb1b857d82f23aacb305136014ec7b0"
+ACCEPTED_MANIFEST_SHA256 = (
+    "b95d17910f8384187ddc94afacc9081507858de1fb69292f5f3d73bf4cc2d6ac")
+ACCEPTED_AUDIT_VERDICT = "ACCEPT WITH NON-BLOCKING OBSERVATIONS"
+ACCEPTED_COMPARISON_METHOD = "byte-for-byte"
+GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# No document may claim a P4.3 status P4.3 does not have, promote the immutable
+# candidate bytes themselves -- publication authority is the external
+# attestation, never a rewritten candidate -- or declare the whole TFM
+# finished: only its EXPERIMENTAL phase is closed, and the thesis analysis,
+# writing, and defence remain.
 FORBIDDEN_DOCUMENT_CLAIMS = (
-    "P4.3 = YES / YES / YES",
     "P4.3 = YES / YES / NO",
     "P4.3 = YES / NO / YES",
-    "P4.3: CLOSED",
-    "P4.3 is closed",
-    "Phase 4: CLOSED",
-    "Phase 4 is closed",
+    "P4.3 = YES / NO / NO",
+    "P4.3 = NO / NO / NO",
     "the TFM is complete",
+    "the complete TFM is closed",
+    "the whole TFM is closed",
+    "the TFM itself is closed",
     "TFM: CLOSED",
     "publishable=true",
     "publishable: true",
     "publishable = true",
-    "P4.3 independent audit: PASSED",
-    "P4.3 is accepted for publication",
-    "P4.3 has been accepted for publication",
     "publication_state: accepted",
     "publication_state=accepted",
-    "the P4.3 analysis has been independently audited",
-    "the production analysis has been run",
 )
-# Claims that are legitimate for the closed P4.1 and P4.2 protocols -- both of
-# which really did pass an independent audit -- but untrue in the P4.3 protocol,
-# which owns the P4.3 status. They are therefore banned only there.
+# The stale pre-acceptance language. Every one of these was true while P4.3 was
+# an unaccepted candidate and is false now, so a status document that still
+# carries one contradicts the accepted state it also records.
+FORBIDDEN_STALE_PRE_ACCEPTANCE_CLAIMS = (
+    "awaiting a new independent audit",
+    "has not been independently audited",
+    "The P4.3 independent audit has not been performed",
+    "Independent audit: NOT PERFORMED",
+    "Production analysis: NOT RUN",
+    "P4.3: IMPLEMENTED; independent audit: NO; production analysis: NO",
+    "no acceptance attestation exists",
+    "Phase 4 and the complete TFM are not closed",
+    "Phase 4 and the complete TFM stay open",
+    "no P4.3 result has been accepted for publication",
+    "no P4.3 curated result has been accepted for publication",
+    "no publishable result exists anywhere",
+    "This tree does not exist yet",
+    "not yet produced",
+)
+# Claims that are legitimate for the closed P4.1 and P4.2 protocols but untrue
+# in the P4.3 protocol, which owns the P4.3 status. They are banned only there.
 FORBIDDEN_P43_PROTOCOL_CLAIMS = (
-    "Independent audit: PASSED",
-    "Independent audit: YES",
-    "Production analysis: RUN",
-    "Production analysis: PERFORMED",
-    "P4.3 = YES / YES",
+    "Independent audit: PENDING",
+    "Production analysis: PENDING",
+    "P4.3 = YES / NO",
+    "P4.3 remains YES / NO / NO",
 )
 
-# Every project-level narrative must keep the honest P4.3 boundary.
+# Every project-level narrative must carry the complete, checkable provenance
+# chain and the acceptance evidence, not a bare assertion that P4.3 is closed.
+# The three commits, the manifest digest, the comparison method, and the
+# independent verdict must all be readable from each narrative document.
 REQUIRED_DOCUMENT_STATEMENTS = (
-    (r"no\s+publishable\s+(phase\s+4\s+)?result", "no publishable result exists"),
     (r"P4\.3", "P4.3 is described"),
+    (re.escape(P43_ACCEPTANCE_RELATIVE_PATH), "the acceptance record is linked"),
+    (re.escape(ACCEPTED_EXECUTION_COMMIT),
+     "the experimental execution commit is recorded"),
+    (re.escape(ACCEPTED_ANALYZER_COMMIT), "the analyzer commit is recorded"),
+    (re.escape(ACCEPTED_CANDIDATE_COMMIT),
+     "the accepted candidate commit is recorded"),
+    (re.escape(ACCEPTED_MANIFEST_SHA256),
+     "the accepted manifest digest is recorded"),
+    (re.escape(ACCEPTED_AUDIT_VERDICT), "the independent audit verdict is recorded"),
+    (re.escape(ACCEPTED_COMPARISON_METHOD), "the comparison method is recorded"),
+    (r"no\s+publishable\s+(phase\s+4\s+)?result",
+     "the P4.2/raw non-publication boundary is retained"),
 )
 REQUIRED_P43_STATEMENTS = {
     "PLAN.md": (
-        "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |",
-        "The P4.3 independent audit has not been performed",
-        "no production analysis of the three final campaigns has been run",
+        "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |",
+        "P4.3 = YES / YES / YES",
+        "Phase 4: CLOSED",
+        "the experimental phase of the TFM is closed",
     ),
     "README.md": (
-        "P4.3: IMPLEMENTED; independent audit: NO; production analysis: NO",
-        "The P4.3 independent audit has not been performed",
+        "P4.3: CLOSED; independent audit: YES; production analysis: YES",
+        "Phase 4: CLOSED",
+        "the experimental phase of the TFM is closed",
     ),
     "results/README.md": (
-        "P4.3 is implemented",
-        "no P4.3 curated result has been accepted for publication",
+        "P4.3 is closed",
+        "the P4.3 curated result is accepted for publication",
     ),
     P43_PROTOCOL_RELATIVE_PATH: (
-        "P4.3 = YES / NO / NO",
-        "Independent audit: NOT PERFORMED",
-        "Production analysis: NOT RUN",
-        "no publishable result exists",
-        "Phase 4 and the complete TFM are not closed",
+        "P4.3 = YES / YES / YES",
+        "Independent audit: ACCEPT WITH NON-BLOCKING OBSERVATIONS",
+        "Production analysis: RUN",
+        "the experimental phase of the TFM is closed",
+        "P4.2 itself produced no publishable Phase 4 result",
     ),
 }
 # The P4.3 protocol must freeze the population, the statistical policy, and the
@@ -273,8 +358,6 @@ EXPECTED_BASE_FONT = 11.0
 EXPECTED_TEXT_ASCENT = 0.80
 EXPECTED_TEXT_DESCENT = 0.20
 
-P43_ACCEPTANCE_RELATIVE_PATH = "src/phase4/P4_3_ACCEPTANCE.json"
-
 P43_CHECK_TARGET = "phase4-p43-check"
 P43_ANALYZE_TARGET = "phase4-p43-analyze"
 P43_VERIFY_TARGET = "phase4-p43-verify"
@@ -354,6 +437,13 @@ def _check_truthful_claims(reporter: Reporter, documents: dict[str, str]) -> Non
         for claim in FORBIDDEN_DOCUMENT_CLAIMS:
             reporter.check(f"{relative} does not claim {claim!r}",
                            claim.lower() not in text.lower(), "")
+    for relative in ("PLAN.md", "README.md", "results/README.md",
+                     P43_PROTOCOL_RELATIVE_PATH):
+        text = documents[relative]
+        for claim in FORBIDDEN_STALE_PRE_ACCEPTANCE_CLAIMS:
+            reporter.check(
+                f"{relative} does not retain the stale pre-acceptance claim {claim!r}",
+                claim.lower() not in text.lower(), "")
     protocol_text = documents[P43_PROTOCOL_RELATIVE_PATH]
     for claim in FORBIDDEN_P43_PROTOCOL_CLAIMS:
         reporter.check(f"{P43_PROTOCOL_RELATIVE_PATH} does not claim {claim!r}",
@@ -1070,8 +1160,15 @@ def _check_output_containment(reporter: Reporter, analyzer, orchestrator) -> Non
 def _check_candidate_and_acceptance(reporter: Reporter, analyzer, orchestrator,
                                     documents: list, repo_root: Path,
                                     protocol: str) -> None:
-    """3.5 -- an immutable candidate plus an external acceptance attestation
-    that does not exist yet and must not."""
+    """3.5 -- an immutable candidate plus the external acceptance attestation
+    that is now the sole source of publication authority.
+
+    The candidate model itself is unchanged by acceptance: the bytes still
+    record `publishable=false` and the invariant candidate publication state,
+    and nothing promotes, overwrites, or deletes them. What changed is that the
+    separate, hash-bound attestation now exists; `_check_acceptance_record()`
+    validates the real file against the real bundle.
+    """
     payloads = dict(documents)
     reporter.check("candidate artifacts record publishable=false and the candidate "
                    "publication state",
@@ -1098,10 +1195,6 @@ def _check_candidate_and_acceptance(reporter: Reporter, analyzer, orchestrator,
                    and "refusing to overwrite" in publication
                    and not re.search(r"\bos\.(replace|rename|remove|unlink|truncate)\b|"
                                      r"\bshutil\.", _strip(publication)), "")
-    acceptance = repo_root / analyzer.ACCEPTANCE_RELATIVE_PATH
-    reporter.check("no acceptance attestation exists: P4.3 is not accepted",
-                   not acceptance.exists() and not acceptance.is_symlink(),
-                   str(acceptance))
     reporter.check("the acceptance attestation is not part of the nine-artifact inventory",
                    analyzer.ACCEPTANCE_RELATIVE_PATH
                    not in analyzer.ARTIFACT_RELATIVE_PATHS, "")
@@ -1157,6 +1250,168 @@ def _check_candidate_and_acceptance(reporter: Reporter, analyzer, orchestrator,
                        template, manifest_sha256=manifest_sha256,
                        artifact_sha256=incomplete_reference,
                        analysis_code_commit=commit)), "")
+
+
+def _check_acceptance_record(reporter: Reporter, analyzer, orchestrator,
+                             repo_root: Path, documents: dict[str, str]) -> None:
+    """3.5b -- the external acceptance attestation exists, is well formed, and
+    binds exactly the accepted bytes.
+
+    The file is parsed as JSON and validated structurally; it is never matched
+    as text. It is checked twice over: field by field against the frozen
+    closure facts, and then by the analyzer's own frozen
+    ``validate_acceptance_document()`` against trusted inputs recomputed from
+    the committed bundle. An attestation that differs in one campaign ID,
+    commit, path, or hash is therefore rejected, and it can never authorize a
+    modified or partially regenerated bundle.
+
+    The closure/documentation commit that adds this file is deliberately not
+    one of the recorded commits: it is not the experimental execution, it did
+    not produce the bundle, and it does not contain the accepted candidate.
+    """
+    path = repo_root / P43_ACCEPTANCE_RELATIVE_PATH
+    if not reporter.check(
+            f"{P43_ACCEPTANCE_RELATIVE_PATH} exists as a regular, non-symlink file",
+            path.is_file() and not path.is_symlink(), str(path)):
+        return
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        reporter.check(f"{P43_ACCEPTANCE_RELATIVE_PATH} parses as JSON", False,
+                       f"{type(exc).__name__}: {exc}")
+        return
+    reporter.check(f"{P43_ACCEPTANCE_RELATIVE_PATH} parses as JSON", True)
+    if not reporter.check("the acceptance record is a JSON object",
+                          isinstance(document, dict), type(document).__name__):
+        return
+
+    reporter.check("the acceptance record carries exactly the frozen "
+                   f"{analyzer.ACCEPTANCE_SCHEMA_VERSION} top-level fields",
+                   set(document) == set(analyzer.ACCEPTANCE_REQUIRED_FIELDS),
+                   str(sorted(set(document) ^ set(analyzer.ACCEPTANCE_REQUIRED_FIELDS))))
+    for field, expected in (
+            ("schema_version", analyzer.ACCEPTANCE_SCHEMA_VERSION),
+            ("unit", analyzer.UNIT),
+            ("status", analyzer.ACCEPTANCE_STATUS_ACCEPTED),
+            ("analysis_code_commit", ACCEPTED_ANALYZER_COMMIT),
+            ("final_campaign_ids", list(analyzer.FINAL_CAMPAIGN_IDS)),
+            ("pilot_campaign_id_excluded", analyzer.PILOT_CAMPAIGN_ID),
+            ("analysis_manifest_sha256", ACCEPTED_MANIFEST_SHA256),
+            ("verification_outcome", analyzer.ACCEPTANCE_VERIFICATION_OUTCOME),
+            ("independent_output_review_outcome", analyzer.ACCEPTANCE_REVIEW_OUTCOME)):
+        reporter.check(f"the acceptance record pins {field} to {expected!r}",
+                       document.get(field) == expected, repr(document.get(field)))
+    reporter.check("accepted_for_publication is exactly the boolean true",
+                   document.get("accepted_for_publication") is True,
+                   repr(document.get("accepted_for_publication")))
+    commit = document.get("analysis_code_commit")
+    reporter.check("the recorded analyzer commit is 40 lowercase hexadecimal characters",
+                   isinstance(commit, str) and GIT_COMMIT_RE.fullmatch(commit) is not None,
+                   repr(commit))
+    digest = document.get("analysis_manifest_sha256")
+    reporter.check("the recorded manifest digest is 64 lowercase hexadecimal characters",
+                   isinstance(digest, str) and SHA256_RE.fullmatch(digest) is not None,
+                   repr(digest))
+    hashes = document.get("artifact_sha256")
+    reporter.check("the acceptance record binds exactly the nine frozen artifacts",
+                   isinstance(hashes, dict)
+                   and set(hashes) == set(analyzer.ARTIFACT_RELATIVE_PATHS),
+                   str(sorted(set(hashes) ^ set(analyzer.ARTIFACT_RELATIVE_PATHS)))
+                   if isinstance(hashes, dict) else type(hashes).__name__)
+    if isinstance(hashes, dict):
+        malformed = sorted(relative for relative, value in hashes.items()
+                           if not isinstance(value, str)
+                           or SHA256_RE.fullmatch(value) is None)
+        reporter.check("every bound artifact digest is 64 lowercase hexadecimal "
+                       "characters", not malformed, str(malformed))
+
+    # The three provenance commits are three different facts. Conflating any
+    # two of them would let a different execution, analyzer, or candidate be
+    # published under an accepted name.
+    reporter.check("the experimental execution, analyzer, and candidate commits are "
+                   "three distinct 40-character commits",
+                   len({ACCEPTED_EXECUTION_COMMIT, ACCEPTED_ANALYZER_COMMIT,
+                        ACCEPTED_CANDIDATE_COMMIT}) == 3
+                   and all(GIT_COMMIT_RE.fullmatch(value) is not None
+                           for value in (ACCEPTED_EXECUTION_COMMIT,
+                                         ACCEPTED_ANALYZER_COMMIT,
+                                         ACCEPTED_CANDIDATE_COMMIT)), "")
+    reporter.check("the acceptance record does not record the execution or the candidate "
+                   "commit as the analyzer commit",
+                   commit not in (ACCEPTED_EXECUTION_COMMIT, ACCEPTED_CANDIDATE_COMMIT),
+                   repr(commit))
+    reporter.check("the analyzer's frozen execution commit is the accepted one",
+                   analyzer.FINAL_EXECUTION_COMMIT == ACCEPTED_EXECUTION_COMMIT,
+                   analyzer.FINAL_EXECUTION_COMMIT)
+    reporter.check("this checker's bundle inventory equals the analyzer's frozen "
+                   "inventory, in the frozen order",
+                   ACCEPTED_BUNDLE_ARTIFACTS == tuple(analyzer.ARTIFACT_RELATIVE_PATHS),
+                   str(ACCEPTED_BUNDLE_ARTIFACTS))
+
+    # Bind the attestation to the bytes that are actually committed.
+    payloads: dict[str, bytes] = {}
+    unreadable: list[str] = []
+    for relative in analyzer.ARTIFACT_RELATIVE_PATHS:
+        artifact = repo_root / ACCEPTED_BUNDLE_ROOT / relative
+        try:
+            if artifact.is_symlink() or not artifact.is_file():
+                unreadable.append(relative)
+                continue
+            payloads[relative] = artifact.read_bytes()
+        except OSError:
+            unreadable.append(relative)
+    if not reporter.check("every accepted artifact is present as a regular, non-symlink "
+                          "file", not unreadable, str(unreadable)):
+        return
+    recomputed = {relative: orchestrator.sha256_bytes(payload)
+                  for relative, payload in payloads.items()}
+    reporter.check("the accepted manifest's own SHA-256 is the frozen digest",
+                   recomputed[analyzer.MANIFEST_RELATIVE_PATH] == ACCEPTED_MANIFEST_SHA256,
+                   recomputed[analyzer.MANIFEST_RELATIVE_PATH])
+    if isinstance(hashes, dict):
+        mismatched = sorted(relative for relative, value in recomputed.items()
+                            if hashes.get(relative) != value)
+        reporter.check("the acceptance record binds the exact committed bytes of all "
+                       "nine artifacts", not mismatched, str(mismatched))
+    try:
+        manifest = json.loads(
+            payloads[analyzer.MANIFEST_RELATIVE_PATH].decode("utf-8"))
+    except ValueError as exc:
+        reporter.check("the accepted manifest parses as JSON", False, str(exc))
+        return
+    reporter.check("the accepted manifest records the analyzer commit the attestation "
+                   "binds",
+                   manifest.get("analysis_code_commit") == ACCEPTED_ANALYZER_COMMIT,
+                   repr(manifest.get("analysis_code_commit")))
+    reporter.check("the accepted manifest records the experimental execution commit the "
+                   "campaigns ran from",
+                   manifest.get("final_execution_commit") == ACCEPTED_EXECUTION_COMMIT,
+                   repr(manifest.get("final_execution_commit")))
+    reporter.check("the accepted manifest never conflates the execution and analyzer "
+                   "commits",
+                   manifest.get("final_execution_commit")
+                   != manifest.get("analysis_code_commit"), "")
+
+    siblings = {relative: value for relative, value in recomputed.items()
+                if relative != analyzer.MANIFEST_RELATIVE_PATH}
+    errors = analyzer.validate_acceptance_document(
+        document, manifest_sha256=recomputed[analyzer.MANIFEST_RELATIVE_PATH],
+        artifact_sha256=siblings,
+        analysis_code_commit=manifest.get("analysis_code_commit", ""))
+    reporter.check("the analyzer's own frozen acceptance validator accepts the real "
+                   "attestation", not errors, str(errors[:3]))
+
+    # The narrative documents must carry the same closure facts, so the record
+    # and the documentation can never drift apart.
+    for relative in ("PLAN.md", "README.md", "results/README.md",
+                     P43_PROTOCOL_RELATIVE_PATH):
+        text = documents[relative]
+        for token in (ACCEPTED_EXECUTION_COMMIT, ACCEPTED_ANALYZER_COMMIT,
+                      ACCEPTED_CANDIDATE_COMMIT, ACCEPTED_MANIFEST_SHA256,
+                      ACCEPTED_AUDIT_VERDICT, ACCEPTED_COMPARISON_METHOD,
+                      P43_ACCEPTANCE_RELATIVE_PATH):
+            reporter.check(f"{relative} records the closure fact {token!r}",
+                           token in text, "")
 
 
 def _check_analysis_code_commit(reporter: Reporter, analyzer) -> None:
@@ -1461,6 +1716,12 @@ def check_repository(repo_root: Path) -> int:
             reporter.check("the bundle, containment, and acceptance contracts hold",
                            False, f"{type(exc).__name__}: {exc}")
     try:
+        _check_acceptance_record(reporter, analyzer, orchestrator, repo_root, documents)
+    except (analyzer.P43Error, KeyError, TypeError, AttributeError,
+            ValueError, OSError) as exc:
+        reporter.check("the external acceptance attestation contract holds", False,
+                       f"{type(exc).__name__}: {exc}")
+    try:
         _check_analysis_code_commit(reporter, analyzer)
     except (analyzer.P43Error, KeyError, TypeError, AttributeError, ValueError) as exc:
         reporter.check("the analysis-code provenance contract holds", False,
@@ -1480,9 +1741,10 @@ def check_repository(repo_root: Path) -> int:
               file=sys.stderr)
         return 1
     print("check_phase4_integration_p43: OK "
-          "(P4.3 implementation contract passed; this GPU-free self-check does not itself "
-          "establish an independent audit, production analysis, output review, or "
-          "acceptance)")
+          "(P4.3 contract passed, and the external acceptance attestation binds the exact "
+          "committed candidate bytes; this GPU-free check re-reads a recorded acceptance, "
+          "it never performs an independent audit, a production analysis, or an output "
+          "review of its own)")
     return 0
 
 
@@ -1546,13 +1808,17 @@ def run_self_test() -> int:
                 rewrite(path, original)
 
         mutate("PLAN.md",
-               "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |",
                "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |",
-               "a PLAN.md that claims P4.3 is audited and verified is rejected")
-        mutate("PLAN.md",
                "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |",
+               "a PLAN.md that regresses accepted P4.3 to implemented-only is rejected")
+        mutate("PLAN.md",
+               "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |",
                "| P4.3 | Integrated analysis, documentation, audit | NO | NO | NO |",
                "a PLAN.md that still calls P4.3 unimplemented is rejected")
+        mutate("PLAN.md",
+               "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |",
+               "| P4.3 | Integrated analysis, documentation, audit | YES | YES | NO |",
+               "a PLAN.md that claims P4.3 was audited but not verified is rejected")
         mutate("PLAN.md",
                "| P4.2 | Pilot plus three final campaigns | YES | YES | YES |",
                "| P4.2 | Pilot plus three final campaigns | YES | NO | NO |",
@@ -1561,21 +1827,24 @@ def run_self_test() -> int:
                "| P1.4 | Profiling, validation, analysis, pilot | YES | YES | YES |",
                "| P1.4 | Profiling, validation, analysis, pilot | YES | NO | NO |",
                "a PLAN.md that regresses closed P1.4 is rejected")
-        mutate(P43_PROTOCOL_RELATIVE_PATH, "Independent audit: NOT PERFORMED",
-               "Independent audit: PASSED",
-               "a protocol that claims the P4.3 audit passed is rejected")
-        mutate(P43_PROTOCOL_RELATIVE_PATH, "P4.3 = YES / NO / NO", "P4.3 = YES / YES / YES",
-               "a protocol that closes P4.3 is rejected")
-        mutate(P43_PROTOCOL_RELATIVE_PATH, "no publishable result exists",
-               "a publishable result exists",
-               "a protocol that claims a publishable result is rejected", every=True)
-        mutate("README.md",
-               "P4.3: IMPLEMENTED; independent audit: NO; production analysis: NO",
-               "P4.3: IMPLEMENTED; independent audit: YES; production analysis: YES",
-               "a README that claims the P4.3 audit and production analysis happened is "
+        mutate(P43_PROTOCOL_RELATIVE_PATH,
+               "Independent audit: ACCEPT WITH NON-BLOCKING OBSERVATIONS",
+               "Independent audit: NOT PERFORMED",
+               "a protocol that reverts to the stale pre-acceptance audit state is "
                "rejected")
-        mutate("results/README.md", "P4.3 is implemented", "P4.3 is closed",
-               "a results/README.md that closes P4.3 is rejected")
+        mutate(P43_PROTOCOL_RELATIVE_PATH, "P4.3 = YES / YES / YES", "P4.3 = YES / NO / NO",
+               "a protocol that reopens P4.3 is rejected", every=True)
+        mutate(P43_PROTOCOL_RELATIVE_PATH,
+               "P4.2 itself produced no publishable Phase 4 result",
+               "P4.2 itself produced a publishable Phase 4 result",
+               "a protocol that drops the P4.2 non-publication boundary is rejected")
+        mutate("README.md",
+               "P4.3: CLOSED; independent audit: YES; production analysis: YES",
+               "P4.3: IMPLEMENTED; independent audit: NO; production analysis: NO",
+               "a README that reverts to the stale implemented-only P4.3 header is "
+               "rejected")
+        mutate("results/README.md", "P4.3 is closed", "P4.3 is implemented",
+               "a results/README.md that reopens P4.3 is rejected")
         mutate(P43_PROTOCOL_RELATIVE_PATH, "publishable=false", "publishable=true",
                "a protocol that promotes an artifact to publishable is rejected",
                every=True)
@@ -1742,25 +2011,104 @@ def run_self_test() -> int:
         mutate(P43_PROTOCOL_RELATIVE_PATH, "p43.acceptance.v1", "p43.acceptance.v9",
                "a protocol whose frozen acceptance schema disagrees with the analyzer is "
                "rejected", every=True)
-        mutate(P43_PROTOCOL_RELATIVE_PATH, "Independent audit: NOT PERFORMED",
-               "Independent audit: YES",
-               "a protocol that claims the P4.3 audit happened is rejected", every=True)
+        mutate(P43_PROTOCOL_RELATIVE_PATH, ACCEPTED_AUDIT_VERDICT,
+               "ACCEPT WITH NO OBSERVATIONS",
+               "a protocol that overstates the independent audit verdict is rejected",
+               every=True)
+        mutate(P43_PROTOCOL_RELATIVE_PATH, ACCEPTED_MANIFEST_SHA256, "0" * 64,
+               "a protocol whose recorded manifest digest is not the accepted one is "
+               "rejected", every=True)
+        mutate(P43_PROTOCOL_RELATIVE_PATH, ACCEPTED_CANDIDATE_COMMIT,
+               ACCEPTED_ANALYZER_COMMIT,
+               "a protocol that collapses the candidate commit onto the analyzer commit "
+               "is rejected", every=True)
 
-        # The real acceptance attestation must not exist while P4.3 is not accepted.
+        # The real acceptance attestation. P4.3 is accepted, so it must exist,
+        # parse, and bind exactly the committed bytes. Every way it could be
+        # wrong is exercised against the clone and then restored.
         acceptance = clone / P43_ACCEPTANCE_RELATIVE_PATH
-        acceptance.write_text("{}\n", encoding="utf-8")
+        accepted_bytes = acceptance.read_text(encoding="utf-8")
+        accepted = json.loads(accepted_bytes)
+
+        def with_acceptance(payload: str, label: str) -> None:
+            acceptance.write_text(payload, encoding="utf-8")
+            try:
+                reporter.check(label, check_repository(clone) == 1, "")
+            finally:
+                acceptance.write_text(accepted_bytes, encoding="utf-8")
+
+        acceptance.unlink()
         try:
-            reporter.check("a repository that already carries the acceptance attestation "
-                           "is rejected while P4.3 is not accepted",
+            reporter.check("a repository with no acceptance attestation is rejected while "
+                           "P4.3 records the accepted state",
                            check_repository(clone) == 1, "")
         finally:
-            acceptance.unlink()
+            acceptance.write_text(accepted_bytes, encoding="utf-8")
+        with_acceptance("{not json", "an acceptance attestation that is not JSON is "
+                                     "rejected")
+        with_acceptance("[]\n", "an acceptance attestation that is not a JSON object is "
+                                "rejected")
+        for label, mutate_document in (
+                ("a wrong manifest digest",
+                 lambda doc: doc.__setitem__("analysis_manifest_sha256", "0" * 64)),
+                ("a truncated manifest digest",
+                 lambda doc: doc.__setitem__("analysis_manifest_sha256",
+                                             ACCEPTED_MANIFEST_SHA256[:63])),
+                ("an upper-case manifest digest",
+                 lambda doc: doc.__setitem__("analysis_manifest_sha256",
+                                             ACCEPTED_MANIFEST_SHA256.upper())),
+                ("a wrong analyzer commit",
+                 lambda doc: doc.__setitem__("analysis_code_commit", "f" * 40)),
+                ("an abbreviated analyzer commit",
+                 lambda doc: doc.__setitem__("analysis_code_commit",
+                                             ACCEPTED_ANALYZER_COMMIT[:12])),
+                ("the candidate commit substituted for the analyzer commit",
+                 lambda doc: doc.__setitem__("analysis_code_commit",
+                                             ACCEPTED_CANDIDATE_COMMIT)),
+                ("the execution commit substituted for the analyzer commit",
+                 lambda doc: doc.__setitem__("analysis_code_commit",
+                                             ACCEPTED_EXECUTION_COMMIT)),
+                ("one wrong artifact digest",
+                 lambda doc: doc["artifact_sha256"].__setitem__("report.md", "0" * 64)),
+                ("a missing artifact binding",
+                 lambda doc: doc["artifact_sha256"].pop("report.md")),
+                ("a missing required field",
+                 lambda doc: doc.pop("verification_outcome")),
+                ("an extra top-level field",
+                 lambda doc: doc.__setitem__("closure_commit", "0" * 40)),
+                ("a non-boolean acceptance flag",
+                 lambda doc: doc.__setitem__("accepted_for_publication", "true")),
+                ("a withdrawn status", lambda doc: doc.__setitem__("status", "PENDING")),
+                ("a substituted population",
+                 lambda doc: doc.__setitem__("final_campaign_ids", [])),
+                ("a reordered population",
+                 lambda doc: doc.__setitem__(
+                     "final_campaign_ids",
+                     list(reversed(accepted["final_campaign_ids"])))),
+                ("the pilot promoted into the population",
+                 lambda doc: doc.__setitem__("pilot_campaign_id_excluded",
+                                             accepted["final_campaign_ids"][0])),
+                ("an unverified byte-for-byte outcome",
+                 lambda doc: doc.__setitem__("verification_outcome", "not_verified")),
+                ("an unreviewed output review outcome",
+                 lambda doc: doc.__setitem__("independent_output_review_outcome",
+                                             "review_skipped")),
+                ("a drifted schema version",
+                 lambda doc: doc.__setitem__("schema_version", "p43.acceptance.v9")),
+                ("a foreign unit", lambda doc: doc.__setitem__("unit", "P4.2"))):
+            document = json.loads(accepted_bytes)
+            mutate_document(document)
+            with_acceptance(json.dumps(document, indent=2) + "\n",
+                            f"an acceptance attestation with {label} is rejected")
 
         reporter.check("the restored clone passes again", check_repository(clone) == 0, "")
 
-    reporter.check("the frozen status frontier records P4.3 as implemented only",
-                   EXPECTED_STATUS_LINES[2].endswith("| YES | NO | NO |"),
+    reporter.check("the frozen status frontier records P4.3 as accepted and closed",
+                   EXPECTED_STATUS_LINES[2].endswith("| YES | YES | YES |"),
                    EXPECTED_STATUS_LINES[2])
+    reporter.check("no P4.3 row other than the accepted one is legal",
+                   len(FORBIDDEN_P43_STATUS_LINES) == 7
+                   and EXPECTED_STATUS_LINES[2] not in FORBIDDEN_P43_STATUS_LINES, "")
     reporter.check("this checker requires no raw evidence path at all",
                    not any("results/raw" in value for value in REQUIRED_P43_FILES), "")
 

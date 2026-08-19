@@ -121,7 +121,7 @@ FROZEN_EXECUTION_PATH_SHA256 = {
 EXPECTED_STATUS_LINES = (
     "| P4.1 | Orchestrator | YES | YES | YES |",
     "| P4.2 | Pilot plus three final campaigns | YES | YES | YES |",
-    "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |",
+    "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |",
 )
 # Every stale or impossible P4.2 state. P4.2 is closed; nothing else is legal.
 FORBIDDEN_P42_STATUS_LINES = (
@@ -133,11 +133,13 @@ FORBIDDEN_P42_STATUS_LINES = (
     "| P4.2 | Pilot plus three final campaigns | YES | YES | NO |",
     "| P4.2 | Pilot plus three final campaigns | YES | NO | YES |",
 )
-# The closed P4.1 row must not regress. P4.3 is implemented and is neither
-# independently audited nor run against the real evidence: its row advanced by
-# exactly one step, and every other P4.3 state -- including the stale
-# "NO | NO | NO" this checker used to require, which structurally forbade P4.3
-# from existing -- stays rejected. See src/phase4/P4_3_PROTOCOL.md section 6.1.
+# The closed P4.1 row must not regress. P4.3 is implemented, independently
+# audited, verified against the real GB300 evidence, and accepted: its row
+# advanced by exactly one step at implementation and by exactly one further
+# step at acceptance, and every other P4.3 state -- including the stale
+# "NO | NO | NO" this checker once required, which structurally forbade P4.3
+# from existing, and the "YES | NO | NO" it required until acceptance -- stays
+# rejected. See src/phase4/P4_3_PROTOCOL.md sections 6.1 and 17.
 FORBIDDEN_P41_STATUS_LINES = (
     "| P4.1 | Orchestrator | NO | NO | NO |",
     "| P4.1 | Orchestrator | YES | YES | NO |",
@@ -149,9 +151,9 @@ FORBIDDEN_P43_STATUS_LINES = (
     "| P4.3 | Integrated analysis, documentation, audit | NO | YES | NO |",
     "| P4.3 | Integrated analysis, documentation, audit | NO | NO | YES |",
     "| P4.3 | Integrated analysis, documentation, audit | NO | YES | YES |",
+    "| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |",
     "| P4.3 | Integrated analysis, documentation, audit | YES | YES | NO |",
     "| P4.3 | Integrated analysis, documentation, audit | YES | NO | YES |",
-    "| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |",
 )
 
 STATUS_DOCUMENTS = ("PLAN.md", "README.md", "results/README.md",
@@ -167,8 +169,6 @@ FORBIDDEN_DOCUMENT_CLAIMS = (
     "GB300 verification: PENDING",
     "zero of three final campaigns",
     "still requires three independent final campaigns",
-    "Phase 4: CLOSED",
-    "Phase 4 is closed",
     "publishable=true",
     "publishable: true",
     "publishable = true",
@@ -200,6 +200,10 @@ REQUIRED_P42_PROTOCOL_STATEMENTS = (
     "20260817T112011Z",
     "b08e45c2636a3ac17c94ad8b1368084914196d7a",
 )
+
+# P4.3's external acceptance attestation. P4.2 only ever names it, so that a
+# Phase 4 closure claim cannot appear in a status document without it.
+P43_ACCEPTANCE_RELATIVE_PATH = "src/phase4/P4_3_ACCEPTANCE.json"
 
 # P4.3 belongs to P4.3. These three files are its own; P4.2 does not implement
 # them, does not depend on them, and still computes no statistic of its own.
@@ -751,6 +755,14 @@ def _check_truthful_claims(reporter: Reporter, documents: dict[str, str]) -> Non
         for claim in FORBIDDEN_DOCUMENT_CLAIMS:
             reporter.check(f"{relative} does not claim {claim!r}",
                            claim.lower() not in text.lower(), "")
+        # Phase 4 closure became truthful only when P4.3 was accepted. P4.2
+        # never authorizes it on its own, so a document that closes Phase 4
+        # without naming the external acceptance attestation is still rejected.
+        for claim in ("Phase 4: CLOSED", "Phase 4 is closed"):
+            reporter.check(f"{relative} closes Phase 4 only together with the P4.3 "
+                           f"acceptance attestation",
+                           claim.lower() not in text.lower()
+                           or P43_ACCEPTANCE_RELATIVE_PATH in text, "")
     for relative in ("PLAN.md", "README.md", "results/README.md",
                      P42_PROTOCOL_RELATIVE_PATH):
         text = documents[relative]

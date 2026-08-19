@@ -700,17 +700,18 @@ implemented, independently audited, and verified on GB300. P4.2 is also
 implemented, independently audited, and verified on GB300: accepted pilot
 `20260812T013848Z` plus final campaigns `20260817T110330Z`,
 `20260817T111310Z`, and `20260817T112011Z` passed terminal revalidation and the
-read-only cross-campaign validator. All evidence remains non-publishable. P4.3
-is implemented and has been remediated after two independent audits; the present
-revision is awaiting a new independent audit. **The P4.3 independent audit has
-not been performed** on this revision and **no production analysis of the three
-final campaigns has been run**, so Phase 4 is not closed.
+read-only cross-campaign validator. **P4.2 itself produced no publishable
+Phase 4 result**, and every raw campaign tree remains `publishable=false`. P4.3
+is implemented, independently audited, and verified against that real GB300
+evidence: `P4.3 = YES / YES / YES`. **Phase 4: CLOSED**, and with it **the
+experimental phase of the TFM is closed**. The next project activity is thesis
+analysis, writing, and the defence — not further experimental work.
 
 | Unit | Description | Implemented | Audited | Verified on GB300 |
 |------|-------------|-------------|---------|-------------------|
 | P4.1 | Orchestrator | YES | YES | YES |
 | P4.2 | Pilot plus three final campaigns | YES | YES | YES |
-| P4.3 | Integrated analysis, documentation, audit | YES | NO | NO |
+| P4.3 | Integrated analysis, documentation, audit | YES | YES | YES |
 
 P4.1 (`scripts/run_all.sh`, `scripts/phase4_orchestrator.py`,
 `scripts/check_phase4_orchestrator_p41.py`, `src/phase4/P4_1_PROTOCOL.md`) is
@@ -895,12 +896,14 @@ closed as `YES / YES / YES`.
 
 P4.2 computes no statistic, winner, threshold, roofline interpretation,
 architectural conclusion, table, or figure; those belong exclusively to P4.3.
-Every campaign remains `publishable=false`, and no publishable Phase 4 result
-exists.
+Every campaign remains `publishable=false`, and
+**P4.2 itself produced no publishable Phase 4 result**: publication authority
+for the curated P4.3 bundle is the external acceptance attestation alone.
 
 P4.3 (`scripts/analyze_phase4_p43.py`,
-`scripts/check_phase4_integration_p43.py`, `src/phase4/P4_3_PROTOCOL.md`) is
-**implemented only**: `P4.3 = YES / NO / NO`. It is an offline, read-only
+`scripts/check_phase4_integration_p43.py`, `src/phase4/P4_3_PROTOCOL.md`,
+`src/phase4/P4_3_ACCEPTANCE.json`) is **accepted and closed**:
+`P4.3 = YES / YES / YES`. It is an offline, read-only
 analysis layer over the already accepted GB300 evidence. It executes no GPU
 command and starts no Docker container, `nvidia-smi`, CUDA compilation, Nsight
 Compute run, preflight, or campaign; it adds no CUDA, CuTe DSL, or cuBLASLt
@@ -952,10 +955,12 @@ owned: the `Makefile`, `scripts/check_gemm_comparison_p35.py`,
 `P4.3 | Integrated analysis, documentation, audit | NO | NO | NO` — and the P4.2
 checker additionally demanded that the three P4.3 files not exist — which
 structurally forbade P4.3 from being implemented at all. Each was advanced by
-exactly one step to the truthful `YES | NO | NO`, each now rejects every other
-P4.3 state, and the P4.2 checker still proves on its own source that **P4.2
-itself computes no statistic, threshold, ranking, or figure** even though the
-separate P4.3 analyzer now exists. No closed P1–P4.2 assertion was weakened.
+exactly one step to the then-truthful `YES | NO | NO` — and, on P4.3's
+acceptance, by exactly one further step to `YES | YES | YES`, as described
+below — each rejects every other P4.3 state, and the P4.2 checker still proves
+on its own source that **P4.2 itself computes no statistic, threshold, ranking,
+or figure** even though the separate P4.3 analyzer now exists. No closed
+P1–P4.2 assertion was weakened.
 
 A first independent audit of that implementation found seven defects that its
 then-passing test suite did not detect, and all seven were remediated in commit
@@ -1000,24 +1005,79 @@ then-passing test suite did not detect, and all seven were remediated in commit
 7. **figure terminology** — the min-max range is a whisker, not a bar.
 
 A second independent audit of that commit found seven further blockers. The
-present revision corrects its time-dependent candidate state, untracked
+following revision corrected its time-dependent candidate state, untracked
 Python/import provenance, incomplete trusted acceptance-map validation,
 metadata contradictions, clipped/overlapping SVGs, omitted terminal
 diagnostics, and unsafe partial-output semantics. Section 15 of the P4.3
 protocol records the exact corrections and regressions.
 
-**This present remediation has not been independently audited.** It is prepared
-for a separate audit and nothing else; it does not merge or open a pull request.
+A third independent audit examined that corrected candidate and returned
+**ACCEPT WITH NON-BLOCKING OBSERVATIONS**: zero BLOCKER and zero MAJOR
+findings, five MINOR findings, and eleven observations. The five MINOR findings
+were presentation, semantic-documentation, and regression-coverage gaps that
+changed no reported value; they are corrected and recorded in section 16 of the
+P4.3 protocol, and because three of the corrections changed generated bytes the
+candidate was regenerated from the frozen campaigns afterwards. The
+observations are non-blocking, and they are kept on the record rather than
+declared absent.
 
-**The P4.3 independent audit has not been performed**, and
-**no production analysis of the three final campaigns has been run** in this
-repository: `results/phase4/` does not exist, `src/phase4/P4_3_ACCEPTANCE.json` does not
-exist, no curated P4.3 artifact exists, no P4.3 result has been accepted for
-publication, and no publishable result exists anywhere here. The
-implementation-time GPU-free checks in `src/phase4/P4_3_PROTOCOL.md` section 12
-are the author's own self-checks; they are not an independent audit and a
-GPU-free check is never GB300 verification. Phase 4 and the complete TFM stay
-open until the independent audit of this analysis layer, a production run from
-that audited commit, fresh read-only validation of all three final campaigns,
-byte-for-byte deterministic recomputation, an independent review of the
-resulting outputs, and the external acceptance attestation have all passed.
+### P4.3 acceptance and the provenance chain
+
+P4.3 is accepted. The canonical, machine-readable record is
+[`src/phase4/P4_3_ACCEPTANCE.json`](src/phase4/P4_3_ACCEPTANCE.json), written
+against the `p43.acceptance.v1` schema that section 7.3 of
+[`src/phase4/P4_3_PROTOCOL.md`](src/phase4/P4_3_PROTOCOL.md) froze before any
+acceptance existed; section 17 of that protocol is the prose addendum.
+
+The chain has three distinct commits, plus the closure commit that carries this
+documentation. None of them is interchangeable with another:
+
+| Role | Commit | What it identifies |
+|------|--------|--------------------|
+| Experimental execution | `b08e45c2636a3ac17c94ad8b1368084914196d7a` | the commit the three GB300 final campaigns ran from — the experimental evidence |
+| Analyzer | `2ef1ac52907c407dd43c41661382fc8d5673cce4` | the commit whose analysis code produced the candidate bundle |
+| Accepted candidate | `577fbe229eb1b857d82f23aacb305136014ec7b0` | the commit containing the accepted candidate bytes under `results/phase4/` |
+| Closure | this documentation commit | acceptance and documentation metadata only; it produced no evidence and contains no candidate byte |
+
+The analyzer and candidate commits are **not** expected to be equal: the
+analyzer is committed and audited before it runs, and its output is committed
+after it runs. The closure commit is deliberately not recorded inside
+`P4_3_ACCEPTANCE.json`, because a file cannot carry the hash of the commit that
+adds it.
+
+The accepted evidence:
+
+```text
+manifest algorithm       SHA-256
+manifest digest          b95d17910f8384187ddc94afacc9081507858de1fb69292f5f3d73bf4cc2d6ac
+raw-to-candidate check   PASS
+comparison method        byte-for-byte
+independent audit        ACCEPT WITH NON-BLOCKING OBSERVATIONS
+final gate state         P4.3 = YES / YES / YES
+```
+
+The byte-for-byte result covers the raw-data scope the verifier defines — the
+frozen population's terminal P1.4, P2.4, and P3.5 artifacts and the nine
+curated artifacts recomputed from them. It is not a claim that the execution
+and candidate Git trees are byte-identical.
+
+`make check-static` recomputes the nine artifact digests and re-validates
+`src/phase4/P4_3_ACCEPTANCE.json` against them on every run, so the
+documentation and the record cannot drift apart. Accepting P4.3 also required
+advancing the stale frontier guards that the `YES | NO | NO` row owned, in the
+`Makefile` and in the P3.5, P4.1, P4.2, and P4.3 checkers, by exactly one step
+each; every other P4.3 state stays rejected, the `Phase 4: CLOSED` bans in the
+P4.1 and P4.2 checkers became consistency rules that still refuse a closure
+claim not accompanied by the acceptance record, and no closed P1–P4.2 assertion
+was weakened. Section 17.5 of the P4.3 protocol records this.
+
+**Phase 4: CLOSED**, and **the experimental phase of the TFM is closed**. No
+further campaign, analysis run, or acceptance step is needed to finish the
+experimental work; the next project activity is thesis analysis, writing, and
+the defence. The TFM itself is not finished, and optional post-submission
+improvements — a GEMM Nsight Compute profile, a cold-cache GEMM workload, a
+fourth final campaign, additional shapes or variants — are outside the accepted
+TFM experimental scope and are not required for closure. The curated bundle is
+accepted for publication by the external attestation; the candidate bytes
+themselves still record `publishable=false`, which is an invariant property of
+those bytes and not a pending state.

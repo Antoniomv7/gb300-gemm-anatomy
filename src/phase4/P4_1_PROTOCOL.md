@@ -701,16 +701,16 @@ change; or any commit, push, merge, or pull request.
 ```text
 P4.1 | Orchestrator                                | YES | YES | YES
 P4.2 | Pilot plus three final campaigns            | YES | YES | YES
-P4.3 | Integrated analysis, documentation, audit   | YES | NO  | NO
+P4.3 | Integrated analysis, documentation, audit   | YES | YES | YES
 ```
 
 `P4.1 = YES / YES / YES`. The independent audit and GB300 verification passed.
 Pilot campaign `20260812T013848Z` is terminally `COMPLETE` and remains
 non-publishable. P4.2 has since completed three independent final campaigns and
-closed as `YES / YES / YES`. P4.3's offline, read-only analysis layer is
-implemented; its independent audit has not been performed and its production
-analysis has not been run, and no publishable result exists anywhere in this
-repository. P4.3 changes nothing in this unit: `scripts/run_all.sh` and
+closed as `YES / YES / YES`. P4.3's offline, read-only analysis layer has since
+been independently audited, run against the real evidence, verified, and
+accepted, and closed as `YES / YES / YES`; P4.1 itself produced no publishable
+result. P4.3 changes nothing in this unit: `scripts/run_all.sh` and
 `scripts/phase4_orchestrator.py` remain byte-identical to the content P4.2
 pinned by SHA-256.
 

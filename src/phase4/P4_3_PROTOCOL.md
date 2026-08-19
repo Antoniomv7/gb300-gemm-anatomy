@@ -1,39 +1,59 @@
 # P4.3 — integrated analysis, documentation, and closing audit preparation
 
-Status: `P4.3 = YES / NO / NO` (Implemented / Audited / Verified on GB300).
+Status: `P4.3 = YES / YES / YES` (Implemented / Audited / Verified on GB300).
+**P4.3 is accepted and closed.** The canonical, machine-readable acceptance
+record is [`P4_3_ACCEPTANCE.json`](P4_3_ACCEPTANCE.json); section 17 is its
+prose addendum. This status block records the outcome; sections 1–16 remain the
+frozen experimental contract and are **not** rewritten to fit it.
 
 * **P4.3 is an implemented, offline, read-only analysis layer** over already
   accepted GB300 evidence. It executes no GPU command and starts no Docker
   container, `nvidia-smi`, CUDA compilation, Nsight Compute run, preflight, or
   campaign, and it starts no child process at all.
-* **The implementation has received remediation after two independent
-  audits.** The first audit found seven defects: an incorrect scientific evidence
-  taxonomy, parsed-then-dropped NCU diagnostics and within-campaign stability
-  evidence, an untruthful metadata contract, an ancestor-symlink escape from the
-  output tree, no immutable candidate-to-acceptance workflow, a missing
-  analysis-code commit, and incorrect figure terminology. All seven are
-  remediated here; section 14 records them. A second audit found seven further
-  release blockers in that remediation: time-dependent lifecycle metadata,
-  incomplete Python/import provenance, an incomplete trusted acceptance map,
-  documentation/metadata contradictions, clipped or overlapping SVG content,
-  omitted terminal diagnostics, and an unsafe partial-output contract. Section
-  15 records the corrections.
-* **The present remediation is awaiting a new independent audit.**
-* **Independent audit: NOT PERFORMED for the present remediation.**
-* **Production analysis: NOT RUN.** No P4.3 run against the three real final
-  campaigns has been performed in this repository, and `results/phase4/` does
-  not exist.
-* **No acceptance attestation exists.** `src/phase4/P4_3_ACCEPTANCE.json` is
-  absent, and the repository checker requires it to stay absent.
-* **No curated P4.3 result has been accepted for publication**, and
-  **no publishable result exists** anywhere in this repository.
-* **Phase 4 and the complete TFM are not closed.** They stay open until the
-  later independent audit, the production run from that audited commit, and the
-  review of its outputs all pass.
+* **The implementation received remediation after two independent audits before
+  it was accepted.** The first audit found seven defects: an incorrect
+  scientific evidence taxonomy, parsed-then-dropped NCU diagnostics and
+  within-campaign stability evidence, an untruthful metadata contract, an
+  ancestor-symlink escape from the output tree, no immutable
+  candidate-to-acceptance workflow, a missing analysis-code commit, and
+  incorrect figure terminology; section 14 records them. A second audit found
+  seven further release blockers in that remediation: time-dependent lifecycle
+  metadata, incomplete Python/import provenance, an incomplete trusted
+  acceptance map, documentation/metadata contradictions, clipped or overlapping
+  SVG content, omitted terminal diagnostics, and an unsafe partial-output
+  contract; section 15 records the corrections. A third audit of the corrected
+  candidate returned **ACCEPT WITH NON-BLOCKING OBSERVATIONS**; section 16
+  records its five MINOR findings and their corrections, and the candidate was
+  regenerated from the frozen campaigns afterwards.
+* **Independent audit: ACCEPT WITH NON-BLOCKING OBSERVATIONS.** The verdict was
+  an acceptance carrying non-blocking observations, not a clean bill with no
+  observations, and the observations are recorded rather than discarded.
+* **Production analysis: RUN.** The analysis of the three real final campaigns
+  ran from analyzer commit `2ef1ac52907c407dd43c41661382fc8d5673cce4`, and
+  `results/phase4/` holds the resulting nine-artifact bundle.
+* **Raw-to-candidate verification: PASS**, by **byte-for-byte** recomputation
+  over the raw-data scope this protocol defines: the frozen population's
+  terminal P1.4, P2.4, and P3.5 artifacts and the nine curated artifacts
+  derived from them. It is *not* a claim that two Git trees are byte-identical.
+* **The acceptance attestation exists.** `src/phase4/P4_3_ACCEPTANCE.json`
+  records `status=ACCEPTED` and binds
+  `analysis_manifest_sha256 = b95d17910f8384187ddc94afacc9081507858de1fb69292f5f3d73bf4cc2d6ac`,
+  which covers all nine artifacts without self-reference. The repository
+  checker now parses and validates it.
+* **The curated P4.3 result is accepted for publication.** The immutable
+  candidate bytes still record `publishable=false`: that is an invariant
+  property of the bytes, and publication authority has always been the separate
+  attestation, never a rewritten candidate. **P4.2 itself produced no
+  publishable Phase 4 result**, and the raw campaign trees remain
+  `publishable=false`.
+* **Phase 4 is closed, and the experimental phase of the TFM is closed.** What
+  remains is thesis analysis, writing, and the defence — not further
+  experimental work.
 
-The GPU-free implementation checks in section 12 were run by the author. **They
-are self-checks, not an independent audit, and a GPU-free check is never GB300
-verification.**
+The GPU-free implementation checks in section 12 were the author's own
+self-checks at implementation time. **They were never an independent audit, and
+a GPU-free check is never GB300 verification**; the audit and the verification
+recorded above were separate, later steps.
 
 ## 0. Trust model
 
@@ -518,6 +538,12 @@ Updated minimally: `Makefile`, `PLAN.md`, `README.md`, `results/README.md`,
 only where a current-status assertion about P4.3 would otherwise have become
 false — plus the stale status-frontier guards described in section 6.1.
 
+Added later, by the separate closure action and not by the analyzer:
+
+```text
+src/phase4/P4_3_ACCEPTANCE.json         the external acceptance attestation
+```
+
 Unchanged: `scripts/run_all.sh`, `scripts/phase4_orchestrator.py`, every CUDA
 and CuTe DSL kernel, `src/memory/`, `src/compute/`, `src/gemm/`, every
 P1.4/P2.4/P3.5 runner, analyzer, schema, and checker contract, `VERSIONS.env`,
@@ -533,9 +559,11 @@ situation P3.5 had to correct for P3.4, P4.1 for itself, and P4.2 for itself.
 The guards in `Makefile`, `scripts/check_gemm_comparison_p35.py`,
 `scripts/check_phase4_orchestrator_p41.py`, and
 `scripts/check_phase4_campaigns_p42.py` were advanced by exactly one step, to
-the now-truthful `YES | NO | NO`, and each of them now rejects every *other*
-P4.3 state, including all four that would claim an audit or a verification that
-has not happened. `scripts/check_phase4_campaigns_p42.py` additionally stopped
+the then-truthful `YES | NO | NO`, and each of them rejected every *other*
+P4.3 state, including all four that would have claimed an audit or a
+verification that had not happened at the time. (On P4.3's acceptance the same
+guards were advanced by exactly one further step, to `YES | YES | YES`;
+section 17.5 records that second step.) `scripts/check_phase4_campaigns_p42.py` additionally stopped
 asserting that the three P4.3 files are absent and instead asserts that they
 exist, are owned by P4.3, and start no campaign — while continuing to prove, on
 its own source, that **P4.2 itself computes no statistic, threshold, ranking, or
@@ -687,9 +715,9 @@ an external acceptance attestation at src/phase4/P4_3_ACCEPTANCE.json
 a final documentation and status commit
 ```
 
-The repository's current status is recorded separately in sections 11 and 12:
-the production candidate has not been produced and no P4.3 result is accepted.
-Future candidate bytes will not need to change as those external steps occur.
+The repository's status is recorded separately in sections 11, 12, and 17.
+Every step of this lifecycle has since been completed, and — exactly as
+designed — **no candidate byte changed as those external steps occurred**.
 
 Only after the independent output review may a **separate** file be created:
 
@@ -757,9 +785,13 @@ The acceptance file:
 
 * is **not** generated by the analyzer;
 * is **not** part of the nine-artifact analysis inventory;
-* **must not exist** in this remediation, and the repository checker fails if it
-  does, because P4.3 remains `YES / NO / NO`;
-* will be created only by a later, explicitly authorized closing action.
+* was created by a later, explicitly authorized closing action, after the
+  independent output review — and **only** then;
+* exists now, and the repository checker parses it as JSON, validates every
+  frozen field, requires 40-character lowercase commits and 64-character
+  lowercase digests, and re-binds it to the recomputed hashes of the committed
+  bundle. An attestation that stopped matching the accepted bytes would fail
+  the check; it could never authorize a modified or regenerated bundle.
 
 ### 7.4 Output containment: descriptor-anchored traversal
 
@@ -808,8 +840,10 @@ analysis_code_commit    resolved and verified at production runtime
                         the commit whose analysis code PRODUCED the bundle
 ```
 
-It cannot be hard-coded, because the audited remediation commit does not exist
-yet. The analyzer resolves and verifies it at production runtime with a strict,
+It is not hard-coded: when this contract was frozen the audited remediation
+commit did not exist yet, and hard-coding it later would let a modified
+analyzer publish under an audited commit's name. The analyzer therefore
+resolves and verifies it at production runtime with a strict,
 pure-Python reader of `.git` that **starts no child process** and needs no
 network: HEAD and refs are resolved from loose refs and `packed-refs`, and Git
 objects from loose files or from a version-2 pack index.
@@ -1011,19 +1045,29 @@ other new dependency is involved.
 ```text
 P4.1 | Orchestrator                              | YES | YES | YES
 P4.2 | Pilot plus three final campaigns          | YES | YES | YES
-P4.3 | Integrated analysis, documentation, audit | YES | NO  | NO
+P4.3 | Integrated analysis, documentation, audit | YES | YES | YES
 ```
 
-`P4.3 = YES / NO / NO`. The implementation exists and has been remediated after
-two independent audits; **the present remediation is awaiting a new independent
-audit**. **Independent audit: NOT PERFORMED for this revision. Production analysis:
-NOT RUN.** `results/phase4/` does not exist, `src/phase4/P4_3_ACCEPTANCE.json`
-does not exist, no curated P4.3 artifact has been produced from the real
-evidence, no P4.3 result has been accepted for publication, **no publishable
-result exists** anywhere in this repository, and **Phase 4 and the complete TFM
-are not closed**.
+`P4.3 = YES / YES / YES`. **Independent audit: ACCEPT WITH NON-BLOCKING
+OBSERVATIONS. Production analysis: RUN.** The implementation exists and was
+remediated after two independent audits; a third audit of the corrected
+candidate accepted it with non-blocking observations (section 16). The
+production analysis of the three frozen final campaigns ran, `results/phase4/`
+holds the nine curated artifacts, the raw-to-candidate check returned PASS by
+byte-for-byte recomputation, the independent output review passed, and
+`src/phase4/P4_3_ACCEPTANCE.json` records the acceptance. **Phase 4 is closed
+and the experimental phase of the TFM is closed**; only thesis analysis,
+writing, and the defence remain.
+**P4.2 itself produced no publishable Phase 4 result**, and the raw campaign
+trees remain `publishable=false`; publication authority for the curated bundle
+is the external attestation alone. Section 17 records the complete closure
+facts.
 
 ## 12. Implementation-time GPU-free checks performed by the author
+
+These were run by the author **while implementing** P4.3, before the audit,
+the production analysis, the verification, the output review, and the
+acceptance that section 17 records:
 
 ```bash
 python3 -I -B -m py_compile \
@@ -1039,10 +1083,12 @@ make check-static
 git diff --check
 ```
 
-**These are the author's own self-checks. They are not an independent audit,
-and no GPU command and no production analysis against the real campaigns was
-run.** `make phase4-p43-analyze` and `make phase4-p43-verify` were deliberately
-**not** executed against the real evidence.
+**They were the author's own self-checks, never an independent audit**, and at
+that time no GPU command and no production analysis against the real campaigns
+had been run: `make phase4-p43-analyze` and `make phase4-p43-verify` were
+deliberately withheld until the audited analyzer commit existed. The later
+audit, production run, verification, and review were separate steps by separate
+actors, and a GPU-free check never establishes any of them.
 
 ## 13. Non-goals
 
@@ -1094,18 +1140,19 @@ regressions that exercise their failure modes:
 | 13 | P1.4/P2.4 terminal diagnostics were still omitted | P1.4 IQR counts; P2.4 per-SM CV, both reported IQR counts, profile SM-clock status, and resolved-profile-diagnostic counts are validated and preserved per campaign |
 | 14 | The prose declared every partial tree fatal while the writer could mutate an incomplete tree before discovering a later conflict | A two-pass retry: validate every existing byte and all paths first, then exclusively create missing artifacts; verification remains exact and rejects partial output |
 
-**This remediation has not been independently audited.** It is prepared for a
-new separate audit and for nothing else. No campaign was created or rerun, no
-file under `results/raw/` was touched, no kernel, runner, shape, candidate,
-measurement parameter, closed-unit schema, dependency, or version pin was
-changed, and no production analysis was executed.
+At the time it was written, that remediation had not yet been independently
+audited: it was prepared for a new separate audit and for nothing else. No
+campaign was created or rerun, no file under `results/raw/` was touched, no
+kernel, runner, shape, candidate, measurement parameter, closed-unit schema,
+dependency, or version pin was changed, and no production analysis was executed
+by it. The audit it was prepared for is the one section 16 records.
 
 
-## 16. Remediation after the second independent audit
+## 16. Remediation after the third independent audit
 
-The second independent audit returned **ACCEPT WITH NON-BLOCKING
-OBSERVATIONS**: zero BLOCKER findings, zero MAJOR findings, five MINOR findings,
-and eleven observations. It confirmed artifact integrity, provenance, and every
+The third independent audit — the one section 15's remediation was prepared
+for — returned **ACCEPT WITH NON-BLOCKING OBSERVATIONS**: zero BLOCKER
+findings, zero MAJOR findings, five MINOR findings, and eleven observations. It confirmed artifact integrity, provenance, and every
 one of the 186 recomputed cross-campaign statistics. The five MINOR findings
 were presentation, semantic-documentation, and regression-coverage gaps that
 changed no reported value; they are corrected here.
@@ -1130,13 +1177,130 @@ regression coverage.
 Three of the corrections change **generated bytes** — the three SVGs (layout),
 `report.md` and `integrated_summary.json` (explanatory text and metadata), and
 `memory_paths.csv` (the `diagnostic_flags` row note only, never a value) — so
-`analysis_manifest.json` will pin different sibling hashes. The candidate
-delivered to the second audit is therefore superseded and **must be
-regenerated from the frozen campaigns** before any acceptance attestation is
-created.
+`analysis_manifest.json` pins different sibling hashes. The candidate delivered
+to the third audit was therefore superseded and **was regenerated from the
+frozen campaigns** before the acceptance attestation was created. The
+regenerated bundle is the accepted one, and section 17 pins its hashes.
 
-**This remediation has not been independently audited.** It is prepared for a
-new separate audit and for nothing else. No campaign was created or rerun, no
-file under `results/raw/` was touched, no kernel, runner, shape, candidate,
-measurement parameter, closed-unit schema, dependency, or version pin was
-changed, and no production analysis or verification was executed.
+That remediation created and reran no campaign, touched no file under
+`results/raw/`, and changed no kernel, runner, shape, candidate, measurement
+parameter, closed-unit schema, dependency, or version pin.
+
+
+## 17. Final status: acceptance and closure (addendum)
+
+This section is an **addendum**. It records the outcome of the lifecycle that
+sections 7.3 and 7.5 froze; it rewrites no normative rule, relaxes no
+acceptance criterion, and changes no experimental contract. Nothing above was
+altered to fit the result.
+
+### 17.1 The canonical acceptance record
+
+[`P4_3_ACCEPTANCE.json`](P4_3_ACCEPTANCE.json) is the canonical acceptance
+record. It follows the `p43.acceptance.v1` schema frozen in section 7.3 —
+exactly those eleven top-level fields, no more and no fewer — so the validator
+`validate_acceptance_document()` in `scripts/analyze_phase4_p43.py`, written
+before the acceptance existed, accepts it unchanged. Prose that the frozen
+schema has no field for lives here instead of being bolted onto the JSON.
+
+### 17.2 Three commits, three different facts
+
+The provenance chain has three distinct commits plus the closure commit. They
+are never interchangeable, and none of them is "the P4.3 commit":
+
+| Role | Commit | What it identifies |
+|------|--------|--------------------|
+| Experimental execution | `b08e45c2636a3ac17c94ad8b1368084914196d7a` | the commit the three GB300 final campaigns **ran from**, so it identifies the experimental evidence. Recorded as `final_execution_commit` in `analysis_manifest.json` and frozen as `FINAL_EXECUTION_COMMIT` in the analyzer |
+| Analyzer | `2ef1ac52907c407dd43c41661382fc8d5673cce4` | the commit whose analysis **code produced** the candidate bundle. Recorded as `analysis_code_commit` in both the manifest and the acceptance record |
+| Accepted candidate | `577fbe229eb1b857d82f23aacb305136014ec7b0` | the commit that **contains** the accepted candidate bytes under `results/phase4/` |
+| Closure (this documentation commit) | — | acceptance and documentation metadata only. It produced no evidence, ran no analysis, and contains no candidate byte |
+
+The analyzer and candidate commits are **not** expected to be equal, and
+requiring them to be equal would be wrong: the analyzer must be committed and
+audited *before* it runs, and its output is committed *after* it runs. The
+analyzer refuses to run when `analysis_code_commit` equals the frozen execution
+commit, because the P4.3 analysis code did not exist at that commit. The
+closure commit is deliberately absent from `P4_3_ACCEPTANCE.json`: a file
+cannot carry the hash of the commit that adds it, and the attestation binds
+bytes, not history.
+
+Reproduction therefore starts from the **analyzer** commit: check out
+`2ef1ac52907c407dd43c41661382fc8d5673cce4`, place the accepted raw evidence
+under `results/raw/phase4/`, and run `make phase4-p43-verify`. Reading the
+accepted results needs no checkout at all — they are committed at
+`577fbe229eb1b857d82f23aacb305136014ec7b0` and present at `HEAD`.
+
+### 17.3 The accepted evidence
+
+```text
+manifest algorithm       SHA-256
+manifest digest          b95d17910f8384187ddc94afacc9081507858de1fb69292f5f3d73bf4cc2d6ac
+raw-to-candidate check   PASS
+comparison method        byte-for-byte
+independent audit        ACCEPT WITH NON-BLOCKING OBSERVATIONS
+final gate state         P4.3 = YES / YES / YES
+```
+
+`results/phase4/analysis_manifest.json` is tracked in this repository, and its
+recomputed SHA-256 equals the digest above. Because the manifest binds the
+other eight artifacts by path and SHA-256, and the acceptance record binds the
+manifest's own digest, the record covers all nine artifacts with no
+self-reference. `make check-static` recomputes all nine and compares them to
+the record on every run.
+
+**Scope of the byte-for-byte result.** It covers the raw-data scope the
+verifier defines: the frozen population's terminal P1.4, P2.4, and P3.5
+artifacts, each re-verified against the hash its campaign manifest pins, and
+the nine curated artifacts recomputed from them. It is **not** a claim that the
+execution and candidate Git trees are byte-identical — they are different
+commits with different contents, and nothing here asserts otherwise.
+
+**Non-blocking observations.** The verdict was `ACCEPT WITH NON-BLOCKING
+OBSERVATIONS`, not an acceptance with nothing to observe. The five MINOR
+findings and eleven observations of section 16 were corrected before the
+accepted candidate was regenerated; the observations remain part of the record
+and are not deleted, downgraded, or restated as absent.
+
+### 17.4 What closure does and does not mean
+
+* **Closed:** P4.3, Phase 4, and the experimental phase of the TFM. No further
+  campaign, analysis run, or acceptance step is required to finish the
+  experimental work.
+* **Not closed:** the TFM itself. The next activity is thesis analysis,
+  writing, and the defence.
+* **Unchanged by acceptance:** the immutable candidate model. The bundle still
+  records `publishable=false` and
+  `publication_state=immutable_candidate_requires_external_attestation`,
+  because that is an invariant property of the bytes. Publication authority was
+  always the separate attestation; no candidate artifact was promoted,
+  rewritten, or deleted to record that acceptance happened. **P4.2 itself
+  produced no publishable Phase 4 result**, and every campaign under
+  `results/raw/` remains `publishable=false`.
+* **Optional, post-submission, and outside the accepted scope:** anything not
+  listed in sections 1–16 — a GEMM Nsight Compute profile, a cold-cache GEMM
+  workload, a fourth final campaign, additional shapes or variants. None of it
+  is part of the accepted TFM experimental scope, and none of it is required
+  for closure.
+
+### 17.5 The stale frontier assertions this closure advanced
+
+Exactly as section 6.1 describes for the implementation step, five closed-unit
+guards required the literal `PLAN.md` row
+`P4.3 | Integrated analysis, documentation, audit | YES | NO | NO`, which
+structurally forbade P4.3 from ever being accepted. The guards in `Makefile`,
+`scripts/check_gemm_comparison_p35.py`,
+`scripts/check_phase4_orchestrator_p41.py`,
+`scripts/check_phase4_campaigns_p42.py`, and
+`scripts/check_phase4_integration_p43.py` were advanced by exactly one step, to
+the now-truthful `YES | YES | YES`, and each of them now rejects every *other*
+P4.3 state, including the stale `YES | NO | NO`. The `Phase 4: CLOSED` bans in
+P4.1's and P4.2's checkers were replaced by a **consistency** rule rather than
+deleted: a document may close Phase 4 only if it also names
+`src/phase4/P4_3_ACCEPTANCE.json`, so neither closed unit can authorize the
+closure on its own. `scripts/check_phase4_integration_p43.py` additionally
+stopped asserting that the acceptance file is absent and now requires it, parses
+it as JSON, validates every frozen field, requires 40-character lowercase
+commits and 64-character lowercase digests, checks the exact frozen commits,
+digest, `PASS`, byte-for-byte method, and verdict, and re-binds the record to
+the recomputed hashes of the committed bundle. Nothing was weakened: every
+closed P1–P4.2 assertion and every impossible-state rejection is preserved.
