@@ -12,7 +12,9 @@ Status: `P4.1 = YES / YES / YES` (Implemented / Audited / Verified on GB300).
 * **P4.2 is now closed as `YES / YES / YES`.** Its three final campaigns and
   read-only cross-campaign validation passed after this P4.1 closure.
 * **P4.3 will perform integrated analysis and publication review**, the final
-  tables and figures, and the closing audit.
+  tables and figures, and the closing audit. Its offline, read-only analysis
+  layer is now implemented; its independent audit has not been performed and its
+  production analysis has not been run.
 
 The GPU-free checks in section 12 were run by the author. **They are the
 author's own self-checks; they are not an independent audit, and GPU-free
@@ -699,14 +701,18 @@ change; or any commit, push, merge, or pull request.
 ```text
 P4.1 | Orchestrator                                | YES | YES | YES
 P4.2 | Pilot plus three final campaigns            | YES | YES | YES
-P4.3 | Integrated analysis, documentation, audit   | NO  | NO  | NO
+P4.3 | Integrated analysis, documentation, audit   | YES | YES | YES
 ```
 
 `P4.1 = YES / YES / YES`. The independent audit and GB300 verification passed.
 Pilot campaign `20260812T013848Z` is terminally `COMPLETE` and remains
 non-publishable. P4.2 has since completed three independent final campaigns and
-closed as `YES / YES / YES`; P4.3 remains unimplemented, and no publishable
-result exists anywhere in this repository.
+closed as `YES / YES / YES`. P4.3's offline, read-only analysis layer has since
+been independently audited, run against the real evidence, verified, and
+accepted, and closed as `YES / YES / YES`; P4.1 itself produced no publishable
+result. P4.3 changes nothing in this unit: `scripts/run_all.sh` and
+`scripts/phase4_orchestrator.py` remain byte-identical to the content P4.2
+pinned by SHA-256.
 
 P4.2 has since landed its frozen protocol and its GPU-free cross-campaign
 checker (`src/phase4/P4_2_PROTOCOL.md`,
