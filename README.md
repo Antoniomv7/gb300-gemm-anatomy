@@ -1074,7 +1074,8 @@ confirmed that no artifact was rewritten and no manifest revision was
 appended. This closes P4.1 as `YES / YES / YES` and supplies P4.2's required
 pilot. At that P4.1 closure, all evidence remained `publishable=false` and the
 three P4.2 final campaigns had not yet run. P4.2 has since closed independently,
-and P4.3's offline analysis layer is now implemented but not yet audited or run.
+and 4.2 and P4.3 have since closed independently; the P4.3 production analysis
+was executed, verified byte-for-byte, independently audited, and accepted.
 
 ### P4.2 (one accepted pilot plus three final campaigns) — closed
 
